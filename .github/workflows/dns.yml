@@ -5,7 +5,7 @@ permissions:
   contents: read
 jobs:
   gate:
-    runs-on: [self-hosted, persoon-build1]
+    runs-on: [self-hosted, dig-home-01]
     environment: production
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
