@@ -14,14 +14,19 @@ import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadReceipts } from "./cap.js";
 import { createVelocityBreaker } from "./velocity.js";
+import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
+import { agentBudgetStatus } from "./check.js";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createKillCheck, kill, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] -- <command...>\n" +
   "       costcap check [--cap USD] [--receipts FILE]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
-  "       costcap mcp [--cap USD] [--receipts FILE]\n" +
+  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
+  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
   "       costcap kill [note] [--kill-file FILE] | costcap resume [--kill-file FILE]\n" +
   "       costcap --version | costcap --help";
 
@@ -54,13 +59,22 @@ export function parseWrapArgs(argv) {
     } else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
+    else if (f === "--agent") opts.agentId = v;
+    else if (f === "--run-id") opts.runId = v;
+    else if (f === "--policy") opts.policyPath = v;
     else throw new Error(`unknown flag ${f}`);
   }
   return opts;
 }
 
+const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
+
 export async function wrap(argv) {
-  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath } = parseWrapArgs(argv);
+  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath } = parseWrapArgs(argv);
+  if (policyPath && !agentId) throw new Error("--policy needs --agent");
+  const policy = policyPath ? loadPolicy(policyPath) : null;
+  // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
+  const who = agentId ? { agent_id: agentId, run_id: runId ?? randomUUID() } : {};
   const release = lockLedger(receiptsPath);
   try {
   const cap = createCapEngine({ caps, history: loadReceipts(receiptsPath) });
@@ -80,7 +94,8 @@ export async function wrap(argv) {
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill });
+  const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
@@ -126,13 +141,21 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else if (cmd === "check" || cmd === "mcp") {
     try {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
-      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps };
+      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined };
       if (cmd === "mcp") serveMcp(options);
       else {
         const result = checkBudget(options);
         console.log(JSON.stringify(result));
         process.exitCode = result.ok ? 0 : 1;
       }
+    } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
+  } else if (cmd === "agent-status") {
+    try {
+      const parsed = parseWrapArgs([...rest, "--", "unused"]);
+      if (!parsed.policyPath) throw new Error("--policy is required");
+      const result = agentBudgetStatus({ receiptsPath: parsed.receiptsPath, policy: loadPolicy(parsed.policyPath), agent_id: parsed.agentId, run_id: parsed.runId ?? null });
+      console.log(JSON.stringify(result));
+      process.exitCode = result.ok ? 0 : 1;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
   } else if (cmd === "enroll") {
     const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
