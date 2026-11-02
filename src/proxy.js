@@ -46,7 +46,13 @@ export function extractUsage(provider, text, requestedModel) {
       // message_start contains input usage; message_delta carries final output.
       const u = chunk.usage ?? chunk.message?.usage;
       if (u) {
-        if (u.input_tokens != null) usage.input_tokens = u.input_tokens + (u.cache_creation_input_tokens ?? 0);
+        if (u.input_tokens != null) usage.input_tokens = u.input_tokens;
+        if (u.cache_creation_input_tokens != null) {
+          // Without the 5m/1h breakdown every write is priced at the 5-minute rate.
+          const longLived = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+          usage.cache_write_input_tokens = u.cache_creation_input_tokens - longLived;
+          usage.cache_write_1h_input_tokens = longLived;
+        }
         if (u.output_tokens != null) usage.output_tokens = u.output_tokens;
         if (u.cache_read_input_tokens != null) usage.cached_input_tokens = u.cache_read_input_tokens;
       }
@@ -118,7 +124,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
             cap?.record(receipt);
-            velocity?.record(receipt.cost_usd);
+            if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
+            else velocity?.record(receipt.cost_usd);
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "usage_unavailable" });

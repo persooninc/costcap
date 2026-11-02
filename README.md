@@ -41,8 +41,10 @@ CostCap. The local proxy binds to 127.0.0.1.
   Anthropic start/delta usage, Gemini usageMetadata, and OpenRouter (OpenAI-shape)
   usage have local fixture tests. Provider billing reconciliation and live SDK
   compatibility remain unverified.
-- Anthropic cache creation is estimated at the input rate. Provider-specific
-  cache-write multipliers, other billable features and dynamic pricing may differ.
+- Anthropic cache writes use per-model 5-minute and 1-hour rates. A response without
+  the 5m/1h breakdown is priced at the 5-minute rate. A cache write on a model with no
+  published rate records `cost_usd: null` and blocks further calls. Other billable
+  features and dynamic pricing may differ.
 - The default kill file is relative to the working directory. Only agents sharing
   that file are affected. Polling defaults to 500ms, with SIGKILL after 5 seconds.
   It does not undo a request already accepted by the provider or stop remote agents.

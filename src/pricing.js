@@ -19,18 +19,25 @@ export function lookupPrice(model) {
   return { model, ...table.fallback, table_version: table.version, fallback: true };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0 } = {}) {
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0 } = {}) {
   const price = lookupPrice(model);
+  // A cache write with no published rate is unpriced, not guessed at another rate.
+  const unpriced = (cache_write_input_tokens > 0 && price.cache_write == null) || (cache_write_1h_input_tokens > 0 && price.cache_write_1h == null);
   const cost =
     (input_tokens * price.input +
       cached_input_tokens * price.cached_input +
+      cache_write_input_tokens * (price.cache_write ?? 0) +
+      cache_write_1h_input_tokens * (price.cache_write_1h ?? 0) +
       output_tokens * price.output) / 1_000_000;
   return {
     model,
-    cost_usd: Number(cost.toFixed(6)),
+    cost_usd: unpriced ? null : Number(cost.toFixed(6)),
+    ...(unpriced ? { reason: "cache_write_unpriced" } : {}),
     input_tokens,
     output_tokens,
     cached_input_tokens,
+    cache_write_input_tokens,
+    cache_write_1h_input_tokens,
     table_version: price.table_version,
     fallback: price.fallback,
   };
