@@ -27,10 +27,11 @@ test("notifications get no reply and replies echo the request id", () => {
   assert.equal(handleMcp({ jsonrpc: "2.0", id: 0, method: "ping" }, {}).id, 0);
 });
 
-test("the server exposes one read-only tool that takes no input", () => {
+test("budget_status is read-only and takes no input", () => {
   const { tools } = call("tools/list").result;
-  assert.deepEqual(tools.map((t) => t.name), ["budget_status"]);
-  assert.deepEqual(tools[0].inputSchema, { type: "object", properties: {}, additionalProperties: false });
+  const tool = tools.find((t) => t.name === "budget_status");
+  assert.deepEqual(tool.inputSchema, { type: "object", properties: {}, additionalProperties: false });
+  for (const t of tools) assert.match(t.description, /Cannot change caps/);
   assert.match(call("initialize").result.instructions, /Not a billing guarantee/);
 });
 
