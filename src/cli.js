@@ -18,7 +18,7 @@ import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
 import { agentBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { createKillCheck, kill, resume, DEFAULT_KILL_FILE } from "./kill.js";
+import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] -- <command...>\n" +
@@ -27,7 +27,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
-  "       costcap kill [note] [--kill-file FILE] | costcap resume [--kill-file FILE]\n" +
+  "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
 
 export function parseWrapArgs(argv) {
@@ -63,6 +63,16 @@ export function parseWrapArgs(argv) {
     else if (f === "--run-id") opts.runId = v;
     else if (f === "--policy") opts.policyPath = v;
     else throw new Error(`unknown flag ${f}`);
+  }
+  return opts;
+}
+
+function parseKillArgs(argv) {
+  const opts = { file: DEFAULT_KILL_FILE, receipts: ".costcap/receipts.jsonl", words: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--kill-file") opts.file = argv[++i];
+    else if (argv[i] === "--receipts") opts.receipts = argv[++i];
+    else opts.words.push(argv[i]);
   }
   return opts;
 }
@@ -171,16 +181,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.log(JSON.stringify(result));
       process.exitCode = result.ok ? 0 : 1;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
-  } else if (cmd === "kill") {
-    const i = rest.indexOf("--kill-file");
-    const file = i >= 0 ? rest[i + 1] : DEFAULT_KILL_FILE;
-    const skip = new Set(i >= 0 ? [i, i + 1] : []);
-    kill(file, rest.filter((a, j) => !skip.has(j)).join(" "));
-    console.error(`costcap: killed. Wrapped agents sharing ${file} are refused until \`costcap resume\`.`);
-  } else if (cmd === "resume") {
-    const i = rest.indexOf("--kill-file");
-    const file = i >= 0 ? rest[i + 1] : DEFAULT_KILL_FILE;
-    console.error(resume(file) ? "costcap: resumed." : "costcap: nothing to resume (not killed).");
+  } else if (cmd === "kill" || cmd === "resume") {
+    const { file, receipts, words } = parseKillArgs(rest);
+    const logEvent = (note) => {
+      // The kill state already changed, so a ledger failure is a warning, not a failure.
+      try { recordKillEvent(receipts, cmd, file, note); }
+      catch (err) { console.error(`costcap: warning: ${cmd} took effect but was not recorded in ${receipts}: ${err.code ?? err.message}`); }
+    };
+    if (cmd === "kill") {
+      const note = words.join(" ");
+      kill(file, note);
+      logEvent(note);
+      console.error(`costcap: killed. Wrapped agents sharing ${file} are refused until \`costcap resume\`.`);
+    } else if (resume(file)) {
+      logEvent(words.join(" "));
+      console.error("costcap: resumed.");
+    } else console.error("costcap: nothing to resume (not killed).");
   } else {
     console.error(`costcap: unknown command "${cmd}"\n${USAGE}`);
     process.exit(2);
