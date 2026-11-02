@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   billing:
-    runs-on: [self-hosted, persoon-build1]
+    runs-on: [self-hosted, dig-home-01]
     environment: production
     env:
       COSTCAP_DEPLOY_HOST: ${{ secrets.COSTCAP_DEPLOY_HOST }}
