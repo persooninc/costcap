@@ -1,6 +1,28 @@
 # Backlog
 
-GitHub issues are the source of truth. This file is the index as of 2026-10-07.
+GitHub issues are the source of truth. Index updated 2026-11-07 by the weekly gap audit. Older rows below stay as history.
+
+## Open after 2026-11-07
+
+| Issue | Priority | State | Note |
+|---|---|---|---|
+| #89 Public claims agree on free CLI vs $19 plan | P1 | open | `ready-for-build`. Live JSON-LD price 0 vs workspace card. |
+| #90 Indexable page for the local spend cap | P1 | open | `ready-for-build`. Sitemap is one URL. |
+| #91 README deploy section matches the workflow | P2 | open | Docs only. No host migration. |
+| #5 npm / `npx costcap` | P1 | open | Owner-gated. Registry 404 on 2026-11-07. |
+| #11 Hosted dashboard epic | P0 | open | Live billing flag enabled; sha behind `main`. |
+| #45 Live login and alert proof | P1 | open | Owner-gated secrets. |
+| #10 Dogfood epic | P2 | open | No two-week receipt archive. |
+| #15 Distribution epic | P2 | open | Marketplace still blocked. SEO split out to #90. |
+| #42 Postgres | P2 | open | Owner-gated. Live store is still the JSON file. |
+| #44 DNS and TLS | P2 | open | Owner-gated. Apex already 301s to `app.costcap.dev`. |
+| #79 Alerts unit tests | — | open | `free-llm`. Not a product gap. |
+| #80 MCP unit tests | — | open | `free-llm`. Not a product gap. |
+| #84 Runner retarget | — | open | Another lane. Not touched. |
+
+Closed #1 is the CLI epic (verified earlier). Do not reopen it.
+
+GitHub issues are the source of truth. The table under this line is the index as of 2026-10-07.
 
 | Issue | Priority | State | Selectable |
 |---|---|---|---|
