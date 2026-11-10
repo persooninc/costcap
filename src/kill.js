@@ -4,14 +4,19 @@
 // by hand works too. Local enforcement only: traffic outside the proxy is
 // not stopped.
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const DEFAULT_KILL_FILE = ".costcap/KILL";
 
 export function createKillCheck(killFile = DEFAULT_KILL_FILE) {
   return () => {
-    if (!existsSync(killFile)) return null;
+    // A stat error other than "not found" means the state is unknown, so it kills.
+    try { statSync(killFile); }
+    catch (err) {
+      if (err.code === "ENOENT") return null;
+      return { reason: "killed", kill_file: killFile, note: `kill state unknown: ${err.code}` };
+    }
     let reason = "";
     try { reason = readFileSync(killFile, "utf8").trim(); } catch { /* unreadable: still killed */ }
     return { reason: "killed", kill_file: killFile, note: reason || undefined };
