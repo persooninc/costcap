@@ -130,3 +130,50 @@ Closed: #2, #3, #4, #7, #8, #9, #17, #18, #19, #20, #37, #38, #39, #40, #41, #46
   `cost_velocity` branch, green on real code.
 - 2026-10-12: fleet live spend. `/v1/fleet` now attaches `spend.day`, `spend.month`, and `spend.all` (`usd` plus `unknown`) per agent from synced receipts. A null `cost_usd` increments `unknown` and is excluded from `usd`. The workspace agent card shows UTC today and month figures and says they are not a provider bill. Covered by `test/hosted-server.test.js` and a UI script assertion in `test/ui.test.js`. Alert evaluation uses the same dollar totals.
 - 2026-10-07: OpenRouter provider coverage. OpenRouter is a wired provider (in `PROVIDERS`, emitted as `OPENROUTER_BASE_URL` by `baseUrlOverrides`, listed in `docs/product-spec.md`) but had no behavioral test, while openai/anthropic/gemini each have usage-extraction fixtures. Added `test/openrouter.test.js`: `extractUsage` for OpenAI-shape OpenRouter responses (cached tokens + slashed model ids), the base-URL override, and a routed `/openrouter` metering + cap hard-stop that also exercises the unknown-model fallback rate. README enforcement-limits now lists OpenRouter among the fixture-tested providers.
+
+## Feature review 2026-11-02
+
+Compared the README's promises, category expectations, and the agent-to-agent needs (per-agent dollar and step budgets, a budget-exceeded verdict, kill one or all). Highest value first. Each story is one PR. PR #87 ships the local per-agent budgets these build on.
+
+### CC-1 Hosted per-agent budget verdict
+- Acceptance: `GET /v1/agents/:id/budget`, scoped to the caller's org, returns `verdict`, `reason` and `budget_remaining` with the same names as `costcap agent-status`. Another org's agent returns 404. Unknown cost returns `accounting_unavailable`, never a pass.
+
+### CC-2 Per-agent step budgets in fleet policy
+- Acceptance: policy carries `maxSteps`, the dashboard edits it, and an enrolled wrapper enforces it offline from cache. A local value can tighten it, not loosen it.
+
+### CC-3 Kill one agent or all from the dashboard, with audit
+- Acceptance: both actions write an audit entry with who and why. A wrapper honors them within one poll. Resume is explicit. The UI states that remote kill is not instant and doesn't undo accepted requests.
+
+### CC-4 Kill and resume receipts in the local ledger
+- Acceptance: `costcap kill` and `resume` append an event with note and time, excluded from spend. A ledger write failure still leaves the kill file in place.
+
+### CC-5 Shared budgets across wrappers
+Separate ledgers don't share caps, so a fleet on one host can overspend.
+- Acceptance: multiple wrappers can share one agent policy through a local coordinator or per-ledger reservation. Concurrent wrappers can't exceed a cap by more than the documented overshoot, proven by a test with parallel processes.
+
+### CC-6 Streaming pass-through with metering
+SSE responses are buffered, which breaks interactive agents.
+- Acceptance: chunks reach the client as they arrive and usage is metered from the stream. A stream cut before usage arrives records `cost_usd: null` and blocks further calls.
+
+### CC-7 Cache-write pricing
+Anthropic cache creation is estimated at the input rate.
+- Acceptance: the price table has a cache-write rate per model. Follows the skill's rule that cache tokens with no rate are unpriced, not guessed.
+
+### CC-8 Regenerate FEATURE-COMPLETE.md
+It is dated 2026-10-11 and lists features as failing because the Docker tests failed the whole run.
+- Acceptance: regenerated after the Docker-free skips land, from a real CI run, with skipped tests reported as skipped.
+
+### CC-9 Pre-flight budget estimate
+Metering after the response allows one call to overshoot.
+- Acceptance: an optional mode estimates the worst case from `max_tokens` and the price table and refuses a call that can't fit. It's off by default and labeled an estimate.
+
+## Owner gates
+
+- CI runners: `costcap` is public and the org `Default` runner group has `allows_public_repositories: false`, so no CI runs. Allow public repos with fork approval required, make the repo private, or approve GitHub-hosted runners. Until then #85, #82, #83, #86 and #87 can't merge.
+- npm: add `NPM_TOKEN` to Actions secrets, then run the publish workflow for `npx costcap` (#5). The code and tarball checks are in place.
+- Live proof: deploy `main` and run the Playwright canary and live login and alert proof (#11, #45).
+- DNS and TLS through IaC (#44).
+- Postgres provisioning with separate migration and application roles (#42).
+- Stripe: billing stays disabled until an owner enables it.
+- Dogfood on the agent fleet for two weeks (#10), and distribution (#15).
+
