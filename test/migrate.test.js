@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
 import { applyFile, psql } from "../scripts/db-migrate.mjs";
+import { skipUnlessDocker } from "./support/docker.js";
 
 const root = new URL("..", import.meta.url);
 const file = (name) => new URL(name, root);
 
-test("postgres migrations apply and roll back without changing the running store", async (t) => {
+test("postgres migrations apply and roll back without changing the running store", { skip: skipUnlessDocker() }, async (t) => {
   const container = `cc-pg-${process.pid}`;
   const started = spawnSync("docker", ["run", "-d", "--rm", "--name", container, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres:16-alpine"], { encoding: "utf8" });
   assert.equal(started.status, 0, started.stderr);
