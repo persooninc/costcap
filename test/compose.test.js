@@ -4,7 +4,9 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { applyDeploy } from "../scripts/deploy-apply.mjs";
+import { skipUnlessDocker } from "./support/docker.js";
 
+const skip = skipUnlessDocker(["compose", "version"]);
 const repo = fileURLToPath(new URL("..", import.meta.url));
 const required = ["COSTCAP_ORIGIN", "TURNSTILE_SITE_KEY", "TURNSTILE_SECRET_KEY", "BREVO_API_KEY", "COSTCAP_EMAIL_FROM"];
 
@@ -18,13 +20,13 @@ function compose(values) {
   return spawnSync("docker", ["compose", "config"], { cwd: repo, env: env(values), encoding: "utf8" });
 }
 
-test("compose config fails closed without required variables", () => {
+test("compose config fails closed without required variables", { skip }, () => {
   const result = compose();
   assert.notEqual(result.status, 0);
   assert.match(`${result.stderr}`, /required variable (?:COSTCAP_ORIGIN|TURNSTILE_SITE_KEY|TURNSTILE_SECRET_KEY|BREVO_API_KEY|COSTCAP_EMAIL_FROM)/);
 });
 
-test("compose config renders one replica and a data volume for uid 1000", () => {
+test("compose config renders one replica and a data volume for uid 1000", { skip }, () => {
   const marker = "not-a-real-mail-marker";
   const result = compose({
     COSTCAP_ORIGIN: "https://app.example.invalid",
@@ -73,7 +75,7 @@ test("deploy preflight reports missing names and does not print values", () => {
   assert.equal(workflow.includes("ssh "), false);
 });
 
-test("production compose is one replica on the existing data directory", () => {
+test("production compose is one replica on the existing data directory", { skip }, () => {
   const sha = "a".repeat(40);
   const result = spawnSync("docker", ["compose", "-f", "compose.production.yaml", "config"], {
     cwd: repo,

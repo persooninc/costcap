@@ -63,12 +63,13 @@ export function extractUsage(provider, text, requestedModel) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
   const emit = (receipt) => {
-    const complete = { id: randomUUID(), ts: new Date().toISOString(), ...receipt };
+    const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
+    agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
@@ -97,6 +98,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const killed = killCheck?.();
         if (killed) return block("killed", killed, { error: "killed", ...killed });
         if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
+        const agentHit = agentBudgets?.check(who);
+        if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
         const hit = cap?.check();
         if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
         const vhit = velocity?.check();

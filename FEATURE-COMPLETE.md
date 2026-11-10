@@ -1,5 +1,35 @@
 # Feature completion
 
+## Audit baseline 2026-11-07
+
+Auditor: Grok Build (grok-4.7 low). This section is the source of truth for the weekly gap audit. The generator table below is historical (2026-10-11). Its FAIL rows mean the generator's CI-id gate did not match, not that the named unit tests are absent. Do not treat that table as the live rating.
+
+Completion toward a stranger's first useful run plus an honest hosted plan: **62%**. Local wedge (wrap, caps, breakers, kill, receipts) is implemented and covered by unit tests in `test/`. The hosted card and checkout code exist. npm is unpublished, the live origin is behind `main`, and the public page disagrees with itself about price.
+
+| Feature | Rating | Evidence |
+|---|---|---|
+| CLI wrap, run/day/month caps, hard stop | DONE | `src/cli.js`, `src/proxy.js`, `src/cap.js`. Tests include `test/cli.test.js`, `test/cap.test.js`, `test/proxy.test.js`. |
+| Retry spiral, cost velocity, step budget | DONE | `src/spiral.js`, `src/velocity.js`. Tests: `test/spiral.test.js`, `test/velocity.test.js`, `test/velocity-proxy.test.js`. |
+| Kill file and resume | DONE | `src/kill.js`, `test/kill.test.js`. README states the kill file is cwd-relative and does not stop an in-flight provider call. |
+| Versioned pricing, unknown-model fallback | DONE | `src/pricing-table.json` version `2026-10-14` lists OpenAI, Anthropic, Gemini, and OpenRouter ids. `test/pricing.test.js`, `test/openrouter.test.js`. Closed issue #73. |
+| Unknown cost stays null; reconcile does not zero it | DONE | `src/reconcile.js`, `test/reconcile.test.js`. |
+| `costcap check` and composite action | DONE | `src/check.js`, `action.yml`, `test/check-mcp.test.js`. No Marketplace listing (epic #15). |
+| Local MCP `budget_status` only | DONE | `src/mcp.js`. Open story #80 adds more unit tests; the tool list is already read-only in `src/mcp.js`. |
+| Hosted org, enroll, fleet spend, alerts, CSV | PARTIAL | Code and tests: `src/hosted/server.js`, `test/hosted-server.test.js`, `test/hosted.test.js`, `test/receipts-csv.test.js`. Live `GET /health` on 2026-11-07: `persistence` `single-process-file`, sha `85c83a80` (behind `main` `9dedb2c`). Live inbox login was not exercised (#45). |
+| Stripe checkout and portal | PARTIAL | `src/hosted/billing.js`, `e2e/billing.spec.js` (fixture, asserts no call to `api.stripe.com` in the isolated spec's negative path). Live health `billing` `enabled`. Live HTML shows "$19 USD per month". This audit did not complete a checkout. Price changes stay owner-gated. |
+| Public claims match the product | BROKEN | Live JSON-LD `offers.price` is `"0"` while the workspace card shows $19. README still says no paid hosted service. Story #89. |
+| Search landing beyond the app shell | PARTIAL | `src/hosted/seo.js` allowlists only `/`. Live sitemap has one URL, `lastmod` 2026-10-09, no `og:` tags. Story #90. |
+| Install without cloning | MISSING | `https://registry.npmjs.org/costcap` HTTP 404 on 2026-11-07. Issue #5, owner-gated. |
+| Deploy description matches the workflow | BROKEN | README says Coolify on Hetzner on push to `main`. `.github/workflows/deploy.yml` is `workflow_dispatch` plus SSH apply. Story #91. Docs only. No host move. |
+| Live email login and alert send | OWNER-GATED | #45. Not run. |
+| Postgres as the live store | OWNER-GATED | Migrations in `db/migrations/`, CI story #49 closed. Live persistence is still the JSON file. #42. |
+| Two-week dogfood | MISSING | Epic #10. Newest acceptance file: `docs/verification/2026-10-07-runaway.json`. |
+| npm publish, Marketplace | OWNER-GATED | #5, #15. |
+
+Latest product `verify` run found: [40195194984](https://github.com/persooninc/costcap/actions/runs/40195194984) on 2026-10-25, conclusion success, sha `1c5e354`. That run is not current `main`. Dependabot runs on `9dedb2c` (41784113646, 41784113245) succeeded and do not execute the product suite. This audit did not re-run `npm test`.
+
+## Historical generator output (2026-10-11)
+
 Generated 2026-10-11T17:16:58.731Z by `node scripts/feature-complete.mjs`.
 Test process exit 1. Passed names: 132. Failed names: compose config fails closed without required variables; compose config renders one replica and a data volume for uid 1000; production compose is one replica on the existing data directory; postgres migrations apply and roll back without changing the running store.
 DONE means COSTCAP_CI_RUN names a finished green GitHub run and the live curl matched. TESTED means the named test passed. BLOCKED is not done.

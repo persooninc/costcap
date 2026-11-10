@@ -75,6 +75,24 @@ mode 0600. A 401/403 response freezes the wrapper. Redirects are refused to avoi
 forwarding agent credentials to another host. These paths have local test-server
 coverage, not production verification or a finished org dashboard.
 
+## Per-agent budgets
+
+```sh
+cat > .costcap/policy.json <<'JSON'
+{ "default": { "run": 5, "day": 20, "maxSteps": 40 },
+  "agents": { "release-bot": { "run": 1, "maxSteps": 10 } } }
+JSON
+node src/cli.js wrap --agent release-bot --policy .costcap/policy.json -- node your-agent.js
+node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
+```
+
+An agent entry replaces the default. An agent with no entry and no default is
+refused (`no_budget_policy`). Blocks return HTTP 429 with `verdict`, `reason`,
+`agent_id` and `run_id`, and `agent-status` and the MCP tool `agent_budget_status`
+return the same verdict with `budget_remaining`. Run and step budgets are per
+`run_id`, which the wrapper assigns. Figures are estimates, the same limits above
+apply, and the policy file must be protected from the agent it limits.
+
 ## CI check and local MCP
 
 ```sh
