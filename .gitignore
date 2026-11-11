@@ -6,3 +6,12 @@ node_modules/
 test-results/
 playwright-report/
 blob-report/
+
+# workspace hygiene (sync-workspace)
+.DS_Store
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.claude/worktrees/
