@@ -140,8 +140,15 @@ See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
 
 ## Deploy / Rollback
 
-Deployed via Coolify on the Hetzner box (Path A) on push to `main`.
-Rollback: Coolify dashboard → Deployments → redeploy previous, or `git revert`.
+Deploys run only by manual dispatch of the `deploy` workflow
+(`.github/workflows/deploy.yml`, `workflow_dispatch`); nothing deploys on push
+to `main`. It checks production secrets, renders one replica with
+`docker compose config`, and applies that one replica with
+`scripts/deploy-apply.mjs` only when `COSTCAP_DEPLOY_HOST` and
+`COSTCAP_DEPLOY_SSH_KEY` are present; otherwise the apply step exits without
+applying. A canary then checks the origin serves the dispatched commit
+(`COSTCAP_EXPECT_SHA`).
+Rollback: `git revert` on `main`, then dispatch `deploy` again.
 
 <!-- iac-gaps -->
 
