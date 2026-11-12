@@ -2,12 +2,17 @@
 // IndexNow is omitted: it needs an owner key (residue).
 
 export const PUBLIC_ORIGIN = "https://costcap.dev";
-export const CONTENT_LASTMOD = "2026-10-09";
+export const CONTENT_LASTMOD = "2026-11-12";
 
 // Single allowlist for sitemap, canonical, and structured data.
 export const PUBLIC_ROUTES = Object.freeze([
   Object.freeze({ path: "/", priority: 1.0, changefreq: "weekly" }),
+  Object.freeze({ path: "/cli", priority: 0.8, changefreq: "monthly" }),
 ]);
+
+// Open Graph copy for the landing. Names the product category, not a guarantee.
+export const OG_TITLE = "CostCap: a local spend cap for AI agents";
+export const OG_DESCRIPTION = "Wrap an AI agent with a local proxy that stops further API calls once its spend cap is reached. Free CLI. Guardrails, not guarantees.";
 
 const FREE_DESCRIPTION = "Free beta spend guardrails for your AI agent fleet. Guardrails, not guarantees.";
 const PLAN_DESCRIPTION = "Free CLI spend guardrails for your AI agent fleet. Optional $19/month hosted workspace plan. Guardrails, not a provider-bill guarantee.";
@@ -27,6 +32,26 @@ export function absoluteUrl(origin, path) {
   const base = canonicalOrigin(origin);
   if (path === "/" || path === "") return base;
   return `${base}${path.startsWith("/") ? path : `/${path}`}`.replace(/\/$/, "");
+}
+
+export function htmlEscape(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// og:title, og:description, og:type, og:url for one public path.
+export function openGraphTags(origin, path, title = OG_TITLE, summary = OG_DESCRIPTION) {
+  return [
+    ["og:type", "website"],
+    ["og:site_name", "CostCap"],
+    ["og:title", title],
+    ["og:description", summary],
+    ["og:url", absoluteUrl(origin, path)],
+  ].map(([property, content]) => `<meta property="${property}" content="${htmlEscape(content)}">`).join("");
 }
 
 function xmlEscape(value) {
