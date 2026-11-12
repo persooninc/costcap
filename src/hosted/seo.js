@@ -9,7 +9,13 @@ export const PUBLIC_ROUTES = Object.freeze([
   Object.freeze({ path: "/", priority: 1.0, changefreq: "weekly" }),
 ]);
 
-const DESCRIPTION = "Free beta spend guardrails for your AI agent fleet. Guardrails, not guarantees.";
+const FREE_DESCRIPTION = "Free beta spend guardrails for your AI agent fleet. Guardrails, not guarantees.";
+const PLAN_DESCRIPTION = "Free CLI spend guardrails for your AI agent fleet. Optional $19/month hosted workspace plan. Guardrails, not a provider-bill guarantee.";
+
+// One description for meta tags and structured data, so they match the visible copy.
+export function description(billing = false) {
+  return billing ? PLAN_DESCRIPTION : FREE_DESCRIPTION;
+}
 
 export function canonicalOrigin(origin = PUBLIC_ORIGIN) {
   const url = new URL(origin);
@@ -70,8 +76,20 @@ export function sitemapXml(origin = PUBLIC_ORIGIN, lastmod = CONTENT_LASTMOD) {
   ].join("\n");
 }
 
-export function jsonLd(origin = PUBLIC_ORIGIN) {
+// With billing on, the page offers a paid plan, so no zero-price Offer is emitted;
+// the free CLI and optional plan are stated in the description instead.
+export function jsonLd(origin = PUBLIC_ORIGIN, billing = false) {
   const url = absoluteUrl(origin, "/");
+  const text = description(billing);
+  const app = {
+    "@type": "SoftwareApplication",
+    name: "CostCap",
+    applicationCategory: "DeveloperApplication",
+    operatingSystem: "Any",
+    url,
+    description: text,
+  };
+  if (!billing) app.offers = { "@type": "Offer", price: "0", priceCurrency: "USD" };
   return {
     "@context": "https://schema.org",
     "@graph": [
@@ -79,21 +97,13 @@ export function jsonLd(origin = PUBLIC_ORIGIN) {
         "@type": "WebSite",
         name: "CostCap",
         url,
-        description: DESCRIPTION,
+        description: text,
       },
-      {
-        "@type": "SoftwareApplication",
-        name: "CostCap",
-        applicationCategory: "DeveloperApplication",
-        operatingSystem: "Any",
-        url,
-        description: DESCRIPTION,
-        offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
-      },
+      app,
     ],
   };
 }
 
-export function jsonLdScript(origin = PUBLIC_ORIGIN) {
-  return JSON.stringify(jsonLd(origin)).replace(/</g, "\\u003c");
+export function jsonLdScript(origin = PUBLIC_ORIGIN, billing = false) {
+  return JSON.stringify(jsonLd(origin, billing)).replace(/</g, "\\u003c");
 }
