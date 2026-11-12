@@ -41,14 +41,14 @@ Runaway execution is the most expensive agent failure class: documented multi-ag
 
 ## Engineering
 
-- TypeScript CLI on npm (`costcap`), Node 20+, single-command install. Mirrors NightlyQA's stack and build standards.
+- JavaScript (ES module) CLI on npm (`costcap`), Node 20+, single-command install. Mirrors NightlyQA's stack and build standards.
 - Hosted beta in this repo: one Node process, local JSON datastore, Brevo for mail, billing disabled. A Postgres migration and paid billing are not part of the running beta.
 - Creds to vault + private dotenv repo (costcap/.env.local); accounts/ dir; build time in prod footer; no repo links in footer.
 - Dogfood: our own agent fleet first - NightlyQA's nightly walks (already burns OpenAI nightly), Pictage evals, ShipReady sync jobs. Real receipts, real caps.
 
 ## Distribution (shared pipeline)
 
-- costcap.dev site (deploy lane, Hetzner) - guardrails-not-guarantees copy, the $47K-pattern story, OSS-first CTA.
+- costcap.dev site (deployed by the manual `deploy` workflow, one replica) - guardrails-not-guarantees copy, the $47K-pattern story, OSS-first CTA.
 - GitHub: public repo at launch for the stars funnel (repo stays private during build; flip at launch), GitHub Action (`costcap check` in CI to gate agent eval jobs on budget).
 - Then the trilogy marketplace path: GitHub Marketplace, MCP ecosystem channels (MCP server so agents can check their own budget), AWS, Microsoft - verified claims only, coordinated with the marketplace agent through main.
 
