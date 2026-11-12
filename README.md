@@ -3,7 +3,13 @@
 Local spend guardrails for proxy-routed AI requests. Development beta.
 The CLI meters token usage, stops subsequent calls once a budget is reached,
 detects normalized retry patterns, enforces step budgets, and supports a local
-kill file. MIT, no warranty. No paid hosted service is available in this repo.
+kill file. MIT, no warranty.
+
+**What is free and what is paid.** The CLI is free and stays free. This repo
+also contains the hosted workspace (`src/hosted/`). When the deployment has
+billing enabled, the workspace offers an optional $19 USD/month plan; without
+billing it is a free beta with no card and no charges. Neither tier is a
+provider-bill guarantee: these are guardrails, not guarantees.
 
 ## Run from source
 
@@ -53,7 +59,8 @@ Receipts include unique IDs, timestamp, model, usage, versioned estimated cost,
 and blocked reasons. No request bodies or authorization headers are written.
 
 The local CLI is covered by `npm test`. The hosted beta at the configured
-origin serves the fleet UI with billing disabled. Live email login, live alert
+origin serves the fleet UI; when billing is enabled it shows the optional $19/month
+plan described above. Live checkout, live email login, live alert
 delivery, npm publication, marketplace distribution, and two-week dogfood are
 not certified by this repository's tests. `costcap reconcile` compares a local
 receipt file with a provider charge file and does not call a provider.

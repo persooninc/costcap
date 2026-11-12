@@ -32,3 +32,22 @@ test('IndexNow key file is served as exactly the key, text/plain', () => {
   assert.match(r.headers['content-type'], /^text\/plain/);
   assert.equal(uiResponse('/other-key.txt'), null);
 });
+
+test('public HTML never pairs a zero-price offer with the $19 plan (#89)', () => {
+  for (const [billing, mode] of [[false, 'live'], [false, 'test'], [true, 'live']]) {
+    const html = uiResponse('/', '', 'https://app.costcap.dev', billing, mode).body;
+    const ld = JSON.parse(html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/)[1]);
+    const app = ld['@graph'].find((n) => n['@type'] === 'SoftwareApplication');
+    assert.ok(!(html.includes('price":"0"') && html.includes('$19')), `billing=${billing} mode=${mode}`);
+    if (billing) {
+      assert.equal(app.offers, undefined);
+      assert.match(app.description, /Free CLI/);
+      assert.match(app.description, /Optional \$19\/month/);
+      assert.match(app.description, /not a provider-bill guarantee/);
+      assert.match(html, /<meta name="description" content="[^"]*Optional \$19\/month/);
+    } else {
+      assert.equal(app.offers.price, '0');
+      assert.equal(html.includes('$19'), false);
+    }
+  }
+});
