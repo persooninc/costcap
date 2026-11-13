@@ -57,15 +57,37 @@ jobs:
           COSTCAP_EMAIL_FROM: ${{ secrets.COSTCAP_EMAIL_FROM }}
           COMPOSE_DISABLE_ENV_FILE: "1"
         run: docker compose config
+      # Exit 3: the host's SSH key no longer matches infra/ssh/costcap-deploy.known_hosts (nothing was sent).
+      # Exit 4: the host preflight in deploy-remote.sh refused the host .env (running image unchanged).
+      # Both need an owner. A manual dispatch fails on them; the automatic run after `verify`
+      # records a warning and skips, so main stays green. prod-drift keeps reporting the lag.
       - name: apply one replica
+        id: apply
         if: steps.fresh.outputs.deploy == 'true'
         env:
           COSTCAP_DEPLOY_HOST: ${{ secrets.COSTCAP_DEPLOY_HOST }}
           COSTCAP_DEPLOY_SSH_KEY: ${{ secrets.COSTCAP_DEPLOY_SSH_KEY }}
           COSTCAP_GIT_SHA: ${{ env.DEPLOY_SHA }}
-        run: node scripts/deploy-apply.mjs
+          EVENT: ${{ github.event_name }}
+        run: |
+          set +e
+          node scripts/deploy-apply.mjs
+          code=$?
+          set -e
+          if [ "$code" = 0 ]; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT" = "workflow_run" ] && { [ "$code" = 3 ] || [ "$code" = 4 ]; }; then
+            if [ "$code" = 3 ]; then reason="the deploy host's SSH key does not match the pinned known_hosts"; else reason="the host preflight refused the host .env"; fi
+            echo "::warning title=auto-deploy skipped::$DEPLOY_SHA was not applied: $reason. Owner action needed; see the step log."
+            echo "Auto-deploy skipped for \`$DEPLOY_SHA\`: $reason. Production is unchanged. Owner action needed before the next deploy." >> "$GITHUB_STEP_SUMMARY"
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$code"
       - name: canary the applied origin
-        if: success() && steps.fresh.outputs.deploy == 'true'
+        if: success() && steps.apply.outputs.applied == 'true'
         env:
           COSTCAP_ORIGIN: ${{ secrets.COSTCAP_ORIGIN }}
           COSTCAP_EXPECT_SHA: ${{ env.DEPLOY_SHA }}
