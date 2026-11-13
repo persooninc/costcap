@@ -40,7 +40,8 @@ if (have.get("COSTCAP_ENTITLEMENTS") or "enforced") not in ("enforced", "report"
 if (have.get("COSTCAP_PUBLIC_PRICING") or "enabled") != "enabled":
     print("deploy: COSTCAP_PUBLIC_PRICING must be enabled or unset", file=sys.stderr)
     raise SystemExit(2)
-mode = have.get("COSTCAP_STRIPE_MODE") or "live"
+# Unset means test. Live is an explicit owner switch in the host .env, never a default.
+mode = have.get("COSTCAP_STRIPE_MODE") or "test"
 if mode not in ("live", "test"):
     print("deploy: COSTCAP_STRIPE_MODE must be live or test", file=sys.stderr)
     raise SystemExit(2)
@@ -59,6 +60,7 @@ if have.get("COSTCAP_BILLING") == "enabled":
     if mode == "live" and not (key.startswith("sk_live_") or key.startswith("rk_live_")):
         print("deploy: live mode requires a live restricted key", file=sys.stderr)
         raise SystemExit(2)
+have["COSTCAP_STRIPE_MODE"] = mode
 lines = [f"export {key}={shlex.quote(have[key])}" for key in need + optional if key in have]
 pathlib.Path("/tmp/costcap-env.sh").write_text("\n".join(lines) + "\n")
 PY
