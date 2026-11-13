@@ -19,6 +19,37 @@ Existing agents keep running over a limit; only new enrollments and invitations
 are refused. The public `/pricing` page is off unless `COSTCAP_PUBLIC_PRICING=enabled`.
 Variables: [env.example](env.example) and [docs/billing-readiness.md](docs/billing-readiness.md).
 
+## Install
+
+Node 20 or newer; no runtime dependencies. **Not yet on npm or the GitHub
+Marketplace:** the package and the Action are release-ready, and the owner
+publishes them (see [docs/RELEASING.md](docs/RELEASING.md)). Until then, use
+[Run from source](#run-from-source) or pin the Action to a commit SHA.
+
+Once the first release is out:
+
+```sh
+npx costcap wrap --cap 5 -- node your-agent.js   # one-off, no install
+npm install --save-dev costcap                   # per project
+npm install --global costcap                     # costcap on your PATH
+costcap --version
+```
+
+GitHub Action (fails the job when the receipt ledger reaches the cap, or when
+any receipt has unknown cost):
+
+```yaml
+- uses: persooninc/costcap@v0.0.1 # or a full commit SHA
+  with:
+    receipts: .costcap/receipts.jsonl
+    cap: "5"
+    day-cap: "10"   # optional, UTC day
+    month-cap: "50" # optional, UTC month
+```
+
+The CLI and the Action are free. The optional hosted workspace plans are
+described above.
+
 ## Run from source
 
 Node 20 or newer; no runtime dependencies.
@@ -118,8 +149,8 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
 receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC.
-`action.yml` exposes this check as a composite GitHub Action; no Marketplace
-listing or public release has been made. MCP exposes only `budget_status` via
+`action.yml` exposes this check as a composite GitHub Action (Marketplace
+branding included); no Marketplace listing or public release has been made yet. MCP exposes only `budget_status` via
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
 protocol tests do not substitute for verification in every MCP client.
 
@@ -143,6 +174,7 @@ See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
 - [ACCOUNTS.md](ACCOUNTS.md) — service names only, no secrets
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — as-built architecture and trust boundaries
 - [docs/PATH_TO_FIRST_DOLLAR.md](docs/PATH_TO_FIRST_DOLLAR.md) — the free→paid path and its owner gates
+- [docs/RELEASING.md](docs/RELEASING.md) — npm release workflow and Marketplace listing (owner steps)
 - [docs/VISION.md](docs/VISION.md)
 - [docs/deck/index.html](docs/deck/index.html) — short pitch
 
