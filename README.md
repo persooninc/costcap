@@ -11,12 +11,17 @@ billing enabled, the workspace offers an optional $19 USD/month plan; without
 billing it is a free beta with no card and no charges. Neither tier is a
 provider-bill guarantee: these are guardrails, not guarantees.
 
-The free hosted workspace covers up to 3 enrolled agents and 3 people; the
-workspace plan raises that to 100 and 20. Limits apply only where checkout is
+The free hosted workspace covers up to 3 enrolled agents and 3 people. Solo
+($19/month list price) raises that to 15 agents, and Team ($79/month list price,
+Stripe test mode only for now) to 50 agents and 15 people, with receipts shown
+for 1 year. Limits apply only where checkout is
 configured, so a limited workspace always has an upgrade path: by default in
 Stripe test mode, and in live mode only with `COSTCAP_ENTITLEMENTS=enforced`.
 Existing agents keep running over a limit; only new enrollments and invitations
-are refused. The public `/pricing` page is off unless `COSTCAP_PUBLIC_PRICING=enabled`.
+are refused. The public `/pricing` page is on by default and shows a test-mode
+banner until live billing is approved; `COSTCAP_PUBLIC_PRICING=disabled` turns it off.
+`/privacy`, `/terms` and `/security` are public. The hosted datastore is the JSON
+file unless `COSTCAP_DATABASE_URL` selects Postgres ([docs/postgres.md](docs/postgres.md)).
 Variables: [env.example](env.example) and [docs/billing-readiness.md](docs/billing-readiness.md).
 
 ## Install
@@ -180,14 +185,17 @@ See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
 
 ## Deploy / Rollback
 
-Deploys run only by manual dispatch of the `deploy` workflow
-(`.github/workflows/deploy.yml`, `workflow_dispatch`); nothing deploys on push
-to `main`. It checks production secrets, renders one replica with
+The `deploy` workflow (`.github/workflows/deploy.yml`) runs after a green
+`verify` run on a push to `main`, for that exact commit (only while it is still
+main HEAD), or by manual dispatch. The repo variable `COSTCAP_AUTO_DEPLOY=off`
+stops the automatic run. It checks production secrets, renders one replica with
 `docker compose config`, and applies that one replica with
 `scripts/deploy-apply.mjs` only when `COSTCAP_DEPLOY_HOST` and
 `COSTCAP_DEPLOY_SSH_KEY` are present; otherwise the apply step exits without
-applying. A canary then checks the origin serves the dispatched commit
-(`COSTCAP_EXPECT_SHA`).
+applying. A canary then checks the origin serves that commit
+(`COSTCAP_EXPECT_SHA`), the expected datastore, and `/cli` plus the trust pages.
+The daily `prod-drift` workflow fails when production has been behind `main`
+HEAD for more than 24 hours.
 Rollback: `git revert` on `main`, then dispatch `deploy` again.
 
 <!-- iac-gaps -->

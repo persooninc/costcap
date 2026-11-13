@@ -8,12 +8,12 @@ import { DEFAULT_PLANS, planForStatus, upgradePlan } from "./plans.js";
 
 /**
  * Entitlements for a workspace.
- * @param {{ status?: string|null, enforced?: boolean, catalog?: import('./index.js').PlanCatalog }} [input]
+ * @param {{ status?: string|null, plan?: string|null, enforced?: boolean, catalog?: import('./index.js').PlanCatalog }} [input]
  * @returns {Entitlements}
  */
-export function entitlementsFor({ status = null, enforced = false, catalog = DEFAULT_PLANS } = {}) {
-  const plan = planForStatus(status, catalog);
-  const next = plan.paid ? null : upgradePlan(catalog);
+export function entitlementsFor({ status = null, plan: planId = null, enforced = false, catalog = DEFAULT_PLANS } = {}) {
+  const plan = planForStatus(status, catalog, planId);
+  const next = upgradePlan(catalog, plan.paid ? plan.id : null);
   return {
     plan: plan.id,
     planName: plan.name,
@@ -22,6 +22,19 @@ export function entitlementsFor({ status = null, enforced = false, catalog = DEF
     limits: { ...plan.limits },
     upgradeTo: next ? { id: next.id, name: next.name, limits: { ...next.limits } } : null,
   };
+}
+
+/**
+ * Receipts older than the plan's retention window are not shown. Only applies
+ * when entitlements are enforced; returns null (no cutoff) otherwise.
+ * @param {Entitlements} entitlements
+ * @param {number} nowMs
+ * @returns {number|null} oldest visible timestamp in ms
+ */
+export function retentionCutoff(entitlements, nowMs) {
+  const days = entitlements.limits.receiptRetentionDays;
+  if (!entitlements.enforced || !Number.isFinite(days)) return null;
+  return nowMs - days * 24 * 3600_000;
 }
 
 /**

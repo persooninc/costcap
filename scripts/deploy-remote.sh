@@ -33,12 +33,12 @@ if have["COSTCAP_EMAIL_PROVIDER"] != "brevo":
 if not have["COSTCAP_ORIGIN"].startswith("https://"):
     print("deploy: COSTCAP_ORIGIN must be https", file=sys.stderr)
     raise SystemExit(2)
-optional = ["COSTCAP_BILLING", "COSTCAP_STRIPE_MODE", "COSTCAP_STRIPE_SECRET_KEY", "COSTCAP_STRIPE_WEBHOOK_SECRET", "COSTCAP_STRIPE_ACCOUNT_ID", "COSTCAP_STRIPE_PRICE_ID", "COSTCAP_ENTITLEMENTS", "COSTCAP_PUBLIC_PRICING"]
+optional = ["COSTCAP_BILLING", "COSTCAP_STRIPE_MODE", "COSTCAP_STRIPE_SECRET_KEY", "COSTCAP_STRIPE_WEBHOOK_SECRET", "COSTCAP_STRIPE_ACCOUNT_ID", "COSTCAP_STRIPE_PRICE_ID", "COSTCAP_STRIPE_TEAM_PRICE_ID", "COSTCAP_ENTITLEMENTS", "COSTCAP_PUBLIC_PRICING", "COSTCAP_DATABASE_URL"]
 if (have.get("COSTCAP_ENTITLEMENTS") or "enforced") not in ("enforced", "report"):
     print("deploy: COSTCAP_ENTITLEMENTS must be enforced or report", file=sys.stderr)
     raise SystemExit(2)
-if (have.get("COSTCAP_PUBLIC_PRICING") or "enabled") != "enabled":
-    print("deploy: COSTCAP_PUBLIC_PRICING must be enabled or unset", file=sys.stderr)
+if (have.get("COSTCAP_PUBLIC_PRICING") or "enabled") not in ("enabled", "disabled"):
+    print("deploy: COSTCAP_PUBLIC_PRICING must be enabled, disabled or unset", file=sys.stderr)
     raise SystemExit(2)
 # Unset means test. Live is an explicit owner switch in the host .env, never a default.
 mode = have.get("COSTCAP_STRIPE_MODE") or "test"
@@ -60,6 +60,9 @@ if have.get("COSTCAP_BILLING") == "enabled":
     if mode == "live" and not (key.startswith("sk_live_") or key.startswith("rk_live_")):
         print("deploy: live mode requires a live restricted key", file=sys.stderr)
         raise SystemExit(2)
+if have.get("COSTCAP_DATABASE_URL") and not have["COSTCAP_DATABASE_URL"].startswith(("postgres://", "postgresql://")):
+    print("deploy: COSTCAP_DATABASE_URL must be a postgres:// URL", file=sys.stderr)
+    raise SystemExit(2)
 have["COSTCAP_STRIPE_MODE"] = mode
 lines = [f"export {key}={shlex.quote(have[key])}" for key in need + optional if key in have]
 pathlib.Path("/tmp/costcap-env.sh").write_text("\n".join(lines) + "\n")
@@ -70,6 +73,8 @@ set -a
 set +a
 rm -f /tmp/costcap-env.sh
 export COSTCAP_GIT_SHA="$SHA"
+# Health readback expects the datastore the host .env selects.
+if [ -n "${COSTCAP_DATABASE_URL:-}" ]; then export COSTCAP_EXPECT_PERSISTENCE=postgres; else export COSTCAP_EXPECT_PERSISTENCE=single-process-file; fi
 if docker image inspect costcap:1 >/dev/null 2>&1; then
   docker tag costcap:1 costcap:previous
 fi
@@ -77,7 +82,7 @@ docker compose -f compose.production.yaml -p costcap build
 docker compose -f compose.production.yaml -p costcap up -d --no-build --force-recreate
 i=0
 while [ "$i" -lt 30 ]; do
-  if docker exec costcap-costcap-1 node -e 'fetch("http://127.0.0.1:"+(process.env.PORT||3000)+"/health").then(r=>r.json()).then(j=>{if(j.billing===(process.env.COSTCAP_BILLING==="enabled"?"enabled":"disabled")&&j.persistence==="single-process-file"&&j.sha===process.env.COSTCAP_GIT_SHA)process.exit(0);process.exit(1)}).catch(()=>process.exit(1))'; then
+  if docker exec costcap-costcap-1 node -e 'fetch("http://127.0.0.1:"+(process.env.PORT||3000)+"/health").then(r=>r.json()).then(j=>{if(j.billing===(process.env.COSTCAP_BILLING==="enabled"?"enabled":"disabled")&&j.persistence===process.env.COSTCAP_EXPECT_PERSISTENCE&&j.sha===process.env.COSTCAP_GIT_SHA)process.exit(0);process.exit(1)}).catch(()=>process.exit(1))'; then
     echo "deploy: health sha matched"
     exit 0
   fi

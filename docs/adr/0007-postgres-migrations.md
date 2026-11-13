@@ -1,6 +1,6 @@
 # ADR 0007: Postgres migrations stay out of the running service
 
-Date: 2026-10-07. Status: accepted for CI proof. Production still uses the JSON file.
+Date: 2026-10-07. Status: accepted for CI proof. Production still uses the JSON file. Superseded in part by [ADR 0012](0012-postgres-store.md): the service may now read `COSTCAP_DATABASE_URL` (app role only).
 
 ## Decision
 

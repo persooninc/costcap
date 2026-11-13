@@ -1,15 +1,44 @@
 name: deploy
+# FA-CC-01: a green `verify` run on a push to main deploys that exact commit.
+# Manual dispatch still works. The host preflight (scripts/deploy-remote.sh) fails
+# closed before building when the host .env is incomplete, so the running image stays.
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: [verify]
+    types: [completed]
+    branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
 jobs:
   gate:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && vars.COSTCAP_AUTO_DEPLOY != 'off')
     runs-on: [self-hosted, dev-home-01]
     environment: production
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - name: deploy only main HEAD
+        id: fresh
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          git fetch --quiet origin main
+          if [ "$EVENT" = "workflow_run" ] && [ "$(git rev-parse origin/main)" != "$DEPLOY_SHA" ]; then
+            echo "deploy: $DEPLOY_SHA is no longer main HEAD; a newer verify run deploys instead"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: fail closed without production secrets
+        if: steps.fresh.outputs.deploy == 'true'
         env:
           COSTCAP_ORIGIN: ${{ secrets.COSTCAP_ORIGIN }}
           TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
@@ -19,6 +48,7 @@ jobs:
           COSTCAP_EMAIL_PROVIDER: brevo
         run: node scripts/deploy-preflight.mjs
       - name: render one replica
+        if: steps.fresh.outputs.deploy == 'true'
         env:
           COSTCAP_ORIGIN: ${{ secrets.COSTCAP_ORIGIN }}
           TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
@@ -28,15 +58,17 @@ jobs:
           COMPOSE_DISABLE_ENV_FILE: "1"
         run: docker compose config
       - name: apply one replica
+        if: steps.fresh.outputs.deploy == 'true'
         env:
           COSTCAP_DEPLOY_HOST: ${{ secrets.COSTCAP_DEPLOY_HOST }}
           COSTCAP_DEPLOY_SSH_KEY: ${{ secrets.COSTCAP_DEPLOY_SSH_KEY }}
-          COSTCAP_GIT_SHA: ${{ github.sha }}
+          COSTCAP_GIT_SHA: ${{ env.DEPLOY_SHA }}
         run: node scripts/deploy-apply.mjs
       - name: canary the applied origin
-        if: success()
+        if: success() && steps.fresh.outputs.deploy == 'true'
         env:
           COSTCAP_ORIGIN: ${{ secrets.COSTCAP_ORIGIN }}
-          COSTCAP_EXPECT_SHA: ${{ github.sha }}
+          COSTCAP_EXPECT_SHA: ${{ env.DEPLOY_SHA }}
+          COSTCAP_EXPECT_PERSISTENCE: ${{ vars.COSTCAP_EXPECT_PERSISTENCE || 'single-process-file' }}
           COSTCAP_EXPECT_BILLING: ${{ vars.COSTCAP_EXPECT_BILLING || 'disabled' }}
         run: node scripts/canary.mjs "$COSTCAP_ORIGIN"

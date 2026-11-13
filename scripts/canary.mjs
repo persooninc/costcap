@@ -23,7 +23,10 @@ async function stable(fetchImpl, url, parse) {
   return last;
 }
 
-export async function canary(base, fetchImpl = globalThis.fetch, expectedSha = "", expectedBilling = "disabled") {
+// Public pages a deploy must serve (FA-CC-01: /cli proves the new build is live; FA-CC-02 trust pages).
+export const PUBLIC_PAGES = Object.freeze(["/cli", "/privacy", "/terms", "/security"]);
+
+export async function canary(base, fetchImpl = globalThis.fetch, expectedSha = "", expectedBilling = "disabled", { persistence = "single-process-file", pages = PUBLIC_PAGES } = {}) {
   const root = String(base).replace(/\/$/, "");
   const healthRes = await stable(fetchImpl, `${root}/health`, true);
   const health = healthRes.body || {};
@@ -31,13 +34,16 @@ export async function canary(base, fetchImpl = globalThis.fetch, expectedSha = "
   const configRes = await stable(fetchImpl, `${root}/ui/config`, true);
   const config = configRes.body;
   const fleetRes = await stable(fetchImpl, `${root}/v1/fleet`, true);
+  const pageStatuses = [];
+  for (const path of pages) pageStatuses.push([path, (await stable(fetchImpl, `${root}${path}`, false)).status]);
   const errors = [];
-  if (healthRes.status !== 200 || health.billing !== expectedBilling || health.persistence !== "single-process-file") errors.push("health");
+  if (healthRes.status !== 200 || health.billing !== expectedBilling || health.persistence !== persistence) errors.push("health");
   if (expectedSha && health.sha !== expectedSha) errors.push("sha");
   if (pageRes.status !== 200) errors.push("ui");
   const keys = config && typeof config === "object" ? Object.keys(config) : [];
   if (configRes.status !== 200 || keys.length !== 1 || keys[0] !== "siteKey" || typeof config.siteKey !== "string" || config.siteKey.length === 0) errors.push("config");
   if (fleetRes.status !== 401) errors.push("fleet");
+  for (const [path, status] of pageStatuses) if (status !== 200) errors.push(`page:${path}`);
   return { ok: errors.length === 0, errors };
 }
 
@@ -47,7 +53,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     console.error("canary: base URL required");
     process.exit(2);
   }
-  const result = await canary(base, globalThis.fetch, process.env.COSTCAP_EXPECT_SHA || "", process.env.COSTCAP_EXPECT_BILLING || "disabled");
+  const result = await canary(base, globalThis.fetch, process.env.COSTCAP_EXPECT_SHA || "", process.env.COSTCAP_EXPECT_BILLING || "disabled", { persistence: process.env.COSTCAP_EXPECT_PERSISTENCE || "single-process-file" });
   if (!result.ok) {
     console.error(`canary: failed ${result.errors.join(", ")}`);
     process.exit(1);

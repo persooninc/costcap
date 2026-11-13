@@ -19,7 +19,10 @@ export function stripeHealth({ enabled = false, env = {}, mode = env.COSTCAP_STR
   let stripe = "disabled";
   if (enabled && shapes) stripe = "ready";
   else if (enabled || shapes) stripe = "misconfigured";
-  return { status: "ok", stripe, checks };
+  // Optional Team price (test mode only). Unset sells Solo alone.
+  const teamPrice = env.COSTCAP_STRIPE_TEAM_PRICE_ID ?? "";
+  const team = !teamPrice ? "unset" : (mode === "test" && /^price_[A-Za-z0-9]+$/.test(teamPrice) && teamPrice !== price) ? "ready" : "misconfigured";
+  return { status: "ok", stripe, checks, team };
 }
 export function verifyStripeEvent(raw, signature, secret, now = Date.now(), { livemode = true } = {}) {
   const fields = String(signature ?? '').split(',').map(x => x.split('='));
@@ -90,7 +93,8 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
       else await syncCheckout(orgId);
       return store.read(s => publicStatus(s, orgId));
     },
-    async checkout(user) {
+    async checkout(user, { plan = 'workspace' } = {}) {
+      if (plan !== 'workspace') throw problem(409, 'Only the Solo plan is sold in live mode');
       const existing = await syncCheckout(user.orgId);
       const state = store.read(s => s.orgs[user.orgId]?.billing ?? {});
       if (state.subscriptionId && !['canceled', 'incomplete_expired'].includes(state.status)) throw problem(409, 'Manage your existing subscription instead');
@@ -161,16 +165,21 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
 
 // Test-mode checkout. Construction does not call Stripe. sk_live_ and every
 // other secret return null. This does not create or edit a price.
-export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId, origin, store,
+// `priceId` sells Solo (plan id "workspace"); optional `teamPriceId` sells Team.
+// Both are owner-supplied test prices; code never creates a price.
+export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId, teamPriceId, origin, store,
   fetchImpl = fetch, now = () => Date.now(), log = console.error } = {}) {
   if (!String(secretKey ?? "").startsWith("sk_test_")) {
     log("costcap: test-mode Stripe key refused");
     return null;
   }
-  if (!String(webhookSecret ?? "").startsWith("whsec_") || !/^price_[A-Za-z0-9]+$/.test(priceId ?? "")) {
+  if (!String(webhookSecret ?? "").startsWith("whsec_") || !/^price_[A-Za-z0-9]+$/.test(priceId ?? "")
+    || (teamPriceId && (!/^price_[A-Za-z0-9]+$/.test(teamPriceId) || teamPriceId === priceId))) {
     log("costcap: test-mode Stripe configuration refused");
     return null;
   }
+  const prices = { workspace: priceId, ...(teamPriceId ? { team: teamPriceId } : {}) };
+  const planForPrice = (id) => Object.keys(prices).find((plan) => prices[plan] === id) ?? null;
   const request = async (path, data, idempotencyKey) => {
     const res = await fetchImpl(`https://api.stripe.com/v1${path}`, {
       method: "POST",
@@ -197,11 +206,12 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
     const b = s.orgs[orgId]?.billing;
     const status = b?.status ?? "free_beta";
     return { enabled: true, amount: null, currency: "usd", interval: "month",
-      status: ended.has(status) ? "free_beta" : status,
+      status: ended.has(status) ? "free_beta" : status, plan: ended.has(status) || status === "free_beta" ? null : (b?.plan ?? null),
+      plans: Object.keys(prices),
       cancelAtPeriodEnd: b?.cancelAtPeriodEnd ?? false, paidInvoiceCount: b?.paidInvoiceCount ?? 0 };
   };
   const scoped = (sub) => sub?.livemode === false && sub.metadata?.app === "costcap"
-    && sub.items?.data?.length === 1 && sub.items.data[0].price.id === priceId && sub.items.data[0].quantity === 1;
+    && sub.items?.data?.length === 1 && Boolean(planForPrice(sub.items.data[0].price?.id)) && sub.items.data[0].quantity === 1;
   const applySubscription = (sub) => {
     if (!scoped(sub)) return false;
     const orgId = sub.metadata.org_id;
@@ -213,10 +223,11 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
       if (ended.has(sub.status)) {
         b.lastSubscriptionId = sub.id;
         delete b.subscriptionId;
+        delete b.plan;
         Object.assign(b, { customerId, status: "free_beta", endedStatus: sub.status, cancelAtPeriodEnd: false, verifiedAt: now() });
       } else {
         Object.assign(b, {
-          subscriptionId: sub.id, customerId, status: sub.status,
+          subscriptionId: sub.id, customerId, status: sub.status, plan: planForPrice(sub.items.data[0].price.id),
           cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end), verifiedAt: now(),
         });
       }
@@ -262,24 +273,28 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
       } else await syncCheckout(orgId);
       return store.read(s => publicStatus(s, orgId));
     },
-    async checkout(user) {
+    async checkout(user, { plan = "workspace" } = {}) {
+      if (!Object.hasOwn(prices, plan)) throw problem(plan === "team" ? 409 : 400, plan === "team" ? "Team plan is not configured" : "Unknown plan");
       await syncCheckout(user.orgId);
       const state = store.read(s => s.orgs[user.orgId]?.billing ?? {});
       if (state.subscriptionId && !ended.has(state.status)) throw problem(409, "Manage your existing subscription instead");
       const open = state.checkout?.id ? await read(`/checkout/sessions/${encodeURIComponent(state.checkout.id)}`) : null;
+      // Reuse an open session only for the same plan; a different plan starts a new session.
       if (open?.livemode === false && open.status === "open" && open.client_reference_id === user.orgId
+        && (state.checkout?.plan ?? "workspace") === plan
         && /^https:\/\/checkout\.stripe\.com\//.test(open.url ?? "")) return { url: open.url };
       let key;
       store.transaction(s => {
         const b = s.orgs[user.orgId].billing ??= {};
-        if (!b.checkout || open?.status === "expired") b.checkout = { key: `costcap-${randomUUID()}` };
+        if (!b.checkout || open?.status === "expired" || (b.checkout.plan ?? "workspace") !== plan) b.checkout = { key: `costcap-${randomUUID()}`, plan };
         key = b.checkout.key;
       });
       const session = await request("/checkout/sessions", {
-        mode: "subscription", "line_items[0][price]": priceId, "line_items[0][quantity]": "1",
+        mode: "subscription", "line_items[0][price]": prices[plan], "line_items[0][quantity]": "1",
         client_reference_id: user.orgId, customer_email: user.email,
-        "metadata[app]": "costcap", "metadata[org_id]": user.orgId,
+        "metadata[app]": "costcap", "metadata[org_id]": user.orgId, "metadata[plan]": plan,
         "subscription_data[metadata][app]": "costcap", "subscription_data[metadata][org_id]": user.orgId,
+        "subscription_data[metadata][plan]": plan,
         success_url: `${origin}/?checkout=returned`, cancel_url: `${origin}/?checkout=canceled`,
       }, key);
       if (session.livemode !== false || !session.id || !/^https:\/\/checkout\.stripe\.com\//.test(session.url ?? "")

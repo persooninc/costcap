@@ -4,7 +4,7 @@ import { uiResponse } from '../src/hosted/ui.js';
 import { PUBLIC_ROUTES, CONTENT_LASTMOD, jsonLd, robotsTxt, sitemapXml, absoluteUrl } from '../src/hosted/seo.js';
 
 test('public allowlist is the landing and /cli; discovery files omit private routes', () => {
-  assert.deepEqual(PUBLIC_ROUTES.map((r) => r.path), ['/', '/cli']);
+  assert.deepEqual(PUBLIC_ROUTES.map((r) => r.path), ['/', '/cli', '/privacy', '/terms', '/security']);
   const robots = robotsTxt('https://costcap.dev');
   assert.match(robots, /^User-agent: \*$/m);
   assert.match(robots, /^Allow: \/$/m);

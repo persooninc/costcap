@@ -1,0 +1,26 @@
+name: prod-drift
+# FA-CC-01: red when production /health.sha has been behind main HEAD for more than 24h.
+# Read-only. No secrets, no deploy, opens nothing.
+on:
+  schedule:
+    - cron: "17 13 * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  drift:
+    runs-on: [self-hosted, dev-home-01]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: compare production sha to main
+        env:
+          COSTCAP_PUBLIC_ORIGIN: ${{ vars.COSTCAP_PUBLIC_ORIGIN || 'https://app.costcap.dev' }}
+          COSTCAP_DRIFT_GRACE_HOURS: "24"
+        run: node scripts/drift-check.mjs "$COSTCAP_PUBLIC_ORIGIN"

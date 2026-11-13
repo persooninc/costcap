@@ -9,7 +9,7 @@ import { evaluateAlerts, auditEntry } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
-import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig } from "../billing/index.js";
+import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -56,19 +56,26 @@ export function spendSummary(receipts, nowMs) {
   return { day: fold("day"), month: fold("month"), all: fold("all") };
 }
 
-export function createHostedServer({ storePath, verifyChallenge, sendCode, sendInvite, deliverAlert,
+// `store` (optional) injects any adapter with the store interface (mode, read, transaction,
+// flush), for example openPostgresStore(); otherwise the JSON file at `storePath` is used.
+export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
   plans = DEFAULT_PLANS, enforceEntitlements, publicPricing } = {}) {
-  if (!storePath || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
-  const store = openStore(storePath);
+  if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
+  const store = injectedStore ?? openStore(storePath);
   const billingConfig = resolveBillingConfig({ ...stripeEnv, COSTCAP_STRIPE_MODE: stripeMode });
   const pricingPublic = publicPricing ?? billingConfig.publicPricing;
   const upgradeUrl = pricingPublic ? "/pricing" : "/#plan";
   let billing;
   // Gating applies only when checkout exists, so a limited workspace always has an upgrade path.
   const enforced = () => Boolean(billing) && (enforceEntitlements ?? billingConfig.enforceEntitlements);
-  const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, enforced: enforced(), catalog: plans });
+  const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, plan: s.orgs[orgId]?.billing?.plan ?? null, enforced: enforced(), catalog: plans });
+  // Receipts older than the plan retention window are hidden (never deleted) when entitlements are enforced.
+  const visibleReceipts = (s, orgId) => {
+    const cutoff = retentionCutoff(entitlements(s, orgId), now());
+    return Object.values(s.receipts).filter((r) => r.orgId === orgId && (cutoff === null || !(Date.parse(r.receipt?.ts) < cutoff)));
+  };
   const billingReady = billingFactory ? Promise.resolve().then(() => billingFactory(store)).then(b => { billing = b; }) : Promise.resolve();
   const rate = new Map();
   const sessionUser = (s, req) => {
@@ -98,14 +105,20 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
       const line = JSON.stringify({ method: req.method, path, status: res.statusCode, durationMs: Date.now() - started });
       try { requestLog(line); } catch { /* a log sink failure must not change the response */ }
     });
-    const json = (status, value, headers = {}) => res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers }).end(JSON.stringify(value));
+    // Answer only after the datastore holds every committed change (a no-op for the file store).
+    const json = async (status, value, headers = {}) => {
+      try { await store.flush?.(); }
+      catch { if (status < 400) { status = 503; value = { error: "Datastore unavailable" }; headers = {}; } }
+      if (res.headersSent) return;
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers }).end(JSON.stringify(value));
+    };
     try {
       const path = new URL(req.url, origin).pathname;
       if (req.method === "GET") {
         const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode, { publicPricing: pricingPublic, plans, checkout: Boolean(billing) });
         if (ui) return res.writeHead(200, ui.headers).end(ui.body);
       }
-      if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: "single-process-file", version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
+      if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: store.mode ?? "single-process-file", ...(store.healthy && !store.healthy() ? { datastore: "degraded" } : {}), version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
       if (req.method === "GET" && path === "/api/health/stripe") {
         await billingReady;
         return json(200, stripeHealth({ enabled: Boolean(billing), env: stripeEnv, mode: stripeMode }));
@@ -120,7 +133,12 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         const user = store.read(s => sessionUser(s, req));
         if (path === "/billing/status" && req.method === "GET") return json(200, await billing.status(user.orgId));
         if (user.role !== "owner") fail(403, "Workspace owner required");
-        if (path === "/billing/checkout" && req.method === "POST") return json(200, await billing.checkout(user));
+        if (path === "/billing/checkout" && req.method === "POST") {
+          let plan;
+          try { plan = text ? JSON.parse(text).plan : undefined; } catch { fail(400, "Invalid JSON"); }
+          if (plan !== undefined && (typeof plan !== "string" || !/^[a-z]{1,20}$/.test(plan))) fail(400, "Unknown plan");
+          return json(200, await billing.checkout(user, plan ? { plan } : {}));
+        }
         if (path === "/billing/portal" && req.method === "POST") return json(200, await billing.portal(user.orgId));
       }
       let body;
@@ -236,7 +254,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
           const u = sessionUser(s, req);
-          const rows = Object.values(s.receipts).filter((r) => r.orgId === u.orgId).map((item) => ({
+          const rows = visibleReceipts(s, u.orgId).map((item) => ({
             ts: item.receipt?.ts ?? "",
             agent_id: item.agentId,
             receipt_id: item.receipt?.id ?? "",
@@ -260,7 +278,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         return json(200, store.read((s) => {
           const u = sessionUser(s, req);
           return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
-            receipts: Object.values(s.receipts).filter((r) => r.orgId === u.orgId),
+            receipts: visibleReceipts(s, u.orgId),
             audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
             beta: true, billing: billing ? "enabled" : "disabled",
@@ -323,7 +341,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         return json(200, result);
       }
       fail(404, "Route not found");
-    } catch (err) { if (!res.headersSent) json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
+    } catch (err) { if (!res.headersSent) await json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
   });
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {
