@@ -12,6 +12,12 @@ COSTCAP_BILLING=enabled, COSTCAP_STRIPE_SECRET_KEY,
 COSTCAP_STRIPE_WEBHOOK_SECRET, COSTCAP_STRIPE_ACCOUNT_ID,
 COSTCAP_STRIPE_PRICE_ID. Store secrets only in secure deployment settings.
 
+`COSTCAP_STRIPE_MODE` defaults to `test` when unset or empty, in the server, the launcher,
+compose and `scripts/deploy-remote.sh`. Live mode is never assumed: it needs an explicit
+`COSTCAP_STRIPE_MODE=live` in the host `.env`, set by the owner. With billing enabled and
+the mode unset, a live key fails the deploy preflight (`test mode requires an sk_test_ key`)
+before any image is built.
+
 `COSTCAP_STRIPE_MODE=test` accepts only an `sk_test_` key. A live key refuses
 to build the client and does not call Stripe. Test mode does not create or
 edit a price; it sends the owner-supplied `COSTCAP_STRIPE_PRICE_ID`. A

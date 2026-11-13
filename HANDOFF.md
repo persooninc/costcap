@@ -32,6 +32,7 @@ enforcement of plan limits (`COSTCAP_ENTITLEMENTS=enforced`) and public pricing
 
 Porting notes: pass your own catalog to every `src/billing` call to change tiers;
 `resolveBillingConfig(env, { prefix: "SRM_" })` reads `SRM_BILLING`, `SRM_STRIPE_MODE`,
-`SRM_ENTITLEMENTS`, `SRM_PUBLIC_PRICING`. The host app counts usage
+`SRM_ENTITLEMENTS`, `SRM_PUBLIC_PRICING`. An unset `<P>STRIPE_MODE` resolves to `test`
+(as do `stripeHealth()` and `createHostedServer()`); live is always an explicit switch. The host app counts usage
 (see `planUsage` in `src/hosted/server.js`) and maps `EntitlementError.body` into its
 error response.

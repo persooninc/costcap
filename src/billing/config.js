@@ -9,7 +9,8 @@ const ENFORCEMENT = new Set(["", "enforced", "report"]);
 /**
  * Resolve billing switches from an env object.
  * - `<P>BILLING=enabled` turns checkout on. Default off.
- * - `<P>STRIPE_MODE` is `live` (default) or `test`. Test mode accepts only an `sk_test_` key.
+ * - `<P>STRIPE_MODE` is `test` (default) or `live`. Test mode accepts only an `sk_test_` key;
+ *   live is an explicit owner switch and is never assumed from an unset value.
  * - `<P>PUBLIC_PRICING=enabled` serves the public pricing page. Owner gate, default off.
  * - `<P>ENTITLEMENTS` is `enforced` or `report`. Default: enforced in test mode,
  *   report-only in live mode, so a deploy never starts limiting live free users
@@ -23,7 +24,7 @@ export function resolveBillingConfig(env = {}, { prefix = "COSTCAP_" } = {}) {
   const errors = [];
   const billingFlag = get("BILLING");
   if (billingFlag && billingFlag !== "enabled") errors.push(`${prefix}BILLING must be enabled or unset`);
-  const stripeMode = get("STRIPE_MODE") || "live";
+  const stripeMode = get("STRIPE_MODE") || "test";
   if (!MODES.has(stripeMode)) errors.push(`${prefix}STRIPE_MODE must be live or test`);
   const enforcementFlag = get("ENTITLEMENTS");
   if (!ENFORCEMENT.has(enforcementFlag)) errors.push(`${prefix}ENTITLEMENTS must be enforced or report`);
@@ -37,7 +38,7 @@ export function resolveBillingConfig(env = {}, { prefix = "COSTCAP_" } = {}) {
   }
   return {
     enabled,
-    stripeMode: MODES.has(stripeMode) ? stripeMode : "live",
+    stripeMode: MODES.has(stripeMode) ? stripeMode : "test",
     publicPricing: get("PUBLIC_PRICING") === "enabled",
     enforceEntitlements: enforcementFlag ? enforcementFlag === "enforced" : stripeMode === "test",
     required,

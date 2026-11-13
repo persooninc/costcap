@@ -6,7 +6,8 @@ import { verifyProductionChallenge } from "./turnstile.js";
 const required = (key) => { if (!process.env[key]) throw new Error(`${key} required`); return process.env[key]; };
 if (process.env.COSTCAP_TURNSTILE_FIXTURE || process.env.COSTCAP_EMAIL_FIXTURE) throw new Error("Production launcher rejects test fixtures");
 if (process.env.COSTCAP_BILLING && process.env.COSTCAP_BILLING !== "enabled") throw new Error("Unknown billing setting");
-const stripeMode = process.env.COSTCAP_STRIPE_MODE ?? "live";
+// Unset or empty (compose passes "") means test. Live needs an explicit COSTCAP_STRIPE_MODE=live.
+const stripeMode = process.env.COSTCAP_STRIPE_MODE || "test";
 if (stripeMode !== "live" && stripeMode !== "test") throw new Error("Unknown Stripe mode");
 if (process.env.COSTCAP_ENTITLEMENTS && !["enforced", "report"].includes(process.env.COSTCAP_ENTITLEMENTS)) throw new Error("Unknown entitlements setting");
 if (process.env.COSTCAP_PUBLIC_PRICING && process.env.COSTCAP_PUBLIC_PRICING !== "enabled") throw new Error("Unknown public pricing setting");

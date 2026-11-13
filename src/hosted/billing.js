@@ -4,7 +4,7 @@ import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 const problem = (status, message) => Object.assign(new Error(message), { status });
 
 // Public probe. Booleans only: never echo a key, webhook secret, account id, or price id.
-export function stripeHealth({ enabled = false, env = {}, mode = env.COSTCAP_STRIPE_MODE || "live" } = {}) {
+export function stripeHealth({ enabled = false, env = {}, mode = env.COSTCAP_STRIPE_MODE || "test" } = {}) {
   const secret = env.COSTCAP_STRIPE_SECRET_KEY ?? "";
   const webhook = env.COSTCAP_STRIPE_WEBHOOK_SECRET ?? "";
   const account = env.COSTCAP_STRIPE_ACCOUNT_ID ?? "";

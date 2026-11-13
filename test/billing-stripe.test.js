@@ -39,13 +39,17 @@ test('stripe health reports shapes only and never the secret values', () => {
     COSTCAP_STRIPE_ACCOUNT_ID: 'acct_fixture',
     COSTCAP_STRIPE_PRICE_ID: 'price_fixture',
   };
-  const ready = stripeHealth({ enabled: true, env });
+  // Unset mode means test, so a live-shaped key is not ready without an explicit live switch.
+  assert.equal(stripeHealth({ enabled: true, env }).stripe, 'misconfigured');
+  assert.equal(stripeHealth({ enabled: true, env }).checks.secretKey, false);
+  const ready = stripeHealth({ enabled: true, env, mode: 'live' });
   assert.equal(ready.stripe, 'ready');
   assert.deepEqual(Object.values(ready.checks), [true, true, true, true]);
   assert.equal(JSON.stringify(ready).includes('rk_live_fixture'), false);
   assert.equal(JSON.stringify(ready).includes('whsec_fixture'), false);
-  assert.equal(stripeHealth({ enabled: false, env }).stripe, 'misconfigured');
-  assert.equal(stripeHealth({ enabled: true, env: { ...env, COSTCAP_STRIPE_SECRET_KEY: 'sk_test_fixture' } }).stripe, 'misconfigured');
+  assert.equal(stripeHealth({ enabled: false, env, mode: 'live' }).stripe, 'misconfigured');
+  assert.equal(stripeHealth({ enabled: true, env: { ...env, COSTCAP_STRIPE_SECRET_KEY: 'sk_test_fixture' }, mode: 'live' }).stripe, 'misconfigured');
+  assert.equal(stripeHealth({ enabled: true, env: { ...env, COSTCAP_STRIPE_SECRET_KEY: 'sk_test_fixture' } }).stripe, 'ready');
   assert.equal(stripeHealth({ enabled: true, env: { ...env, COSTCAP_STRIPE_PRICE_ID: 'price_1900' } }).checks.priceId, true);
 });
 test('Stripe signatures reject altered, expired and test-mode events',()=>{
