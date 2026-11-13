@@ -2,10 +2,44 @@
   "name": "costcap",
   "version": "0.0.1",
   "description": "Spend guardrails for AI agents: meter, cap, hard-stop. Guardrails, not guarantees.",
-  "type": "module",
+  "keywords": [
+    "ai",
+    "agents",
+    "llm",
+    "spend",
+    "budget",
+    "cost",
+    "guardrails",
+    "openai",
+    "anthropic",
+    "gemini",
+    "openrouter",
+    "mcp",
+    "cli",
+    "github-action"
+  ],
+  "homepage": "https://github.com/persooninc/costcap#readme",
+  "bugs": {
+    "url": "https://github.com/persooninc/costcap/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/persooninc/costcap.git"
+  },
   "license": "MIT",
+  "author": "CostCap contributors",
+  "type": "module",
   "bin": {
-    "costcap": "./src/cli.js"
+    "costcap": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -13,16 +47,12 @@
     "acceptance:runaway": "node scripts/runaway-smoke.mjs",
     "security": "node scripts/security-scan.mjs",
     "audit": "npm audit --audit-level=high",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "release:check": "node scripts/release-check.mjs"
   },
   "engines": {
     "node": ">=20"
   },
-  "files": [
-    "src",
-    "README.md",
-    "LICENSE"
-  ],
   "devDependencies": {
     "@playwright/test": "^1.65.0"
   }
