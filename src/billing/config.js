@@ -11,7 +11,8 @@ const ENFORCEMENT = new Set(["", "enforced", "report"]);
  * - `<P>BILLING=enabled` turns checkout on. Default off.
  * - `<P>STRIPE_MODE` is `test` (default) or `live`. Test mode accepts only an `sk_test_` key;
  *   live is an explicit owner switch and is never assumed from an unset value.
- * - `<P>PUBLIC_PRICING=enabled` serves the public pricing page. Owner gate, default off.
+ * - `<P>PUBLIC_PRICING` serves the public pricing page. Default on (FA-CC-03); `disabled` turns it off.
+ * - `<P>STRIPE_TEAM_PRICE_ID` (optional) is the owner-supplied price for the Team plan. Without it only Solo is sold.
  * - `<P>ENTITLEMENTS` is `enforced` or `report`. Default: enforced in test mode,
  *   report-only in live mode, so a deploy never starts limiting live free users
  *   without an explicit owner switch.
@@ -26,6 +27,10 @@ export function resolveBillingConfig(env = {}, { prefix = "COSTCAP_" } = {}) {
   if (billingFlag && billingFlag !== "enabled") errors.push(`${prefix}BILLING must be enabled or unset`);
   const stripeMode = get("STRIPE_MODE") || "test";
   if (!MODES.has(stripeMode)) errors.push(`${prefix}STRIPE_MODE must be live or test`);
+  const pricingFlag = get("PUBLIC_PRICING");
+  if (!["", "enabled", "disabled"].includes(pricingFlag)) errors.push(`${prefix}PUBLIC_PRICING must be enabled, disabled or unset`);
+  const teamPrice = get("STRIPE_TEAM_PRICE_ID");
+  if (teamPrice && !/^price_[A-Za-z0-9]+$/.test(teamPrice)) errors.push(`${prefix}STRIPE_TEAM_PRICE_ID must be a price_ id`);
   const enforcementFlag = get("ENTITLEMENTS");
   if (!ENFORCEMENT.has(enforcementFlag)) errors.push(`${prefix}ENTITLEMENTS must be enforced or report`);
   const enabled = billingFlag === "enabled";
@@ -39,7 +44,8 @@ export function resolveBillingConfig(env = {}, { prefix = "COSTCAP_" } = {}) {
   return {
     enabled,
     stripeMode: MODES.has(stripeMode) ? stripeMode : "test",
-    publicPricing: get("PUBLIC_PRICING") === "enabled",
+    publicPricing: pricingFlag !== "disabled",
+    teamPrice: Boolean(teamPrice),
     enforceEntitlements: enforcementFlag ? enforcementFlag === "enforced" : stripeMode === "test",
     required,
     missing,

@@ -33,12 +33,12 @@ if have["COSTCAP_EMAIL_PROVIDER"] != "brevo":
 if not have["COSTCAP_ORIGIN"].startswith("https://"):
     print("deploy: COSTCAP_ORIGIN must be https", file=sys.stderr)
     raise SystemExit(2)
-optional = ["COSTCAP_BILLING", "COSTCAP_STRIPE_MODE", "COSTCAP_STRIPE_SECRET_KEY", "COSTCAP_STRIPE_WEBHOOK_SECRET", "COSTCAP_STRIPE_ACCOUNT_ID", "COSTCAP_STRIPE_PRICE_ID", "COSTCAP_ENTITLEMENTS", "COSTCAP_PUBLIC_PRICING"]
+optional = ["COSTCAP_BILLING", "COSTCAP_STRIPE_MODE", "COSTCAP_STRIPE_SECRET_KEY", "COSTCAP_STRIPE_WEBHOOK_SECRET", "COSTCAP_STRIPE_ACCOUNT_ID", "COSTCAP_STRIPE_PRICE_ID", "COSTCAP_STRIPE_TEAM_PRICE_ID", "COSTCAP_ENTITLEMENTS", "COSTCAP_PUBLIC_PRICING"]
 if (have.get("COSTCAP_ENTITLEMENTS") or "enforced") not in ("enforced", "report"):
     print("deploy: COSTCAP_ENTITLEMENTS must be enforced or report", file=sys.stderr)
     raise SystemExit(2)
-if (have.get("COSTCAP_PUBLIC_PRICING") or "enabled") != "enabled":
-    print("deploy: COSTCAP_PUBLIC_PRICING must be enabled or unset", file=sys.stderr)
+if (have.get("COSTCAP_PUBLIC_PRICING") or "enabled") not in ("enabled", "disabled"):
+    print("deploy: COSTCAP_PUBLIC_PRICING must be enabled, disabled or unset", file=sys.stderr)
     raise SystemExit(2)
 # Unset means test. Live is an explicit owner switch in the host .env, never a default.
 mode = have.get("COSTCAP_STRIPE_MODE") or "test"

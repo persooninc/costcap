@@ -9,7 +9,7 @@ import { evaluateAlerts, auditEntry } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
-import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig } from "../billing/index.js";
+import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -68,7 +68,12 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
   let billing;
   // Gating applies only when checkout exists, so a limited workspace always has an upgrade path.
   const enforced = () => Boolean(billing) && (enforceEntitlements ?? billingConfig.enforceEntitlements);
-  const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, enforced: enforced(), catalog: plans });
+  const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, plan: s.orgs[orgId]?.billing?.plan ?? null, enforced: enforced(), catalog: plans });
+  // Receipts older than the plan retention window are hidden (never deleted) when entitlements are enforced.
+  const visibleReceipts = (s, orgId) => {
+    const cutoff = retentionCutoff(entitlements(s, orgId), now());
+    return Object.values(s.receipts).filter((r) => r.orgId === orgId && (cutoff === null || !(Date.parse(r.receipt?.ts) < cutoff)));
+  };
   const billingReady = billingFactory ? Promise.resolve().then(() => billingFactory(store)).then(b => { billing = b; }) : Promise.resolve();
   const rate = new Map();
   const sessionUser = (s, req) => {
@@ -120,7 +125,12 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         const user = store.read(s => sessionUser(s, req));
         if (path === "/billing/status" && req.method === "GET") return json(200, await billing.status(user.orgId));
         if (user.role !== "owner") fail(403, "Workspace owner required");
-        if (path === "/billing/checkout" && req.method === "POST") return json(200, await billing.checkout(user));
+        if (path === "/billing/checkout" && req.method === "POST") {
+          let plan;
+          try { plan = text ? JSON.parse(text).plan : undefined; } catch { fail(400, "Invalid JSON"); }
+          if (plan !== undefined && (typeof plan !== "string" || !/^[a-z]{1,20}$/.test(plan))) fail(400, "Unknown plan");
+          return json(200, await billing.checkout(user, plan ? { plan } : {}));
+        }
         if (path === "/billing/portal" && req.method === "POST") return json(200, await billing.portal(user.orgId));
       }
       let body;
@@ -236,7 +246,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
           const u = sessionUser(s, req);
-          const rows = Object.values(s.receipts).filter((r) => r.orgId === u.orgId).map((item) => ({
+          const rows = visibleReceipts(s, u.orgId).map((item) => ({
             ts: item.receipt?.ts ?? "",
             agent_id: item.agentId,
             receipt_id: item.receipt?.id ?? "",
@@ -260,7 +270,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         return json(200, store.read((s) => {
           const u = sessionUser(s, req);
           return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
-            receipts: Object.values(s.receipts).filter((r) => r.orgId === u.orgId),
+            receipts: visibleReceipts(s, u.orgId),
             audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
             beta: true, billing: billing ? "enabled" : "disabled",

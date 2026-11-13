@@ -1,12 +1,14 @@
 // Public API of the portable billing module (src/billing).
 
-export type LimitKey = "agents" | "seats" | (string & {});
+export type LimitKey = "agents" | "seats" | "receiptRetentionDays" | (string & {});
 
 export interface Plan {
   id: string;
   name: string;
   hosted: boolean;
   paid: boolean;
+  /** List price in whole USD per month (0 for free plans). Display only; checkout uses the provider price id. */
+  priceUsdMonthly?: number;
   summary: string;
   limits: Partial<Record<LimitKey, number>>;
   features: readonly string[];
@@ -37,6 +39,8 @@ export interface BillingConfig {
   enabled: boolean;
   stripeMode: "live" | "test";
   publicPricing: boolean;
+  /** True when an owner-supplied Team price id is configured. */
+  teamPrice: boolean;
   enforceEntitlements: boolean;
   required: string[];
   missing: string[];
@@ -47,10 +51,12 @@ export const DEFAULT_PLANS: PlanCatalog;
 export const PAID_STATUSES: readonly string[];
 export function listPlans(catalog?: PlanCatalog): Plan[];
 export function isPaidStatus(status: string | null | undefined): boolean;
-export function planForStatus(status: string | null | undefined, catalog?: PlanCatalog): Plan;
-export function upgradePlan(catalog?: PlanCatalog): Plan | null;
+export function paidPlans(catalog?: PlanCatalog): Plan[];
+export function planForStatus(status: string | null | undefined, catalog?: PlanCatalog, planId?: string | null): Plan;
+export function upgradePlan(catalog?: PlanCatalog, fromPlanId?: string | null): Plan | null;
 
-export function entitlementsFor(input?: { status?: string | null; enforced?: boolean; catalog?: PlanCatalog }): Entitlements;
+export function entitlementsFor(input?: { status?: string | null; plan?: string | null; enforced?: boolean; catalog?: PlanCatalog }): Entitlements;
+export function retentionCutoff(entitlements: Entitlements, nowMs: number): number | null;
 export function checkLimit(entitlements: Entitlements, feature: LimitKey, used: number, adding?: number): EntitlementDecision;
 export function requireLimit(entitlements: Entitlements, feature: LimitKey, used: number, adding?: number, upgradeUrl?: string): EntitlementDecision;
 export class EntitlementError extends Error {
