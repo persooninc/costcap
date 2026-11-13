@@ -55,7 +55,8 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await page.locator("#code").fill(codes.at(-1).code);
     await page.locator("#verify button[type=submit]").click();
     await expect(page.locator("#workspace")).toBeVisible();
-    await expect(page.locator("#workspace")).toContainText("Billing is disabled");
+    // Unset COSTCAP_STRIPE_MODE resolves to test, so the default server shows the test-mode copy.
+    await expect(page.locator("#workspace")).toContainText("Test mode. No public price.");
     await expect(page.locator("#agentCount")).toHaveText("0");
     await page.locator("#enroll input[name=day]").fill("5");
     await page.locator("#enroll button").click();
