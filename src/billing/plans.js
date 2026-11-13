@@ -64,6 +64,8 @@ export const DEFAULT_PLANS = Object.freeze({
     hosted: true,
     paid: true,
     priceUsdMonthly: 79,
+    // Sold only in Stripe test mode until the owner approves a live Team price.
+    testModeOnly: true,
     summary: "For a team sharing one agent fleet.",
     limits: Object.freeze({ agents: 50, seats: 15, receiptRetentionDays: 365 }),
     features: Object.freeze([

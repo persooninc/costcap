@@ -9,6 +9,8 @@ export interface Plan {
   paid: boolean;
   /** List price in whole USD per month (0 for free plans). Display only; checkout uses the provider price id. */
   priceUsdMonthly?: number;
+  /** Sold only in Stripe test mode; public pages show it as not on sale in live mode. */
+  testModeOnly?: boolean;
   summary: string;
   limits: Partial<Record<LimitKey, number>>;
   features: readonly string[];
