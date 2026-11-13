@@ -63,7 +63,10 @@ test("postgres migrations apply and roll back without changing the running store
   assert.equal(psql(container, "SELECT name FROM orgs WHERE id = '" + orgB + "';").trim(), "B");
   applyFile(container, file("db/migrations/001_init.down.sql"));
   assert.equal(psql(container, "SELECT to_regclass('public.orgs');").trim(), "");
-  assert.equal(readFileSync(file("src/hosted/run.js"), "utf8").includes("DATABASE_URL"), false);
+  // FA-CC-04: the service reads only the application-role URL; the migration URL stays with scripts/db-apply.mjs.
+  const run = readFileSync(file("src/hosted/run.js"), "utf8");
+  assert.equal(run.includes("COSTCAP_DATABASE_URL"), true);
+  assert.equal(run.includes("MIGRATE_DATABASE_URL"), false);
   const service = createHostedServer({
     storePath: join(mkdtempSync(join(tmpdir(), "cc-health-")), "store.json"),
     origin: "http://localhost",

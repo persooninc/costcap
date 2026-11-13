@@ -3,6 +3,7 @@ import { createTransactionalEmail } from "./email.js";
 import { createHostedServer } from "./server.js";
 import { createAlertDelivery } from "./delivery.js";
 import { verifyProductionChallenge } from "./turnstile.js";
+import { openPostgresStore } from "./store-postgres.js";
 const required = (key) => { if (!process.env[key]) throw new Error(`${key} required`); return process.env[key]; };
 if (process.env.COSTCAP_TURNSTILE_FIXTURE || process.env.COSTCAP_EMAIL_FIXTURE) throw new Error("Production launcher rejects test fixtures");
 if (process.env.COSTCAP_BILLING && process.env.COSTCAP_BILLING !== "enabled") throw new Error("Unknown billing setting");
@@ -22,8 +23,14 @@ const emailTo = process.env.COSTCAP_ALERT_EMAILS?.split(",").map((x) => x.trim()
 const authorizedOrg = process.env.COSTCAP_ALERT_ORG_ID;
 const sendEmail = createTransactionalEmail({ provider: "brevo", apiKey: emailKey, from });
 const delivery = createAlertDelivery({ emailKey, emailFrom: from, emailTo, slackWebhook: process.env.COSTCAP_SLACK_WEBHOOK });
+// FA-CC-04: COSTCAP_DATABASE_URL (application role, not the migration role) switches the
+// datastore to Postgres. Unset keeps the JSON file. A database that cannot be read stops startup.
+const databaseUrl = process.env.COSTCAP_DATABASE_URL || "";
+if (databaseUrl && !/^postgres(ql)?:\/\//.test(databaseUrl)) throw new Error("COSTCAP_DATABASE_URL must be a postgres:// URL");
+const store = databaseUrl ? await openPostgresStore({ connectionString: databaseUrl }) : undefined;
 const { server, evaluateFleetAlerts, billingReady } = createHostedServer({
   origin,
+  store,
   stripeMode,
   billingFactory: process.env.COSTCAP_BILLING === "enabled" ? store => {
     const priceId = required("COSTCAP_STRIPE_PRICE_ID");

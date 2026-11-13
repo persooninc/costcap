@@ -1,6 +1,8 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
+# Runtime install is the optional pg driver only (the CLI has no runtime dependencies).
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 COPY src ./src
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node

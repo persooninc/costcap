@@ -56,12 +56,14 @@ export function spendSummary(receipts, nowMs) {
   return { day: fold("day"), month: fold("month"), all: fold("all") };
 }
 
-export function createHostedServer({ storePath, verifyChallenge, sendCode, sendInvite, deliverAlert,
+// `store` (optional) injects any adapter with the store interface (mode, read, transaction,
+// flush), for example openPostgresStore(); otherwise the JSON file at `storePath` is used.
+export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
   plans = DEFAULT_PLANS, enforceEntitlements, publicPricing } = {}) {
-  if (!storePath || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
-  const store = openStore(storePath);
+  if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
+  const store = injectedStore ?? openStore(storePath);
   const billingConfig = resolveBillingConfig({ ...stripeEnv, COSTCAP_STRIPE_MODE: stripeMode });
   const pricingPublic = publicPricing ?? billingConfig.publicPricing;
   const upgradeUrl = pricingPublic ? "/pricing" : "/#plan";
@@ -103,14 +105,20 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
       const line = JSON.stringify({ method: req.method, path, status: res.statusCode, durationMs: Date.now() - started });
       try { requestLog(line); } catch { /* a log sink failure must not change the response */ }
     });
-    const json = (status, value, headers = {}) => res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers }).end(JSON.stringify(value));
+    // Answer only after the datastore holds every committed change (a no-op for the file store).
+    const json = async (status, value, headers = {}) => {
+      try { await store.flush?.(); }
+      catch { if (status < 400) { status = 503; value = { error: "Datastore unavailable" }; headers = {}; } }
+      if (res.headersSent) return;
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers }).end(JSON.stringify(value));
+    };
     try {
       const path = new URL(req.url, origin).pathname;
       if (req.method === "GET") {
         const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode, { publicPricing: pricingPublic, plans, checkout: Boolean(billing) });
         if (ui) return res.writeHead(200, ui.headers).end(ui.body);
       }
-      if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: "single-process-file", version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
+      if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: store.mode ?? "single-process-file", ...(store.healthy && !store.healthy() ? { datastore: "degraded" } : {}), version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
       if (req.method === "GET" && path === "/api/health/stripe") {
         await billingReady;
         return json(200, stripeHealth({ enabled: Boolean(billing), env: stripeEnv, mode: stripeMode }));
@@ -333,7 +341,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         return json(200, result);
       }
       fail(404, "Route not found");
-    } catch (err) { if (!res.headersSent) json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
+    } catch (err) { if (!res.headersSent) await json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
   });
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {

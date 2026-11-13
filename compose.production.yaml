@@ -27,6 +27,8 @@ services:
       COSTCAP_STRIPE_TEAM_PRICE_ID: ${COSTCAP_STRIPE_TEAM_PRICE_ID:-}
       COSTCAP_ENTITLEMENTS: ${COSTCAP_ENTITLEMENTS:-}
       COSTCAP_PUBLIC_PRICING: ${COSTCAP_PUBLIC_PRICING:-}
+      COSTCAP_DATABASE_URL: ${COSTCAP_DATABASE_URL:-}
+      COSTCAP_EXPECT_PERSISTENCE: ${COSTCAP_EXPECT_PERSISTENCE:-single-process-file}
     volumes:
       - /opt/costcap/data:/data
     security_opt: ["no-new-privileges:true"]
