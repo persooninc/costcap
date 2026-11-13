@@ -23,8 +23,8 @@ async function stable(fetchImpl, url, parse) {
   return last;
 }
 
-// Public pages a deploy must serve (FA-CC-01: /cli proves the new build is live).
-export const PUBLIC_PAGES = Object.freeze(["/cli"]);
+// Public pages a deploy must serve (FA-CC-01: /cli proves the new build is live; FA-CC-02 trust pages).
+export const PUBLIC_PAGES = Object.freeze(["/cli", "/privacy", "/terms", "/security"]);
 
 export async function canary(base, fetchImpl = globalThis.fetch, expectedSha = "", expectedBilling = "disabled", { persistence = "single-process-file", pages = PUBLIC_PAGES } = {}) {
   const root = String(base).replace(/\/$/, "");

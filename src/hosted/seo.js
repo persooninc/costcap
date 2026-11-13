@@ -1,13 +1,15 @@
 // Public-discovery files for the landing. Search controls are not access control.
 // IndexNow is omitted: it needs an owner key (residue).
+import { TRUST_ROUTES } from "./trust.js";
 
 export const PUBLIC_ORIGIN = "https://costcap.dev";
-export const CONTENT_LASTMOD = "2026-11-12";
+export const CONTENT_LASTMOD = "2026-11-13";
 
 // Single allowlist for sitemap, canonical, and structured data.
 export const PUBLIC_ROUTES = Object.freeze([
   Object.freeze({ path: "/", priority: 1.0, changefreq: "weekly" }),
   Object.freeze({ path: "/cli", priority: 0.8, changefreq: "monthly" }),
+  ...TRUST_ROUTES,
 ]);
 
 // Served and listed only behind the COSTCAP_PUBLIC_PRICING owner gate.
