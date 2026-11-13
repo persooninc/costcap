@@ -9,8 +9,20 @@ import { evaluateAlerts, auditEntry } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
+import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig } from "../billing/index.js";
+import { onboardingState } from "./onboarding.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
+
+// Plan usage counted from the store. Pending enrollment tokens and invitations
+// hold a slot so a free workspace cannot issue ten tokens and redeem them all.
+export function planUsage(s, orgId, nowMs, { pending = true } = {}) {
+  const agents = Object.values(s.agents).filter((a) => a.orgId === orgId && !a.revoked).length;
+  const tokens = pending ? Object.values(s.enrollments ?? {}).filter((e) => e.orgId === orgId && e.expires > nowMs).length : 0;
+  const users = Object.values(s.users).filter((u) => u.orgId === orgId).length;
+  const invites = pending ? Object.values(s.invitations ?? {}).filter((i) => i.orgId === orgId && i.expires > nowMs).length : 0;
+  return { agents: agents + tokens, seats: users + invites };
+}
 const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(auditEntry({ orgId, actor, action, target, detail }));
 
 // A missing channel is not a failed send. Retry only when a configured
@@ -46,10 +58,17 @@ export function spendSummary(receipts, nowMs) {
 
 export function createHostedServer({ storePath, verifyChallenge, sendCode, sendInvite, deliverAlert,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
-  requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "live" } = {}) {
+  requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "live",
+  plans = DEFAULT_PLANS, enforceEntitlements, publicPricing } = {}) {
   if (!storePath || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
   const store = openStore(storePath);
+  const billingConfig = resolveBillingConfig({ ...stripeEnv, COSTCAP_STRIPE_MODE: stripeMode });
+  const pricingPublic = publicPricing ?? billingConfig.publicPricing;
+  const upgradeUrl = pricingPublic ? "/pricing" : "/#plan";
   let billing;
+  // Gating applies only when checkout exists, so a limited workspace always has an upgrade path.
+  const enforced = () => Boolean(billing) && (enforceEntitlements ?? billingConfig.enforceEntitlements);
+  const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, enforced: enforced(), catalog: plans });
   const billingReady = billingFactory ? Promise.resolve().then(() => billingFactory(store)).then(b => { billing = b; }) : Promise.resolve();
   const rate = new Map();
   const sessionUser = (s, req) => {
@@ -83,7 +102,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
     try {
       const path = new URL(req.url, origin).pathname;
       if (req.method === "GET") {
-        const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode);
+        const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode, { publicPricing: pricingPublic, plans, checkout: Boolean(billing) });
         if (ui) return res.writeHead(200, ui.headers).end(ui.body);
       }
       if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: "single-process-file", version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
@@ -169,6 +188,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         if (validatePolicy(policy).length) fail(400, "Invalid caps");
         store.transaction((s) => {
           const user = admin(s, req);
+          requireLimit(entitlements(s, user.orgId), "agents", planUsage(s, user.orgId, now()).agents, 1, upgradeUrl);
           s.enrollments[hashToken(raw)] = { orgId: user.orgId, policy, expires: now() + 600_000 };
           audit(s, user.orgId, user.id, "enrollment.issue", null);
         });
@@ -181,6 +201,8 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
           const grant = s.enrollments[h];
           if (!grant || grant.expires <= now()) fail(401, "Enrollment invalid/expired/used");
           if (typeof body.name !== "string" || !body.name.trim() || body.name.length > 100) fail(400, "Agent name required");
+          // Re-check at redemption: the plan may have lapsed since the token was issued.
+          requireLimit(entitlements(s, grant.orgId), "agents", planUsage(s, grant.orgId, now(), { pending: false }).agents, 1, upgradeUrl);
           const id = randomUUID();
           s.agents[id] = { id, orgId: grant.orgId, name: body.name, hash: hashToken(raw), policy: grant.policy, lastSeen: now(), revoked: false };
           delete s.enrollments[h];
@@ -241,7 +263,13 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
             receipts: Object.values(s.receipts).filter((r) => r.orgId === u.orgId),
             audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
-            beta: true, billing: billing ? "enabled" : "disabled" };
+            beta: true, billing: billing ? "enabled" : "disabled",
+            plan: { ...entitlements(s, u.orgId), usage: planUsage(s, u.orgId, now(), { pending: false }), upgradeUrl },
+            onboarding: onboardingState({
+              tokensIssued: s.audit.filter((e) => e.org_id === u.orgId && e.action === "enrollment.issue").length,
+              agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).length,
+              receipts: Object.values(s.receipts).filter((r) => r.orgId === u.orgId).length,
+            }) };
         }));
       }
       if (path === "/v1/invitations" && req.method === "POST") {
@@ -257,6 +285,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
           const pending = Object.values(s.invitations).filter((item) => item.orgId === user.orgId && item.expires > now());
           if (pending.some((item) => item.email === email)) fail(409, "An invite is already pending for that email");
           if (pending.length >= 20) fail(429, "Too many pending invitations");
+          requireLimit(entitlements(s, user.orgId), "seats", planUsage(s, user.orgId, now()).seats, 1, upgradeUrl);
           s.invitations[id] = { id, email, orgId: user.orgId, role: body.role, expires: now() + 7 * 24 * 3600_000, invitedBy: user.id };
           audit(s, user.orgId, user.id, "invitation.issue", id, { email, role: body.role });
           return { orgName: s.orgs[user.orgId].name };
@@ -294,7 +323,7 @@ export function createHostedServer({ storePath, verifyChallenge, sendCode, sendI
         return json(200, result);
       }
       fail(404, "Route not found");
-    } catch (err) { if (!res.headersSent) json(err.status ?? 500, { error: err.status ? err.message : "Internal error" }); }
+    } catch (err) { if (!res.headersSent) json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
   });
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {

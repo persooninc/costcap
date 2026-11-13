@@ -8,6 +8,8 @@ if (process.env.COSTCAP_TURNSTILE_FIXTURE || process.env.COSTCAP_EMAIL_FIXTURE) 
 if (process.env.COSTCAP_BILLING && process.env.COSTCAP_BILLING !== "enabled") throw new Error("Unknown billing setting");
 const stripeMode = process.env.COSTCAP_STRIPE_MODE ?? "live";
 if (stripeMode !== "live" && stripeMode !== "test") throw new Error("Unknown Stripe mode");
+if (process.env.COSTCAP_ENTITLEMENTS && !["enforced", "report"].includes(process.env.COSTCAP_ENTITLEMENTS)) throw new Error("Unknown entitlements setting");
+if (process.env.COSTCAP_PUBLIC_PRICING && process.env.COSTCAP_PUBLIC_PRICING !== "enabled") throw new Error("Unknown public pricing setting");
 const origin = required("COSTCAP_ORIGIN");
 if (new URL(origin).protocol !== "https:") throw new Error("Production origin must be HTTPS");
 const turnstileKey = required("TURNSTILE_SECRET_KEY");

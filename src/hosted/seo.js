@@ -10,6 +10,9 @@ export const PUBLIC_ROUTES = Object.freeze([
   Object.freeze({ path: "/cli", priority: 0.8, changefreq: "monthly" }),
 ]);
 
+// Served and listed only behind the COSTCAP_PUBLIC_PRICING owner gate.
+export const PRICING_ROUTE = Object.freeze({ path: "/pricing", priority: 0.7, changefreq: "monthly" });
+
 // Open Graph copy for the landing. Names the product category, not a guarantee.
 export const OG_TITLE = "CostCap: a local spend cap for AI agents";
 export const OG_DESCRIPTION = "Wrap an AI agent with a local proxy that stops further API calls once its spend cap is reached. Free CLI. Guardrails, not guarantees.";
@@ -79,9 +82,9 @@ export function robotsTxt(origin = PUBLIC_ORIGIN) {
   ].join("\n");
 }
 
-export function sitemapXml(origin = PUBLIC_ORIGIN, lastmod = CONTENT_LASTMOD) {
+export function sitemapXml(origin = PUBLIC_ORIGIN, lastmod = CONTENT_LASTMOD, routes = PUBLIC_ROUTES) {
   const base = canonicalOrigin(origin);
-  const urls = PUBLIC_ROUTES.map((route) => {
+  const urls = routes.map((route) => {
     const loc = xmlEscape(absoluteUrl(base, route.path));
     return [
       "  <url>",
