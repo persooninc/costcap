@@ -11,6 +11,14 @@ billing enabled, the workspace offers an optional $19 USD/month plan; without
 billing it is a free beta with no card and no charges. Neither tier is a
 provider-bill guarantee: these are guardrails, not guarantees.
 
+The free hosted workspace covers up to 3 enrolled agents and 3 people; the
+workspace plan raises that to 100 and 20. Limits apply only where checkout is
+configured, so a limited workspace always has an upgrade path: by default in
+Stripe test mode, and in live mode only with `COSTCAP_ENTITLEMENTS=enforced`.
+Existing agents keep running over a limit; only new enrollments and invitations
+are refused. The public `/pricing` page is off unless `COSTCAP_PUBLIC_PRICING=enabled`.
+Variables: [env.example](env.example) and [docs/billing-readiness.md](docs/billing-readiness.md).
+
 ## Run from source
 
 Node 20 or newer; no runtime dependencies.

@@ -61,3 +61,26 @@ restricted $1 promotion code at Checkout or test mode without changing the stand
 
 Existing constraints: single-process file datastore, no high availability,
 no guaranteed remote kill during disconnection, no provider-bill guarantee.
+
+## Path to paid in test mode (2026-11-12)
+
+Plan catalog and entitlement checks live in the portable `src/billing/` module
+(see HANDOFF.md, Portable modules). The hosted server counts usage and calls it.
+
+- Free workspace: 3 agents, 3 people (owner included). Workspace plan: 100 agents, 20 people.
+  Pending enrollment tokens and invitations hold a slot. Redemption re-checks the agent limit.
+- Paid statuses: `active`, `trialing`, `past_due`. Everything else is the free workspace.
+- Over a limit, `POST /v1/enrollment-tokens`, `POST /v1/enroll` and `POST /v1/invitations`
+  return `402` with `{ code: "plan_limit", feature, limit, used, plan, upgrade }`. The UI
+  scrolls to the plan card, where the owner starts Checkout.
+- Enforcement needs checkout to exist. `COSTCAP_ENTITLEMENTS` defaults to enforced in
+  `COSTCAP_STRIPE_MODE=test` and to report-only in live mode. Live enforcement is an owner switch.
+- `COSTCAP_PUBLIC_PRICING=enabled` serves `/pricing` and lists it in the sitemap. Off by default.
+  In test mode the page shows no price.
+- Onboarding: `/v1/fleet` returns `onboarding` (token, enroll, first receipt). The workspace
+  shows the checklist with the exact enroll and wrap commands until the first receipt syncs.
+
+Test-mode variables: `COSTCAP_BILLING=enabled`, `COSTCAP_STRIPE_MODE=test`,
+`COSTCAP_STRIPE_SECRET_KEY` (`sk_test_` only), `COSTCAP_STRIPE_WEBHOOK_SECRET` (test endpoint
+`whsec_`), `COSTCAP_STRIPE_PRICE_ID` (test recurring price). Use Stripe test card 4242 4242 4242 4242.
+Live keys stay parked until the owner approves them.
