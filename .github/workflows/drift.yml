@@ -1,6 +1,8 @@
 name: prod-drift
 # FA-CC-01: red when production /health.sha has been behind main HEAD for more than 24h.
 # Read-only. No secrets, no deploy, opens nothing.
+# infra/drift-ack.json can downgrade drift to a warning for one named prod sha while the
+# deploy is blocked on an owner action. The ack expires within 7 days; delete it once prod ships.
 on:
   schedule:
     - cron: "17 13 * * *"
