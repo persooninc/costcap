@@ -11,7 +11,7 @@ The database is defined in persooninc/infra#69 (`homelab/dev-home-02/app-dbs/`):
 - Passwords are kept in `~/.homelab-appdb-secrets/costcap.env` on dev-home-02 (`COSTCAP_MIGRATE_PASSWORD`, `COSTCAP_APP_PASSWORD`). Never commit or print them.
 - Backups run nightly to `dev-home-03:/srv/backup/app-dbs/costcap/`, sha256-verified, 14 dumps kept on each side.
 
-Status on 2026-11-13: infra#69 is open and has not been applied. The operator runs its `apply.sh` on dev-home-02. Nothing in this repo creates the database or the roles.
+Status on 2026-11-13: infra#69 is merged, and its role and database names match this repo (`costcap`, `costcap_migrate`, `costcap_app`). It has not been applied yet because lane hosts have no SSH to dev-home-02. The operator runs its `apply.sh` and `hba.sh` on dev-home-02 and installs `cron.example`. Nothing in this repo creates the database or the roles.
 
 ## Cutover (owner)
 
