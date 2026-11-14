@@ -7,4 +7,4 @@
 - The Dockerfile installs the pinned optional `pg@8.23.1`. The CLI still needs no install.
 - Tests: `test/store-contract.test.js` runs the same contract on the file and Postgres adapters, plus the RLS cross-org read/write denial cases, against a disposable PG16 container (CI only).
 - Docs: `docs/postgres.md` (instance, backups, cutover runbook) and ADR 0012.
-- Blocked (owner): persooninc/infra#69 (home-lab PG for CostCap) is open and has not been applied on dev-home-02. The prod host also has to reach the LAN-only `192.168.1.244:5432`. Production stays on the JSON file until `COSTCAP_DATABASE_URL` is set.
+- Blocked (owner): persooninc/infra#69 (home-lab PG for CostCap) was merged on 2026-11-13 with matching role names, but it has not been applied on dev-home-02 (lane hosts have no SSH there). The prod host also has to reach the LAN-only `192.168.1.244:5432`. Production stays on the JSON file until `COSTCAP_DATABASE_URL` is set.
