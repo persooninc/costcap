@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
 import { applyFile, psql } from "../scripts/db-migrate.mjs";
+import { skipUnlessDocker } from "./support/docker.js";
 
 const root = new URL("..", import.meta.url);
 const file = (name) => new URL(name, root);
 
-test("postgres migrations apply and roll back without changing the running store", async (t) => {
+test("postgres migrations apply and roll back without changing the running store", { skip: skipUnlessDocker() }, async (t) => {
   const container = `cc-pg-${process.pid}`;
   const started = spawnSync("docker", ["run", "-d", "--rm", "--name", container, "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres:16-alpine"], { encoding: "utf8" });
   assert.equal(started.status, 0, started.stderr);
@@ -62,7 +63,10 @@ test("postgres migrations apply and roll back without changing the running store
   assert.equal(psql(container, "SELECT name FROM orgs WHERE id = '" + orgB + "';").trim(), "B");
   applyFile(container, file("db/migrations/001_init.down.sql"));
   assert.equal(psql(container, "SELECT to_regclass('public.orgs');").trim(), "");
-  assert.equal(readFileSync(file("src/hosted/run.js"), "utf8").includes("DATABASE_URL"), false);
+  // FA-CC-04: the service reads only the application-role URL; the migration URL stays with scripts/db-apply.mjs.
+  const run = readFileSync(file("src/hosted/run.js"), "utf8");
+  assert.equal(run.includes("COSTCAP_DATABASE_URL"), true);
+  assert.equal(run.includes("MIGRATE_DATABASE_URL"), false);
   const service = createHostedServer({
     storePath: join(mkdtempSync(join(tmpdir(), "cc-health-")), "store.json"),
     origin: "http://localhost",

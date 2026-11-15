@@ -23,7 +23,8 @@ test("the default server and a billing flag do not create a charge route", async
   assert.equal(charge.status, 404);
   const flagged = spawnSync(process.execPath, ["src/hosted/run.js"], {
     encoding: "utf8",
-    timeout: 1000,
+    // The launcher stays up; a slow shared runner needs more than 1s to print both lines.
+    timeout: 5000,
     env: {
       ...process.env,
       COSTCAP_ORIGIN: "https://app.example.invalid",

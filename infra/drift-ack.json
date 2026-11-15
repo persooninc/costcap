@@ -1,0 +1,6 @@
+{
+  "prodSha": "85c83a80b411f5031a816f0f10d4fce2f9a213fe",
+  "reason": "Deploy is blocked on the owner: the pinned key in infra/ssh/costcap-deploy.known_hosts matches neither 157.180.14.21 nor 2.29.29.67, and COSTCAP_STRIPE_MODE is unset in the host .env. Auto-deploy skips with exit 3. See progress/FA-CC-01.md.",
+  "acknowledgedOn": "2026-11-14T00:00:00Z",
+  "expiresOn": "2026-11-21T00:00:00Z"
+}

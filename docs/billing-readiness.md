@@ -12,6 +12,12 @@ COSTCAP_BILLING=enabled, COSTCAP_STRIPE_SECRET_KEY,
 COSTCAP_STRIPE_WEBHOOK_SECRET, COSTCAP_STRIPE_ACCOUNT_ID,
 COSTCAP_STRIPE_PRICE_ID. Store secrets only in secure deployment settings.
 
+`COSTCAP_STRIPE_MODE` defaults to `test` when unset or empty, in the server, the launcher,
+compose and `scripts/deploy-remote.sh`. Live mode is never assumed: it needs an explicit
+`COSTCAP_STRIPE_MODE=live` in the host `.env`, set by the owner. With billing enabled and
+the mode unset, a live key fails the deploy preflight (`test mode requires an sk_test_ key`)
+before any image is built.
+
 `COSTCAP_STRIPE_MODE=test` accepts only an `sk_test_` key. A live key refuses
 to build the client and does not call Stripe. Test mode does not create or
 edit a price; it sends the owner-supplied `COSTCAP_STRIPE_PRICE_ID`. A
@@ -61,3 +67,30 @@ restricted $1 promotion code at Checkout or test mode without changing the stand
 
 Existing constraints: single-process file datastore, no high availability,
 no guaranteed remote kill during disconnection, no provider-bill guarantee.
+
+## Path to paid in test mode (2026-11-12)
+
+Plan catalog and entitlement checks live in the portable `src/billing/` module
+(see HANDOFF.md, Portable modules). The hosted server counts usage and calls it.
+
+- Free workspace: 3 agents, 3 people (owner included), receipts shown for 30 days. Solo (`workspace`, $19 list):
+  15 agents, 3 people, 90 days. Team (`team`, $79 list, test mode only, FA-CC-03): 50 agents, 15 people, 1 year.
+  Older receipts are hidden, never deleted, and only when entitlements are enforced.
+  Pending enrollment tokens and invitations hold a slot. Redemption re-checks the agent limit.
+- Paid statuses: `active`, `trialing`, `past_due`. Everything else is the free workspace.
+- Over a limit, `POST /v1/enrollment-tokens`, `POST /v1/enroll` and `POST /v1/invitations`
+  return `402` with `{ code: "plan_limit", feature, limit, used, plan, upgrade }`. The UI
+  scrolls to the plan card, where the owner starts Checkout.
+- Enforcement needs checkout to exist. `COSTCAP_ENTITLEMENTS` defaults to enforced in
+  `COSTCAP_STRIPE_MODE=test` and to report-only in live mode. Live enforcement is an owner switch.
+- `/pricing` is served and listed in the sitemap by default (FA-CC-03); `COSTCAP_PUBLIC_PRICING=disabled`
+  turns it off. It shows the catalog list prices and, in test mode, a banner that no real charge is made.
+- Team checkout needs the owner's test price in `COSTCAP_STRIPE_TEAM_PRICE_ID`. Without it, only Solo is sold.
+  The live adapter sells Solo only.
+- Onboarding: `/v1/fleet` returns `onboarding` (token, enroll, first receipt). The workspace
+  shows the checklist with the exact enroll and wrap commands until the first receipt syncs.
+
+Test-mode variables: `COSTCAP_BILLING=enabled`, `COSTCAP_STRIPE_MODE=test`,
+`COSTCAP_STRIPE_SECRET_KEY` (`sk_test_` only), `COSTCAP_STRIPE_WEBHOOK_SECRET` (test endpoint
+`whsec_`), `COSTCAP_STRIPE_PRICE_ID` (test recurring price). Use Stripe test card 4242 4242 4242 4242.
+Live keys stay parked until the owner approves them.
