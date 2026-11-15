@@ -27,7 +27,7 @@ test("isolated signed billing callback, paid UI, owner portal and cancellation r
   };
   const service = createHostedServer({
     storePath: join(mkdtempSync(join(tmpdir(), "cc-billing-e2e-")), "data.json"),
-    origin: "http://127.0.0.1", secureCookies: false, turnstileSiteKey: "fixture-key",
+    origin: "http://127.0.0.1", secureCookies: false, turnstileSiteKey: "fixture-key", stripeMode: "live",
     verifyChallenge: async () => true, sendCode: async d => { code = d.code; },
     billingFactory: async s => { store = s; return createStripeBilling({ store: s, secretKey: "rk_live_local_fixture", webhookSecret: secret, accountId: "acct_1TdlLm0Yt0O6HtVs", priceId: "price_local", origin: "https://costcap.example.invalid", fetchImpl: provider }); },
   });

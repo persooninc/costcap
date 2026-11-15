@@ -1,5 +1,9 @@
 name: CostCap receipt budget check
-description: Check estimated spend in a local CostCap receipt ledger. Unknown spend fails closed.
+description: Fail a CI job when AI agent spend in a CostCap receipt ledger reaches a USD cap. Unknown spend fails closed.
+author: CostCap contributors
+branding:
+  icon: shield
+  color: green
 inputs:
   receipts:
     description: Receipt JSONL file path relative to the workspace

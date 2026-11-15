@@ -3,7 +3,57 @@
 Local spend guardrails for proxy-routed AI requests. Development beta.
 The CLI meters token usage, stops subsequent calls once a budget is reached,
 detects normalized retry patterns, enforces step budgets, and supports a local
-kill file. MIT, no warranty. No paid hosted service is available in this repo.
+kill file. MIT, no warranty.
+
+**What is free and what is paid.** The CLI is free and stays free. This repo
+also contains the hosted workspace (`src/hosted/`). When the deployment has
+billing enabled, the workspace offers an optional $19 USD/month plan; without
+billing it is a free beta with no card and no charges. Neither tier is a
+provider-bill guarantee: these are guardrails, not guarantees.
+
+The free hosted workspace covers up to 3 enrolled agents and 3 people. Solo
+($19/month list price) raises that to 15 agents, and Team ($79/month list price,
+Stripe test mode only for now) to 50 agents and 15 people, with receipts shown
+for 1 year. Limits apply only where checkout is
+configured, so a limited workspace always has an upgrade path: by default in
+Stripe test mode, and in live mode only with `COSTCAP_ENTITLEMENTS=enforced`.
+Existing agents keep running over a limit; only new enrollments and invitations
+are refused. The public `/pricing` page is on by default and shows a test-mode
+banner until live billing is approved; `COSTCAP_PUBLIC_PRICING=disabled` turns it off.
+`/privacy`, `/terms` and `/security` are public. The hosted datastore is the JSON
+file unless `COSTCAP_DATABASE_URL` selects Postgres ([docs/postgres.md](docs/postgres.md)).
+Variables: [env.example](env.example) and [docs/billing-readiness.md](docs/billing-readiness.md).
+
+## Install
+
+Node 20 or newer; no runtime dependencies. **Not yet on npm or the GitHub
+Marketplace:** the package and the Action are release-ready, and the owner
+publishes them (see [docs/RELEASING.md](docs/RELEASING.md)). Until then, use
+[Run from source](#run-from-source) or pin the Action to a commit SHA.
+
+Once the first release is out:
+
+```sh
+npx costcap wrap --cap 5 -- node your-agent.js   # one-off, no install
+npm install --save-dev costcap                   # per project
+npm install --global costcap                     # costcap on your PATH
+costcap --version
+```
+
+GitHub Action (fails the job when the receipt ledger reaches the cap, or when
+any receipt has unknown cost):
+
+```yaml
+- uses: persooninc/costcap@v0.0.1 # or a full commit SHA
+  with:
+    receipts: .costcap/receipts.jsonl
+    cap: "5"
+    day-cap: "10"   # optional, UTC day
+    month-cap: "50" # optional, UTC month
+```
+
+The CLI and the Action are free. The optional hosted workspace plans are
+described above.
 
 ## Run from source
 
@@ -53,7 +103,8 @@ Receipts include unique IDs, timestamp, model, usage, versioned estimated cost,
 and blocked reasons. No request bodies or authorization headers are written.
 
 The local CLI is covered by `npm test`. The hosted beta at the configured
-origin serves the fleet UI with billing disabled. Live email login, live alert
+origin serves the fleet UI; when billing is enabled it shows the optional $19/month
+plan described above. Live checkout, live email login, live alert
 delivery, npm publication, marketplace distribution, and two-week dogfood are
 not certified by this repository's tests. `costcap reconcile` compares a local
 receipt file with a provider charge file and does not call a provider.
@@ -103,8 +154,8 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
 receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC.
-`action.yml` exposes this check as a composite GitHub Action; no Marketplace
-listing or public release has been made. MCP exposes only `budget_status` via
+`action.yml` exposes this check as a composite GitHub Action (Marketplace
+branding included); no Marketplace listing or public release has been made yet. MCP exposes only `budget_status` via
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
 protocol tests do not substitute for verification in every MCP client.
 
@@ -128,13 +179,24 @@ See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
 - [ACCOUNTS.md](ACCOUNTS.md) — service names only, no secrets
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — as-built architecture and trust boundaries
 - [docs/PATH_TO_FIRST_DOLLAR.md](docs/PATH_TO_FIRST_DOLLAR.md) — the free→paid path and its owner gates
+- [docs/RELEASING.md](docs/RELEASING.md) — npm release workflow and Marketplace listing (owner steps)
 - [docs/VISION.md](docs/VISION.md)
 - [docs/deck/index.html](docs/deck/index.html) — short pitch
 
 ## Deploy / Rollback
 
-Deployed via Coolify on the Hetzner box (Path A) on push to `main`.
-Rollback: Coolify dashboard → Deployments → redeploy previous, or `git revert`.
+The `deploy` workflow (`.github/workflows/deploy.yml`) runs after a green
+`verify` run on a push to `main`, for that exact commit (only while it is still
+main HEAD), or by manual dispatch. The repo variable `COSTCAP_AUTO_DEPLOY=off`
+stops the automatic run. It checks production secrets, renders one replica with
+`docker compose config`, and applies that one replica with
+`scripts/deploy-apply.mjs` only when `COSTCAP_DEPLOY_HOST` and
+`COSTCAP_DEPLOY_SSH_KEY` are present; otherwise the apply step exits without
+applying. A canary then checks the origin serves that commit
+(`COSTCAP_EXPECT_SHA`), the expected datastore, and `/cli` plus the trust pages.
+The daily `prod-drift` workflow fails when production has been behind `main`
+HEAD for more than 24 hours.
+Rollback: `git revert` on `main`, then dispatch `deploy` again.
 
 <!-- iac-gaps -->
 

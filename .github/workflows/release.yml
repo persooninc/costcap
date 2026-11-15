@@ -1,0 +1,93 @@
+name: release
+# Publishes the costcap CLI to npm. Nothing here runs on push to main.
+#   - Push a tag vX.Y.Z that matches package.json "version" -> real publish.
+#   - workflow_dispatch -> dry run by default; set publish=true to publish the
+#     version already in package.json on the dispatched ref.
+# Owner-only setup (not done by this repo): create an npm automation/granular
+# token with publish rights and store it as the NPM_TOKEN repository secret.
+# Without NPM_TOKEN a real publish fails closed before `npm publish` runs.
+#
+# Provenance: npm can only sign provenance on GitHub-hosted runners. The owner
+# rule is self-hosted runners, so by default this publishes without provenance.
+# To publish with provenance, set the repository variable
+# COSTCAP_RELEASE_RUNS_ON to '["ubuntu-latest"]' (a JSON runner label list);
+# the publish step adds --provenance whenever the runner is GitHub-hosted.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm (false = npm publish --dry-run)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  npm:
+    runs-on: ${{ fromJSON(vars.COSTCAP_RELEASE_RUNS_ON || '["self-hosted","dev-home-01"]') }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # npm provenance (GitHub-hosted runners only)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - run: node scripts/pack-check.mjs
+      - id: meta
+        name: version and tag agree
+        run: node scripts/release-check.mjs --ref "$GITHUB_REF" >> "$GITHUB_OUTPUT"
+      - id: mode
+        name: choose real publish or dry run
+        env:
+          EVENT: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "push" ] || [ "$PUBLISH_INPUT" = "true" ]; then
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: fail closed without NPM_TOKEN
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not set; nothing was published"
+            exit 2
+          fi
+      - name: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+        run: |
+          args=(--access public --tag "$DIST_TAG")
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then args+=(--provenance); else echo "::notice::self-hosted runner: publishing without npm provenance"; fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          npm publish "${args[@]}"
+      - name: registry readback
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "costcap@$VERSION" version dist.integrity "dist-tags.$DIST_TAG" --json > readback.json 2>/dev/null; then
+              cat readback.json
+              node -e 'const r=require("./readback.json");const want=process.env.VERSION;if(r.version!==want||r["dist-tags."+process.env.DIST_TAG]!==want||!r["dist.integrity"]){console.error("readback mismatch");process.exit(1)}'
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "::error::costcap@$VERSION not visible on the registry after publish"
+          exit 1

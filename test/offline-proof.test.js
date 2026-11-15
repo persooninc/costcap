@@ -16,11 +16,12 @@ test('offline frozen cache refuses upstream calls across wrapper restarts',async
  const dir=mkdtempSync(join(tmpdir(),'cc-offline-proof-'));
  const cache=join(dir,'enrollment.json');
  writeFileSync(cache,JSON.stringify({url:`http://127.0.0.1:${fleetPort}`,token:'fixture-token',agentId:'fixture-agent',policy:{version:3,caps:{run:1},killed:true},syncedIds:[]}),{mode:0o600});
+ // The slow kill poll stops the watcher ending the child before it prints what the proxy answered.
  for(let restart=0;restart<2;restart++){
   const receipts=join(dir,`receipts-${restart}.jsonl`);
   const script=`const r=await fetch(process.env.OPENAI_BASE_URL+'/chat/completions',{method:'POST',body:JSON.stringify({model:'gpt-4o-mini'})});console.log(r.status);`;
   const result=await new Promise((resolve,reject)=>{
-   const child=spawn(process.execPath,['src/cli.js','wrap','--enrollment',cache,'--receipts',receipts,'--kill-file',join(dir,'KILL'),'--',process.execPath,'--input-type=module','-e',script],{env:{...process.env,COSTCAP_TEST_OPENAI_UPSTREAM:`http://127.0.0.1:${port}`}});
+   const child=spawn(process.execPath,['src/cli.js','wrap','--enrollment',cache,'--receipts',receipts,'--kill-file',join(dir,'KILL'),'--',process.execPath,'--input-type=module','-e',script],{env:{...process.env,COSTCAP_TEST_OPENAI_UPSTREAM:`http://127.0.0.1:${port}`,COSTCAP_KILL_POLL_MS:'60000'}});
    let out='',err='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>err+=d);child.on('error',reject);child.on('exit',code=>resolve({code,out,err}));
   });
   assert.equal(result.out.replace(/\x1b\[[0-9;]*m/g, "").trim(),'429',result.err);
