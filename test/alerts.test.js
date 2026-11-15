@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ALERT_KINDS, auditEntry, dedupeAlerts, evaluateAlerts } from "../src/hosted/alerts.js";
+import { ALERT_KINDS, auditEntry, dedupeAlerts, evaluateAlerts, projectMonthSpend } from "../src/hosted/alerts.js";
 
 const state = (over = {}) => ({ agentId: "a1", caps: {}, spend: {}, blockedReasons: [], ...over });
 const kinds = (alerts) => alerts.map((a) => a.kind);
 
 test("alert kinds are the documented set", () => {
-  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent"]);
+  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected"]);
 });
 
 test("no caps and no activity raise nothing", () => {
@@ -70,4 +70,31 @@ test("audit entries need org, actor and action", () => {
   for (const missing of ["orgId", "actor", "action"]) {
     assert.throws(() => auditEntry({ orgId: "o", actor: "u", action: "kill", [missing]: "" }), /audit entry needs/);
   }
+});
+
+// Issue #109: month burn-rate projection.
+const mid = Date.parse("2026-11-16T00:00:00.000Z"); // 15 of 30 days elapsed
+
+test("projectMonthSpend is linear over the UTC month", () => {
+  assert.equal(projectMonthSpend(5, mid), 10);
+  assert.equal(projectMonthSpend(5, Date.parse("2026-11-01T12:00:00.000Z")), null);
+  assert.equal(projectMonthSpend(1, Date.parse("2026-11-01T12:00:00.000Z"), { minElapsedMs: 0 }), 60);
+  assert.equal(projectMonthSpend(undefined, mid), null);
+  assert.equal(projectMonthSpend(NaN, mid), null);
+  assert.equal(projectMonthSpend(5, undefined), null);
+  assert.equal(projectMonthSpend(3, Date.parse("2026-12-31T00:00:00.000Z")).toFixed(6), "3.100000");
+});
+
+test("cap_projected fires when the burn rate reaches the month cap", () => {
+  const at = (spent, over = {}) => evaluateAlerts(state({ caps: { month: 20 }, spend: { month: spent }, nowMs: mid, ...over }));
+  assert.deepEqual(at(9), []);
+  const [alert] = at(10);
+  assert.deepEqual(alert, { kind: "cap_projected", scope: "month", key: "cap_projected:a1:month", cap: 20, spent: 10, projected: 20, lowerBound: false });
+  assert.equal(at(10, { unknown: { month: 2 } })[0].lowerBound, true);
+  assert.deepEqual(kinds(at(16)), ["cap_approaching"]);
+  assert.deepEqual(kinds(at(20)), ["cap_hit"]);
+  assert.deepEqual(kinds(at(10, { nowMs: Date.parse("2026-11-01T06:00:00.000Z") })), []);
+  assert.deepEqual(kinds(evaluateAlerts(state({ caps: { month: "20" }, spend: { month: 19 }, nowMs: mid }))), []);
+  assert.deepEqual(kinds(evaluateAlerts(state({ caps: { month: 20 }, spend: {}, nowMs: mid }))), []);
+  assert.deepEqual(kinds(evaluateAlerts(state({ caps: { month: 20 }, spend: { month: 2 }, nowMs: Date.parse("2026-11-01T06:00:00.000Z") }), { minProjectionMs: 0 })), ["cap_projected"]);
 });

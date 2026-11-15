@@ -432,3 +432,22 @@ test("receipt csv is the signed-in org only and ignores an agent bearer", async 
   const theirs = await pull(other.cookie);
   assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,model,cost_usd,reason,scope");
 });
+
+test("regression #109: month burn-rate projection pages once through the fleet worker", async (t) => {
+  let clock = Date.parse("2026-11-16T00:00:00.000Z");
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("burn@example.invalid");
+  const token = (await f.request("/v1/enrollment-tokens", { caps: { month: 20 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "burn" }, null, token)).body;
+  assert.equal((await f.request("/v1/receipts", { receipts: [
+    { id: "burn-1", ts: "2026-11-10T00:00:00.000Z", cost_usd: 11, model: "test" },
+    { id: "burn-2", ts: "2026-11-11T00:00:00.000Z", cost_usd: null, model: "test" },
+  ] }, null, agent.token)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, 1);
+  assert.equal(f.delivery[0].kind, "cap_projected");
+  assert.equal(f.delivery[0].lowerBound, true);
+  assert.equal(f.delivery[0].projected, 22);
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, 1);
+});

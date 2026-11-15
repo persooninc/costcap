@@ -3,12 +3,26 @@
 // them (Brevo email, Slack) and writes the audit log. Dedupe: an alert
 // with the same key does not fire again until it clears and re-arms.
 
-export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent"];
+export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected"];
 
 // state: { agentId, caps:{run,day,month}, spend:{run,day,month},
 //          blockedReasons:[...recent blocked receipts' reason/error],
 //          lastSeenMs, nowMs }
-export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = 6 * 3600_000 } = {}) {
+// Month burn-rate projection (issue #109). Linear: month-to-date spend divided
+// by the elapsed share of the UTC month. Returns null before minElapsedMs so a
+// first-hour burst does not page. Unknown-cost receipts are not counted as
+// zero; the caller reports them and the projection is then a lower bound.
+export function projectMonthSpend(spent, nowMs, { minElapsedMs = 24 * 3600_000 } = {}) {
+  if (typeof spent !== "number" || !Number.isFinite(spent) || !Number.isFinite(nowMs)) return null;
+  const now = new Date(nowMs);
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  const elapsed = nowMs - start;
+  if (elapsed < minElapsedMs) return null;
+  return spent * ((end - start) / elapsed);
+}
+
+export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = 6 * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
   const out = [];
   for (const scope of ["run", "day", "month"]) {
     const cap = state.caps?.[scope];
@@ -17,6 +31,14 @@ export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = 
     if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
     if (spent >= cap) out.push({ kind: "cap_hit", scope, key: `cap_hit:${state.agentId}:${scope}`, cap, spent });
     else if (spent >= cap * approachFraction) out.push({ kind: "cap_approaching", scope, key: `cap_approaching:${state.agentId}:${scope}`, cap, spent });
+  }
+  const monthCap = state.caps?.month;
+  if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month")) {
+    const projected = projectMonthSpend(state.spend?.month, state.nowMs, { minElapsedMs: minProjectionMs });
+    if (projected !== null && projected >= monthCap) {
+      const unknown = state.unknown?.month ?? 0;
+      out.push({ kind: "cap_projected", scope: "month", key: `cap_projected:${state.agentId}:month`, cap: monthCap, spent: state.spend.month, projected: Number(projected.toFixed(6)), lowerBound: unknown > 0 });
+    }
   }
   // Step budget is the third shipped loop guardrail, with spiral and velocity.
   // Accounting gaps and ordinary cap or kill blocks are not loops.
