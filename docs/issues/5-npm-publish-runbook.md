@@ -50,3 +50,11 @@ The publish is CI/IaC only — never run `npm publish` from a laptop.
 `npx costcap` resolves the published package and prints usage; the registry read-back
 matches `package.json`; no person ran `npm publish` (the GitHub Actions run log is the
 source of truth).
+
+## Audit read-only verification (2026-11-15)
+
+- `npm view costcap version` → **E404, not found** — the package is not yet published,
+  confirming the owner-gated state (publish is what creates the registry record).
+- All referenced code is present on `main`: `package.json` (`bin.costcap`, `files`
+  allowlist), `src/cli.js` (shebanged), `scripts/pack-check.mjs`, `test/pack.test.js`,
+  `scripts/publish-preflight.mjs`, `.github/workflows/publish.yml` — all confirmed to exist.

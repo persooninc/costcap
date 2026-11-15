@@ -41,3 +41,9 @@ No customer organization is enrolled for this dogfood.
 14 consecutive days of real receipts from an owner-authorized agent are stored and
 reviewed, unknown-cost receipts are reconciled or the wrap stayed stopped, and no customer
 org was enrolled.
+
+## Audit read-only verification (2026-11-15)
+
+- Dogfood-relevant tests confirmed present on `main`: `test/agent-budget.test.js`,
+  `test/reconcile.test.js`, `test/receipts-csv.test.js`. No code slice remains; this epic is
+  an owner-operational 14-day real-receipt exercise (no customer org), nothing buildable here.

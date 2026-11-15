@@ -38,3 +38,9 @@ covered by #44. Child stories #5 and #44 are covered by runbooks in this PR.
 The Action is published to the Marketplace with honest copy, the npm package is CI-published
 (#5), and any visibility change is recorded in a log. Child stories #5 and #44 are covered
 by this PR.
+
+## Audit read-only verification (2026-11-15)
+
+- `action.yml` confirmed present (first AC shipped). `npm view costcap version` → **E404**:
+  package not yet CI-published (#5 gate). Child stories #5 and #44 are covered by runbooks in
+  this PR. Remaining ACs are owner-gated: npm token, public-repo decision, Marketplace access.

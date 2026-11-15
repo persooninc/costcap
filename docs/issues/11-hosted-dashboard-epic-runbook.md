@@ -54,3 +54,13 @@ without the billing story's secret and read-back.
 `main` is deployed by the workflow, `/health` matches the deployed SHA, the canary passes,
 billing stays disabled, and one replica + volume come from IaC. All child stories are
 closed or covered by this PR.
+
+## Audit read-only verification (2026-11-15)
+
+- Children confirmed **CLOSED**: #12 (org auth), #13 (enrollment sync), #14 (alerts),
+  #72 (RLS), #73 (pricing). Remaining: #42 and #45, both owner-gated with runbooks in this PR.
+- `curl -sSfI https://app.costcap.dev/health` → **HTTP 403** — the origin is reachable but
+  the deployed service with a public `/health` is not live yet; the deploy + canary + live
+  proof remain the owner gate (expected).
+- Deploy/canary/billing code confirmed present: `.github/workflows/deploy.yml`,
+  `scripts/deploy-preflight.mjs`, `scripts/canary.mjs`, `src/hosted/billing.js`.

@@ -47,3 +47,10 @@ test inbox is used.
 
 CI proves one Brevo-accepted sign-in (then logout) and one alert delivery for
 `COSTCAP_ALERT_ORG_ID` only, with the fixture verifier absent and no secret printed.
+
+## Audit read-only verification (2026-11-15)
+
+- Live-proof code confirmed present: `scripts/live-proof.mjs`,
+  `.github/workflows/live-proof.yml`, `test/live-proof.test.js`, `docs/adr/0010-live-proof-gate.md`.
+- `app.costcap.dev/health` → HTTP 403: no live origin yet, so the live proof cannot run
+  until the #11 deploy lands and the production Turnstile/Brevo secrets are set (expected gate).

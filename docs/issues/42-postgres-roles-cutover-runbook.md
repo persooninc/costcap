@@ -59,3 +59,12 @@ until the Postgres read-back is confirmed. `db-migrate.mjs down` reverses the sc
 Schema+grants are migrations (done), tenant isolation is enforced in the DB (done, #72),
 rollback is tested (done), `/health` reports the Postgres backend, and the JSON store
 stays the only backend until that read-back exists.
+
+## Audit read-only verification (2026-11-15)
+
+- `curl -sSfI https://app.costcap.dev/health` → **HTTP 403**: no deployed origin reporting a
+  DB backend yet, so the JSON store correctly remains the only backend (per the AC).
+- #72 (RLS write-harden) confirmed **CLOSED**. Migration + helper files all present:
+  `db/migrations/000_roles.sql`/`001_init.sql`/`002_grants.sql`/`003_store.sql` plus
+  `001_init.down.sql`/`003_store.down.sql`, `test/migrate.test.js`, `scripts/db-migrate.mjs`,
+  `scripts/db-import-json.mjs`.
