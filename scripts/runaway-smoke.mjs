@@ -17,12 +17,12 @@ const up = http.createServer((req, res) => {
 });
 await new Promise((r) => up.listen(0, "127.0.0.1", r));
 
-function scenario(name, flags, count, distinct = true) {
+function scenario(name, flags, count, distinct = true, extraEnv = {}) {
   hits = 0;
   const receipts = join(root, `${name}.jsonl`);
   const childCode = `for (let i = 0; i < ${count}; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: ${distinct ? "String(i)" : "'same retry'"} }] }) }); console.log(r.status); if (r.status === 429) break; }`;
   const child = spawn(process.execPath, [join(repo, "src/cli.js"), "wrap", ...flags, "--receipts", receipts, "--kill-file", join(root, "KILL"), "--", process.execPath, "--input-type=module", "-e", childCode], {
-    env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` },
+    env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}`, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -76,7 +76,9 @@ try {
   assert.equal(unknown.blockedReason, "unreconciled_receipt");
   assert.ok(unknown.unknownCostCount >= 1);
   writeFileSync(join(root, "KILL"), "synthetic frozen");
-  const killed = await scenario("kill-file", [], 20);
+  // Pin the child-stop watcher off so this scenario proves the proxy 429 path
+  // deterministically; watcher SIGTERM (143) is covered in test/kill.test.js.
+  const killed = await scenario("kill-file", [], 20, true, { COSTCAP_KILL_POLL_MS: "600000" });
   assert.equal(killed.upstreamCalls, 0);
   assert.equal(killed.blockedReason, "killed");
   const results = [cap, spiral, steps, day, month, unknown, killed];
