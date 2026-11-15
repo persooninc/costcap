@@ -11,7 +11,10 @@ export async function startPostgres(t, { publish = false, autoStop = true } = {}
   // With autoStop: false the caller closes its clients first, then calls stop().
   const stop = () => spawnSync("docker", ["rm", "-f", container]);
   if (autoStop) t.after(stop);
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  // Deadline, not an attempt count: on a loaded shared runner the image init
+  // restart can take well over 30 s (CI run 43774011703).
+  const deadline = Date.now() + (Number(process.env.COSTCAP_PG_READY_MS) || 120_000);
+  while (Date.now() < deadline) {
     const logs = spawnSync("docker", ["logs", container], { encoding: "utf8" });
     const boots = `${logs.stdout}\n${logs.stderr}`.split("ready to accept connections").length - 1;
     if (boots >= 2) {

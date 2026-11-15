@@ -1,5 +1,5 @@
 {
-  "checkedAt": "2026-11-15T23:15:10.714Z",
+  "checkedAt": "2026-11-15T23:25:19.660Z",
   "command": "npm run acceptance:runaway",
   "provider": "local fake OpenAI",
   "paidCalls": 0,
@@ -18,8 +18,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "f3be1896-1880-4914-9043-1daf76e7b45f",
-          "ts": "2026-11-15T23:14:57.984Z",
+          "id": "300293cf-2815-44cd-b3c3-a9c219567fcc",
+          "ts": "2026-11-15T23:25:09.498Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -35,8 +35,8 @@
           "fallback": false
         },
         {
-          "id": "90c723bf-3448-40cf-bbff-6b268d60e98e",
-          "ts": "2026-11-15T23:14:58.085Z",
+          "id": "dc64a249-70da-4387-bf29-4a16441dfbba",
+          "ts": "2026-11-15T23:25:09.551Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -66,8 +66,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "d2a05785-2ad8-46de-9a1c-3bc9a1068336",
-          "ts": "2026-11-15T23:15:00.526Z",
+          "id": "d6a58e6e-b152-43c4-a22a-fd9370f18247",
+          "ts": "2026-11-15T23:25:11.055Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -83,8 +83,8 @@
           "fallback": false
         },
         {
-          "id": "43e8aa92-477d-45d9-a923-cb4fb9e96cc7",
-          "ts": "2026-11-15T23:15:00.650Z",
+          "id": "35da15a5-1cc2-4a38-9dc6-b4f7c7295019",
+          "ts": "2026-11-15T23:25:11.203Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -100,8 +100,8 @@
           "fallback": false
         },
         {
-          "id": "9d35c0b8-98f6-44a2-8978-5a8025867953",
-          "ts": "2026-11-15T23:15:00.694Z",
+          "id": "fa2d768e-3c46-4a79-b8fd-fb7d826d38c2",
+          "ts": "2026-11-15T23:25:11.228Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -117,8 +117,8 @@
           "fallback": false
         },
         {
-          "id": "7d471605-68c7-4513-bb12-50f4cd576c23",
-          "ts": "2026-11-15T23:15:00.739Z",
+          "id": "f0620974-2066-43f7-b843-82ad3425b9d8",
+          "ts": "2026-11-15T23:25:11.265Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -134,8 +134,8 @@
           "fallback": false
         },
         {
-          "id": "5d8f60ce-dfff-4c0f-92fa-779505fe8ac7",
-          "ts": "2026-11-15T23:15:00.787Z",
+          "id": "913f4519-ce6a-4779-9d2d-61b798dc80a8",
+          "ts": "2026-11-15T23:25:11.308Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -151,8 +151,8 @@
           "fallback": false
         },
         {
-          "id": "4ddb2dc0-03bf-43d0-9ef6-abbf3d2f1fc6",
-          "ts": "2026-11-15T23:15:00.814Z",
+          "id": "5e326749-b78b-427d-b6c4-71b8c9aa6084",
+          "ts": "2026-11-15T23:25:11.328Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -180,8 +180,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "eff3d79f-f5dd-48e9-b1c4-5508ae7fbd4b",
-          "ts": "2026-11-15T23:15:03.582Z",
+          "id": "6fe638c1-782d-4d4c-bbaa-45ca8593b3b2",
+          "ts": "2026-11-15T23:25:12.561Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -197,8 +197,8 @@
           "fallback": false
         },
         {
-          "id": "04025965-d506-42f9-b92a-254ed0a1a75a",
-          "ts": "2026-11-15T23:15:03.713Z",
+          "id": "740743f8-196f-4b8b-b6b9-04ac73f0360d",
+          "ts": "2026-11-15T23:25:12.617Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -214,8 +214,8 @@
           "fallback": false
         },
         {
-          "id": "a6e24026-43ad-4f7d-8926-7a2a0d829655",
-          "ts": "2026-11-15T23:15:03.747Z",
+          "id": "14c08141-fe90-479f-8c37-35d0e95ce42a",
+          "ts": "2026-11-15T23:25:12.648Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -231,8 +231,8 @@
           "fallback": false
         },
         {
-          "id": "6d06aa86-4363-4d89-ac71-32a3d9e87c18",
-          "ts": "2026-11-15T23:15:03.765Z",
+          "id": "276ef977-1643-4798-9d9d-ce7c94939e46",
+          "ts": "2026-11-15T23:25:12.654Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -257,13 +257,13 @@
       "receipts": [
         {
           "id": "seed-day",
-          "ts": "2026-11-15T23:15:04.438Z",
+          "ts": "2026-11-15T23:25:13.169Z",
           "cost_usd": 1,
           "model": "gpt-4o-mini"
         },
         {
-          "id": "708adc71-ffd6-4019-b131-1ea3c627af74",
-          "ts": "2026-11-15T23:15:06.144Z",
+          "id": "b66e471b-3a42-469e-9390-f478117ecc4f",
+          "ts": "2026-11-15T23:25:14.216Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -294,8 +294,8 @@
           "model": "gpt-4o-mini"
         },
         {
-          "id": "cbd6a465-1b92-41ba-8b97-5191e23cbe72",
-          "ts": "2026-11-15T23:15:07.672Z",
+          "id": "d7683bb5-6ad6-4fb1-a193-a8e9fb7ceed6",
+          "ts": "2026-11-15T23:25:15.728Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -321,14 +321,14 @@
       "receipts": [
         {
           "id": "seed-unknown",
-          "ts": "2026-11-15T23:15:04.438Z",
+          "ts": "2026-11-15T23:25:13.169Z",
           "cost_usd": null,
           "model": "gpt-4o-mini",
           "reason": "usage_unavailable"
         },
         {
-          "id": "bee790d0-6943-45ad-9b1d-f2a75c9fc0c7",
-          "ts": "2026-11-15T23:15:09.070Z",
+          "id": "5022f691-fe10-4acc-97bb-43365f1bb3a5",
+          "ts": "2026-11-15T23:25:17.002Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -353,14 +353,14 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "bd76b6a9-8abd-4e05-bf76-12401c81d9e2",
-          "ts": "2026-11-15T23:15:10.541Z",
+          "id": "e91688d4-a53c-4ad1-bb76-410fbd462f59",
+          "ts": "2026-11-15T23:25:19.305Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
           "reason": "killed",
           "cost_usd": 0,
-          "kill_file": "/tmp/cc-runaway-sjk2jL/KILL",
+          "kill_file": "/tmp/cc-runaway-Xniqc9/KILL",
           "note": "synthetic frozen"
         }
       ]
