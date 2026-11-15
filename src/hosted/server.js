@@ -5,6 +5,7 @@ import { uiResponse } from "./ui.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
+import { buildEvidence } from "./evidence.js";
 import { evaluateAlerts, auditEntry } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
@@ -273,6 +274,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         };
         if (csv.truncated) headers["x-costcap-truncated"] = "true";
         return res.writeHead(200, headers).end(csv.body);
+      }
+      if (path === "/v1/evidence.json" && req.method === "GET") {
+        return json(200, store.read((s) => {
+          const u = sessionUser(s, req);
+          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
+            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
+            receipts: visibleReceipts(s, u.orgId),
+            alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active) });
+        }));
       }
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {

@@ -217,3 +217,7 @@ Rollback: `git revert` on `main`, then dispatch `deploy` again.
 ```bash
 npm test
 ```
+
+## SRM evidence export
+
+`GET /v1/evidence.json` (signed-in session, scoped to your org) returns a `costcap.evidence/v1` document for ShipReady Metrics. It holds per-agent caps, day/month known spend, unknown-cost counts, active alerts, and receipts. A receipt with unknown cost keeps `cost_usd: null`. It is never counted as $0, and `cost_complete` is false whenever any cost is unknown. Sample: `docs/fixtures/srm-evidence.sample.json`.
