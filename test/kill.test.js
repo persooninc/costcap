@@ -5,7 +5,8 @@ import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createKillCheck, kill, resume } from "../src/kill.js";
+import { createKillCheck, kill, recordKillEvent, resume } from "../src/kill.js";
+import { createCapEngine, loadEvents, loadReceipts } from "../src/cap.js";
 import { startMeteringProxy } from "../src/proxy.js";
 
 test("kill writes the file, check sees it, resume clears it", () => {
@@ -64,4 +65,40 @@ test("wrap SIGTERMs the child when the kill file appears", async () => {
   setTimeout(() => kill(f, "test"), 300);
   const code = await Promise.race([run, new Promise((r) => setTimeout(() => r("timeout"), 8000))]);
   assert.equal(code, 143);
+});
+
+test("kill and resume events are recorded with note and time, and are not spend", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-"));
+  const receipts = join(dir, "receipts.jsonl");
+  const killFile = join(dir, "KILL");
+  writeFileSync(receipts, `${JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", cost_usd: 1.5 })}\n`);
+  const cli = (...args) => spawnSync(process.execPath, ["src/cli.js", ...args, "--kill-file", killFile, "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(cli("kill", "runaway", "agent").status, 0);
+  assert.equal(existsSync(killFile), true);
+  assert.equal(cli("resume", "reviewed").status, 0);
+  assert.equal(cli("resume").status, 0);
+  const events = loadEvents(receipts);
+  assert.deepEqual(events.map((e) => [e.event, e.note, e.kill_file]), [["kill", "runaway agent", killFile], ["resume", "reviewed", killFile]]);
+  assert.ok(events.every((e) => Number.isFinite(Date.parse(e.ts))));
+  const history = loadReceipts(receipts);
+  assert.equal(history.length, 1);
+  assert.doesNotThrow(() => createCapEngine({ caps: { day: 5 }, history }));
+});
+
+test("a ledger write failure warns and leaves the kill file in place", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-"));
+  const blocker = join(dir, "not-a-dir");
+  writeFileSync(blocker, "");
+  const killFile = join(dir, "KILL");
+  const result = spawnSync(process.execPath, ["src/cli.js", "kill", "stop", "--kill-file", killFile, "--receipts", join(blocker, "receipts.jsonl")], { encoding: "utf8" });
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /was not recorded/);
+  assert.equal(existsSync(killFile), true);
+});
+
+test("recordKillEvent throws so the caller decides what a failure means", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-"));
+  const blocker = join(dir, "file");
+  writeFileSync(blocker, "");
+  assert.throws(() => recordKillEvent(join(blocker, "r.jsonl"), "kill", "KILL"));
 });

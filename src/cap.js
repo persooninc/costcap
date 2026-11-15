@@ -5,12 +5,21 @@
 
 import { readFileSync, existsSync } from "node:fs";
 
-export function loadReceipts(path) {
+function loadLines(path) {
   if (!path || !existsSync(path)) return [];
   return readFileSync(path, "utf8")
     .split("\n")
     .filter(Boolean)
     .map((l) => JSON.parse(l));
+}
+
+// Event lines such as kill and resume share the ledger but are never spend.
+export function loadReceipts(path) {
+  return loadLines(path).filter((r) => !r.event);
+}
+
+export function loadEvents(path) {
+  return loadLines(path).filter((r) => r.event);
 }
 
 // caps: { run, day, month } in USD; any may be undefined.

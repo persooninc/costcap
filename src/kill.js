@@ -4,7 +4,7 @@
 // by hand works too. Local enforcement only: traffic outside the proxy is
 // not stopped.
 
-import { existsSync, mkdirSync, statSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const DEFAULT_KILL_FILE = ".costcap/KILL";
@@ -34,4 +34,15 @@ export function resume(killFile = DEFAULT_KILL_FILE) {
   const had = existsSync(killFile);
   rmSync(killFile, { force: true });
   return had;
+}
+
+// A wrapper may hold the ledger lock for as long as it runs, and kill must still
+// work then, so this appends one line without taking the lock. The kill file is
+// the control and the event is the record: callers change the file first, so a
+// ledger failure can't undo a kill.
+export function recordKillEvent(receiptsPath, event, killFile, note = "", now = () => new Date()) {
+  mkdirSync(dirname(receiptsPath), { recursive: true });
+  const line = { event, ts: now().toISOString(), kill_file: killFile };
+  if (note) line.note = note;
+  appendFileSync(receiptsPath, `${JSON.stringify(line)}\n`);
 }
