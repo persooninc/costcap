@@ -58,7 +58,8 @@ test("unknown usage latches accounting failure before a second upstream call", a
 
 test("timeout latches uncertain outcome, not zero spend", async (t) => {
   let hits = 0;
-  const call = await fixture(t, () => { hits++; }, { timeoutMs: 30 });
+  // The upstream never answers. 500ms leaves a slow runner time to deliver the request first.
+  const call = await fixture(t, () => { hits++; }, { timeoutMs: 500 });
   assert.equal((await call(1)).status, 502);
   assert.equal((await call(2)).status, 429);
   assert.equal(hits, 1);
