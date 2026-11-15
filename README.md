@@ -140,7 +140,17 @@ node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 ```
 
 An agent entry replaces the default. An agent with no entry and no default is
-refused (`no_budget_policy`). Blocks return HTTP 429 with `verdict`, `reason`,
+refused (`no_budget_policy`).
+
+Team budgets share one cap across a group of agents:
+`"teams": { "ops": { "agents": ["release-bot", "triage-bot"], "day": 30, "month": 400 } }`.
+Each agent's own cap applies first, then the team's summed spend. A team cap
+blocks with `budget_exceeded` plus `team`. An unknown cost from any teammate
+returns `accounting_unavailable` instead of being counted as $0. An agent can be
+in only one team, and team membership on its own counts as a budget policy.
+`budget_remaining` shows the tighter of the agent and team remainders.
+
+Blocks return HTTP 429 with `verdict`, `reason`,
 `agent_id` and `run_id`, and `agent-status` and the MCP tool `agent_budget_status`
 return the same verdict with `budget_remaining`. Run and step budgets are per
 `run_id`, which the wrapper assigns. Figures are estimates, the same limits above

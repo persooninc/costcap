@@ -22,7 +22,8 @@ function assertReceipt(r) {
   if (!Number.isFinite(Date.parse(r.ts)) || badCost) throw new Error("Invalid receipt history; reconcile before running");
 }
 
-const POLICY_KEYS = new Set(["default", "agents"]);
+const POLICY_KEYS = new Set(["default", "agents", "teams"]);
+const TEAM_KEYS = new Set([...SCOPES, "agents"]);
 const LIMIT_KEYS = new Set([...SCOPES, "maxSteps"]);
 
 // Unknown keys are refused: a misspelled limit must not silently mean "no limit".
@@ -35,6 +36,18 @@ export function assertAgentPolicy(policy) {
   };
   if (policy.default) check(policy.default, "default");
   for (const [agent, limits] of Object.entries(policy.agents ?? {})) check(limits, agent);
+  const members = new Set();
+  for (const [team, def] of Object.entries(policy.teams ?? {})) {
+    const label = `team ${team}`;
+    if (!def || typeof def !== "object" || Array.isArray(def)) throw new Error(`Invalid ${label}`);
+    for (const key of Object.keys(def)) if (!TEAM_KEYS.has(key)) throw new Error(`Unknown limit ${key} for ${label}`);
+    assertLimits(def, label);
+    if (!Array.isArray(def.agents) || !def.agents.length || def.agents.some((a) => typeof a !== "string" || !a)) throw new Error(`Invalid ${label} agents`);
+    for (const agent of def.agents) {
+      if (members.has(agent)) throw new Error(`Agent ${agent} is in more than one team`);
+      members.add(agent);
+    }
+  }
   return policy;
 }
 
@@ -58,12 +71,16 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
   history.forEach(add);
 
   const limitsFor = (agentId) => policy.agents?.[agentId] ?? policy.default ?? null;
+  const teamFor = (agentId) => {
+    for (const [team, def] of Object.entries(policy.teams ?? {})) if (def.agents.includes(agentId)) return { team, ...def };
+    return null;
+  };
 
-  function spend({ agent_id: agentId = UNKNOWN_AGENT, run_id: runId = null } = {}) {
+  function spend({ agent_id: agentId = UNKNOWN_AGENT, run_id: runId = null } = {}, agentIds = [agentId]) {
     const today = now().toISOString();
     const out = { run: 0, day: 0, month: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
-      if (r.agent_id !== agentId) continue;
+      if (!agentIds.includes(r.agent_id)) continue;
       if (r.cost_usd === null) out.unknown += 1;
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
@@ -78,20 +95,35 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
   return {
     spend,
     limitsFor,
+    teamFor,
+    teamSpend(who) {
+      const team = teamFor(who.agent_id ?? UNKNOWN_AGENT);
+      return team ? spend(who, team.agents) : null;
+    },
     // null when the next call may proceed, otherwise a verdict with a cited reason.
     check({ agent_id: agentId = UNKNOWN_AGENT, run_id: runId = null } = {}) {
       const who = { agent_id: agentId, run_id: runId };
       const limits = limitsFor(agentId);
-      if (!limits) return { verdict: "no_budget_policy", reason: "no_budget_policy", ...who };
+      const team = teamFor(agentId);
+      if (!limits && !team) return { verdict: "no_budget_policy", reason: "no_budget_policy", ...who };
       const s = spend(who);
+      const ts = team ? spend(who, team.agents) : null;
       if (s.unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", unknown_receipts: s.unknown, ...who };
+      // A teammate's unknown cost makes the shared total unknowable too.
+      if (ts?.unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", unknown_receipts: ts.unknown, team: team.team, ...who };
       for (const scope of SCOPES) {
-        const cap = limits[scope];
+        const cap = limits?.[scope];
         if (cap != null && s[scope] >= cap) {
           return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, cap_usd: cap, spent_usd: round6(s[scope]), ...who };
         }
       }
-      if (limits.maxSteps != null && s.steps >= limits.maxSteps) {
+      for (const scope of SCOPES) {
+        const cap = team?.[scope];
+        if (cap != null && ts[scope] >= cap) {
+          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, team: team.team, cap_usd: cap, spent_usd: round6(ts[scope]), ...who };
+        }
+      }
+      if (limits?.maxSteps != null && s.steps >= limits.maxSteps) {
         return { verdict: "breaker_open", reason: "step_budget", steps: s.steps, max_steps: limits.maxSteps, ...who };
       }
       return null;
@@ -106,8 +138,17 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
 // Remaining budget for a verdict or MCP response. Numbers are estimates.
 export function budgetRemaining(budgets, who) {
   const limits = budgets.limitsFor(who.agent_id);
-  if (!limits) return null;
+  const team = budgets.teamFor?.(who.agent_id) ?? null;
+  if (!limits && !team) return null;
   const s = budgets.spend(who);
+  const ts = team ? budgets.teamSpend(who) : null;
   const left = (cap, used) => (cap == null ? null : round6(Math.max(cap - used, 0)));
-  return { run_usd: left(limits.run, s.run), day_usd: left(limits.day, s.day), month_usd: left(limits.month, s.month), steps: left(limits.maxSteps, s.steps) };
+  // The tighter of the agent's own remainder and the team's shared remainder.
+  const tight = (scope) => {
+    const own = left(limits?.[scope], s[scope]);
+    const shared = left(team?.[scope], ts?.[scope]);
+    if (own == null) return shared;
+    return shared == null ? own : Math.min(own, shared);
+  };
+  return { run_usd: tight("run"), day_usd: tight("day"), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps) };
 }
