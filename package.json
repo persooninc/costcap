@@ -49,7 +49,8 @@
     "security": "node scripts/security-scan.mjs",
     "audit": "npm audit --audit-level=high",
     "e2e": "playwright test",
-    "release:check": "node scripts/release-check.mjs"
+    "release:check": "node scripts/release-check.mjs",
+    "stress": "node --test test/stress/*.test.js"
   },
   "engines": {
     "node": ">=20"

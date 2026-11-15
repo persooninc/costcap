@@ -20,6 +20,7 @@ jobs:
       - run: npm test
       - if: matrix.node == 22
         run: npm run test:coverage
+      - run: npm run stress
       - run: npm run acceptance:runaway
       - run: npm pack --dry-run
       - run: node scripts/pack-check.mjs

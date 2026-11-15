@@ -33,14 +33,20 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   let run = 0;
   let unknown = history.filter((r) => r.cost_usd === null).length;
   // Null cost is unknown. It is omitted from sums so it is not treated as $0.
-  const entries = history.filter((r) => r.cost_usd !== null).map((r) => ({ ts: new Date(r.ts), cost: r.cost_usd }));
-  const sum = (pred) => entries.filter(pred).reduce((a, e) => a + e.cost, 0);
+  // Spend is bucketed by UTC day and month key once, at record time, so check()
+  // stays O(1) per call instead of rescanning the whole ledger (stress suite).
+  const byDay = new Map();
+  const byMonth = new Map();
+  const add = (ts, cost) => {
+    const key = new Date(ts).toISOString();
+    byDay.set(key.slice(0, 10), (byDay.get(key.slice(0, 10)) ?? 0) + cost);
+    byMonth.set(key.slice(0, 7), (byMonth.get(key.slice(0, 7)) ?? 0) + cost);
+  };
+  for (const r of history) if (r.cost_usd !== null) add(r.ts, r.cost_usd);
 
   function spend() {
-    const n = now();
-    const day = sum((e) => e.ts.toISOString().slice(0, 10) === n.toISOString().slice(0, 10));
-    const month = sum((e) => e.ts.toISOString().slice(0, 7) === n.toISOString().slice(0, 7));
-    return { run, day, month, unknown };
+    const n = now().toISOString();
+    return { run, day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown };
   }
 
   return {
@@ -64,7 +70,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     record(receipt) {
       if (receipt.cost_usd === null) { unknown += 1; return; }
       run += receipt.cost_usd;
-      entries.push({ ts: new Date(receipt.ts ?? now()), cost: receipt.cost_usd });
+      add(receipt.ts ?? now(), receipt.cost_usd);
     },
   };
 }

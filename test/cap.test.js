@@ -51,3 +51,16 @@ test("invalid caps/history fail closed, uncertain spend persists across restart"
   const cap = createCapEngine({ history: [{ ts: new Date().toISOString(), cost_usd: null }] });
   assert.equal(cap.check().reason, "unreconciled_receipt");
 });
+
+test("regression: bucketed spend keeps day and month boundaries exact (stress fix)", () => {
+  let n = new Date("2026-11-30T23:59:59Z");
+  const cap = createCapEngine({ caps: { day: 2, month: 3 }, history: [{ ts: "2026-10-31T23:59:59Z", cost_usd: 5 }], now: () => n });
+  assert.equal(cap.check(), null);
+  cap.record({ ts: "2026-11-30T10:00:00Z", cost_usd: 2 });
+  assert.equal(cap.check().scope, "day");
+  n = new Date("2026-12-01T00:00:00Z");
+  assert.equal(cap.check(), null);
+  assert.deepEqual(cap.spend(), { run: 2, day: 0, month: 0, unknown: 0 });
+  cap.record({ cost_usd: 3 });
+  assert.equal(cap.check().scope, "day");
+});
