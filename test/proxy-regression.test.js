@@ -21,7 +21,7 @@ test("Gemini counts cached, generated and reasoning tokens", () => {
 
 test("Anthropic stream combines start input and delta output", () => {
   const text = ['data: {"message":{"model":"claude-test","usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":20,"cache_creation_input_tokens":10}}}', 'data: {"usage":{"output_tokens":50}}'].join("\n");
-  assert.deepEqual(extractUsage("anthropic", text), { model: "claude-test", usage: { input_tokens: 110, cached_input_tokens: 20, output_tokens: 50 } });
+  assert.deepEqual(extractUsage("anthropic", text), { model: "claude-test", usage: { input_tokens: 100, cache_write_input_tokens: 10, cache_write_1h_input_tokens: 0, cached_input_tokens: 20, output_tokens: 50 } });
 });
 
 test("Responses API usage is parsed and missing usage is not free", () => {

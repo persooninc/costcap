@@ -41,7 +41,7 @@ test("Claude and Gemini models the proxy routes use table rates, not the fallbac
   for (const model of ["claude-sonnet-4-6", "gemini-2.5-flash", "anthropic/claude-sonnet-4.6"]) {
     const p = lookupPrice(model);
     assert.equal(p.fallback, false, model);
-    assert.equal(p.table_version, "2026-10-14");
+    assert.equal(p.table_version, TABLE_VERSION);
     assert.notEqual(p.output, table.fallback.output);
   }
   assert.equal(lookupPrice("claude-sonnet-4-6").output, 15);
@@ -57,6 +57,24 @@ test("every table rate is finite and positive and each provider has a source URL
     for (const field of ["input", "cached_input", "output"]) {
       assert.equal(Number.isFinite(rates[field]) && rates[field] > 0, true, `${model}.${field}`);
     }
+  }
+});
+
+test("every Claude model has cache-write rates at the published multiples, and the fallback declares them", () => {
+  for (const [model, rates] of Object.entries(table.models)) {
+    if (!model.startsWith("claude-")) continue;
+    assert.equal(rates.cache_write, rates.input * 1.25, model);
+    assert.equal(rates.cache_write_1h, rates.input * 2, model);
+  }
+  assert.equal(table.fallback.cache_write, table.fallback.input * 1.25);
+  assert.equal(table.fallback.cache_write_1h, table.fallback.input * 2);
+});
+
+test("current Claude models use published rates, not the fallback", () => {
+  for (const [model, output] of [["claude-fable-5-1", 50], ["claude-fable-5", 50], ["claude-opus-5-5", 20], ["claude-sonnet-5-5", 10]]) {
+    const p = lookupPrice(model);
+    assert.equal(p.fallback, false, model);
+    assert.equal(p.output, output, model);
   }
 });
 

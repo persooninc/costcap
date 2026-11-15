@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCapEngine } from "../src/cap.js";
+import { createCapEngine, loadReceipts } from "../src/cap.js";
 import { extractUsage, startMeteringProxy } from "../src/proxy.js";
 import { costForUsage, TABLE_VERSION } from "../src/pricing.js";
 import { lockLedger } from "../src/ledger-lock.js";
@@ -140,12 +140,49 @@ test("SSE fixtures for OpenAI, Anthropic and Gemini are buffered then metered", 
   assert.ok(ledger.every((r) => r.cost_usd > 0 && r.table_version === TABLE_VERSION));
 });
 
-test("Anthropic cache creation is priced at the input rate", () => {
-  const parsed = extractUsage("anthropic", JSON.stringify({ model: "gpt-4o", usage: { input_tokens: 0, cache_creation_input_tokens: 1_000_000, output_tokens: 0 } }));
+test("Anthropic cache creation is priced at the cache-write rate, not the input rate", () => {
+  const parsed = extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage: { input_tokens: 0, cache_creation_input_tokens: 1_000_000, output_tokens: 0 } }));
   const cost = costForUsage(parsed.model, parsed.usage);
-  assert.equal(parsed.usage.input_tokens, 1_000_000);
-  assert.equal(cost.cost_usd, 2.5);
-  assert.notEqual(cost.cost_usd, 1.25);
+  assert.equal(parsed.usage.input_tokens, 0);
+  assert.equal(parsed.usage.cache_write_input_tokens, 1_000_000);
+  assert.equal(cost.cost_usd, 3.75);
+});
+
+test("Anthropic 5-minute and 1-hour writes are priced apart", () => {
+  const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 1_000_000, cache_creation: { ephemeral_5m_input_tokens: 400_000, ephemeral_1h_input_tokens: 600_000 } };
+  const parsed = extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage }));
+  assert.equal(parsed.usage.cache_write_input_tokens, 400_000);
+  assert.equal(parsed.usage.cache_write_1h_input_tokens, 600_000);
+  assert.equal(costForUsage(parsed.model, parsed.usage).cost_usd, 0.4 * 3.75 + 0.6 * 6);
+});
+
+test("an impossible 1-hour count is unusable usage, not a discount", () => {
+  const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 10, cache_creation: { ephemeral_1h_input_tokens: 11 } };
+  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage })), null);
+});
+
+test("a stream delta without cache fields keeps the writes from message_start", () => {
+  const text = ['data: {"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"cache_creation_input_tokens":10}}}', 'data: {"usage":{"input_tokens":1,"output_tokens":5}}'].join("\n");
+  assert.equal(extractUsage("anthropic", text).usage.cache_write_input_tokens, 10);
+});
+
+test("a cache write on a model with no rate is unpriced and blocks the next call", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-"));
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o", usage: { input_tokens: 1, cache_creation_input_tokens: 10, output_tokens: 1 } })));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const receiptsPath = join(dir, "receipts.jsonl");
+  const { server, port } = await startMeteringProxy({ receiptsPath, upstreams: { anthropic: `http://127.0.0.1:${upstream.address().port}` } });
+  t.after(() => { server.close(); upstream.close(); });
+  const call = () => fetch(`http://127.0.0.1:${port}/anthropic/v1/messages`, { method: "POST", body: "{}" });
+  assert.equal((await call()).status, 200);
+  const blocked = await call();
+  assert.notEqual(blocked.status, 200);
+  const [first] = loadReceipts(receiptsPath);
+  assert.equal(first.cost_usd, null);
+  assert.equal(first.reason, "cache_write_unpriced");
 });
 
 test("metering proxy binds to 127.0.0.1", async () => {
