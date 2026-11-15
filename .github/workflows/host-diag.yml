@@ -18,6 +18,7 @@ jobs:
           install -m 600 /dev/null /tmp/id; printf '%s\n' "$COSTCAP_DEPLOY_SSH_KEY" > /tmp/id
           S="ssh -i /tmp/id -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=20"
           [ -f infra/ssh/costcap-deploy.known_hosts ] && S="$S -o UserKnownHostsFile=$PWD/infra/ssh/costcap-deploy.known_hosts -o StrictHostKeyChecking=yes" || S="$S -o StrictHostKeyChecking=accept-new"
+          # shellcheck disable=SC2016 # remote script is single-quoted on purpose
           $S "$COSTCAP_DEPLOY_HOST" '
             echo "== containers mentioning 50search"
             for c in $(docker ps -q); do

@@ -26,7 +26,7 @@ jobs:
           OLD=ulhel33ckh6ukvvn2wo9kcms-211006418705
           $S "$COSTCAP_DEPLOY_HOST" "docker stop $OLD >/dev/null && echo stopped $OLD"
           ok=0
-          for i in $(seq 1 15); do
+          for _ in $(seq 1 15); do
             sleep 4
             h=$(curl -s -m 10 https://app.costcap.dev/health || true); echo "$h"
             case "$h" in *"$EXPECT_SHA"*) ok=1; break;; esac
