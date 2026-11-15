@@ -12,6 +12,9 @@ async function fixture(t, { now } = {}) {
   const origin = "http://localhost";
   const start = async () => {
     service = createHostedServer({ storePath, origin, secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (value) => value === "test-pass", sendCode: async (data) => { if (failCode) throw new Error("mail down"); code = data.code; }, sendInvite: async (data) => { if (failInvite) throw new Error("mail down"); invites.push(data); }, deliverAlert: async (a) => { delivery.push(a); return deliveryResult ?? [{ status: failDelivery ? "failed" : "accepted" }]; } });
+    // Regression: on slow runners undici reused a socket the server had just
+    // idle-closed (5s default) and fetch failed mid-test. Outlive the client.
+    service.server.keepAliveTimeout = 60_000;
     await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
   };
   await start();
@@ -208,6 +211,12 @@ test("a month-scope budget block pages as cap_hit and is not a loop", async (t) 
   assert.equal(f.delivery[0].kind, "cap_hit");
   assert.equal(f.delivery[0].scope, "month");
   assert.equal(f.delivery.filter((d) => d.kind === "loop_detected").length, 0);
+});
+
+test("fixture server outlives the client keep-alive window (fetch reuse race)", async (t) => {
+  const f = await fixture(t);
+  assert.ok(f.service().server.keepAliveTimeout > 5000);
+  assert.equal((await f.request("/v1/fleet")).status, 401);
 });
 
 test("a step-budget receipt pages once, ages out, and re-arms", async (t) => {
