@@ -18,6 +18,8 @@ jobs:
       - run: npm audit --audit-level=high
       - run: node scripts/security-scan.mjs
       - run: npm test
+      - if: matrix.node == 22
+        run: npm run test:coverage
       - run: npm run acceptance:runaway
       - run: npm pack --dry-run
       - run: node scripts/pack-check.mjs

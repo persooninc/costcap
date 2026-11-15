@@ -43,6 +43,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-exclude='node_modules/**' --test-coverage-lines=97 --test-coverage-branches=87 --test-coverage-functions=92 test/*.test.js",
     "start": "node src/hosted/run.js",
     "acceptance:runaway": "node scripts/runaway-smoke.mjs",
     "security": "node scripts/security-scan.mjs",
