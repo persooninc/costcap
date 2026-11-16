@@ -18,7 +18,7 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
   // channels are not sent and not reported.
   return async (alert, { channels } = {}) => {
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
-    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.kind === "cap_projected" && num(alert.projected) !== null ? ` (spent $${fmt(alert.spent)}, projected $${fmt(alert.projected)} of $${fmt(alert.cap)} cap by period end)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (!want("email")) { /* already settled for this occurrence */ }
     else if (emailKey && emailFrom && emailTo?.length) {
@@ -86,6 +86,7 @@ export function verifyWebhookSignature(secret, body, header, { nowMs = Date.now(
   const expected = Buffer.from(createHmac("sha256", secret).update(`${t}.${body}`).digest("hex"));
   return timingSafeEqual(expected, Buffer.from(parts.v1));
 }
+const fmt = (v) => (typeof v === "number" && Number.isFinite(v) ? v.toFixed(2) : "?");
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 export function webhookPayload(alert, { dashboardUrl } = {}) {
   return {
@@ -94,6 +95,8 @@ export function webhookPayload(alert, { dashboardUrl } = {}) {
     tag: alert.tag && typeof alert.tag === "object" ? { key: alert.tag.key, value: alert.tag.value } : null,
     run_id: alert.run_id ?? null, scope: alert.scope ?? null, period: alert.period ?? null,
     fraction: num(alert.fraction), spent_usd: num(alert.spent), cap_usd: num(alert.cap),
+    // Issue #247: projected month-end spend on cap_projected; null on other kinds.
+    projected_usd: alert.kind === "cap_projected" ? num(alert.projected) : null,
     unknown_count: Number.isInteger(alert.unknown_count) ? alert.unknown_count : Number.isInteger(alert.unknownCount) ? alert.unknownCount : null,
     // Spend anomaly (#223) fields; null on other kinds.
     today_usd: num(alert.today), baseline_usd: num(alert.baseline), multiplier: num(alert.multiplier),

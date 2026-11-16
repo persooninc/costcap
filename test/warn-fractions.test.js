@@ -165,7 +165,8 @@ test("regression: team warnFractions [0.5] fires p50 at $50, not 80%; [] on an a
   // Omitting warnFractions on update keeps it.
   assert.deepEqual((await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], month: 100 }, owner.cookie)).body.warnFractions, [0.5]);
   await f.spend(rb.token, 30); await f.spend(tb.token, 20); await f.sweep();
-  const team = () => f.delivered.filter((d) => d.team === "ops");
+  // #247 projections are covered in projection-247.test.js; this test pins the warning fractions.
+  const team = () => f.delivered.filter((d) => d.team === "ops" && d.kind !== "cap_projected");
   assert.deepEqual(team().map((d) => d.key), [`cap_approaching:team:${team()[0].orgId}:ops:month:p50`]);
   await f.spend(rb.token, 35); await f.sweep(); await f.sweep();
   assert.equal(team().length, 1);

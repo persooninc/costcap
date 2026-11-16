@@ -218,7 +218,7 @@ export function auditEntry({ orgId, actor, action, target, detail = {}, now = ne
 // receipts blocked with scope team:<name>:<scope> in the last hour.
 // Unknown cost (accounting_unavailable) or non-finite spend raises no cap
 // alert: unknown cost never counts as $0.
-export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { approachFraction = 0.8, warnFractions } = {}) {
+export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [], nowMs, budgetPeriod = null }, { approachFraction = 0.8, warnFractions, minProjectionMs = 24 * 3600_000 } = {}) {
   if (!verdict || verdict.spend?.unknown_count !== 0 || verdict.verdict === "accounting_unavailable") return [];
   const out = [];
   const id = `team:${orgId}:${verdict.name}`;
@@ -234,6 +234,12 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { app
       const warn = approaching(id, scope, cap, spent, fractions, explicit, {});
       if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, ...(explicit ? { fraction: warn.fraction } : {}) });
     }
+  }
+  // Issue #247: team month cap_projected, same rule as the org (#240).
+  const monthCap = verdict.caps?.month;
+  if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month" && a.kind === "cap_hit")) {
+    const projected = projectMonthSpend(verdict.spend.month_usd, nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+    if (projected !== null && projected >= monthCap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, team: verdict.name, scope: "month", cap: monthCap, spent: verdict.spend.month_usd, projected: Number(projected.toFixed(6)) });
   }
   return out;
 }
@@ -271,7 +277,7 @@ export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, b
 // blockedHits: [{tag_key, tag_value, scope}] from tag_budget_exceeded blocks
 // synced in the last hour. Key `<kind>:tag:<orgId>:<key>=<value>:<scope>`.
 // A value with unknown-cost receipts this period raises no alert (never $0).
-export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits = [] }) {
+export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits = [], nowMs, budgetPeriod = null }, { minProjectionMs = 24 * 3600_000 } = {}) {
   const out = [];
   for (const rule of rules) {
     const values = spend?.[rule.key] ?? {};
@@ -289,6 +295,11 @@ export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits =
       else {
         const warn = approaching(id, rule.scope, rule.usd, spent, fractions, true, {});
         if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, fraction: warn.fraction });
+        // Issue #247: month rules project per value; day rules never do.
+        if (rule.scope === "month") {
+          const projected = projectMonthSpend(spent, nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+          if (projected !== null && projected >= rule.usd) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, ...base, projected: Number(projected.toFixed(6)) });
+        }
       }
     }
   }

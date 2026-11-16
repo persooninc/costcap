@@ -273,3 +273,49 @@ test("admin saves a signed webhook, sees it masked, viewer is read-only, fixture
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #247: a team month projection shows in the dashboard alert list with the projected $.
+test("team mid-month run rate shows cap_projected · team ops month · projected $", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  let clock = Date.parse("2026-11-07T12:00:00.000Z"); // sessions last 24h
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-proj-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); }, sendInvite: async () => {},
+    deliverAlert: async () => [{ status: "accepted" }],
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("proj-owner@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const ok = await page.evaluate(async ({ credential, ts }) => {
+      const agent = await (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "ops-bot" }) })).json();
+      const team = await fetch("/v1/teams", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "ops", agents: [agent.agentId], month: 100 }) });
+      const r = await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "p1", ts, cost_usd: 40, model: "m" }] }) });
+      return [team.status, r.status];
+    }, { credential: token, ts: new Date(clock).toISOString() });
+    expect(ok).toEqual([200, 200]);
+    clock = Date.parse("2026-11-08T00:00:00.000Z"); // day 7 of 30: $40 -> $171.43 projected
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_projected · team ops month · projected $171.43" })).toBeVisible();
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

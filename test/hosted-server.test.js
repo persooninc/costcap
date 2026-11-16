@@ -1455,7 +1455,8 @@ async function pendingFixture(t, deliverAlert, clockRef) {
 }
 
 test("issue #210: hung send then restart re-sends once after the lease, audited recovered", async (t) => {
-  const clock = { now: Date.now() };
+  // Fixed early-UTC clock: 2.5h of lease steps must not cross a day rollover (flaked after ~21:30 UTC).
+  const clock = { now: Date.parse("2026-11-16T09:00:00.000Z") };
   let calls = 0; let hang = true;
   const deliverAlert = async () => { calls++; if (hang) return new Promise(() => {}); return [{ status: "accepted" }]; };
   const { f, capHit } = await pendingFixture(t, deliverAlert, clock);
