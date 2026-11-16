@@ -15,6 +15,7 @@ import { preflightCheck, openRouterModels } from "./preflight.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
+import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -305,7 +306,7 @@ const CHAT_STREAM_PROVIDERS = new Set(["openai", "openrouter"]);
 // #152: OpenAI-compatible chat streams carry no usage unless stream_options.include_usage is set.
 // Returns the rewritten body when costcap had to inject it, else null (forward byte-identical).
 export function injectStreamUsage(provider, method, pathname, body) {
-  if (!CHAT_STREAM_PROVIDERS.has(provider) || method !== "POST" || !/\/chat\/completions\/?$/.test(pathname)) return null;
+  if (!(CHAT_STREAM_PROVIDERS.has(provider) || isCustomProvider(provider)) || method !== "POST" || !/\/chat\/completions\/?$/.test(pathname)) return null;
   let parsed;
   try { parsed = JSON.parse(body); } catch { return null; }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.stream !== true) return null;
@@ -349,7 +350,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -417,8 +418,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
-    const [, provider, ...rest] = url.pathname.split("/");
-    const upstream = upstreams[provider];
+    let [, provider, ...rest] = url.pathname.split("/");
+    let upstream = upstreams[provider];
+    // #186: /u/<NAME>/<rest> -> custom upstream URL/<rest>, receipts record provider "u/<NAME>".
+    const custom = provider === "u" && rest.length > 0;
+    if (custom) {
+      const name = rest.shift();
+      upstream = Object.hasOwn(customUpstreams, name) ? customUpstreams[name] : undefined;
+      provider = `u/${name}`;
+    }
+    // Custom upstreams price only from --upstream-prices, never the shipped table or fallback.
+    const priced = (m) => (custom ? userPrice(userPrices, provider, m) !== null : isPricedModel(m));
+    const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; } : undefined;
     const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
     // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
@@ -503,8 +514,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
           }
-          if (generates && unknownModels === "refuse" && offending(isPricedModel) !== -1) {
-            refuse(offending(isPricedModel));
+          if (generates && unknownModels === "refuse" && offending(priced) !== -1) {
+            refuse(offending(priced));
             return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
           }
           const agentHit = agentBudgets?.check(who);
@@ -514,7 +525,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
-            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; });
+            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, priceFor);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -627,11 +638,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           clearTimeout(timer);
           res.off("close", onClientClose);
           if (metered) {
-            Object.assign(receipt, costForUsage(metered.model, metered.usage));
+            Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage) : costForUsage(metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);
             if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.reason === "upstream_model_unpriced") failMsg = `Model ${receipt.model} on custom upstream ${provider} has no rate in --upstream-prices. Restart only after reconciling this request.`;
             else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
             else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
             else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";

@@ -416,3 +416,48 @@ test("#184 wrap with a bad --cache TTL exits 2", () => {
   assert.equal(r.status, 2);
   assert.match(r.stderr, /--cache must be/);
 });
+
+// #186 AC1/AC6: wrap --upstream end to end against a local fake OpenAI-compatible upstream.
+test("wrap --upstream routes the child through GROQ_BASE_URL, prices from --upstream-prices, and caps", async (t) => {
+  const hits = [];
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => { hits.push(q.url); res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "llama-3.3-70b", usage: { prompt_tokens: 100_000, completion_tokens: 100_000 } })); });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const prices = path.join(dir, "prices.json");
+  writeFileSync(prices, JSON.stringify({ version: "p1", upstreams: { groq: { "llama-3.3-70b": { input: 0.5, output: 0.5 } } } }));
+  const script = `
+    const u = process.env.GROQ_BASE_URL + "/v1/chat/completions";
+    console.log(process.env.GROQ_BASE_URL === process.env.COSTCAP_UPSTREAM_GROQ_BASE_URL, /\\/u\\/groq$/.test(process.env.GROQ_BASE_URL));
+    const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"llama-3.3-70b"})});
+    const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"llama-3.3-70b"})});
+    console.log(a.status, b.status);`;
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.05", "--receipts", receipts, "--upstream", `groq=http://127.0.0.1:${up.port}/openai,env=GROQ_BASE_URL`, "--upstream-prices", prices, "--", process.execPath, "--input-type=module", "-e", script]);
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out }));
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.out.trim(), "true true\n200 429");
+  assert.deepEqual(hits, ["/openai/v1/chat/completions"]);
+  const first = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.provider === "u/groq" && !r.blocked);
+  assert.equal(first.cost_usd, 0.1);
+  assert.equal(first.cost_source, "user_prices");
+});
+
+test("wrap exits 2 and spawns nothing for a bad --upstream or prices file", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const marker = path.join(dir, "spawned");
+  const bad = path.join(dir, "bad.json");
+  writeFileSync(bad, "{");
+  for (const args of [["--upstream", "Bad=https://x"], ["--upstream", "a=https://x", "--upstream", "a=https://y"], ["--upstream", "openai=https://x"],
+    ["--upstream", "a=http://10.1.2.3"], ["--upstream", "a=https://x,env=lower"], ["--upstream", "a=https://x", "--upstream-prices", bad]]) {
+    const r = spawnSync(process.execPath, ["src/cli.js", "wrap", ...args, "--receipts", path.join(dir, "r.jsonl"), "--", process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "1")`], { encoding: "utf8" });
+    assert.equal(r.status, 2, args.join(" "));
+    assert.match(r.stderr, /costcap: .*upstream/);
+  }
+  assert.throws(() => readFileSync(marker));
+});

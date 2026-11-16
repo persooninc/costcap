@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { receiptPath, redactQuery, scrubReceiptPath } from "../src/receipt-path.js";
+import { CREDENTIAL_PARAMS, receiptPath, redactQuery, scrubReceiptPath } from "../src/receipt-path.js";
 import { startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 
@@ -57,4 +57,9 @@ test("#130 kill refusal does not persist the key", async (t) => {
   assert.equal(f.receipts().at(-1).blocked, true);
   assert.equal(f.receipts().at(-1).path, EXPECTED);
   assert.equal(f.seen.length, 0);
+});
+
+test("#186: Azure api-key query parameter is redacted", () => {
+  assert.ok(CREDENTIAL_PARAMS.includes("api-key"));
+  assert.equal(receiptPath("/openai/deployments/d/chat/completions", "?api-version=2024-10-21&api-key=s3cret"), "/openai/deployments/d/chat/completions?api-version=2024-10-21&api-key=REDACTED");
 });

@@ -85,6 +85,43 @@ The Python `google-genai` SDK has no base-URL environment variable; set
 `http_options={"base_url": os.environ["GOOGLE_GEMINI_BASE_URL"]}` in code or its
 traffic bypasses CostCap.
 
+### Other OpenAI-compatible providers
+
+Groq, DeepSeek, Together, Mistral, a self-hosted vLLM/Ollama server or an Azure
+OpenAI deployment can be metered and capped with `--upstream NAME=URL[,env=VAR][,insecure]`
+(repeatable). The proxy forwards `/u/<NAME>/<rest>` to `URL/<rest>` (query and
+headers, including Azure's `api-key`, pass through; redirects are refused) and
+sets `COSTCAP_UPSTREAM_<NAME>_BASE_URL=http://127.0.0.1:<port>/u/<NAME>` for the
+child, plus `VAR` when `env=VAR` is given. `URL` must be `https`; plain `http` is
+allowed for loopback hosts, or any host with `,insecure` (warned on stderr).
+Receipts record `provider: "u/<NAME>"`.
+
+```bash
+# Groq
+costcap wrap --upstream groq=https://api.groq.com/openai,env=GROQ_BASE_URL --upstream-prices prices.json --cap 1 -- node agent.js
+# Point an OpenAI SDK at a local vLLM box
+costcap wrap --upstream vllm=http://127.0.0.1:8000,env=OPENAI_BASE_URL --upstream-prices prices.json -- python agent.py
+# Azure OpenAI (send requests to $AZURE_OPENAI_ENDPOINT/openai/deployments/<dep>/...)
+costcap wrap --upstream azure=https://my-resource.openai.azure.com,env=AZURE_OPENAI_ENDPOINT --upstream-prices prices.json -- node agent.js
+```
+
+**Fail-safe pricing.** Custom upstreams never price from the shipped table and
+never use the fallback rate. Rates come only from `--upstream-prices FILE` (USD
+per 1M tokens; snapshot date suffixes are stripped):
+
+```json
+{ "version": "2026-11", "upstreams": { "groq": { "llama-3.3-70b-versatile": { "input": 0.59, "output": 0.79 } } } }
+```
+
+A priced receipt carries `cost_source: "user_prices"`, `prices_version` and
+`prices_sha256`. A model missing from the file (or cached tokens with no
+`cached_input` rate) records `cost_usd: null, reason: "upstream_model_unpriced"`
+and pauses the run until `costcap reconcile --apply` settles it.
+`--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
+request with no body `model` (Azure deployments) is model-less and refused when
+an allowlist is set. Native non-OpenAI wire formats (Bedrock, Vertex, Cohere v2)
+and embeddings/batch/files billing on custom upstreams stay unknown.
+
 ## Enforcement limits
 
 - Metering uses provider-reported usage after each response. A call can exceed

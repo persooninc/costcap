@@ -111,3 +111,39 @@ test("usage chunk filter handles CRLF, split events and trailing data", () => {
   out += f.end();
   assert.equal(out, 'data: {"choices":[{"delta":{}}]}\r\n\r\n: comment\n\ndata: [DONE]');
 });
+
+// #186 AC3: custom OpenAI-compatible upstreams get the same include_usage injection.
+test("custom upstream stream: include_usage injected and priced from user prices; cut stream is stream_incomplete", async (t) => {
+  const prices = { version: "t", sha256: "x", upstreams: { groq: { "gpt-4o-mini": { input: 1, output: 2 } } } };
+  assert.ok(injectStreamUsage("u/groq", "POST", "/v1/chat/completions", Buffer.from('{"stream":true}')));
+  assert.equal(injectStreamUsage("u/groq", "POST", "/v1/embeddings", Buffer.from('{"stream":true}')), null);
+  const seen = [];
+  let cut = false;
+  const up = http.createServer((req, res) => {
+    const parts = []; req.on("data", (c) => parts.push(c));
+    req.on("end", () => {
+      seen.push(Buffer.concat(parts).toString("utf8"));
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(CONTENT.join(""));
+      if (cut) { setTimeout(() => res.destroy(), 10); return; }
+      res.end((JSON.parse(seen.at(-1)).stream_options?.include_usage ? USAGE : "") + DONE);
+    });
+  });
+  const base = `http://127.0.0.1:${await listen(up)}`;
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ customUpstreams: { groq: base }, userPrices: prices, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { server.closeAllConnections(); server.close(); up.closeAllConnections(); up.close(); });
+  const res = await fetch(`http://127.0.0.1:${port}/u/groq/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini","stream":true}' });
+  assert.equal(await res.text(), CONTENT.join("") + DONE);
+  assert.deepEqual(JSON.parse(seen[0]).stream_options, { include_usage: true });
+  await tick();
+  assert.equal(receipts[0].provider, "u/groq");
+  assert.equal(receipts[0].cost_usd, Number(((1000 * 1 + 500 * 2) / 1e6).toFixed(6)));
+  assert.equal(receipts[0].cost_source, "user_prices");
+  cut = true;
+  const { server: s2, port: p2 } = await startMeteringProxy({ customUpstreams: { groq: base }, userPrices: prices, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { s2.closeAllConnections(); s2.close(); });
+  await fetch(`http://127.0.0.1:${p2}/u/groq/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini","stream":true}' }).then((r) => r.text()).catch(() => {});
+  await tick();
+  assert.equal(receipts.at(-1).reason, "stream_incomplete");
+});

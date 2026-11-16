@@ -29,8 +29,9 @@ import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 import { createResponseCache, parseTtl } from "./response-cache.js";
 import { dirname, join } from "node:path";
+import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
@@ -94,11 +95,17 @@ export function parseWrapArgs(argv) {
     else if (f === "--cache") opts.cacheTtlMs = parseTtl(v);
     else if (f === "--cache-dir") opts.cacheDir = v;
     else if (f === "--cache-max-mb") opts.cacheMaxMb = positiveNumber(f, v);
+    else if (f === "--upstream") opts.upstreamSpecs = [...(opts.upstreamSpecs ?? []), v];
+    else if (f === "--upstream-prices") opts.upstreamPricesPath = v;
     else throw new Error(`unknown flag ${f}`);
   }
   // #169: validated here so a bad --tag exits 2 before anything is spawned.
   if ((opts.cacheDir !== undefined || opts.cacheMaxMb !== undefined) && opts.cacheTtlMs === undefined) throw new Error("--cache-dir and --cache-max-mb need --cache TTL");
   if (opts.tagPairs) { opts.tags = parseTagList(opts.tagPairs); delete opts.tagPairs; }
+  // #186: custom upstreams and their prices are validated before anything is spawned.
+  opts.upstreams = parseUpstreams(opts.upstreamSpecs ?? []);
+  delete opts.upstreamSpecs;
+  if (opts.upstreamPricesPath) opts.userPrices = loadUpstreamPrices(opts.upstreamPricesPath, opts.upstreams.map((u) => u.name));
   return opts;
 }
 
@@ -132,7 +139,8 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices } = parseWrapArgs(argv);
+  for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
@@ -198,6 +206,7 @@ export async function wrap(argv) {
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
   const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits,
+    customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);
@@ -207,6 +216,9 @@ export async function wrap(argv) {
     const [k, ...v] = line.split("=");
     env[k] = v.join("=");
   }
+  const custom = upstreamEnv(customList, port);
+  for (const note of custom.notes) console.error(note);
+  Object.assign(env, custom.env);
   const child = spawn(command[0], command.slice(1), { env, stdio: "inherit" });
   // Kill switch also stops the wrapped child: SIGTERM, then SIGKILL after 5s.
   const killCheck = combinedKill;

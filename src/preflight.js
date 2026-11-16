@@ -43,15 +43,15 @@ export function outputMultiplier(provider, req) {
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
 // #167: an OpenRouter `models` fallback list may route to any entry, so the
 // worst case is the max over every candidate (any unpriced candidate refuses).
-export function estimateWorstCase(provider, body, path = "") {
+export function estimateWorstCase(provider, body, path = "", priceFor) {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
   const candidates = provider === "openrouter" ? openRouterModels(req) : null;
-  if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0]);
+  if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0], priceFor);
   let worst;
   for (const m of candidates) {
-    const e = estimateOne(provider, req, text, path, m);
+    const e = estimateOne(provider, req, text, path, m, priceFor);
     if (!e.ok) return e;
     if (!worst || e.estimate_usd > worst.estimate_usd) worst = e;
   }
@@ -70,10 +70,11 @@ export function openRouterModels(req) {
   return out;
 }
 
-function estimateOne(provider, req, text, path, forcedModel) {
+function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   let model = forcedModel ?? (typeof req.model === "string" ? req.model : undefined);
   if (!model && provider === "gemini") model = /models\/([^/:]+)/.exec(path)?.[1];
-  const price = model ? lookupPrice(model) : null;
+  // #186: a custom upstream estimates only from user prices (priceFor), never the shipped table.
+  const price = model ? (priceFor ? priceFor(model) : lookupPrice(model)) : null;
   if (!price || price.fallback || !Number.isFinite(price.input) || !Number.isFinite(price.output)) {
     return { ok: false, reason: "preflight_unpriced", model: model ?? "unknown" };
   }
@@ -91,14 +92,14 @@ function estimateOne(provider, req, text, path, forcedModel) {
   if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
   const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(priceFor ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
 }
 
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit) {
-  const est = estimateWorstCase(provider, body, path);
+export function preflightCheck(cap, provider, body, path, onFit, priceFor) {
+  const est = estimateWorstCase(provider, body, path, priceFor);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "hour", "day", "month"]) {

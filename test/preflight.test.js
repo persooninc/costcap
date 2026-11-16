@@ -253,3 +253,13 @@ test("estimator: OpenRouter models fallbacks budget at the priciest candidate", 
   assert.equal(preflightCheck(cap, "openrouter", body({ model: "openai/gpt-4o-mini", max_tokens: 20_000 })), null);
   assert.equal(preflightCheck(cap, "openrouter", body({ model: "openai/gpt-4o-mini", models: ["openai/gpt-4o"], max_tokens: 20_000 })).reason, "preflight_estimate");
 });
+
+test("#186: estimateWorstCase with a user price resolver never reads the shipped table", async () => {
+  const { estimateWorstCase } = await import("../src/preflight.js");
+  const priceFor = (m) => (m === "llama" ? { model: m, input: 1, output: 1, fallback: false } : null);
+  const ok = estimateWorstCase("u/groq", JSON.stringify({ model: "llama", max_tokens: 10 }), "/v1/chat/completions", priceFor);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.cost_source, "user_prices");
+  assert.equal(ok.table_sha256, undefined);
+  assert.equal(estimateWorstCase("u/groq", JSON.stringify({ model: "gpt-4o" }), "/v1/chat/completions", priceFor).reason, "preflight_unpriced");
+});
