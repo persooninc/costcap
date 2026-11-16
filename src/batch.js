@@ -55,7 +55,7 @@ function priceLine(provider, body, userPrices) {
   const tokens = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider });
   if (tokens.fallback || tokens.cost_usd === null) return null;
   // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
-  const c = withToolCost(tokens, userPrices, provider, metered, null);
+  const c = withToolCost(tokens, userPrices, provider, metered, null, body);
   if (c.cost_usd === null) return null;
   return c;
 }

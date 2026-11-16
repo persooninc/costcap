@@ -111,13 +111,15 @@ export function effectivePrice(prices, provider, model) {
  * #214: adds per-call provider tool spend (metered.toolCalls) to a priced receipt.
  * Tokens keep their own pricing (batch discount included); tools always bill at the full
  * per-call rate. An unpriced tool / model family makes the receipt tool_use_unpriced, never $0.
+ * #219: when the request names no web_search type (background GET, batch line), the
+ * response object's echoed `tools` decides; the max-rate fallback applies only if neither does.
  * A `tools` entry in --prices overrides the table rate and pins the receipt as user_prices.
  */
-export function withToolCost(c, prices, provider, metered, req) {
+export function withToolCost(c, prices, provider, metered, req, res = null) {
   const toolCalls = metered?.toolCalls;
   if (!toolCalls || !Object.keys(toolCalls).length) return c;
   if (c.cost_usd === null || c.cost_usd === undefined) return { ...c, tool_calls: toolCalls };
-  const t = toolCallCost(provider, metered.model, toolCalls, { webSearchType: requestWebSearchType(req), userTools: prices?.tools });
+  const t = toolCallCost(provider, metered.model, toolCalls, { webSearchType: requestWebSearchType(req) ?? requestWebSearchType(res), userTools: prices?.tools });
   if (t.unpriced) return { ...c, cost_usd: null, reason: "tool_use_unpriced", tool_calls: toolCalls };
   return { ...c, cost_usd: Number((c.cost_usd + t.tool_cost_usd).toFixed(6)), tool_calls: toolCalls, tool_cost_usd: t.tool_cost_usd,
     ...(t.user_prices && pin(prices)) };

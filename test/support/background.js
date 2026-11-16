@@ -36,7 +36,7 @@ export function fakeUpstream(state) {
         res.write(ev({ type: `response.${state.status}`, sequence_number: 5, response: resp(m[1], state.status, state.usage) }));
         return res.end();
       }
-      return json(resp(m[1], state.status, state.usage));
+      return json({ ...resp(m[1], state.status, state.usage), ...state.extra });
     }
     if (req.method === "POST" && (m = /^\/v1\/responses\/([^/]+)\/cancel$/.exec(u.pathname))) return json(resp(m[1], "cancelled", state.usage));
     if (req.method === "GET" && /^\/v1\/chat\/completions\/[^/]+$/.test(u.pathname)) return json({ id: "chatcmpl_1", object: "chat.completion", model: MODEL, usage: { prompt_tokens: 1000, completion_tokens: 500 } });

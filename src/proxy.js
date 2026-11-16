@@ -9,7 +9,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
@@ -38,6 +38,8 @@ const PROVIDERS = {
   bedrock: BEDROCK_UPSTREAM,
   vertex: VERTEX_UPSTREAM,
 };
+
+const safeJson = (b) => { try { return JSON.parse(b.toString("utf8")); } catch { return null; } };
 
 export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   const lines = [];
@@ -521,7 +523,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
     const r = lines.find((l) => !l.event && l.reason === "background_pending" && l.response_id === responseId && l.cost_usd === null);
     if (!r) return null;
-    const entry = { id: r.id, ts: r.ts, response_id: responseId, run_id: r.run_id ?? null };
+    const entry = { id: r.id, ts: r.ts, response_id: responseId, run_id: r.run_id ?? null, ...(r.web_search_type && { web_search_type: r.web_search_type }) };
     pendingBackground.set(responseId, entry);
     if (lines.some((l) => (isSettlement(l) || l.event === "background_unpriced") && l.receipt_id === r.id)) resolvedBackground.add(responseId);
     return entry;
@@ -946,7 +948,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             resolvedBackground.add(bgRead.id);
             let c = null;
             if (metered && !metered.toolUseUnpriced) {
-              c = withToolCost(costWithOverrides(userPrices, provider, metered.model, metered.usage), userPrices, provider, metered, parsedBody);
+              c = withToolCost(costWithOverrides(userPrices, provider, metered.model, metered.usage), userPrices, provider, metered,
+                // #219: the GET has no tools; use the type recorded at create time, else the response's echoed tools.
+                bgPending.web_search_type ? { tools: [{ type: bgPending.web_search_type }] } : parsedBody, raw ? safeJson(raw) : null);
               if (c.cost_usd === null || c.reason) c = null;
             }
             receipt.response_id = bgRead.id;
@@ -977,9 +981,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             metered = null; streamCut = false; sseIncomplete = false;
           } else if (bgCreate && ok2xx && bgState.id && (raw ? PENDING_STATUSES.has(bgState.status) : !bgState.status)) {
             // #196: queued/in-progress (or a cut background stream): pending, unknown (never $0), the run continues.
-            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "background_pending", response_id: bgState.id });
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "background_pending", response_id: bgState.id,
+              ...(requestWebSearchType(parsedBody) && { web_search_type: requestWebSearchType(parsedBody) }) });
             const done = emit(receipt);
-            pendingBackground.set(bgState.id, { id: done.id, ts: done.ts, response_id: bgState.id, run_id: done.run_id ?? null });
+            pendingBackground.set(bgState.id, { id: done.id, ts: done.ts, response_id: bgState.id, run_id: done.run_id ?? null, ...(done.web_search_type && { web_search_type: done.web_search_type }) });
             flushWarnings();
             if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw); }
             else if (streamCut) res.destroy();

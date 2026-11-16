@@ -185,3 +185,31 @@ test("#201: a same-run background settle of the same cost still trips the breake
   assert.equal((await next.json()).reason, "cost_velocity");
   assert.ok(s.lines().some((r) => r.blocked && r.reason === "cost_velocity"));
 });
+
+// #219: background settles price web_search_call by the create's or the response's tool type.
+const WS_USAGE = { input_tokens: 1000, output_tokens: 500, total_tokens: 1500 };
+const wsCalls = (n) => Array.from({ length: n }, (_, i) => ({ type: "web_search_call", id: `ws_${i}`, status: "completed" }));
+async function bgSearch(t, { createTools, respTools, opts = {}, restart = false }) {
+  const state = { status: "queued", usage: null };
+  const s = await setup(t, { cap: capOf({ run: 5 }), ...opts }, state);
+  await s.call("POST", "/openai/v1/responses", JSON.stringify({ model: "gpt-4o", input: "q", background: true, ...(createTools && { tools: createTools }) }));
+  if (restart) await s.restart();
+  Object.assign(state, { status: "completed", usage: WS_USAGE, extra: { model: "gpt-4o", output: wsCalls(4), ...(respTools && { tools: respTools }) } });
+  await s.call("GET", "/openai/v1/responses/resp_bg1");
+  return settlements(s)[0].cost_usd;
+}
+const TOK = 0.0075; // gpt-4o: 1000 * 2.5/1M + 500 * 10/1M
+const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} != ${b}`);
+
+test("#219 AC1: background web_search on gpt-4o settles at $10/1k from the create's tools (also after restart)", async (t) => {
+  near(await bgSearch(t, { createTools: [{ type: "web_search" }] }), TOK + 0.04);
+  near(await bgSearch(t, { createTools: [{ type: "web_search" }], restart: true }), TOK + 0.04);
+});
+test("#219 AC1: background type comes from the response object's tools when the create named none", async (t) => {
+  near(await bgSearch(t, { respTools: [{ type: "web_search" }] }), TOK + 0.04);
+});
+test("#219 AC3: web_search_preview stays $25/1k; no type anywhere falls back to the max rate", async (t) => {
+  near(await bgSearch(t, { createTools: [{ type: "web_search_preview" }] }), TOK + 0.1);
+  near(await bgSearch(t, { respTools: [{ type: "web_search_preview" }] }), TOK + 0.1);
+  near(await bgSearch(t, {}), TOK + 0.1);
+});

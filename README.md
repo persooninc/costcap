@@ -583,7 +583,11 @@ Responses `web_search_call` at $10 per 1,000 (`web_search` tool, and
 1,000. The receipt adds `tool_calls` (for example `{"web_search": 3}`) and
 `tool_cost_usd`, and `cost_usd` is tokens plus tools, so search spend counts
 toward every cap. In batches the 50% discount applies to tokens only; tool
-calls bill at the full rate. With `--preflight`, an Anthropic web search tool
+calls bill at the full rate. The OpenAI web search type comes from the
+request's `tools`; background receipts (settled on the terminal GET) use the type
+recorded at create time or the Response object's echoed `tools`, and batch
+receipts use each result line's Response `tools`. Only when none names a type
+does the higher rate apply (#219). With `--preflight`, an Anthropic web search tool
 that sets `max_uses` adds `max_uses × rate` to the worst case. Override a rate
 with a top-level `tools` map in the `--prices` / `--upstream-prices` file, for
 example `{"tools": {"web_search": 0.008}}` (keys `web_search`,
