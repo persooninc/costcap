@@ -637,3 +637,43 @@ test("#189 costcap pricing show --prices prints the discounted row (AC5)", () =>
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /\(discount 0\.2\): input \$2\.4,/);
 });
+
+test("#194 AC6: wrap exports COSTCAP_OPENAI_REALTIME_URL; the session is metered, closed at the cap and shown in runs", async (t) => {
+  const { startRealtimeUpstream, responseDone } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream({ onConnection: async (conn) => {
+    conn.send({ type: "session.created", session: { id: "sess_w", model: "gpt-realtime" } });
+    conn.send(responseDone("r1"));
+    await new Promise((r) => setTimeout(r, 30));
+    conn.send(responseDone("r2"));
+  } });
+  t.after(() => up.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt-wrap-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
+  const script = `
+    const { connectRealtime } = await import(${JSON.stringify(fixture)});
+    const u = new URL(process.env.COSTCAP_OPENAI_REALTIME_URL);
+    const c = await connectRealtime(Number(u.port), u.pathname + "?model=gpt-realtime");
+    await c.closed;
+    console.log(c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out }));
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.out.trim(), "101 2 budget_exceeded 1008");
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const metered = lines.filter((l) => l.transport === "websocket" && l.response_id);
+  assert.deepEqual(metered.map((l) => l.cost_usd), [0.0538, 0.0538]);
+  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(runs.status, 0);
+  assert.match(runs.stdout, /0\.1076/);
+});
+
+test("#194 AC6: pricing show gpt-realtime lists the audio rates; snapshots resolve", () => {
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-realtime-2025-08-28"], { encoding: "utf8" });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /gpt-realtime-2025-08-28 \(audio\): input \$32, cached_input \$0\.4, output \$64/);
+});

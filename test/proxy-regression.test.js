@@ -547,3 +547,23 @@ test("#184 without a cache every receipt keeps its exact pre-cache shape and no 
   assert.deepEqual(Object.keys(receipts[1]).sort(), Object.keys(receipts[0]).sort());
   for (const r of receipts) for (const k of ["cache", "saved_usd", "cache_source_receipt"]) assert.equal(k in r, false);
 });
+
+test("#194 AC5: upgrades on non-realtime paths get 501 websocket_unsupported, nothing latches", async (t) => {
+  const { connectRealtime } = await import("./fixtures/realtime-upstream.js");
+  let hits = 0, upgrades = 0;
+  const up = http.createServer((req, res) => { hits++; req.resume(); res.setHeader("content-type", "application/json"); res.end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":1,"completion_tokens":1}}'); });
+  up.on("upgrade", (req, socket) => { upgrades++; socket.destroy(); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${up.address().port}`;
+  const p = await startMeteringProxy({ upstreams: { openai: base, anthropic: base } });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  for (const path of ["/openai/v1/chat/completions", "/anthropic/v1/messages", "/nope/v1/realtime"]) {
+    const r = await connectRealtime(p.port, path);
+    assert.equal(r.status, 501, path);
+    assert.equal(r.body.error, "websocket_unsupported");
+  }
+  assert.equal(hits + upgrades, 0);
+  assert.equal(p.server.accountingFailure(), null);
+  const ok = await fetch(`http://127.0.0.1:${p.port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) });
+  assert.equal(ok.status, 200);
+});

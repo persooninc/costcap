@@ -22,6 +22,8 @@ import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
+import https from "node:https";
+import { OP, closePayload, costcapErrorEvent, createFrameParser, encodeFrame, isRealtimePath, upstreamHandshakeHeaders, writeHttpResponse } from "./realtime.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -35,7 +37,11 @@ const PROVIDERS = {
 
 export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   const lines = [];
-  if (providers.includes("openai")) lines.push(`OPENAI_BASE_URL=http://127.0.0.1:${port}/openai/v1`);
+  if (providers.includes("openai")) {
+    lines.push(`OPENAI_BASE_URL=http://127.0.0.1:${port}/openai/v1`);
+    // #194: raw-socket Realtime apps (the Python SDK derives ws:// from OPENAI_BASE_URL).
+    lines.push(`COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:${port}/openai/v1/realtime`);
+  }
   if (providers.includes("anthropic")) lines.push(`ANTHROPIC_BASE_URL=http://127.0.0.1:${port}/anthropic`);
   if (providers.includes("openrouter")) lines.push(`OPENROUTER_BASE_URL=http://127.0.0.1:${port}/openrouter`);
   if (providers.includes("gemini")) {
@@ -214,17 +220,19 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
         return;
       }
       // Both prompt/input and completion/output counters are required; duration-billed or empty shapes are unknown.
+      // #194: Realtime usage names its details input_token_details / output_token_details (singular).
+      const inDetails = u ? u.prompt_tokens_details ?? u.input_tokens_details ?? u.input_token_details : undefined;
+      const cachedIn = u ? u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.input_token_details?.cached_tokens ?? 0 : 0;
       if (u && !(isCount(u.prompt_tokens ?? u.input_tokens) && isCount(u.completion_tokens ?? u.output_tokens))) usage = { unpriceable: NaN };
-      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
+      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - cachedIn,
         output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
-        cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0 };
+        cached_input_tokens: cachedIn };
       if (u && usage.input_tokens !== undefined) {
-        const inDetails = u.prompt_tokens_details ?? u.input_tokens_details;
         const cachedDetails = inDetails?.cached_tokens_details;
         const cached = openaiModalitySlice(cachedDetails, usage.cached_input_tokens);
         const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens);
         const input = all ? Object.fromEntries(Object.keys(all).map((k) => [k, Math.max(0, all[k] - (cached?.[k] ?? (k === "text" ? usage.cached_input_tokens : 0)))])) : null;
-        const output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details, usage.output_tokens);
+        const output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details ?? u.output_token_details, usage.output_tokens);
         const mt = modalityTokens({ input, cached_input: cached, output });
         if (mt) usage.modality_tokens = mt;
       }
@@ -875,6 +883,231 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       queue = queue.then(run).catch(() => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); });
     });
   });
+  // #194: OpenAI Realtime API over WebSocket. Same admission gate as HTTP before 101; bytes are
+  // relayed unchanged both ways while a tap meters each response.done and re-checks the gate.
+  const realtimeSessions = new Set();
+  let realtimeKillTimer = null;
+  const watchRealtimeKills = () => {
+    if (realtimeKillTimer || !killCheck) return;
+    realtimeKillTimer = setInterval(() => {
+      if (!realtimeSessions.size) { clearInterval(realtimeKillTimer); realtimeKillTimer = null; return; }
+      let k = null;
+      try { k = killCheck(); } catch { k = null; }
+      if (k) for (const s of [...realtimeSessions]) s.stop("killed", k);
+    }, Number(process.env.COSTCAP_REALTIME_KILL_POLL_MS) || 250);
+    realtimeKillTimer.unref?.();
+  };
+  const pricedOpenai = (m) => (userPrices ? isPricedWithOverrides(userPrices, "openai", m) : isPricedModel(m));
+  server.on("upgrade", (req, socket, head) => {
+    socket.on("error", () => {});
+    const url = new URL(req.url, "http://localhost");
+    if (!isRealtimePath(req.url) || !upstreams.openai) {
+      // Never forwarded, never latched: the HTTP path cannot carry a WebSocket.
+      req.resume?.();
+      writeHttpResponse(socket, 501, { error: "websocket_unsupported", message: "CostCap proxies WebSocket upgrades only on /openai/v1/realtime. The upstream call was not made." });
+      return;
+    }
+    let reqTags = null, tagError = null;
+    try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
+    const storedPath = receiptPath("/v1/realtime", url.search);
+    const base = { provider: "openai", path: storedPath, transport: "websocket" };
+    const emit = (receipt) => emitBase(reqTags ? { ...base, ...receipt, tags: reqTags } : { ...base, ...receipt });
+    let model = url.searchParams.get("model") || undefined;
+    const refuse = (status, body, receipt, headers = {}) => { emit(receipt); writeHttpResponse(socket, status, body, headers); return true; };
+    let refused;
+    try {
+      if (tagError) {
+        reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
+        refuse(400, { error: "invalid_tags", message: `CostCap: ${tagError}. The upstream call was not made.` }, { blocked: false, status: 400, reason: "invalid_tags", cost_usd: 0 });
+        return;
+      }
+      refused = guarded(() => {
+        const block = (reason, detail, body) => refuse(429, body, { blocked: true, reason, cost_usd: 0, ...detail }, detail?.retry_after_s != null ? { "retry-after": String(detail.retry_after_s) } : {});
+        const killed = killCheck?.();
+        if (killed) return block("killed", killed, { error: "killed", ...killed });
+        const accountingFailure = accountingFailureNow();
+        if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
+        const modelRefusal = (error, message) => refuse(403, { error, model: model ?? null, message }, { blocked: true, reason: error, outcome: "blocked_model", model: model ?? "unknown", cost_usd: 0 });
+        const allow = allowedModels?.() ?? null;
+        if (allow && !(model && allow.includes(model))) {
+          return modelRefusal("model_not_allowed", allow.length
+            ? `CostCap: model "${model ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
+            : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
+        }
+        if (unknownModels === "refuse" && !(model && pricedOpenai(model))) {
+          return modelRefusal("model_unpriced", `CostCap: model "${model ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
+        }
+        const agentHit = agentBudgets?.check(who);
+        if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
+        const teamHit = teamCheck?.();
+        if (teamHit) return block(teamHit.reason, teamHit, { error: teamHit.verdict, ...teamHit });
+        const hit = cap?.check();
+        if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
+        const tagHit = tagCaps?.check(reqTags);
+        if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
+        return false;
+      });
+    } catch {
+      hardFailure = "Receipt ledger unavailable.";
+      writeHttpResponse(socket, 503, { error: "receipt_ledger_unavailable" });
+      return;
+    }
+    if (refused) return;
+
+    const target = new URL(`${upstreams.openai}/v1/realtime${url.search}`);
+    const mod = target.protocol === "https:" ? https : http;
+    let upgraded = false, handshakeDone = false;
+    const handshakeReceipt = (status, reason) => {
+      if (handshakeDone) return;
+      handshakeDone = true;
+      // #135: a handshake that never got 101 generated nothing. $0, never latched.
+      try { emit({ status, blocked: false, model: model ?? "unknown", cost_usd: 0, reason }); } catch { hardFailure = "Receipt ledger unavailable."; }
+    };
+    const upReq = mod.request({ protocol: target.protocol, hostname: target.hostname, port: target.port || undefined,
+      path: `${target.pathname}${target.search}`, method: "GET", headers: upstreamHandshakeHeaders(req.headers, target.host) });
+    upReq.setTimeout(timeoutMs, () => upReq.destroy(new Error("upstream_timeout")));
+    socket.once("close", () => { if (!upgraded) { upReq.destroy(); handshakeReceipt(null, "client_closed"); } });
+    upReq.on("error", () => {
+      if (upgraded) return;
+      handshakeReceipt(null, "upstream_handshake_failed");
+      writeHttpResponse(socket, 502, { error: "upstream_handshake_failed", message: "CostCap could not open the Realtime WebSocket upstream." });
+    });
+    upReq.on("response", (upRes) => {
+      const parts = [];
+      upRes.on("data", (c) => parts.push(c));
+      upRes.on("error", () => {});
+      upRes.on("end", () => {
+        handshakeReceipt(upRes.statusCode, "upstream_rejected");
+        writeHttpResponse(socket, upRes.statusCode, Buffer.concat(parts), { "content-type": upRes.headers["content-type"] ?? "application/json" });
+      });
+    });
+    upReq.on("upgrade", (upRes, upSocket, upHead) => {
+      upgraded = true;
+      handshakeDone = true;
+      upSocket.on("error", () => {});
+      if (socket.destroyed) { upSocket.destroy(); return; }
+      const lines = [`HTTP/1.1 101 ${upRes.statusMessage || "Switching Protocols"}`];
+      for (let i = 0; i < upRes.rawHeaders.length; i += 2) lines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+      const sess = { sessionId: null, inflight: new Set(), stopped: false, finished: false };
+      const stopReceiptBase = () => ({ status: 101, session_id: sess.sessionId, model: model ?? "unknown" });
+      const finish = () => {
+        if (sess.finished) return;
+        sess.finished = true;
+        realtimeSessions.delete(sess);
+        // A response started but never done: usage is unknown, never $0 (#171 latch per receipt).
+        try {
+          for (const id of sess.inflight) {
+            const emitted = emit({ ...stopReceiptBase(), blocked: false, response_id: id, cost_usd: null, reason: "stream_incomplete" });
+            failures.set(emitted.id, "A Realtime response was cut before response.done. Restart only after reconciling this request.");
+            recordSpend(emitted);
+          }
+          sess.inflight.clear();
+          flushWarnings();
+        } catch { hardFailure = "Receipt ledger unavailable."; }
+        // Queued bytes (e.g. the last response.done) flush before the sockets close.
+        socket.end();
+        upSocket.end();
+        setTimeout(() => { socket.destroy(); upSocket.destroy(); }, 1000).unref?.();
+      };
+      sess.stop = (reason, detail = {}) => {
+        if (sess.stopped || sess.finished) return;
+        sess.stopped = true;
+        try { emit({ ...stopReceiptBase(), blocked: true, reason, cost_usd: 0, ...detail }); } catch { hardFailure = "Receipt ledger unavailable."; }
+        if (!socket.destroyed) {
+          socket.write(encodeFrame(OP.TEXT, costcapErrorEvent(reason)));
+          socket.end(encodeFrame(OP.CLOSE, closePayload(1008, `costcap: ${reason}`)));
+        }
+        if (!upSocket.destroyed) upSocket.end(encodeFrame(OP.CLOSE, closePayload(1008, `costcap: ${reason}`), { mask: true }));
+        setTimeout(finish, 1000).unref?.();
+      };
+      sess.destroy = finish;
+      realtimeSessions.add(sess);
+      watchRealtimeKills();
+      const gate = () => guarded(() => {
+        const killed = killCheck?.();
+        if (killed) return ["killed", killed];
+        const af = accountingFailureNow();
+        if (af) return ["accounting_unavailable", {}];
+        const agentHit = agentBudgets?.check(who);
+        if (agentHit) return [agentHit.reason, agentHit];
+        const teamHit = teamCheck?.();
+        if (teamHit) return [teamHit.reason, teamHit];
+        const hit = cap?.check();
+        if (hit) return ["budget_exceeded", hit];
+        const tagHit = tagCaps?.check(reqTags);
+        if (tagHit) return ["tag_budget_exceeded", tagHit];
+        return null;
+      });
+      const meter = (response) => {
+        const m = model ?? "unknown";
+        const metered = response?.usage ? extractUsage("openai", JSON.stringify({ usage: response.usage }), m) : null;
+        const receipt = { status: 101, blocked: false, session_id: sess.sessionId, response_id: typeof response?.id === "string" ? response.id : null };
+        let failMsg = null;
+        if (metered) {
+          Object.assign(receipt, costWithOverrides(userPrices, "openai", m, metered.usage));
+          recordSpend(receipt);
+          if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
+          else if (receipt.cost_usd === null) failMsg = "A Realtime response has no published rate. Restart only after reconciling this request.";
+          else velocity?.record(receipt.cost_usd);
+        } else {
+          Object.assign(receipt, { model: m, cost_usd: null, reason: "usage_unavailable" });
+          failMsg = "A Realtime response.done carried no usable token usage. Restart only after reconciling this request.";
+        }
+        const emitted = emit(receipt);
+        if (failMsg) { failures.set(emitted.id, failMsg); if (!metered) recordSpend(emitted); }
+        flushWarnings();
+      };
+      const onEvent = (ev) => {
+        if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return;
+        if (ev.type === "session.created" || ev.type === "session.updated") {
+          if (typeof ev.session?.id === "string") sess.sessionId = ev.session.id;
+          if (typeof ev.session?.model === "string" && ev.session.model) model = ev.session.model;
+        } else if (ev.type === "response.created") {
+          if (typeof ev.response?.id === "string") sess.inflight.add(ev.response.id);
+        } else if (ev.type === "response.done") {
+          sess.inflight.delete(ev.response?.id);
+          meter(ev.response);
+          const hit = gate();
+          if (hit) sess.stop(hit[0], hit[1]);
+        } else if (ev.type === "conversation.item.input_audio_transcription.completed" && ev.usage) {
+          // Transcription is billed by its own model with no rate here: unknown, never $0.
+          const emitted = emit({ status: 101, blocked: false, session_id: sess.sessionId, model: model ?? "unknown", item_id: ev.item_id ?? null, cost_usd: null, reason: "transcription_unpriced" });
+          failures.set(emitted.id, "Realtime input audio transcription was billed with no published rate. Restart only after reconciling this request.");
+          recordSpend(emitted);
+          flushWarnings();
+          const hit = gate();
+          if (hit) sess.stop(hit[0], hit[1]);
+        }
+      };
+      const tap = createFrameParser((op, payload) => {
+        if (sess.stopped || op !== OP.TEXT) return;
+        let ev;
+        try { ev = JSON.parse(payload.toString("utf8")); } catch { return; }
+        try { onEvent(ev); } catch {
+          hardFailure = "Receipt ledger unavailable.";
+          sess.stop("accounting_unavailable");
+        }
+      });
+      const relay = (from, to, onChunk) => {
+        from.on("data", (chunk) => {
+          if (sess.stopped) return;
+          if (!to.destroyed && !to.write(chunk)) { from.pause(); to.once("drain", () => from.resume()); }
+          onChunk?.(chunk);
+        });
+        // WebSocket has no half-close: either side ending ends the session.
+        from.on("end", finish);
+        from.on("close", finish);
+      };
+      relay(socket, upSocket);
+      relay(upSocket, socket, (chunk) => tap.push(chunk));
+      if (head?.length) upSocket.write(head);
+      if (upHead?.length) { socket.write(upHead); tap.push(upHead); }
+    });
+    upReq.end();
+  });
+  const closeAllHttp = server.closeAllConnections.bind(server);
+  server.closeAllConnections = () => { for (const s of [...realtimeSessions]) s.destroy(); closeAllHttp(); };
   // #171: a settlement (hosted poll or reconciliation) of a receipt that caused an
   // accounting failure clears that failure; the block lifts once all are settled.
   // #176: a settled pending batch is resolved, so a later results read in this run

@@ -90,3 +90,18 @@ test("helpers: slices, null/garbage inputs", () => {
 
 import { readFileSync } from "node:fs";
 function require_table() { return readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"); }
+
+test("#194: Realtime usage (input_token_details / output_token_details) prices audio and cached audio", () => {
+  const usage = { input_tokens: 1300, output_tokens: 600,
+    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
+    output_token_details: { text_tokens: 100, audio_tokens: 500 } };
+  const m = extractUsage("openai", JSON.stringify({ usage }), "gpt-realtime");
+  assert.deepEqual(m.usage.modality_tokens, { input: { text: 200, image: 0, audio: 600, video: 0 }, cached_input: { text: 100, image: 0, audio: 400, video: 0 }, output: { text: 100, image: 0, audio: 500, video: 0 } });
+  const r = price(m);
+  assert.equal(r.cost_usd, 0.0538);
+  assert.equal(r.cost_usd, Number(((200 * 4 + 100 * 0.40 + 600 * 32 + 400 * 0.40 + 100 * 16 + 500 * 64) / 1e6).toFixed(6)));
+  assert.equal(costForUsage("gpt-realtime-mini", m.usage).reason, "modality_unpriced");
+  assert.equal(lookupPrice("gpt-realtime-2025-08-28").fallback, false);
+  assert.equal(lookupPrice("gpt-realtime-2025-08-28").modalities.audio.output, 64);
+  assert.equal(costForUsage("gpt-realtime-2.1-mini", m.usage).cost_usd, Number(((200 * 0.60 + 100 * 0.06 + 600 * 10 + 400 * 0.30 + 100 * 2.40 + 500 * 20) / 1e6).toFixed(6)));
+});

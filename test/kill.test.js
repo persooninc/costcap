@@ -181,3 +181,26 @@ test("#144 kill/resume --host CLI: separate files, scoped receipts, --status JSO
   assert.equal(events[0].kill_file, join(home, "KILL"));
   assert.equal(events[0].note, "runaway");
 });
+
+test("#194: kill closes an open idle Realtime session within 1s and writes a blocked receipt", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream({ onConnection: (conn) => conn.send({ type: "response.created", response: { id: "r_live" } }) });
+  const dir = mkdtempSync(join(tmpdir(), "cc-"));
+  const f = join(dir, "KILL");
+  const receipts = join(dir, "r.jsonl");
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url }, receiptsPath: receipts, killCheck: createKillCheck(f, { hostFile: join(dir, "HOST") }) });
+  t.after(() => { server.closeAllConnections(); server.close(); up.close(); });
+  const client = await connectRealtime(port);
+  await client.waitFor((c) => c.messages.length === 1);
+  const t0 = Date.now();
+  kill(f, "mid-session");
+  await client.closed;
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(client.closeCode, 1008);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(up.state.conns[0].closed, true);
+  const lines = loadReceipts(receipts);
+  assert.ok(lines.some((r) => r.blocked && r.reason === "killed" && r.transport === "websocket" && r.note === "mid-session"));
+  // The response that was generating when the kill landed is unknown, never $0.
+  assert.ok(lines.some((r) => r.reason === "stream_incomplete" && r.response_id === "r_live" && r.cost_usd === null));
+});

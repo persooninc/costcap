@@ -76,7 +76,7 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 | Provider | Variables set for the child |
 | --- | --- |
-| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1`, `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` |
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
@@ -160,6 +160,28 @@ providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `
 - `costcap pricing show MODEL --prices FILE` prints the effective row. `costcap pricing verify
   --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
   `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
+
+## OpenAI Realtime API
+
+`wrap` proxies the Realtime WebSocket at `/openai/v1/realtime` and also exports
+`COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` for raw-socket apps.
+
+- The handshake passes the same gate as HTTP calls before `101`: kill, accounting
+  failure, `--models`, `--unknown-models refuse` on `?model=`, agent/team budgets,
+  tag caps and caps. A refusal is a plain HTTP JSON response; nothing reaches OpenAI.
+- Frames are relayed unchanged. Each `response.done` writes one receipt
+  (`transport: "websocket"`, `session_id`, `response_id`) priced at the text, audio
+  and image rates of `gpt-realtime`, `gpt-realtime-2.1` and `gpt-realtime-2.1-mini`
+  (`gpt-realtime-mini` is text-only in the table; its audio is `modality_unpriced`).
+- After each receipt the gate is re-checked. On a hit the client gets that
+  `response.done`, then `{"type":"error","error":{"type":"costcap","code":"<reason>"}}`
+  and close `1008`; the upstream is closed. `costcap kill` closes open sessions within 1 s.
+- Unknowns stop later calls until reconciled: a session closed mid-response
+  (`stream_incomplete`), unpriced audio, and transcription usage (`transcription_unpriced`).
+- The Python SDK works as is (it derives `ws://…/realtime` from `OPENAI_BASE_URL`).
+  The Node SDK forces `wss:` and is not supported against the local plain-HTTP proxy.
+  Clients with a hardcoded `wss://api.openai.com` bypass CostCap. Other WebSocket
+  upgrades get `501 websocket_unsupported`. WebRTC/SIP are not covered.
 
 ## Claude on Bedrock / Vertex
 
