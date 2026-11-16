@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { costForUsage } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { createSpiralDetector } from "./spiral.js";
+import { preflightCheck } from "./preflight.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -117,7 +118,7 @@ export function createSseUsageParser(provider, requestedModel) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -165,6 +166,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
+          if (preflight) {
+            const pf = preflightCheck(cap, provider, body, path);
+            if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
+              message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
+            if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
+              message: `CostCap preflight estimate: worst case $${pf.estimate_usd} does not fit the remaining ${pf.scope} budget ($${pf.remaining_usd[pf.scope]}). This is an estimate. The upstream call was not made.`,
+              scope: pf.scope, estimate_usd: pf.estimate_usd, remaining_usd: pf.remaining_usd } });
+          }
           const vhit = velocity?.check();
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
           const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));

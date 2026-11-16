@@ -1,0 +1,163 @@
+// CC-9 (#117): opt-in pre-flight worst-case estimate.
+import test from "node:test";
+import assert from "node:assert/strict";
+import http from "node:http";
+import { spawn } from "node:child_process";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { estimateWorstCase, preflightCheck, requestedOutputTokens, DEFAULT_MAX_OUTPUT } from "../src/preflight.js";
+import { createCapEngine } from "../src/cap.js";
+import { startMeteringProxy } from "../src/proxy.js";
+import { parseWrapArgs } from "../src/cli.js";
+
+const body = (o) => JSON.stringify(o);
+
+test("estimator: OpenAI shape uses max_tokens and bytes/4", () => {
+  const b = body({ model: "gpt-4o-mini", max_tokens: 1000, messages: [{ role: "user", content: "hi" }] });
+  const e = estimateWorstCase("openai", b);
+  assert.equal(e.ok, true);
+  assert.equal(e.input_tokens, Math.ceil(Buffer.byteLength(b) / 4));
+  assert.equal(e.output_tokens, 1000);
+  assert.equal(e.estimate_usd, Number(((e.input_tokens * 0.15 + 1000 * 0.6) / 1e6).toFixed(6)));
+  assert.equal(estimateWorstCase("openai", body({ model: "gpt-4o", max_completion_tokens: 7 })).output_tokens, 7);
+});
+
+test("estimator: Anthropic shape, and default when max_tokens absent", () => {
+  assert.equal(estimateWorstCase("anthropic", body({ model: "claude-sonnet-4-6", max_tokens: 50 })).output_tokens, 50);
+  const d = estimateWorstCase("anthropic", Buffer.from(body({ model: "claude-sonnet-4-6" })));
+  assert.equal(d.output_tokens, DEFAULT_MAX_OUTPUT.anthropic);
+  assert.equal(d.output_defaulted, true);
+});
+
+test("estimator: Gemini shape reads model from path and generationConfig.maxOutputTokens", () => {
+  const e = estimateWorstCase("gemini", body({ generationConfig: { maxOutputTokens: 200 } }), "/v1beta/models/gemini-2.5-flash:generateContent");
+  assert.equal(e.model, "gemini-2.5-flash");
+  assert.equal(e.output_tokens, 200);
+  assert.equal(estimateWorstCase("gemini", body({}), "/v1beta/models/gemini-2.5-pro:generateContent").output_tokens, DEFAULT_MAX_OUTPUT.gemini);
+});
+
+test("estimator: OpenRouter shape, no max_tokens", () => {
+  const e = estimateWorstCase("openrouter", body({ model: "google/gemini-2.5-flash" }));
+  assert.equal(e.ok, true);
+  assert.equal(e.output_tokens, DEFAULT_MAX_OUTPUT.openrouter);
+});
+
+test("estimator: unknown or missing model is unpriced, never $0", () => {
+  assert.deepEqual(estimateWorstCase("openai", body({ model: "made-up-9" })), { ok: false, reason: "preflight_unpriced", model: "made-up-9" });
+  assert.equal(estimateWorstCase("openai", "not json").model, "unknown");
+  assert.equal(estimateWorstCase("openai", undefined).ok, false);
+  assert.equal(requestedOutputTokens("other", {}).tokens, 65_536);
+  assert.equal(requestedOutputTokens("openai", { max_tokens: -1 }).defaulted, true);
+});
+
+test("preflightCheck and cap.remaining", () => {
+  const cap = createCapEngine({ caps: { day: 1 } });
+  assert.deepEqual(cap.remaining(), { day: 1 });
+  assert.equal(preflightCheck(cap, "openai", body({ model: "gpt-4o-mini", max_tokens: 10 })), null);
+  const hit = preflightCheck(cap, "openai", body({ model: "gpt-4o", max_tokens: 1_000_000 }));
+  assert.equal(hit.reason, "preflight_estimate");
+  assert.equal(hit.scope, "day");
+  assert.equal(preflightCheck(undefined, "openai", body({ model: "gpt-4o", max_tokens: 10 })), null);
+  assert.equal(preflightCheck(cap, "openai", body({ model: "nope" })).reason, "preflight_unpriced");
+});
+
+async function harness({ preflight, caps = { day: 0.05 } }) {
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; res.writeHead(200, { "content-type": "application/json" }).end(body({ model: "gpt-4o-mini", usage: { prompt_tokens: 100, completion_tokens: 100 } })); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const dir = mkdtempSync(join(tmpdir(), "cc-pf-"));
+  const receipts = join(dir, "r.jsonl");
+  const cap = createCapEngine({ caps });
+  const { server } = await startMeteringProxy({ receiptsPath: receipts, cap, preflight, upstreams: { openai: `http://127.0.0.1:${up.address().port}` } });
+  const call = (b) => fetch(`http://127.0.0.1:${server.address().port}/openai/v1/chat/completions`, { method: "POST", body: b });
+  const ledger = () => readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
+  return { call, ledger, cap, hits: () => hits, close: () => { server.close(); up.close(); } };
+}
+
+const big = body({ model: "gpt-4o", max_tokens: 100_000 }); // worst case ≈ $1 > $0.05
+
+test("preflight off: oversize call is forwarded exactly as before (regression)", async () => {
+  const h = await harness({ preflight: false });
+  const r = await h.call(big);
+  assert.equal(r.status, 200);
+  assert.equal(h.hits(), 1);
+  const [rec] = h.ledger();
+  assert.equal(rec.blocked, false);
+  assert.equal("estimate" in rec, false);
+  h.close();
+});
+
+test("preflight on: oversize call refused before upstream, receipt labelled estimate, spend excludes it", async () => {
+  const h = await harness({ preflight: true });
+  const r = await h.call(big);
+  assert.equal(r.status, 429);
+  const j = await r.json();
+  assert.equal(j.error.type, "budget_exceeded");
+  assert.equal(j.error.reason, "preflight_estimate");
+  assert.equal(j.error.estimate, true);
+  assert.ok(j.error.estimate_usd > 0.05);
+  assert.equal(j.error.remaining_usd.day, 0.05);
+  assert.equal(h.hits(), 0);
+  const [rec] = h.ledger();
+  assert.equal(rec.blocked, true);
+  assert.equal(rec.estimate, true);
+  assert.equal(rec.scope, "day");
+  assert.equal(rec.cost_usd, 0);
+  assert.ok(rec.estimate_usd > 0.05);
+  assert.equal(h.cap.spend().day, 0);
+  h.close();
+});
+
+test("preflight on: a call that fits is forwarded and metered at real cost", async () => {
+  const h = await harness({ preflight: true });
+  const r = await h.call(body({ model: "gpt-4o-mini", max_tokens: 100 }));
+  assert.equal(r.status, 200);
+  assert.equal(h.hits(), 1);
+  const [rec] = h.ledger();
+  assert.equal(rec.cost_usd, Number(((100 * 0.15 + 100 * 0.6) / 1e6).toFixed(6)));
+  assert.equal(h.cap.spend().day, rec.cost_usd);
+  h.close();
+});
+
+test("preflight on: unpriced model refused as preflight_unpriced, never forwarded", async () => {
+  const h = await harness({ preflight: true });
+  const r = await h.call(body({ model: "mystery-model", max_tokens: 1 }));
+  assert.equal(r.status, 429);
+  assert.equal((await r.json()).error.type, "preflight_unpriced");
+  assert.equal(h.hits(), 0);
+  assert.equal(h.ledger()[0].reason, "preflight_unpriced");
+  h.close();
+});
+
+test("parseWrapArgs reads --preflight", () => {
+  assert.equal(parseWrapArgs(["--preflight", "--", "x"]).preflight, true);
+  assert.equal(parseWrapArgs(["--", "x"]).preflight, undefined);
+});
+
+test("e2e: costcap wrap --preflight refuses an oversize call against a fake upstream", async (t) => {
+  let hits = 0;
+  const up = http.createServer((q, res) => { hits++; res.writeHead(200, { "content-type": "application/json" }).end(body({ model: "gpt-4o-mini", usage: { prompt_tokens: 1, completion_tokens: 1 } })); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const dir = mkdtempSync(join(tmpdir(), "cc-pf-e2e-"));
+  const script = `
+    const u = process.env.OPENAI_BASE_URL + "/chat/completions";
+    const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"gpt-4o",max_tokens:100000})});
+    const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"gpt-4o-mini",max_tokens:10})});
+    console.log(a.status, b.status);`;
+  for (const [args, env, expected, expectedHits] of [
+    [["--preflight"], {}, "429 200", 1],
+    [[], { COSTCAP_PREFLIGHT: "1" }, "429 200", 2],
+    [[], {}, "200 200", 4],
+  ]) {
+    const out = await new Promise((resolve) => {
+      const c = spawn(process.execPath, ["src/cli.js", "wrap", "--day-cap", "0.05", ...args, "--receipts", join(dir, `r${expectedHits}.jsonl`), "--", process.execPath, "--input-type=module", "-e", script],
+        { env: { ...process.env, COSTCAP_PREFLIGHT: "", ...env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` } });
+      let o = ""; c.stdout.on("data", (d) => (o += d)); c.stderr.on("data", () => {});
+      c.on("exit", () => resolve(o));
+    });
+    assert.equal(out.replace(/\x1b\[[0-9;]*m/g, "").trim(), expected);
+    assert.equal(hits, expectedHits);
+  }
+});

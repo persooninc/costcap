@@ -90,6 +90,16 @@ CostCap. The local proxy binds to 127.0.0.1.
   on for 5s and then the wrapper refuses calls with `receipt_ledger_unavailable`.
   Shared and exclusive (default) wrappers refuse to run on the same ledger.
   Sharing across hosts is the hosted fleet's job.
+- `--preflight` (or `COSTCAP_PREFLIGHT=1`, off by default) refuses a call whose
+  **estimated** worst case cannot fit the remaining run/day/month budget, before
+  any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
+  It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
+  tokens = `max_tokens` (or `max_completion_tokens`, Gemini
+  `generationConfig.maxOutputTokens`), else a conservative provider default.
+  Text that tokenizes denser than 4 bytes/token can still overshoot. Models
+  with no published rate are refused with `preflight_unpriced`, never priced at
+  the fallback. The blocked receipt has `estimate: true`, `estimate_usd` and
+  `scope`, and costs $0 toward spend.
 - Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Unknown models use the declared fallback. Rates are the

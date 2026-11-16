@@ -166,7 +166,7 @@ Anthropic cache creation is estimated at the input rate.
 It is dated 2026-10-11 and lists features as failing because the Docker tests failed the whole run.
 - Acceptance: regenerated after the Docker-free skips land, from a real CI run, with skipped tests reported as skipped.
 
-### CC-9 Pre-flight budget estimate
+### CC-9 Pre-flight budget estimate (done, #117: `wrap --preflight`)
 Metering after the response allows one call to overshoot.
 - Acceptance: an optional mode estimates the worst case from `max_tokens` and the price table and refuses a call that can't fit. It's off by default and labeled an estimate.
 

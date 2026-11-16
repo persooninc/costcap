@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
   "       costcap check [--cap USD] [--receipts FILE]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
@@ -44,6 +44,7 @@ export function parseWrapArgs(argv) {
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
     if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
+    if (f === "--preflight") { opts.preflight = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -81,7 +82,9 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared } = parseWrapArgs(argv);
+  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
+  // --preflight or COSTCAP_PREFLIGHT=1 (CC-9): refuse calls whose estimated worst case cannot fit.
+  const preflight = Boolean(preflightFlag) || /^(1|true|on)$/i.test(process.env.COSTCAP_PREFLIGHT ?? "");
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
@@ -112,7 +115,7 @@ export async function wrap(argv) {
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger });
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
