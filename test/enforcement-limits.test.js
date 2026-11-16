@@ -101,7 +101,7 @@ test("missing usage is stored as null and blocks the next call", async () => {
   up.close();
 });
 
-test("SSE fixtures for OpenAI, Anthropic and Gemini are buffered then metered", async (t) => {
+test("SSE fixtures for OpenAI, Anthropic and Gemini stream in real time and are metered from the stream", async (t) => {
   let upstreamFinished = 0;
   const routes = [
     ["/openai/v1/chat/completions", "/v1/chat/completions", 'data: {"model":"gpt-4o-mini","usage":{"prompt_tokens":1000,"completion_tokens":0}}\n\n'],
@@ -125,15 +125,18 @@ test("SSE fixtures for OpenAI, Anthropic and Gemini are buffered then metered", 
   for (const [proxyPath] of routes) {
     upstreamFinished = 0;
     let firstByte = 0;
+    const got = [];
     await new Promise((resolve, reject) => {
       const req = http.request(`http://127.0.0.1:${proxy}${proxyPath}`, { method: "POST" }, (res) => {
-        res.on("data", () => { if (!firstByte) firstByte = Date.now(); });
+        res.on("data", (c) => { got.push(c); if (!firstByte) firstByte = Date.now(); });
         res.on("end", resolve);
       });
       req.on("error", reject);
       req.end("{}");
     });
-    assert.ok(firstByte >= upstreamFinished, proxyPath);
+    // First chunk reached the client before the upstream finished (CC-6).
+    assert.ok(firstByte > 0 && upstreamFinished > 0 && firstByte < upstreamFinished, proxyPath);
+    assert.equal(Buffer.concat(got).toString("utf8"), byUpstream[proxyPath.replace(/^\/(openai|anthropic|gemini)/, "")], proxyPath);
   }
   const ledger = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(ledger.map((r) => r.provider), ["openai", "anthropic", "gemini"]);

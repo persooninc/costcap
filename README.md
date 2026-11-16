@@ -87,7 +87,13 @@ CostCap. The local proxy binds to 127.0.0.1.
   Such receipts have `cost_usd: null`. Reconcile them before starting again;
   existing unknown-cost receipts block restart. Never replace unknown cost with
   zero without evidence from the provider.
-- SSE responses are buffered, not delivered in real time. OpenAI chat/Responses,
+- SSE (`text/event-stream`) responses are passed through in real time, chunk by
+  chunk with backpressure, and usage is metered from the stream as it passes.
+  The receipt is written when the stream ends, so a cap hit by a streamed call
+  blocks the **next** call; a call already in flight can overshoot the cap. A
+  stream cut (upstream error, client abort or timeout) before usage arrives
+  records `cost_usd: null` with `reason: "stream_incomplete"` and blocks further
+  calls. The proxy timeout covers the whole stream. OpenAI chat/Responses,
   Anthropic start/delta usage, Gemini usageMetadata, and OpenRouter (OpenAI-shape)
   usage have local fixture tests. Provider billing reconciliation and live SDK
   compatibility remain unverified.

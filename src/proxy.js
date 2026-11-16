@@ -25,17 +25,12 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   return lines;
 }
 
-export function extractUsage(provider, text, requestedModel) {
-  let chunks;
-  try { const parsed = JSON.parse(text); chunks = Array.isArray(parsed) ? parsed : [parsed]; }
-  catch {
-    chunks = text.split("\n").filter((line) => line.startsWith("data:")).flatMap((line) => {
-      try { return [JSON.parse(line.slice(5).trim())]; } catch { return []; }
-    });
-  }
+// Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
+export function createUsageAccumulator(provider, requestedModel) {
   let model = requestedModel ?? "unknown";
   let usage = {};
-  for (const chunk of chunks) {
+  const add = (chunk) => {
+    if (!chunk || typeof chunk !== "object") return;
     if (chunk.model || chunk.modelVersion || chunk.message?.model) model = chunk.model ?? chunk.modelVersion ?? chunk.message.model;
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
@@ -62,10 +57,63 @@ export function extractUsage(provider, text, requestedModel) {
         output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
         cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0 };
     }
+  };
+  const result = () => {
+    if (!Object.keys(usage).length) return null;
+    for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
+    return { model, usage: { ...usage } };
+  };
+  return { add, result };
+}
+
+export function extractUsage(provider, text, requestedModel) {
+  let chunks;
+  try { const parsed = JSON.parse(text); chunks = Array.isArray(parsed) ? parsed : [parsed]; }
+  catch {
+    const parser = createSseUsageParser(provider, requestedModel);
+    parser.push(text);
+    return parser.end();
   }
-  if (!Object.keys(usage).length) return null;
-  for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
-  return { model, usage };
+  const acc = createUsageAccumulator(provider, requestedModel);
+  for (const chunk of chunks) acc.add(chunk);
+  return acc.result();
+}
+
+// Incremental SSE parser: accepts arbitrary text fragments (lines may be split
+// across network chunks), joins multi-line `data:` fields per event, and
+// ignores `[DONE]` and non-JSON payloads.
+export function createSseUsageParser(provider, requestedModel) {
+  const acc = createUsageAccumulator(provider, requestedModel);
+  let pending = "";
+  let data = [];
+  let done = false;
+  const dispatch = () => {
+    if (!data.length) return;
+    const payload = data.join("\n");
+    data = [];
+    if (payload.trim() === "[DONE]") { done = true; return; }
+    try { acc.add(JSON.parse(payload)); } catch { /* non-JSON event data is passed through unmetered */ }
+  };
+  const line = (raw) => {
+    const text = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (text === "") return dispatch();
+    if (!text.startsWith("data:")) return;
+    const value = text.slice(5);
+    // Lenient: some providers/fixtures omit the blank line between events, so a
+    // new data line after an already-complete JSON payload starts a new event.
+    if (data.length) { try { JSON.parse(data.join("\n")); dispatch(); } catch { if (data.join("\n").trim() === "[DONE]") dispatch(); } }
+    data.push(value.startsWith(" ") ? value.slice(1) : value);
+  };
+  return {
+    push(fragment) {
+      pending += fragment;
+      let i;
+      while ((i = pending.indexOf("\n")) !== -1) { line(pending.slice(0, i)); pending = pending.slice(i + 1); }
+    },
+    end() { if (pending) { line(pending); pending = ""; } dispatch(); return acc.result(); },
+    usage: () => acc.result(),
+    get done() { return done; },
+  };
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
@@ -118,24 +166,64 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
         try {
+          const abort = new AbortController();
+          const onClientClose = () => { if (!res.writableFinished) abort.abort(); };
+          res.once("close", onClientClose);
           const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
-            body: ["GET", "HEAD"].includes(req.method) ? undefined : body, signal: AbortSignal.timeout(timeoutMs) });
-          // Buffered SSE preserves data but is not real-time streaming.
-          const raw = Buffer.from(await upstreamRes.arrayBuffer());
-          const metered = extractUsage(provider, raw.toString("utf8"), requestedModel);
+            body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
+            signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), abort.signal]) });
+          const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           const receipt = { provider, path: url.pathname.replace(`/${provider}`, ""), status: upstreamRes.status, blocked: false };
+          let metered, raw, streamCut = false;
+          if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
+            // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
+            const parser = createSseUsageParser(provider, requestedModel);
+            const decoder = new TextDecoder();
+            if (!res.destroyed) {
+              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache" });
+              res.flushHeaders();
+            }
+            const reader = upstreamRes.body.getReader();
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                parser.push(decoder.decode(value, { stream: true }));
+                if (res.destroyed) throw new Error("client_closed");
+                if (!res.write(value)) {
+                  await new Promise((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
+                }
+              }
+              parser.push(decoder.decode());
+            } catch {
+              streamCut = true;
+              abort.abort();
+              reader.cancel().catch(() => {});
+            }
+            metered = parser.end();
+          } else {
+            raw = Buffer.from(await upstreamRes.arrayBuffer());
+            metered = extractUsage(provider, raw.toString("utf8"), requestedModel);
+          }
+          res.off("close", onClientClose);
           if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
             cap?.record(receipt);
             if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);
+          } else if (streamCut) {
+            // Stream cut (upstream error, client abort or timeout) before usage arrived.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
+            accountingFailure = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "usage_unavailable" });
             accountingFailure = "Provider returned no usable token usage. Restart only after reconciling this request.";
           }
           emit(receipt);
-          if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": upstreamRes.headers.get("content-type") ?? "application/json" }).end(raw);
+          if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw); }
+          else if (streamCut) res.destroy();
+          else if (!res.destroyed) res.end();
         } catch {
           // A failed fetch may already have billed upstream. Do not assume zero.
           accountingFailure = "Upstream outcome or receipt persistence is uncertain. Reconcile before restarting.";

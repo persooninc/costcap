@@ -10,17 +10,31 @@ import assert from "node:assert/strict";
 const root = mkdtempSync(join(tmpdir(), "cc-runaway-"));
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
 let hits = 0;
-const up = http.createServer((req, res) => {
+const up = http.createServer(async (req, res) => {
   hits++;
+  let body = "";
+  for await (const c of req) body += c;
+  if (/"stream":true/.test(body)) {
+    // CC-6: SSE with gaps so the wrapped client can prove it sees chunks before the end.
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const e of ['{"model":"gpt-4o-mini","choices":[{"delta":{"content":"a"}}]}', '{"model":"gpt-4o-mini","choices":[{"delta":{"content":"b"}}]}',
+      '{"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":1000000,"completion_tokens":0}}', "[DONE]"]) {
+      if (res.destroyed) return;
+      res.write(`data: ${e}\n\n`);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    res.end();
+    return;
+  }
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1_000_000, completion_tokens: 0 } }));
 });
 await new Promise((r) => up.listen(0, "127.0.0.1", r));
 
-function scenario(name, flags, count, distinct = true, extraEnv = {}) {
+function scenario(name, flags, count, distinct = true, extraEnv = {}, code) {
   hits = 0;
   const receipts = join(root, `${name}.jsonl`);
-  const childCode = `for (let i = 0; i < ${count}; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: ${distinct ? "String(i)" : "'same retry'"} }] }) }); console.log(r.status); if (r.status === 429) break; }`;
+  const childCode = code ?? `for (let i = 0; i < ${count}; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: ${distinct ? "String(i)" : "'same retry'"} }] }) }); console.log(r.status); if (r.status === 429) break; }`;
   const child = spawn(process.execPath, [join(repo, "src/cli.js"), "wrap", ...flags, "--receipts", receipts, "--kill-file", join(root, "KILL"), "--", process.execPath, "--input-type=module", "-e", childCode], {
     env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}`, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
@@ -75,13 +89,19 @@ try {
   assert.equal(unknown.upstreamCalls, 0);
   assert.equal(unknown.blockedReason, "unreconciled_receipt");
   assert.ok(unknown.unknownCostCount >= 1);
+  const streamCode = `for (let i = 0; i < 5; i++) { const t0 = Date.now(); const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: String(i) }] }) }); if (r.status !== 200) { console.log(r.status); break; } let first = 0, text = ""; for await (const c of r.body) { if (!first) first = Date.now() - t0; text += Buffer.from(c).toString(); } const total = Date.now() - t0; if (!(first < total - 300) || !text.includes("[DONE]")) { console.error("not streamed", first, total); process.exit(3); } console.log(r.status); }`;
+  const streamed = await scenario("stream-cap", ["--cap", "0.10"], 5, true, {}, streamCode);
+  assert.equal(streamed.upstreamCalls, 1);
+  assert.equal(streamed.blockedReason, "budget_exceeded");
+  assert.deepEqual(streamed.statuses, ["200", "429"]);
+  assert.ok(streamed.receipts[0].cost_usd > 0.10);
   writeFileSync(join(root, "KILL"), "synthetic frozen");
   // Pin the child-stop watcher off so this scenario proves the proxy 429 path
   // deterministically; watcher SIGTERM (143) is covered in test/kill.test.js.
   const killed = await scenario("kill-file", [], 20, true, { COSTCAP_KILL_POLL_MS: "600000" });
   assert.equal(killed.upstreamCalls, 0);
   assert.equal(killed.blockedReason, "killed");
-  const results = [cap, spiral, steps, day, month, unknown, killed];
+  const results = [cap, spiral, steps, day, month, unknown, killed, streamed];
   const checkedAt = new Date().toISOString();
   const report = { checkedAt, command: "npm run acceptance:runaway", provider: "local fake OpenAI", paidCalls: 0, results };
   const outDir = join(repo, "docs/verification");

@@ -154,7 +154,7 @@ Compared the README's promises, category expectations, and the agent-to-agent ne
 Separate ledgers don't share caps, so a fleet on one host can overspend.
 - Acceptance: multiple wrappers can share one agent policy through a local coordinator or per-ledger reservation. Concurrent wrappers can't exceed a cap by more than the documented overshoot, proven by a test with parallel processes.
 
-### CC-6 Streaming pass-through with metering
+### CC-6 Streaming pass-through with metering (done, #115)
 SSE responses are buffered, which breaks interactive agents.
 - Acceptance: chunks reach the client as they arrive and usage is metered from the stream. A stream cut before usage arrives records `cost_usd: null` and blocks further calls.
 
