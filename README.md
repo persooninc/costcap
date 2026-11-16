@@ -12,8 +12,8 @@ billing it is a free beta with no card and no charges. Neither tier is a
 provider-bill guarantee: these are guardrails, not guarantees.
 
 The free hosted workspace covers up to 3 enrolled agents and 3 people. Solo
-($19/month list price) raises that to 15 agents, and Team ($79/month list price,
-Stripe test mode only for now) to 50 agents and 15 people, with receipts shown
+($19/month list price) raises that to 15 agents, and Team ($79/month: the Agent Guardrails Team
+bundle, Stripe lookup key `guardrails_team_month`) to 50 agents and 15 people, with receipts shown
 for 1 year. Limits apply only where checkout is
 configured, so a limited workspace always has an upgrade path: by default in
 Stripe test mode, and in live mode only with `COSTCAP_ENTITLEMENTS=enforced`.

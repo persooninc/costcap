@@ -5,7 +5,7 @@ name: release
 #     version already in package.json on the dispatched ref.
 # Owner-only setup (not done by this repo): create an npm automation/granular
 # token with publish rights and store it as the NPM_TOKEN repository secret.
-# Without NPM_TOKEN a real publish fails closed before `npm publish` runs.
+# Without NPM_TOKEN the release skips cleanly: only `npm publish --dry-run` runs.
 #
 # Provenance: npm can only sign provenance on GitHub-hosted runners. The owner
 # rule is self-hosted runners, so by default this publishes without provenance.
@@ -50,8 +50,13 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
         run: |
-          if [ "$EVENT" = "push" ] || [ "$PUBLISH_INPUT" = "true" ]; then
+          if [ "$HAS_NPM_TOKEN" != "true" ]; then
+            # Skip cleanly: without NPM_TOKEN only a dry run happens, nothing is published.
+            echo "::notice::NPM_TOKEN secret is not set; skipping npm publish (dry run only)"
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "push" ] || [ "$PUBLISH_INPUT" = "true" ]; then
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "dry_run=true" >> "$GITHUB_OUTPUT"

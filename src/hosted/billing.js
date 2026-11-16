@@ -39,7 +39,15 @@ export function verifyStripeEvent(raw, signature, secret, now = Date.now(), { li
   if (!event.id || (livemode !== null && event.livemode !== livemode)) throw problem(400, livemode ? 'Live event required' : 'Test event required');
   return event;
 }
-export async function createStripeBilling({ secretKey, webhookSecret, accountId, priceId, origin, store,
+// Agent Guardrails Team bundle ($79/mo). Resolved by lookup key so test and live share code.
+export const TEAM_BUNDLE_LOOKUP_KEY = 'guardrails_team_month';
+/** Throws unless `price` is an active, licensed, monthly USD price for `amount` cents in the expected mode. */
+export function checkMonthlyPrice(price, amount, livemode = true) {
+  return Boolean(price?.active && price.livemode === livemode && price.currency === 'usd' && price.unit_amount === amount
+    && price.recurring?.interval === 'month' && price.recurring?.interval_count === 1 && price.recurring?.usage_type === 'licensed'
+    && price.product?.active !== false && /^price_[A-Za-z0-9]+$/.test(price.id ?? ''));
+}
+export async function createStripeBilling({ secretKey, webhookSecret, accountId, priceId, origin, store, teamLookupKey,
   fetchImpl = fetch, now = () => Date.now() }) {
   if (!/^sk_live_/.test(secretKey ?? '') && !/^rk_live_/.test(secretKey ?? '')) throw new Error('Live restricted Stripe key required');
   if (!webhookSecret?.startsWith('whsec_') || !/^acct_/.test(accountId ?? '') || !/^price_/.test(priceId ?? '')) throw new Error('Stripe readback configuration required');
@@ -58,20 +66,33 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
   if (accountId !== 'acct_1TdlLm0Yt0O6HtVs' || account.id !== accountId || !account.charges_enabled) throw new Error('Persoon.ai Inc live account readback failed');
   const price = await request(`/prices/${encodeURIComponent(priceId)}?expand[]=product`);
   if (!price.active || price.livemode !== true || price.currency !== 'usd' || price.unit_amount !== 1900 || price.recurring?.interval !== 'month' || price.recurring?.interval_count !== 1 || price.recurring?.usage_type !== 'licensed' || !price.product?.active || price.product.metadata?.app !== 'costcap') throw new Error('CostCap $19/month price readback failed');
+  // Optional Team: the Guardrails bundle price, looked up by key. No price found = Solo only.
+  let teamPriceId = null;
+  if (teamLookupKey) {
+    const list = await request(`/prices?active=true&lookup_keys[]=${encodeURIComponent(teamLookupKey)}&expand[]=data.product`);
+    const team = list?.data?.[0];
+    if (team) {
+      if (!checkMonthlyPrice(team, 7900, true) || team.lookup_key !== teamLookupKey || team.id === priceId) throw new Error('Guardrails Team $79/month price readback failed');
+      teamPriceId = team.id;
+    }
+  }
+  const prices = { workspace: priceId, ...(teamPriceId ? { team: teamPriceId } : {}) };
+  const planForPrice = (id) => Object.keys(prices).find((p) => prices[p] === id) ?? null;
   const publicStatus = (s, orgId) => {
     const b = s.orgs[orgId]?.billing;
     return { enabled: true, amount: 1900, currency: 'usd', interval: 'month', status: b?.status ?? 'free_beta',
+      plan: b?.status && !['free_beta', 'canceled', 'unpaid', 'incomplete_expired'].includes(b.status) ? (b.plan ?? 'workspace') : null, plans: Object.keys(prices),
       cancelAtPeriodEnd: b?.cancelAtPeriodEnd ?? false, paidInvoiceCount: b?.paidInvoiceCount ?? 0 };
   };
   const applySubscription = (orgId, sub) => {
-    if (sub.livemode !== true || sub.metadata?.app !== 'costcap' || sub.metadata?.org_id !== orgId || sub.items?.data?.length !== 1 || sub.items.data[0].price.id !== priceId || sub.items.data[0].quantity !== 1) throw problem(400, 'Subscription scope mismatch');
+    if (sub.livemode !== true || sub.metadata?.app !== 'costcap' || sub.metadata?.org_id !== orgId || sub.items?.data?.length !== 1 || !planForPrice(sub.items.data[0].price?.id) || sub.items.data[0].quantity !== 1) throw problem(400, 'Subscription scope mismatch');
     store.transaction(s => {
       if (!s.orgs[orgId]) throw problem(400, 'Unknown workspace');
       const b = s.orgs[orgId].billing ??= {};
       // Never switch the workspace to another subscription from a late event.
       if (b.subscriptionId && b.subscriptionId !== sub.id) throw problem(409, 'Subscription conflict');
       Object.assign(b, { subscriptionId: sub.id, customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id,
-        status: sub.status, cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end), verifiedAt: now() });
+        status: sub.status, plan: planForPrice(sub.items.data[0].price.id), cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end), verifiedAt: now() });
     });
   };
   const syncCheckout = async (orgId) => {
@@ -86,7 +107,7 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
     return session;
   };
   return {
-    accountId, priceId,
+    accountId, priceId, teamPriceId,
     async status(orgId) {
       const subId = store.read(s => s.orgs[orgId]?.billing?.subscriptionId);
       if (subId) applySubscription(orgId, await request(`/subscriptions/${encodeURIComponent(subId)}`));
@@ -94,25 +115,26 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
       return store.read(s => publicStatus(s, orgId));
     },
     async checkout(user, { plan = 'workspace' } = {}) {
-      if (plan !== 'workspace') throw problem(409, 'Only the Solo plan is sold in live mode');
+      if (!Object.hasOwn(prices, plan)) throw problem(plan === 'team' ? 409 : 400, plan === 'team' ? 'Team plan is not configured' : 'Unknown plan');
       const existing = await syncCheckout(user.orgId);
       const state = store.read(s => s.orgs[user.orgId]?.billing ?? {});
       if (state.subscriptionId && !['canceled', 'incomplete_expired'].includes(state.status)) throw problem(409, 'Manage your existing subscription instead');
       if (state.subscriptionId) throw problem(409, 'Contact support before starting a new subscription');
-      if (existing?.status === 'open') {
+      if (existing?.status === 'open' && (state.checkout?.plan ?? 'workspace') === plan) {
         if (!/^https:\/\/checkout\.stripe\.com\//.test(existing.url ?? '')) throw problem(503, 'Invalid Checkout response');
         return { url: existing.url };
       }
       let key;
       store.transaction(s => {
         const b = s.orgs[user.orgId].billing ??= {};
-        if (!b.checkout || (existing && existing.status === 'expired')) b.checkout = { key: `costcap-${randomUUID()}` };
+        if (!b.checkout || (existing && existing.status === 'expired') || (b.checkout.plan ?? 'workspace') !== plan) b.checkout = { key: `costcap-${randomUUID()}`, plan };
         key = b.checkout.key;
       });
       const session = await request('/checkout/sessions', {
-        mode: 'subscription', 'line_items[0][price]': priceId, 'line_items[0][quantity]': '1',
+        mode: 'subscription', 'line_items[0][price]': prices[plan], 'line_items[0][quantity]': '1',
         client_reference_id: user.orgId, customer_email: user.email,
         'metadata[app]': 'costcap', 'metadata[org_id]': user.orgId,
+        'metadata[plan]': plan, 'subscription_data[metadata][plan]': plan,
         'subscription_data[metadata][app]': 'costcap', 'subscription_data[metadata][org_id]': user.orgId,
         success_url: `${origin}/?checkout=returned`, cancel_url: `${origin}/?checkout=canceled`,
         allow_promotion_codes: 'true',

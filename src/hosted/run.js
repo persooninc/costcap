@@ -1,4 +1,4 @@
-import { createStripeBilling, createTestModeStripeBilling } from "./billing.js";
+import { createStripeBilling, createTestModeStripeBilling, TEAM_BUNDLE_LOOKUP_KEY } from "./billing.js";
 import { createTransactionalEmail } from "./email.js";
 import { createHostedServer } from "./server.js";
 import { createOrgAlertRouter } from "./delivery.js";
@@ -46,6 +46,7 @@ const { server, evaluateFleetAlerts, billingReady } = createHostedServer({
     return createStripeBilling({
       store, origin, secretKey, webhookSecret, priceId,
       accountId: required("COSTCAP_STRIPE_ACCOUNT_ID"),
+      teamLookupKey: process.env.COSTCAP_STRIPE_TEAM_LOOKUP_KEY || TEAM_BUNDLE_LOOKUP_KEY,
     });
   } : undefined,
   turnstileSiteKey: required("TURNSTILE_SITE_KEY"),

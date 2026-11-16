@@ -101,12 +101,14 @@ test("live adapter refuses a Team checkout before calling Stripe", async () => {
   assert.equal(called, before);
 });
 
-test("live pricing page does not offer the test-mode-only Team plan", async () => {
+test("live pricing page offers Team (Agent Guardrails bundle) at $79", async () => {
   const { uiResponse } = await import("../src/hosted/ui.js");
   const live = uiResponse("/pricing", "", "https://costcap.dev", true, "live", { publicPricing: true }).body;
   const team = live.slice(live.indexOf('data-plan="team"'));
-  assert.match(team, /Not on sale yet/);
-  assert.doesNotMatch(team.slice(0, team.indexOf("</section>")), /href="\/\?plan=team/);
+  assert.doesNotMatch(team.slice(0, team.indexOf("</section>")), /Not on sale yet/);
+  assert.match(team.slice(0, team.indexOf("</section>")), /\$79 USD per month[^]*href="\/\?plan=team/);
+  const app = uiResponse("/", "", "https://costcap.dev", true, "live", { publicPricing: true }).body;
+  assert.match(app, /id="upgradeTeam"[^>]*hidden>Review \$79\/month Team/);
   assert.match(live, /data-plan="workspace"[^]*\$19 USD per month/);
   assert.doesNotMatch(live, /testModeBanner/);
   const testMode = uiResponse("/pricing", "", "https://costcap.dev", true, "test", { publicPricing: true }).body;

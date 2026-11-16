@@ -130,3 +130,39 @@ test('failed billing initialization keeps hosted app available with all charging
   assert.equal((await fetch(base+path,{method:'POST',headers:{origin:'http://localhost','content-type':'application/json'},body:'{}'})).status,404);
  }
 });
+
+// #131: Agent Guardrails Team bundle grants CostCap Team in live mode.
+const bundlePrice={id:'price_bundle',lookup_key:'guardrails_team_month',active:true,livemode:true,currency:'usd',unit_amount:7900,recurring:{interval:'month',interval_count:1,usage_type:'licensed'},product:{active:true,metadata:{bundle:'agent_guardrails'}}};
+const bundlePath='/prices?active=true&lookup_keys[]=guardrails_team_month&expand[]=data.product';
+test('readback accepts the Solo price and the Guardrails bundle price by lookup key',async()=>{
+ const f=fixture({[bundlePath]:{data:[bundlePrice]}});
+ const b=await createStripeBilling({...f.options,teamLookupKey:'guardrails_team_month'});
+ assert.equal(b.priceId,'price_fixture');assert.equal(b.teamPriceId,'price_bundle');
+ assert.ok(f.calls.some(c=>c.path===bundlePath&&c.method==='GET'));
+ const none=fixture({[bundlePath]:{data:[]}});
+ assert.equal((await createStripeBilling({...none.options,teamLookupKey:'guardrails_team_month'})).teamPriceId,null);
+ for(const change of [{unit_amount:1900},{livemode:false},{recurring:{interval:'year',interval_count:1,usage_type:'licensed'}},{lookup_key:'other'},{id:'price_fixture'}]){
+  const bad=fixture({[bundlePath]:{data:[{...bundlePrice,...change}]}});
+  await assert.rejects(createStripeBilling({...bad.options,teamLookupKey:'guardrails_team_month'}),/Team \$79\/month price readback/);
+ }
+});
+test('Team checkout uses the bundle lookup-key price; a bundle subscription grants Team limits',async()=>{
+ const f=fixture({[bundlePath]:{data:[bundlePrice]}});
+ const b=await createStripeBilling({...f.options,teamLookupKey:'guardrails_team_month'});
+ await b.checkout({orgId:'org1',email:'o@example.invalid'},{plan:'team'});
+ const post=f.calls.find(c=>c.path==='/checkout/sessions'&&c.method==='POST');
+ const form=new URLSearchParams(post.body);
+ assert.equal(form.get('line_items[0][price]'),'price_bundle');assert.equal(form.get('subscription_data[metadata][plan]'),'team');
+ await assert.rejects(b.checkout({orgId:'org1',email:'o@example.invalid'},{plan:'gold'}),e=>e.status===400);
+ f.sub.items.data[0].price.id='price_bundle';f.complete();
+ const st=await b.status('org1');
+ assert.equal(st.plan,'team');assert.deepEqual(st.plans,['workspace','team']);
+ const {entitlementsFor}=await import('../src/billing/entitlements.js');
+ const e=entitlementsFor({status:st.status,plan:f.store.read(s=>s.orgs.org1.billing.plan),enforced:true});
+ assert.equal(e.plan,'team');assert.equal(e.limits.agents,50);assert.equal(e.limits.seats,15);
+});
+test('without a Team lookup key live mode sells Solo only and a bundle subscription is out of scope',async()=>{
+ const f=fixture();const b=await createStripeBilling(f.options);
+ await assert.rejects(b.checkout({orgId:'org1',email:'o@example.invalid'},{plan:'team'}),e=>e.status===409);
+ assert.ok(!f.calls.some(c=>c.path.startsWith('/prices?')));
+});

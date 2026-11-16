@@ -69,7 +69,7 @@ test("isolated signed billing callback, paid UI, owner portal and cancellation r
     expect(store.read(s => s.orgs[orgId].billing.invoices.in_local.amountPaid)).toBe(100);
     expect(store.read(s => s.orgs.other_fixture_org.billing)).toBeUndefined();
     await page.locator("#refresh").click();
-    await expect(page.locator("#billingStatus")).toHaveText("Verified subscription: active");
+    await expect(page.locator("#billingStatus")).toHaveText("Verified subscription: active · Solo plan");
     await expect(page.locator("#upgrade")).toBeHidden();
     await expect(page.locator("#portal")).toBeVisible();
     await expect(page.locator("#portal")).toBeEnabled();
