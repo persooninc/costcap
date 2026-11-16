@@ -24,6 +24,7 @@ import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
 import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
+import { receiptsCommand } from "./receipts-cli.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--run-id ID] [--receipts FILE] [--github-output]\n" +
@@ -32,6 +33,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
+  "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv]\n" +
   "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
   "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
@@ -225,6 +227,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       if (err) console.error(err);
       process.exitCode = code;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
+  } else if (cmd === "receipts") {
+    process.exitCode = receiptsCommand(rest);
   } else if (cmd === "runs") {
     runsCommand(rest);
   } else if (cmd === "kill" || cmd === "resume") {

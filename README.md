@@ -286,6 +286,9 @@ With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
 Unknown cost inside the run exits 1 (`accounting_unavailable`); unknown cost in
 another run only affects day/month caps. A run id with no receipts exits 2.
 List run ids with `costcap runs`.
+List and export local receipts with `costcap receipts [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv] [--receipts FILE]`
+(oldest first; kill/resume/reconciliation lines skipped; unknown cost prints `unknown`, settled receipts show `settled_cost_usd`;
+CSV uses the hosted export columns and formula-injection escaping; exit 2 on a bad time or unreadable ledger).
 `action.yml` exposes this check as a composite GitHub Action (Marketplace
 branding included); no Marketplace listing or public release has been made yet. MCP exposes only `budget_status` via
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
