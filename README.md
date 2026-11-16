@@ -605,6 +605,21 @@ Each enrolled wrapper gets its team's caps and the team's synced spend with ever
 
 **Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
 
+## Model downgrade
+
+Degrade, don't die: past a fraction of a cap, a wrapped agent's expensive model calls go upstream on a cheaper model instead of stopping at 100%.
+
+```sh
+costcap wrap --day-cap 10 --downgrade gpt-4o=gpt-4o-mini,claude-opus-4-1=claude-sonnet-4-5 --downgrade-at 0.8 -- node agent.js
+```
+
+- **Trigger:** the first run/hour/day/month scope whose spend is at or above `F` (default `0.8`, 0 < F ≤ 1) of its cap. That can be a local cap, a `--policy` agent or team budget, or an enrolled fleet agent or team cap. Unknown cost is never counted as $0: known spend is a lower bound and still triggers.
+- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes (streamed requests included). Under `F`, requests are byte-identical. The allowlist, `--unknown-models refuse`, preflight, tag caps and the cache key all see the new model. A disallowed or unpriced target is refused as usual, never sent as the original. An unpriced `--downgrade` target exits `2` at wrap start.
+- **Not rewritten:** Gemini (model in the path), Bedrock/Vertex, batches, multipart audio and OpenRouter `models[]`. These pass through unchanged, with receipt `downgrade: "unsupported_route"`.
+- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction}`, and the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line are written per scope and period, never counted as spend. The run summary and `costcap runs` show `downgraded_calls`.
+- **Hard stop:** at 100% the cap still refuses. A downgrade never raises or bypasses any cap.
+- **Fleet:** `downgrade: {at, map}` on `POST /v1/agents/:id/policy` ("Downgrade models" / "Downgrade at (%)" on the agent card; `null` clears it). A bad fraction, an empty map or FROM equal to TO returns `400`. Enrolled wrappers use the cached map offline. Local `--downgrade` can only add models the fleet does not map, and local `--downgrade-at` can only lower `at`.
+
 ## Rate limits
 
 Cap how fast a wrapped agent may call the model, independent of dollars:

@@ -34,8 +34,10 @@ import { dirname, join } from "node:path";
 import { unpricedDiscountWarnings } from "./price-overrides.js";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
 import { awsCredentials } from "./sigv4.js";
+import { createDowngrader, mergeDowngrade, parseDowngradeAt, parseDowngradeMap, scopeUsage } from "./downgrade.js";
+import { isPricedModel } from "./pricing.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
@@ -96,6 +98,8 @@ export function parseWrapArgs(argv) {
       opts.unknownModels = v;
     } else if (f === "--timeout") opts.timeoutS = positiveNumber(f, v);
     else if (f === "--warn-at") opts.warnAt = parseWarnAt(v);
+    else if (f === "--downgrade") opts.downgradeMap = parseDowngradeMap(v);
+    else if (f === "--downgrade-at") opts.downgradeAt = parseDowngradeAt(v);
     else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
@@ -120,6 +124,11 @@ export function parseWrapArgs(argv) {
   opts.upstreams = parseUpstreams(opts.upstreamSpecs ?? []);
   delete opts.upstreamSpecs;
   if (opts.upstreamPricesPath) opts.userPrices = loadUpstreamPrices(opts.upstreamPricesPath, opts.upstreams.map((u) => u.name));
+  // #207: a downgrade target must have a rate, so spend stays known after the switch.
+  for (const to of Object.values(opts.downgradeMap ?? {})) {
+    const userPriced = Object.values(opts.userPrices?.upstreams ?? {}).some((t) => t && typeof t === "object" && Object.hasOwn(t, to));
+    if (!isPricedModel(to) && !userPriced) throw new Error(`--downgrade target "${to}" has no published rate; add it to --upstream-prices or pick a priced model`);
+  }
   return opts;
 }
 
@@ -153,7 +162,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm, downgradeMap, downgradeAt } = parseWrapArgs(argv);
   for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   const limits = proxyLimits({ timeoutS });
@@ -175,12 +184,13 @@ export async function wrap(argv) {
   // #181: bound once the proxy is listening; capWarner once created.
   let checkWarnings = () => {};
   let capWarner = null;
+  let downgrader = null;
   const settleWithWarnings = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle, tagCaps: () => tagCaps,
     onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); } });
   const settleReceipt = (s, r) => { const applied = settleWithWarnings(s, r); if (applied) checkWarnings(); return applied; };
   const sharedLedger = shared ? openSharedLedger(receiptsPath, {
     onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); tagCaps?.record(r); checkWarnings(); },
-    onExternalWarning: (e) => capWarner?.note(e),
+    onExternalWarning: (e) => { capWarner?.note(e); downgrader?.note(e); },
     // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
     // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
     onExternalSettle: (s, r) => settleReceipt(s, r),
@@ -201,12 +211,16 @@ export async function wrap(argv) {
     const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
     rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
   };
+  // #207: local --downgrade / --downgrade-at merged with the fleet downgrade (local only adds or lowers).
+  const localDowngrade = downgradeMap ? { map: downgradeMap, at: downgradeAt } : downgradeAt != null ? { at: downgradeAt } : null;
+  let downgradeConfig = mergeDowngrade(null, localDowngrade);
   let raiseTimer = null;
   const setPolicy = (p) => {
     fleetPolicy = p;
     // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
     clearTimeout(raiseTimer);
     if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
+    downgradeConfig = mergeDowngrade(p.downgrade ?? null, localDowngrade);
     const resolved = resolvePolicy({ local: { ...caps, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
     cap.updateCaps(resolved.caps);
     checkWarnings();
@@ -233,9 +247,27 @@ export async function wrap(argv) {
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
   capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
+  // #207: trigger order: local caps, --policy agent and team budgets, enrolled fleet agent and team caps.
+  const downgradeUsage = () => {
+    const rows = scopeUsage(cap.limits(), cap.spend());
+    if (agentBudgets) {
+      const id = who.agent_id ?? "unknown";
+      const limits = agentBudgets.limitsFor(id);
+      if (limits) rows.push(...scopeUsage(limits, agentBudgets.spend(who), "agent"));
+      const team = agentBudgets.teamFor?.(id);
+      if (team) rows.push(...scopeUsage(team, agentBudgets.teamSpend(who), `team ${team.team}`));
+    }
+    const fr = fleet?.preflightRemaining?.();
+    const spentOf = (caps, left) => Object.fromEntries(Object.entries(left ?? {}).filter(([k, v]) => caps?.[k] != null && typeof v === "number").map(([k, v]) => [k, Math.max(caps[k] - v, 0)]));
+    if (fr?.agent) rows.push(...scopeUsage(fleetPolicy?.caps, spentOf(fleetPolicy?.caps, fr.agent), "fleet"));
+    const team = fleet?.team?.();
+    if (fr?.team && team) { const tc = team.caps ?? {}; rows.push(...scopeUsage(tc, spentOf(tc, fr.team), `team ${team.name}`)); }
+    return rows;
+  };
+  downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, rateLimit, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
