@@ -12,7 +12,7 @@ import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
-import { parseSpendQuery, spendBreakdown } from "./spend.js";
+import { parseSpendQuery, spendBreakdown, spendCsv } from "./spend.js";
 import { validTags } from "../tags.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
@@ -522,8 +522,23 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = member(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams);
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId) });
+          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
         }));
+      }
+      // #213: finance summary CSV, one row per period and group. Viewers and viewer keys may read it.
+      if (path === "/v1/spend.csv" && req.method === "GET") {
+        const csv = store.read((s) => {
+          const u = member(s, req);
+          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { csv: true });
+          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
+          return spendCsv(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
+        });
+        return res.writeHead(200, {
+          "content-type": "text/csv; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "content-disposition": 'attachment; filename="costcap-spend.csv"',
+        }).end(csv.body);
       }
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {

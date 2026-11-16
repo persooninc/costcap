@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
-import { parseSpendQuery, spendBreakdown } from "../src/hosted/spend.js";
+import { parseSpendQuery, spendBreakdown, spendCsv, NO_TEAM, SPEND_CSV_COLUMNS } from "../src/hosted/spend.js";
 
 const DAY = 86_400_000;
 const NOW = Date.parse("2026-11-16T12:00:00Z");
@@ -101,7 +101,7 @@ test("GET /v1/spend: session auth, viewer access, org isolation, 400s, settlemen
   const agents = (await f.request("/v1/spend?group_by=agent", undefined, owner)).body;
   assert.deepEqual(agents.buckets.map((b) => b.label), ["worker", "batch"]);
   assert.equal((await f.request("/v1/spend?group_by=model", undefined, outsider)).body.total.usd_known, 99);
-  for (const q of ["group_by=team", "since=bad", "until=2026-13-40"]) assert.equal((await f.request(`/v1/spend?${q}`, undefined, owner)).status, 400, q);
+  for (const q of ["group_by=nope", "since=bad", "until=2026-13-40"]) assert.equal((await f.request(`/v1/spend?${q}`, undefined, owner)).status, 400, q);
   // Regression: the new route changes nothing in existing payloads.
   const after = await Promise.all(["/v1/fleet", "/v1/receipts.csv", "/v1/evidence.json"].map((p) => f.request(p, undefined, owner)));
   for (let i = 0; i < 3; i++) assert.equal(after[i].text, before[i].text);
@@ -173,4 +173,77 @@ test("#209 spendBreakdown buckets by local date and reports budget_period", () =
   assert.deepEqual(la.budget_period, { timezone: "America/Los_Angeles", monthStartDay: 1 });
   assert.deepEqual(la.buckets.map((b) => [b.key, b.usd_known, b.unknown_count]), [["2026-11-15", 2, 0], ["2026-11-16", 0, 1]]);
   assert.equal(la.buckets[1].cost_complete, false); // unknown cost is never $0
+});
+
+// #213: team chargeback.
+const TEAMS = [{ name: "core", agents: ["a1"] }, { name: "idle", agents: ["zz"] }];
+test("#213 group_by=team: one bucket per team plus (no team), sum invariant, current membership", () => {
+  const r = spendBreakdown(FIXTURE, { groupBy: "team", teams: TEAMS });
+  assert.equal(r.team_membership, "current");
+  assert.deepEqual(r.buckets.map((b) => [b.key, b.label, b.usd_known, b.calls, b.unknown_count, b.cost_complete]),
+    [["core", "core", 1.223456, 3, 0, true], ["(no team)", "(no team)", 0.200001, 3, 1, false], ["idle", "idle", 0, 0, 0, true]]);
+  for (const k of ["usd_known", "calls", "unknown_count", "blocked_count"]) assert.equal(Math.round(r.buckets.reduce((n, b) => n + b[k], 0) * 1e6) / 1e6, r.total[k], k);
+  const none = spendBreakdown(FIXTURE, { groupBy: "team" });
+  assert.deepEqual(none.buckets.map((b) => b.key), [NO_TEAM]);
+  assert.equal(spendBreakdown(FIXTURE, { groupBy: "day" }).team_membership, undefined);
+});
+
+test("#213 team bucket: a settled unknown counts at its settled value, an unsettled one is never $0", () => {
+  const items = FIXTURE.map((x) => x.receipt.id === "4" ? { ...x, settlement: { cost_usd: 2 } } : x);
+  const b = spendBreakdown(items, { groupBy: "team", teams: [{ name: "batch", agents: ["a2"] }] }).buckets.find((x) => x.key === "batch");
+  assert.deepEqual([b.usd_known, b.unknown_count, b.cost_complete], [2.200001, 0, true]);
+});
+
+test("#213 spendCsv: month and day periods follow the budget period, escaping, clamp and incomplete lines", () => {
+  const items = [
+    { agentId: "a1", receipt: { ts: "2026-10-31T23:30:00Z", cost_usd: 1, model: "m" } },
+    { agentId: "a1", receipt: { ts: "2026-11-02T10:00:00Z", cost_usd: 2, model: "m" } },
+    { agentId: "a2", receipt: { ts: "2026-11-03T10:00:00Z", cost_usd: null, model: "=cmd", blocked: true } },
+  ];
+  const utc = spendCsv(items, { groupBy: "team", period: "month", teams: [{ name: "core", agents: ["a1"] }] });
+  const lines = utc.body.trim().split("\n");
+  assert.match(lines[0], /^# cost_incomplete: 1 receipts/);
+  assert.match(lines[1], /^# team_membership: current/);
+  assert.equal(lines[2], SPEND_CSV_COLUMNS.join(","));
+  assert.deepEqual(lines.slice(3), ["2026-10,team,core,core,1,1,0,true,0", "2026-10,team,(no team),(no team),0,0,0,true,0",
+    "2026-11,team,core,core,2,1,0,true,0", "2026-11,team,(no team),(no team),0,1,1,false,1"]);
+  // LA: Oct 31 23:30Z is Oct 31 local; a month starting on day 2 puts Nov 2 10:00Z in the Nov period, Oct 31 in the Oct one.
+  const la = spendCsv(items, { groupBy: "model", period: "month", budgetPeriod: { timezone: "America/Los_Angeles", monthStartDay: 3 } });
+  assert.deepEqual(la.body.trim().split("\n").filter((l) => !l.startsWith("#")).slice(1).map((l) => l.split(",").slice(0, 3).join(",")), ["2026-10,model,m", "2026-11,model,'=cmd"]);
+  const day = spendCsv(items, { groupBy: "day", period: "day", cutoff: Date.parse("2026-11-01T00:00:00Z") });
+  assert.match(day.body, /^# retention_clamped: since moved to 2026-11-01T00:00:00.000Z/);
+  assert.equal(day.rows, 2);
+  assert.throws(() => spendCsv(items, { period: "year" }), (e) => e.status === 400);
+  assert.equal(parseSpendQuery(new URLSearchParams("group_by=team"), { csv: true }).period, "month");
+  assert.throws(() => parseSpendQuery(new URLSearchParams("period=week"), { csv: true }), (e) => e.status === 400);
+});
+
+test("#213 GET /v1/spend?group_by=team and /v1/spend.csv: auth, viewer + viewer key, org isolation, 400s, other groups unchanged", async (t) => {
+  const f = await serve(t);
+  assert.equal((await f.request("/v1/spend.csv")).status, 401);
+  const owner = await f.login("team-owner@example.invalid");
+  const outsider = await f.login("team-outsider@example.invalid");
+  const a1 = await f.agent(owner, "worker"), a2 = await f.agent(owner, "batch"), o = await f.agent(outsider, "theirs");
+  const tok = { a1: a1.token, a2: a2.token };
+  for (const x of FIXTURE) assert.equal((await f.request("/v1/receipts", { receipts: [x.receipt] }, null, tok[x.agentId])).status, 200);
+  await f.request("/v1/receipts", { receipts: [{ id: "x", ts: "2026-11-15T00:00:00Z", cost_usd: 99, model: "gpt-4.1" }] }, null, o.token);
+  const before = await Promise.all(["day", "model", "agent"].map((g) => f.request(`/v1/spend?group_by=${g}`, undefined, owner)));
+  assert.equal((await f.request("/v1/teams", { name: "core", agents: [a1.agentId], day: 50 }, owner)).status, 200);
+  assert.equal((await f.request("/v1/teams", { name: "spy", agents: [o.agentId], day: 50 }, outsider)).status, 200);
+  const after = await Promise.all(["day", "model", "agent"].map((g) => f.request(`/v1/spend?group_by=${g}`, undefined, owner)));
+  for (let i = 0; i < 3; i++) assert.equal(after[i].text, before[i].text);
+  const team = (await f.request("/v1/spend?group_by=team", undefined, owner)).body;
+  assert.equal(team.team_membership, "current");
+  assert.deepEqual(team.buckets.map((b) => [b.key, b.usd_known, b.calls]), [["core", 1.223456, 3], ["(no team)", 0.200001, 3]]);
+  const csv = await f.request("/v1/spend.csv?group_by=team&period=month&since=2026-11-01&until=2026-11-30", undefined, owner);
+  assert.equal(csv.status, 200);
+  assert.ok(!csv.text.includes("spy") && !csv.text.includes(",99,"));
+  assert.ok(csv.text.includes("2026-11,team,core,core,1.223456,3,0,true,1"));
+  await f.request("/v1/invitations", { email: "team-viewer@example.invalid", role: "viewer" }, owner);
+  const viewer = await f.login("team-viewer@example.invalid");
+  assert.equal((await f.request("/v1/spend.csv?group_by=team", undefined, viewer)).text, (await f.request("/v1/spend.csv?group_by=team", undefined, owner)).text);
+  const key = (await f.request("/v1/api-keys", { name: "finance", role: "viewer" }, owner)).body.key;
+  assert.equal((await f.request("/v1/spend.csv?group_by=team", undefined, null, key)).status, 200);
+  assert.equal((await f.request("/v1/spend?group_by=team", undefined, null, key)).status, 200);
+  for (const q of ["group_by=nope", "period=week", "since=bad", "until=2026-13-40"]) assert.equal((await f.request(`/v1/spend.csv?${q}`, undefined, owner)).status, 400, q);
 });

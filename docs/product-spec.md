@@ -63,3 +63,5 @@ Runaway execution is the most expensive agent failure class: documented multi-ag
 ## Open decisions
 
 None blocking. Legal fields on marketplace listings are Roger's at listing time (same as ShipReady/NightlyQA).
+
+- #213 Team chargeback: `/v1/spend?group_by=team` (current membership, `(no team)` bucket) and `GET /v1/spend.csv` summary per day/month budget period; By team rows and Download CSV on the Spend card.

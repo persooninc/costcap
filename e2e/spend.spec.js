@@ -68,6 +68,22 @@ test("Spend card: day, model and agent rows, incomplete badge, period switch, vi
     await expect(page.locator('#spendModels [data-key="claude-sonnet-4"]')).toContainText("$4.50");
     expect(dialogs).toBe(0);
 
+    // #213: By team rows and the summary CSV that matches them.
+    expect((await post("/v1/teams", { name: "core", agents: [a.agentId], day: 100 }, { cookie: owner })).status).toBe(200);
+    await page.reload();
+    await expect(page.locator('#spendTeams [data-key="core"]')).toContainText("$1.25");
+    await expect(page.locator('#spendTeams [data-key="core"] .incomplete')).toContainText("1 unknown");
+    await expect(page.locator('#spendTeams [data-key="(no team)"]')).toContainText("$0.50");
+    await expect(page.locator("#spendCsv")).toHaveAttribute("href", /group_by=team&period=day/);
+    await page.locator("#spendPeriodSelect").selectOption("month");
+    await expect(page.locator("#spendCsv")).toHaveAttribute("href", /group_by=team&period=month/);
+    const href = await page.locator("#spendCsv").getAttribute("href");
+    const csv = await fetch(origin + href, { headers: { cookie: owner } }).then((r) => r.text());
+    const month = today.slice(0, 7);
+    expect(csv).toContain(`${month},team,core,core,1.25,2,1,false,0`);
+    expect(csv).toContain(`${month},team,(no team),(no team),0.5,1,0,true,0`);
+    await page.locator("#spendPeriodSelect").selectOption("30d");
+
     // #169: By tag. Tagged receipts, one unknown-cost, one untagged.
     await sync(a, [{ id: "t1", ts: now.toISOString(), cost_usd: 2, model: "gpt-4.1", tags: { customer: "acme" } },
       { id: "t2", ts: now.toISOString(), cost_usd: null, model: "o3", tags: { customer: "beta" } }]);
