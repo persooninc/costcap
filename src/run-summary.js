@@ -1,4 +1,5 @@
 import { applySettlements } from "./cap.js";
+import { stopReasonFor, deriveOutcome } from "./hosted/run-outcome.js";
 // Local per-run JSON summary (costcap.run-summary/v1): calls, tokens and cost per
 // model, unknown-cost count, caps and stop reason. Written to <ledger-dir>/runs/.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,7 +17,8 @@ export function stopReason(reason) {
 }
 
 // Build a summary from this run's receipt lines (event lines are ignored).
-export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false }) {
+export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false, signal = null }) {
+  let firstStop = null;
   const by_model = {};
   let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, downgraded_calls = 0, total = 0;
   let stopped_by = killed ? "killed" : null, stopped_scope = killed ? (kill?.kill_scope ?? null) : null;
@@ -27,6 +29,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     if (r.blocked) {
       blocked_calls++;
       const s = stopReason(r.reason);
+      if (s && !firstStop) firstStop = r.reason;
       if (s && !stopped_by) { stopped_by = s; stopped_scope = r.scope ?? r.kill_scope ?? null; }
       if (s === "killed" && !killInfo && r.kill_scope) killInfo = { kill_scope: r.kill_scope, kill_file: r.kill_file };
       continue;
@@ -55,8 +58,10 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   for (const scope of ["run", "day", "month"]) {
     if (caps[scope] != null) capsOut[scope] = { limit_usd: caps[scope], spent_usd: r6(spend[scope] ?? 0) };
   }
+  // #225: stop reason and outcome (success|failure|killed) for hosted run-end sync.
+  const stop_reason = stopReasonFor({ killed, reason: firstStop, signal });
   return {
-    schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
+    schema: SCHEMA, run_id, started_at, ended_at, exit_code, stop_reason, outcome: deriveOutcome({ exit_code, stop_reason }), calls, blocked_calls, rejected_calls, by_model,
     total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls, ...(downgraded_calls ? { downgraded_calls } : {}),
     caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(cacheSeen ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
   };
@@ -107,7 +112,18 @@ export function runsCommand(argv, { log = console.log, warn = console.error } = 
   else if (!runs.length) log("no runs recorded");
   else for (const r of runs) {
     const cost = r.total_cost_usd === null ? "unknown" : `$${Number(r.total_cost_usd).toFixed(4)}`;
-    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}`);
+    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}  outcome=${r.outcome ?? (r.stop_reason ? deriveOutcome(r) : "unknown")}`);
   }
   return { runs, errors };
+}
+
+// #225: the run-end record an enrolled wrap syncs to the hosted service.
+export function runEndRecord(summary) {
+  return {
+    run_id: summary.run_id, started_at: summary.started_at, ended_at: summary.ended_at,
+    exit_code: Number.isInteger(summary.exit_code) && summary.exit_code >= 0 && summary.exit_code <= 255 ? summary.exit_code : null,
+    stop_reason: summary.stop_reason, calls: summary.calls + summary.blocked_calls,
+    usd_known: summary.total_cost_usd ?? r6(Object.values(summary.by_model).reduce((n, m) => n + (m.cost_usd ?? 0), 0)),
+    unknown_count: summary.unknown_cost_calls,
+  };
 }

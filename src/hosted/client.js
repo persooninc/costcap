@@ -100,6 +100,22 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       saveEnrollment(path, data);
     }
   }
+  // Issue #225: run-end records go up once each, after the receipts. An older server
+  // without the route (404) is skipped and the records retry on the next sync. Other
+  // failures leave the record queued and never fail the receipt sync; 401/403 still revoke.
+  async function uploadRunEnds() {
+    for (const rec of [...(data.pendingRunEnds ?? [])]) {
+      try {
+        await request(data.url, data.token, "/v1/runs/end", rec);
+      } catch (err) {
+        if (err.status === 401 || err.status === 403) throw err;
+        if (err.status === 404 && err.route) return;
+        if (err.status !== 409 && err.status !== 400) return;
+      }
+      data.pendingRunEnds = (data.pendingRunEnds ?? []).filter((x) => x.run_id !== rec.run_id);
+      saveEnrollment(path, data);
+    }
+  }
   // Issue #162: an admin settlement in the dashboard reaches the local ledger as one
   // append-only reconciliation line. Only this host's own null-cost receipts that are
   // not settled locally yet; known costs are never overridden; repeat polls are no-ops.
@@ -158,6 +174,11 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       return cachedFleetTagVerdict(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     revoked: () => revoked,
+    pendingRunEnds: () => [...(data.pendingRunEnds ?? [])],
+    queueRunEnd(record) {
+      data.pendingRunEnds = [...(data.pendingRunEnds ?? []).filter((x) => x.run_id !== record.run_id), record];
+      saveEnrollment(path, data);
+    },
     // wait: true (used at exit) waits for an in-flight sync, then runs a fresh one,
     // so a final sync never gets skipped while the 60s poll is mid-upload (#146).
     async sync({ wait = false } = {}) {
@@ -187,6 +208,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
           saveEnrollment(path, data);
         }
         await uploadSettlements(synced);
+        await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
         const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, budget_period: budgetPeriod = null, ...fetchedPolicy } = fetched ?? {};
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");

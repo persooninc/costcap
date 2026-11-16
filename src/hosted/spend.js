@@ -6,7 +6,9 @@ import { TAG_KEY } from "../tags.js";
 import { normalizeBudgetPeriod, periodKey, periodBounds, localParts, zonedMidnight } from "../period.js";
 import { cell } from "./receipts-csv.js";
 
-export const SPEND_GROUPS = ["day", "model", "agent", "tag", "team"];
+export const SPEND_GROUPS = ["day", "model", "agent", "tag", "team", "outcome"];
+// #225: run outcome buckets, always all four, in this order.
+export const OUTCOME_BUCKETS = ["success", "failure", "killed", "unknown"];
 export const UNTAGGED = "(untagged)";
 // #213: agents in no team. Membership is the current one, not history.
 export const NO_TEAM = "(no team)";
@@ -71,7 +73,7 @@ export function parseSpendQuery(params, { csv = false, budgetPeriod = null, now 
 
 // items: [{ agentId, receipt, settlement? }]. names: { agentId: label }.
 // teams (group_by=team): [{ name, agents }] of the caller's org only.
-export function spendBreakdown(items, { groupBy = "day", range = null, since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [] } = {}) {
+export function spendBreakdown(items, { groupBy = "day", range = null, since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [], outcomeOf = () => "unknown" } = {}) {
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   if (groupBy === "tag" && (!tagKey || !TAG_KEY.test(tagKey))) throw bad("tag_key is required with group_by=tag");
   let from = since, clamped = false;
@@ -86,6 +88,8 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
     }
     buckets.set(NO_TEAM, { ...newBucket(NO_TEAM), label: NO_TEAM });
   }
+  const runSets = new Map();
+  if (groupBy === "outcome") for (const o of OUTCOME_BUCKETS) { buckets.set(o, { ...newBucket(o), label: o }); runSets.set(o, new Set()); }
   const total = { usd_known: 0, calls: 0, unknown_count: 0, blocked_count: 0, cost_complete: true, cache_hits: 0, saved_usd: 0, user_priced_count: 0, user_priced_usd: 0 };
   for (const item of items) {
     const r = item?.receipt;
@@ -97,6 +101,7 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
       : groupBy === "model" ? (typeof r.model === "string" && r.model ? r.model : "unknown")
       : groupBy === "tag" ? (typeof r.tags?.[tagKey] === "string" ? r.tags[tagKey] : UNTAGGED)
       : groupBy === "team" ? (teamOf.get(item.agentId) ?? NO_TEAM)
+      : groupBy === "outcome" ? (typeof r.run_id === "string" && r.run_id ? outcomeOf(item.agentId, r.run_id) : "unknown")
       : String(item.agentId ?? "unknown");
     let b = buckets.get(key);
     if (!b) {
@@ -104,6 +109,7 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
       if (groupBy === "agent") b.label = names[key] ?? key;
       buckets.set(key, b);
     }
+    if (groupBy === "outcome" && typeof r.run_id === "string" && r.run_id) runSets.get(key)?.add(`${item.agentId}:${r.run_id}`);
     const settled = item.settlement?.cost_usd;
     const cost = r.cost_usd == null ? (typeof settled === "number" && Number.isFinite(settled) ? settled : null) : r.cost_usd;
     for (const t of [b, total]) {
@@ -117,8 +123,10 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
       if (r.reason === "cache_hit") { t.cache_hits += 1; if (Number.isFinite(r.saved_usd)) t.saved_usd += r.saved_usd; }
     }
   }
-  const rows = [...buckets.values()].map((b) => ({ ...b, usd_known: round6(b.usd_known), saved_usd: round6(b.saved_usd), user_priced_usd: round6(b.user_priced_usd) }));
-  rows.sort(groupBy === "day" ? (a, b) => a.key.localeCompare(b.key) : (a, b) => b.usd_known - a.usd_known || b.unknown_count - a.unknown_count || a.key.localeCompare(b.key));
+  const rows = [...buckets.values()].map((b) => ({ ...b, usd_known: round6(b.usd_known), saved_usd: round6(b.saved_usd), user_priced_usd: round6(b.user_priced_usd),
+    ...(groupBy === "outcome" ? { runs: runSets.get(b.key)?.size ?? 0, lower_bound: !b.cost_complete } : {}) }));
+  if (groupBy === "outcome") rows.sort((a, b) => OUTCOME_BUCKETS.indexOf(a.key) - OUTCOME_BUCKETS.indexOf(b.key));
+  else rows.sort(groupBy === "day" ? (a, b) => a.key.localeCompare(b.key) : (a, b) => b.usd_known - a.usd_known || b.unknown_count - a.unknown_count || a.key.localeCompare(b.key));
   return {
     group_by: groupBy,
     ...(groupBy === "tag" ? { tag_key: tagKey } : {}),

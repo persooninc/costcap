@@ -69,7 +69,7 @@ test("list sorts newest first and skips corrupt files; runsCommand output", () =
   const out = [], warn = [];
   runsCommand(["--receipts", rp], { log: (l) => out.push(l), warn: (l) => warn.push(l) });
   assert.match(out[0], /new\s+calls=1\s+cost=unknown\s+stopped_by=killed/);
-  assert.match(out[1], /old\s+calls=1\s+cost=\$0\.1000$/);
+  assert.match(out[1], /old\s+calls=1\s+cost=\$0\.1000\s+outcome=unknown$/);
   assert.equal(warn.length, 2);
 });
 

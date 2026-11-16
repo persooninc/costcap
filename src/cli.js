@@ -23,7 +23,7 @@ import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run-summary.js";
+import { buildRunSummary, rollupLine, runsCommand, writeRunSummary, runEndRecord } from "./run-summary.js";
 import { createKillCheck, hostKillFile, kill, killStatus, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
@@ -307,19 +307,21 @@ export async function wrap(argv) {
     child.kill("SIGTERM");
     setTimeout(() => child.kill("SIGKILL"), 5000).unref();
   }, Number(process.env.COSTCAP_KILL_POLL_MS) || 500);
+  let exitSignal = null;
   const code = await new Promise((resolve) => {
-    child.on("exit", (c, sig) => resolve(killedByCostcap ? 143 : (c ?? (sig ? 1 : 0))));
+    child.on("exit", (c, sig) => { exitSignal = sig ?? null; resolve(killedByCostcap ? 143 : (c ?? (sig ? 1 : 0))); });
     child.on("error", (e) => { console.error(`costcap: failed to start ${command[0]}: ${e.message}`); resolve(127); });
   });
   clearInterval(watcher);
   if (syncTimer) clearInterval(syncTimer);
-  if (fleet) await fleet.sync({ wait: true });
+  const s = cap.spend();
+  const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
+    receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted, cacheEnabled: Boolean(cache), signal: killedByCostcap ? null : exitSignal });
+  // #225: the run-end record goes up with the final receipt sync (retried on later syncs if it fails).
+  if (fleet) { fleet.queueRunEnd(runEndRecord(summary)); await fleet.sync({ wait: true }); }
   server.closeAllConnections();
   server.close();
-  const s = cap.spend();
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
-  const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
-    receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted, cacheEnabled: Boolean(cache) });
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
   return code;

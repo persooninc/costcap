@@ -14,6 +14,7 @@ import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
+import { parseRunEnd, parseOutcomeOverride, upsertRunEnd, runOutcomeFields, outcomeSummary } from "./run-outcome.js";
 import { parseSpendQuery, spendBreakdown, spendCsv } from "./spend.js";
 import { validTags } from "../tags.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
@@ -257,6 +258,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   // Issue #123: org teams and their verdicts from synced receipts.
   const orgTeams = (s, orgId) => Object.values(s.teams ?? {}).filter((t) => t.orgId === orgId).sort((a, b) => a.name.localeCompare(b.name));
   const sweepRaises = (s) => { for (const row of expireRaises(s, now())) audit(s, row.orgId, "cap-raise-expiry", "cap_request.expire", row.agentId, { request_id: row.request_id, scope: row.scope, reason: row.reason, before: row.before, after: row.after }); };
+  // #225: run outcome lookup for an org (agent+run → success|failure|killed|unknown).
+  const outcomeLookup = (s, orgId) => (agentId, runId) => { const rec = (s.runEnds ?? {})[`${agentId}:${runId}`]; return rec && rec.orgId === orgId ? runOutcomeFields(rec).outcome : "unknown"; };
+  const withOutcome = (s, orgId, agentId, run) => { const rec = (s.runEnds ?? {})[`${agentId}:${run.run_id}`]; return { ...run, ...runOutcomeFields(rec && rec.orgId === orgId ? rec : null) }; };
+  const agentOutcomes = (s, orgId, agentId) => { const floor = now() - 30 * 86_400_000; return outcomeSummary(visibleReceipts(s, orgId).filter((i) => i.agentId === agentId && Date.parse(i.receipt?.ts) >= floor), outcomeLookup(s, orgId)); };
   const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map(costedReceipt);
   // Issue #127: org-scoped, so another org's receipts never count toward agent_spend.
   const orgAgentReceipts = (s, orgId, agentId) => Object.values(s.receipts).filter((r) => r.orgId === orgId && r.agentId === agentId).map(costedReceipt);
@@ -555,7 +560,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = member(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams, { budgetPeriod: orgPeriod(s, u.orgId), now: now() });
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
+          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId) });
         }));
       }
       // #220: Prometheus scrape endpoint. Viewer/admin cck_ keys or a member session; org-scoped.
@@ -580,7 +585,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = member(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams, { csv: true, budgetPeriod: orgPeriod(s, u.orgId), now: now() });
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendCsv(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
+          return spendCsv(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId) });
         });
         return res.writeHead(200, {
           "content-type": "text/csv; charset=utf-8",
@@ -592,7 +597,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)) })),
+          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)), outcomes: agentOutcomes(s, u.orgId, a.id) })),
             budget_period: { ...orgPeriod(s, u.orgId) },
             receipts: visibleReceipts(s, u.orgId),
             audit: labelAudit(s, u.orgId, s.audit), alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
@@ -851,6 +856,42 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(200, result);
       }
       // Issue #159: per-run drill-down. An agent token reads only its own runs; any member (viewer included) any agent in the org.
+      // #225: an enrolled wrap reports how its run ended. Idempotent by (agent_id, run_id).
+      if (path === "/v1/runs/end" && req.method === "POST") {
+        const input = parseRunEnd(body);
+        return json(200, store.transaction((s) => {
+          const a = agentUser(s, req);
+          s.runEnds ??= {};
+          const { duplicate } = upsertRunEnd(s.runEnds, { orgId: a.orgId, agentId: a.id }, input, new Date(now()).toISOString());
+          a.lastSeen = now();
+          if (!duplicate) audit(s, a.orgId, a.id, "run.end", input.run_id, { exit_code: input.exit_code, stop_reason: input.stop_reason });
+          return { run_id: input.run_id, duplicate, ...runOutcomeFields(s.runEnds[`${a.id}:${input.run_id}`]) };
+        }));
+      }
+      // #225: explicit outcome override (agent's own token, member session or org API key). Audited.
+      const outcomeRoute = /^\/v1\/agents\/([^/]+)\/runs\/([^/]+)\/outcome$/.exec(path);
+      if (outcomeRoute && req.method === "POST") {
+        const input = parseOutcomeOverride(body);
+        return json(200, store.transaction((s) => {
+          const caller = req.headers.authorization && !bearerApiKey(req) ? { agent: agentUser(s, req) } : { user: member(s, req) };
+          const orgId = caller.agent?.orgId ?? caller.user.orgId;
+          const a = s.agents[decodeURIComponent(outcomeRoute[1])];
+          if (!a || a.orgId !== orgId) fail(404, "Agent not found");
+          if (caller.agent && caller.agent.id !== a.id) fail(403, "An agent may only set its own run outcomes");
+          if (caller.user && caller.user.role === "viewer") fail(403, "Viewers cannot change run outcomes");
+          const runId = decodeURIComponent(outcomeRoute[2]);
+          const key = `${a.id}:${runId}`;
+          s.runEnds ??= {};
+          const hasReceipts = Object.values(s.receipts).some((r) => r.orgId === orgId && r.agentId === a.id && r.receipt?.run_id === runId);
+          if (!s.runEnds[key] && !hasReceipts) fail(404, "Run not found");
+          const rec = s.runEnds[key] ??= { orgId, agentId: a.id, run_end: null, received_at: null, override: null };
+          const before = runOutcomeFields(rec).outcome;
+          const actor = caller.agent?.id ?? caller.user.id;
+          rec.override = { outcome: input.outcome, note: input.note, by: actor, at: new Date(now()).toISOString() };
+          audit(s, orgId, actor, "run.outcome", a.id, { run_id: runId, before, after: input.outcome, note: input.note });
+          return { agent_id: a.id, run_id: runId, ...runOutcomeFields(rec) };
+        }));
+      }
       const runsRoute = /^\/v1\/agents\/([^/]+)\/runs(?:\/([^/]+))?$/.exec(path);
       if (runsRoute && req.method === "GET") {
         return json(200, store.read((s) => {
@@ -865,10 +906,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             const receipts = runReceipts(items, runId, { cutoff });
             if (!receipts.length) fail(404, "Run not found");
             const [run] = summarizeRuns(items.filter((item) => receipts.some((r) => r.receipt_id === item.receipt?.id)));
-            return { agent_id: a.id, run, receipts, estimate_only: true };
+            return { agent_id: a.id, run: withOutcome(s, orgId, a.id, run), receipts, estimate_only: true };
           }
           const query = parseRunsQuery(new URL(req.url, origin).searchParams);
-          return { agent_id: a.id, ...pageRuns(items, { ...query, cutoff }), estimate_only: true };
+          const page = pageRuns(items, { ...query, cutoff });
+          return { agent_id: a.id, ...page, runs: page.runs.map((r) => withOutcome(s, orgId, a.id, r)), estimate_only: true };
         }));
       }
       const budgetRoute = /^\/v1\/agents\/([^/]+)\/budget$/.exec(path);
