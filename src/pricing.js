@@ -157,7 +157,7 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false } = {}) {
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale } = {}) {
   const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
@@ -165,7 +165,9 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   if (batch && batchM === null) throw new Error(`no batch rate for provider ${batch}`);
   // Regional premium stacks with batch and long-context like batch_multiplier (#188).
   const regionalM = regional && !price.fallback ? regionalMultiplier(model) : null;
-  const multiplier = batchM === null && regionalM === null ? null : (batchM ?? 1) * (regionalM ?? 1);
+  // #189: a user discount (scale = 1 - d) stacks like batch/regional; never on the fallback rate.
+  const userM = scale !== undefined && !price.fallback ? scale : null;
+  const multiplier = batchM === null && regionalM === null && userM === null ? null : (batchM ?? 1) * (regionalM ?? 1) * (userM ?? 1);
   const pricing_tier = tiered.pricing_tier;
   const selected = tiered.rates && multiplier !== null ? scaleRates(tiered.rates, multiplier) : tiered.rates;
   const premium = pricing_tier === "fast" || pricing_tier === "priority";

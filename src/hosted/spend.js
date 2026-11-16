@@ -41,7 +41,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
   let from = since, clamped = false;
   if (cutoff !== null && cutoff !== undefined && (from === undefined || from < cutoff)) { from = cutoff; clamped = true; }
   const buckets = new Map();
-  const total = { usd_known: 0, calls: 0, unknown_count: 0, blocked_count: 0, cost_complete: true, cache_hits: 0, saved_usd: 0 };
+  const total = { usd_known: 0, calls: 0, unknown_count: 0, blocked_count: 0, cost_complete: true, cache_hits: 0, saved_usd: 0, user_priced_count: 0, user_priced_usd: 0 };
   for (const item of items) {
     const r = item?.receipt;
     const ms = Date.parse(r?.ts);
@@ -54,7 +54,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
       : String(item.agentId ?? "unknown");
     let b = buckets.get(key);
     if (!b) {
-      b = { key, usd_known: 0, calls: 0, unknown_count: 0, blocked_count: 0, cost_complete: true, cache_hits: 0, saved_usd: 0 };
+      b = { key, usd_known: 0, calls: 0, unknown_count: 0, blocked_count: 0, cost_complete: true, cache_hits: 0, saved_usd: 0, user_priced_count: 0, user_priced_usd: 0 };
       if (groupBy === "agent") b.label = names[key] ?? key;
       buckets.set(key, b);
     }
@@ -63,13 +63,15 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
     for (const t of [b, total]) {
       t.calls += 1;
       if (r.blocked === true) t.blocked_count += 1;
+      // #189: spend priced from the customer's own --upstream-prices, shown alongside.
+      if (r.cost_source === "user_prices" && typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd)) { t.user_priced_count += 1; t.user_priced_usd += r.cost_usd; }
       if (typeof cost === "number" && Number.isFinite(cost)) t.usd_known += cost;
       else { t.unknown_count += 1; t.cost_complete = false; }
       // #184: savings are reported alongside, never counted as spend.
       if (r.reason === "cache_hit") { t.cache_hits += 1; if (Number.isFinite(r.saved_usd)) t.saved_usd += r.saved_usd; }
     }
   }
-  const rows = [...buckets.values()].map((b) => ({ ...b, usd_known: round6(b.usd_known), saved_usd: round6(b.saved_usd) }));
+  const rows = [...buckets.values()].map((b) => ({ ...b, usd_known: round6(b.usd_known), saved_usd: round6(b.saved_usd), user_priced_usd: round6(b.user_priced_usd) }));
   rows.sort(groupBy === "day" ? (a, b) => a.key.localeCompare(b.key) : (a, b) => b.usd_known - a.usd_known || b.unknown_count - a.unknown_count || a.key.localeCompare(b.key));
   return {
     group_by: groupBy,
@@ -77,7 +79,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
     since: from === undefined ? null : new Date(from).toISOString(),
     until: until === undefined ? null : new Date(until).toISOString(),
     retention_clamped: clamped,
-    total: { ...total, usd_known: round6(total.usd_known), saved_usd: round6(total.saved_usd) },
+    total: { ...total, usd_known: round6(total.usd_known), saved_usd: round6(total.saved_usd), user_priced_usd: round6(total.user_priced_usd) },
     buckets: rows,
   };
 }

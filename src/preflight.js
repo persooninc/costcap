@@ -94,7 +94,7 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
   const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(priceFor && !price.table_version ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(price.user_prices || (priceFor && !price.table_version) ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
 }
 
 // Compares the estimate with the remaining run/hour/day/month budget.

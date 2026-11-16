@@ -17,6 +17,7 @@ import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResu
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
+import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
 
@@ -472,8 +473,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       provider = `u/${name}`;
     }
     // Custom upstreams price only from --upstream-prices, never the shipped table or fallback.
-    const priced = (m) => (custom ? userPrice(userPrices, provider, m) !== null : isPricedModel(m));
-    const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; } : undefined;
+    // #189: built-in routes use per-model overrides/discounts from the same file when present.
+    const priced = (m) => (custom ? userPrice(userPrices, provider, m) !== null : userPrices ? isPricedWithOverrides(userPrices, provider, m) : isPricedModel(m));
+    const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; }
+      : userPrices ? (m) => effectivePrice(userPrices, provider, m) : undefined;
     const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
     // #188: Bedrock/Vertex serve only the Anthropic Messages routes. Anything else is answered
@@ -756,12 +759,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (metered) {
             if (cloud) metered.model = cloudModel;
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
-              : costForUsage(metered.model, metered.usage, cloud ? { regional: cloudRoute.scope === "regional" } : {}));
+              : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional" })
+                : costWithOverrides(userPrices, provider, metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);
             if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
             else if (receipt.reason === "upstream_model_unpriced") failMsg = `Model ${receipt.model} on custom upstream ${provider} has no rate in --upstream-prices. Restart only after reconciling this request.`;
+            else if (receipt.reason === "user_price_unpriced") failMsg = `Model ${receipt.model} was billed for a component (cache write, long context, premium tier or non-text tokens) your --upstream-prices entry does not price. Restart only after reconciling this request.`;
             else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
             else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
             else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";
@@ -796,7 +801,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             const pending = batchId ? findPending(batchId) : null;
             if (pending && !resolvedBatches.has(batchId) && pending.provider === provider) {
               resolvedBatches.add(batchId);
-              const folded = foldBatchResults(provider, raw.toString("utf8"));
+              const folded = foldBatchResults(provider, raw.toString("utf8"), userPrices);
               receipt.batch_id = batchId;
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,

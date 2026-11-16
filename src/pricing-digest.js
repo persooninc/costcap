@@ -31,11 +31,20 @@ export function verifyTableDigest(table, recorded) {
 
 // Group receipts by their table_sha256 against the installed digest.
 // Receipts without a digest are "unknown", never counted as matching.
-export function auditReceipts(receipts, installedSha256) {
-  const out = { total: 0, matching: 0, unknown: 0, different: 0, by_digest: {}, mismatched: [] };
+// #189: user_prices receipts count in their own bucket; with pricesSha256 each must match it.
+export function auditReceipts(receipts, installedSha256, pricesSha256) {
+  const out = { total: 0, matching: 0, unknown: 0, different: 0, user_prices: 0, prices_mismatched: 0, by_digest: {}, mismatched: [] };
   receipts.forEach((r, i) => {
     if (!r || (r.table_version === undefined && r.table_sha256 === undefined && typeof r.cost_usd !== "number")) return; // priced receipts only
     out.total += 1;
+    if (r.cost_source === "user_prices") {
+      out.user_prices += 1;
+      if (pricesSha256 !== undefined && r.prices_sha256 !== pricesSha256) {
+        out.prices_mismatched += 1;
+        out.mismatched.push({ line: i + 1, prices_version: r.prices_version ?? null, prices_sha256: r.prices_sha256 ?? null, status: "prices_different" });
+      }
+      return;
+    }
     const d = r.table_sha256;
     if (typeof d !== "string" || !d) { out.unknown += 1; out.mismatched.push({ line: i + 1, table_version: r.table_version ?? null, table_sha256: null, status: "unknown" }); return; }
     if (d === installedSha256) { out.matching += 1; return; }
@@ -43,6 +52,6 @@ export function auditReceipts(receipts, installedSha256) {
     out.by_digest[d] = (out.by_digest[d] ?? 0) + 1;
     out.mismatched.push({ line: i + 1, table_version: r.table_version ?? null, table_sha256: d, status: "different" });
   });
-  out.ok = out.unknown === 0 && out.different === 0;
+  out.ok = out.unknown === 0 && out.different === 0 && out.prices_mismatched === 0;
   return out;
 }

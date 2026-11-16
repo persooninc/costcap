@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawnSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseWrapArgs } from "../src/cli.js";
@@ -611,4 +611,29 @@ test("#188 wrap: Vertex rawPredict through COSTCAP_TEST_VERTEX_UPSTREAM keeps th
   assert.deepEqual(hits, [["/v1/projects/p/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict", "Bearer ya29.x"]]);
   const row = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).find((r) => r.provider === "vertex");
   assert.deepEqual([row.model, row.endpoint_scope, row.regional_multiplier], ["claude-haiku-4-5", "global", undefined]);
+});
+
+test("#189 wrap --upstream-prices with a bad built-in entry exits 2 before spawning (AC4)", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
+  const marker = path.join(dir, "spawned");
+  for (const [i, entry] of [{ discount: 1 }, { discount: 0 }, { input: 0, output: 1 }, { input: -1, output: 1 }, { discount: 0.2, input: 1 }, { input: 1, ouput: 2 }].entries()) {
+    const f = path.join(dir, `p${i}.json`);
+    writeFileSync(f, JSON.stringify({ upstreams: { openai: { "gpt-4o": entry } } }));
+    const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--upstream-prices", f, "--", process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`], { encoding: "utf8" });
+    assert.equal(r.status, 2, JSON.stringify(entry));
+    assert.match(r.stderr, /upstream-prices/);
+  }
+  const star = path.join(dir, "star.json");
+  writeFileSync(star, JSON.stringify({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }));
+  assert.equal(spawnSync(process.execPath, ["src/cli.js", "wrap", "--upstream-prices", star, "--", process.execPath, "-e", "0"]).status, 2);
+  assert.equal(existsSync(marker), false);
+});
+
+test("#189 costcap pricing show --prices prints the discounted row (AC5)", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
+  const f = path.join(dir, "p.json");
+  writeFileSync(f, JSON.stringify({ upstreams: { anthropic: { "claude-sonnet-4-5": { discount: 0.2 } } } }));
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "claude-sonnet-4-5", "--prices", f], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\(discount 0\.2\): input \$2\.4,/);
 });

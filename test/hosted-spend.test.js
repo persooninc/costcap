@@ -144,3 +144,18 @@ test("#184 spendBreakdown reports cache_hits and saved_usd; usd_known is unchang
   const model = spendBreakdown(items, { groupBy: "model" });
   assert.deepEqual(model.buckets.map((b) => [b.key, b.cache_hits, b.saved_usd]), [["o3", 0, 0], ["gpt-4.1", 1, 0.25]]);
 });
+
+test("#189 spendBreakdown splits user_prices spend; usd_known and cost_complete unchanged", () => {
+  const ts = "2026-11-16T10:00:00Z";
+  const items = [{ agentId: "a", receipt: { ts, model: "gpt-4.1", cost_usd: 0.5, cost_source: "table" } },
+    { agentId: "a", receipt: { ts, model: "claude-sonnet-4-5", cost_usd: 0.24, cost_source: "user_prices" } },
+    { agentId: "a", receipt: { ts, model: "o3", cost_usd: null, cost_source: "user_prices", reason: "user_price_unpriced" } }];
+  const out = spendBreakdown(items, { groupBy: "day" });
+  assert.equal(out.buckets[0].user_priced_count, 1);
+  assert.equal(out.buckets[0].user_priced_usd, 0.24);
+  assert.equal(out.total.usd_known, 0.74);
+  assert.equal(out.total.cost_complete, false);
+  assert.equal(out.total.unknown_count, 1);
+  const byModel = spendBreakdown(items, { groupBy: "model" }).buckets.find((b) => b.key === "gpt-4.1");
+  assert.equal(byModel.user_priced_count, 0);
+});

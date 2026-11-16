@@ -131,6 +131,36 @@ an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere 
 and embeddings/batch/files billing on custom upstreams stay unknown. Claude on
 Bedrock and Vertex has its own built-in routes (next section).
 
+## Negotiated rates and new models
+
+The same `--upstream-prices FILE` can override the shipped table for the built-in
+providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `--upstream`:
+
+```json
+{ "version": "acme-2026-11", "upstreams": {
+  "anthropic": { "claude-sonnet-4-5": { "discount": 0.2 } },
+  "openai": { "gpt-6-preview": { "input": 3, "output": 12 }, "*": { "discount": 0.1 } } } }
+```
+
+- `{discount: d}` (0 < d < 1) scales every table component of the model (standard,
+  long context, fast/priority, modalities, batch) by `1-d`. `"*"` applies a discount to
+  every model in the table for that provider; a model-specific entry wins over it.
+- Absolute rates (`input`, `output`, optional `cached_input`, `cache_write`, `cache_write_1h`,
+  USD per 1M tokens) can price a model that isn't in the table. They price only the
+  standard text components they list.
+- **Never $0, never silently lower.** Rates must be > 0. `wrap` exits 2 before spawning on
+  a discount outside (0,1), rates mixed with a discount, an unknown key, or `"*"` with rates.
+  A discount never applies to a fallback-priced model. If a call needs a component that an
+  absolute entry doesn't list (a cache write with no rate, long context over the table
+  threshold, fast/priority, non-text tokens or a batch line), the receipt is
+  `cost_usd: null, reason: "user_price_unpriced"` and the run pauses. The table rate is never used instead.
+- Receipts record `cost_source: "user_prices"`, `prices_version`, `prices_sha256` and the
+  table pin. `--unknown-models refuse`, `--preflight` and `--models` use the same rates.
+  OpenRouter's reported `usage.cost` still wins.
+- `costcap pricing show MODEL --prices FILE` prints the effective row. `costcap pricing verify
+  --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
+  `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
+
 ## Claude on Bedrock / Vertex
 
 `costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL` and `ANTHROPIC_VERTEX_BASE_URL`, so

@@ -4,6 +4,7 @@
 // rate. Rates come only from --upstream-prices FILE; anything else is unknown (cost_usd null).
 import { readFileSync } from "node:fs";
 import { tableDigest } from "./pricing-digest.js";
+import { OVERRIDE_PROVIDERS, validateBuiltinPrices } from "./price-overrides.js";
 
 export const BUILTIN_PROVIDERS = Object.freeze(["openai", "anthropic", "openrouter", "gemini", "bedrock", "vertex"]);
 export const BUILTIN_ENV_VARS = Object.freeze(["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "OPENROUTER_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"]);
@@ -78,6 +79,8 @@ export function loadUpstreamPrices(path, names) {
     throw new Error(`--upstream-prices ${path}: expected {version, upstreams: {NAME: {MODEL: {input, output, cached_input?}}}}`);
   }
   for (const [name, models] of Object.entries(doc.upstreams)) {
+    // #189: built-in provider keys need no --upstream; they override or discount the table.
+    if (OVERRIDE_PROVIDERS.includes(name)) { validateBuiltinPrices(path, name, models); continue; }
     if (!names.includes(name)) throw new Error(`--upstream-prices ${path}: upstream "${name}" is not declared with --upstream`);
     if (!models || typeof models !== "object" || Array.isArray(models)) throw new Error(`--upstream-prices ${path}: upstreams.${name} must be an object of models`);
     for (const [model, r] of Object.entries(models)) {

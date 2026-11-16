@@ -129,3 +129,40 @@ test("Spend card: cached calls show the saved spend", async ({ page }) => {
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// #189: user_prices receipts add "$X at your prices (N receipts)" and a custom prices badge.
+test("Spend card: receipts at the customer's own prices are labelled", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-spend-userprices-e2e-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const email = "spend-userprices-e2e@example.invalid";
+    const c = await post("/auth/request", { email, turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes[email] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", {}, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "negotiated" }) }).then((r) => r.json());
+    const ts = new Date().toISOString();
+    const res = await fetch(origin + "/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ receipts: [{ id: "t1", ts, cost_usd: 0.5, cost_source: "table", model: "gpt-4.1" },
+        { id: "u1", ts, cost_usd: 0.24, cost_source: "user_prices", prices_sha256: "a".repeat(64), model: "claude-sonnet-4-5" },
+        { id: "n1", ts, cost_usd: null, reason: "stream_incomplete", model: "o3" }] }) });
+    expect(res.status).toBe(200);
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    await expect(page.locator("#spendTotal")).toContainText("$0.74 plus 1 unknown-cost receipts");
+    await expect(page.locator("#spendTotal")).toContainText("$0.24 at your prices (1 receipts)");
+    await expect(page.locator('#spendModels [data-key="claude-sonnet-4-5"] .custom-prices')).toContainText("custom prices");
+    await expect(page.locator('#spendModels [data-key="gpt-4.1"] .custom-prices')).toHaveCount(0);
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});

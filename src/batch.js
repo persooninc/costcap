@@ -3,7 +3,7 @@
 // A batch create has no usage; its cost is known only once results are read.
 // Results are priced at the provider's batch multiplier (pricing table `batch`).
 import { createUsageAccumulator } from "./proxy.js";
-import { costForUsage } from "./pricing.js";
+import { costWithOverrides } from "./price-overrides.js";
 
 const unsafe = (pathname) => /%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname);
 const pathOf = (rawUrl) => {
@@ -44,14 +44,15 @@ export function anthropicBatchModels(body) {
 
 const r6 = (n) => Number(n.toFixed(6));
 
-function priceLine(provider, body) {
+function priceLine(provider, body, userPrices) {
   const acc = createUsageAccumulator(provider, undefined);
   acc.add(body);
   const metered = acc.result();
   if (!metered || metered.toolUseUnpriced) return null;
   // A premium speed/service tier has no published batch rate: unknown, never standard.
   if (metered.usage.speed === "fast" || metered.usage.service_tier === "priority") return null;
-  const c = costForUsage(metered.model, metered.usage, { batch: provider });
+  // #189: a discount stacks on the batch multiplier; an absolute override has no batch rate (unknown).
+  const c = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider });
   if (c.fallback || c.cost_usd === null) return null;
   return c;
 }
@@ -61,7 +62,7 @@ function priceLine(provider, body) {
  * or { ok: false, reason: "batch_unpriced", line }. Any malformed, unpriced or
  * premium-speed billed line makes the whole batch unknown: never a $0 guess.
  */
-export function foldBatchResults(provider, text) {
+export function foldBatchResults(provider, text, userPrices = null) {
   let cost = 0, succeeded = 0, free = 0, n = 0;
   const lines = String(text).split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -84,7 +85,7 @@ export function foldBatchResults(provider, text) {
       if (status < 200 || status >= 300) { free++; continue; }
       billed = line.response.body;
     }
-    const c = priceLine(provider, billed);
+    const c = priceLine(provider, billed, userPrices);
     if (!c) return { ok: false, reason: "batch_unpriced", line: i + 1 };
     cost += c.cost_usd;
     succeeded++;

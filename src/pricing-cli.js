@@ -4,6 +4,8 @@
 import { readFileSync } from "node:fs";
 import { loadPricingTable } from "./pricing.js";
 import { auditReceipts } from "./pricing-digest.js";
+import { loadUpstreamPrices } from "./upstreams.js";
+import { builtinOverride, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
 
 function option(args, name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
 
@@ -11,14 +13,19 @@ function readJsonl(path) {
   return readFileSync(path, "utf8").split("\n").map((l) => { try { return l.trim() ? JSON.parse(l) : null; } catch { return null; } });
 }
 
-const fmt = (n) => (n == null ? "n/a" : `$${n}`);
+const fmt = (n) => (n == null ? "n/a" : `$${Number(n.toFixed(6))}`);
 
-export const PRICING_USAGE = "usage: costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]";
+export const PRICING_USAGE = "usage: costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--prices FILE]";
 
 export function pricingCommand(args, { tablePath } = {}) {
   const [sub, ...rest] = args;
   if (sub !== "verify" && sub !== "show") return { code: 2, out: "", err: PRICING_USAGE };
   const { table, tablePath: path, verification: v } = loadPricingTable(tablePath);
+  const pricesPath = option(rest, "--prices");
+  let prices;
+  if (pricesPath) {
+    try { prices = loadUpstreamPrices(pricesPath, []); } catch (e) { return { code: 2, out: "", err: e.message }; }
+  }
   if (sub === "verify") {
     const lines = [];
     let code = 0;
@@ -27,16 +34,17 @@ export function pricingCommand(args, { tablePath } = {}) {
     const receiptsPath = option(rest, "--receipts");
     let audit;
     if (receiptsPath) {
-      audit = auditReceipts(readJsonl(receiptsPath), v.actual);
-      lines.push(`receipts: ${audit.total} priced, ${audit.matching} matching, ${audit.different} different, ${audit.unknown} unknown (no table_sha256)`);
+      audit = auditReceipts(readJsonl(receiptsPath), v.actual, prices?.sha256);
+      lines.push(`receipts: ${audit.total} priced, ${audit.matching} matching, ${audit.different} different, ${audit.unknown} unknown (no table_sha256), ${audit.user_prices} user_prices${prices ? ` (${audit.prices_mismatched} not matching ${pricesPath})` : ""}`);
       for (const [d, n] of Object.entries(audit.by_digest)) lines.push(`  different digest ${d}: ${n}`);
-      for (const m of audit.mismatched) lines.push(`  line ${m.line}: ${m.status} (table_version ${m.table_version ?? "none"}, table_sha256 ${m.table_sha256 ?? "none"})`);
+      for (const m of audit.mismatched) lines.push(m.status === "prices_different" ? `  line ${m.line}: prices_different (prices_version ${m.prices_version ?? "none"}, prices_sha256 ${m.prices_sha256 ?? "none"})`
+        : `  line ${m.line}: ${m.status} (table_version ${m.table_version ?? "none"}, table_sha256 ${m.table_sha256 ?? "none"})`);
       if (!audit.ok) code = 1;
     }
     if (rest.includes("--json")) return { code, out: JSON.stringify({ ok: code === 0, table: { path, version: table.version, ...v }, ...(audit ? { receipts: audit } : {}) }), err: "" };
     return { code, out: code === 0 ? lines.join("\n") : "", err: code === 0 ? "" : lines.join("\n") };
   }
-  const model = rest.find((a) => !a.startsWith("--"));
+  const model = rest.find((a, i) => !a.startsWith("--") && rest[i - 1] !== "--prices");
   const head = `pricing table ${table.version} (${table.currency}) sha256 ${v.actual}${v.ok ? "" : " UNVERIFIED"}`;
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
   // A long-context tier (#151) prints as a second row for the same model.
@@ -50,6 +58,16 @@ export function pricingCommand(args, { tablePath } = {}) {
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
+  }
+  // #189: with --prices, the effective row for the first built-in provider that overrides the model.
+  // A model-specific entry wins over another provider's "*" discount.
+  const listed = (p) => [model, model.replace(/-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/, "")].some((id) => Object.hasOwn(prices.upstreams[p] ?? {}, id));
+  const provider = prices && (OVERRIDE_PROVIDERS.find(listed) ?? OVERRIDE_PROVIDERS.find((p) => builtinOverride(prices, p, model)));
+  if (provider) {
+    const o = builtinOverride(prices, provider, model);
+    const tag = o.absolute ? ` (user_prices ${prices.sha256.slice(0, 8)})` : ` (discount ${o.discount})`;
+    const eff = effectivePrice(prices, provider, model);
+    return { code: 0, out: [head, ...(o.absolute ? [row(`${provider}/${model}`, eff, tag)] : rowsFor(`${provider}/${model}`, eff).map((l, i) => (i === 0 ? l.replace(":", `${tag}:`) : l)))].join("\n"), err: "" };
   }
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const entry = table.models[model] ?? table.models[base];

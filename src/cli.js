@@ -43,7 +43,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] 
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
   "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--json] [--export csv]\n" +
-  "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
+  "       costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--prices FILE]\n" +
   "       costcap kill [note] [--host] [--kill-file FILE] [--receipts FILE] | costcap kill --status | costcap resume [--host] [--kill-file FILE] [--receipts FILE]\n" +
   "       (--host uses $COSTCAP_HOME/KILL, default ~/.costcap/KILL, and freezes every wrapped agent on this machine)\n" +
   "       costcap --version | costcap --help";
