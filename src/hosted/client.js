@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
-import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict } from "./teams.js";
+import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -122,6 +122,17 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       if (!data.agentSpend) return null;
       const synced = new Set(data.syncedIds ?? []);
       return cachedAgentVerdict(data.agentSpend, policy().caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+    },
+    // #195: fleet agent / hosted team remainders for --preflight.
+    preflightRemaining(nowMs = Date.now()) {
+      if (!data.agentSpend && !data.team) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      return {
+        agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy().caps, pending, nowMs) : null,
+        team: data.team ? cachedTeamRemaining(data.team, pending, nowMs) : null,
+        teamName: data.team?.name ?? null,
+      };
     },
     revoked: () => revoked,
     // wait: true (used at exit) waits for an in-flight sync, then runs a fresh one,

@@ -1,3 +1,4 @@
+import { teamScope } from "./hosted/teams.js";
 // Local, post-response metering. Only proxy-routed traffic is covered.
 // Requests are serialized per proxy, so the next decision sees prior usage.
 // A request already accepted by a provider can exceed the remaining budget.
@@ -400,7 +401,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -641,6 +642,19 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
                   message: `CostCap preflight estimate: worst case $${est} does not fit this agent's remaining ${agentScope} budget ($${detail.remaining_usd}). This is an estimate. The upstream call was not made.` });
+              }
+              // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
+              const fr = fleetRemaining?.();
+              for (const [kind, left] of [["agent", fr?.agent], ["team", fr?.team]]) {
+                const sc = left && ["day", "month"].find((x) => left[x] != null && est > left[x]);
+                if (!sc) continue;
+                const isTeam = kind === "team";
+                const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, fleet: true,
+                  scope: isTeam ? teamScope(fr.teamName, sc) : sc, estimate_usd: est, remaining_usd: left[sc],
+                  ...(isTeam ? { team: fr.teamName } : {}), ...who };
+                const what = isTeam ? `team "${fr.teamName}"` : "fleet agent";
+                return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
+                  message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.` });
               }
               const tagPf = tagCaps?.preflight?.(reqTags, est);
               if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));

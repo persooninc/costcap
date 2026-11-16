@@ -247,7 +247,10 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   **estimated** worst case cannot fit the remaining run/day/month budget, before
   any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
   It also covers `--policy` agent and team budgets (the tighter remainder) and
-  every matching `--tag-cap` (`tag_budget_exceeded`).
+  every matching `--tag-cap` (`tag_budget_exceeded`). With `--enrollment` it also
+  covers the enrolled fleet agent day/month caps and the hosted team budget,
+  against fleet-wide synced spend plus this host's unsynced receipts
+  (`fleet: true`, and `team` for a team budget).
   It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
   tokens = `max_tokens` (or `max_completion_tokens`, Gemini
   `generationConfig.maxOutputTokens`), else a conservative provider default,

@@ -177,3 +177,22 @@ export function cachedAgentVerdict(spend, caps, pending, nowMs) {
   }
   return null;
 }
+
+// Issue #195: what is left of each capped window for --preflight. Pure.
+// Returns { day, month } (null = no cap on that window), or null when nothing applies.
+// Unknown-cost receipts make the verdict functions refuse already; here they add 0.
+function cachedRemaining(entry, caps, pending, nowMs) {
+  if (!entry || !TEAM_SCOPES.some((s) => caps?.[s] != null)) return null;
+  const { total } = cachedTotals(entry, pending, nowMs);
+  const left = {};
+  for (const s of TEAM_SCOPES) left[s] = caps[s] == null ? null : round6(Math.max(0, caps[s] - total[s]));
+  return left;
+}
+
+export function cachedAgentRemaining(spend, caps, pending, nowMs) {
+  return cachedRemaining(spend, caps, pending, nowMs);
+}
+
+export function cachedTeamRemaining(team, pending, nowMs) {
+  return team ? cachedRemaining(team, team.caps, pending, nowMs) : null;
+}
