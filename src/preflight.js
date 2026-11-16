@@ -5,7 +5,7 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
-import { lookupPrice, selectTier, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+import { lookupPrice, selectRates, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // Conservative default output ceilings when the request sets no limit.
 export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, gemini: 65_536 };
@@ -59,7 +59,10 @@ export function estimateWorstCase(provider, body, path = "") {
   const mult = outputMultiplier(provider, req);
   const output_tokens = out.tokens * mult.multiplier;
   // Long-context tier (#151): a prompt estimated over the threshold budgets at the higher rates.
-  const { pricing_tier, rates } = selectTier(price, input_tokens);
+  // Premium speed / service tier (#155): fast or priority requests budget at premium rates.
+  const signal = { ...(typeof req.speed === "string" && { speed: req.speed }), ...(typeof req.service_tier === "string" && { service_tier: req.service_tier }) };
+  const { pricing_tier, rates } = selectRates(price, input_tokens, signal);
+  if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
   const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
   return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
@@ -70,7 +73,7 @@ export function estimateWorstCase(provider, body, path = "") {
 // receives the estimate of a call that fits (for the allowed-call receipt).
 export function preflightCheck(cap, provider, body, path, onFit) {
   const est = estimateWorstCase(provider, body, path);
-  if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model };
+  if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {

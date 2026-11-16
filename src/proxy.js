@@ -62,6 +62,7 @@ const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
   let usage = {};
+  const signal = {};
   // OpenAI Responses API streams nest model/usage under `response` and end with
   // a terminal event (response.completed / response.incomplete / response.failed).
   let responsesStream = false, responsesTerminal = false;
@@ -109,9 +110,13 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
         }
         if (u.output_tokens != null) usage.output_tokens = u.output_tokens;
         if (u.cache_read_input_tokens != null) usage.cached_input_tokens = u.cache_read_input_tokens;
+        // Fast mode (#155): usage.speed may arrive on message_start or message_delta.
+        if (typeof u.speed === "string") signal.speed = u.speed;
       }
     } else {
       const u = chunk.usage;
+      // Priority processing (#155): top-level service_tier on chat bodies, stream chunks and Responses objects.
+      if (typeof chunk.service_tier === "string") signal.service_tier = chunk.service_tier;
       if (provider === "openrouter" && u && typeof u === "object") {
         providerCost = typeof u.cost === "number" && Number.isFinite(u.cost) && u.cost >= 0 ? u.cost : undefined;
       }
@@ -132,7 +137,7 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
-    return { model, usage: { ...usage }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
+    return { model, usage: { ...usage, ...signal }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A Responses stream that never reached a terminal event is incomplete.
   return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
@@ -373,6 +378,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             cap?.record(receipt);
             if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.reason === "service_tier_unpriced") accountingFailure = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
             else if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);
           } else if (streamCut || sseIncomplete) {

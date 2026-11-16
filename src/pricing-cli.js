@@ -40,7 +40,9 @@ export function pricingCommand(args, { tablePath } = {}) {
   const head = `pricing table ${table.version} (${table.currency}) sha256 ${v.actual}${v.ok ? "" : " UNVERIFIED"}`;
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
   // A long-context tier (#151) prints as a second row for the same model.
-  const rowsFor = (name, r) => [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : [])];
+  // Premium speed / service tiers (#155) print as (fast) / (priority) rows.
+  const rowsFor = (name, r) => [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
+    ...["fast", "priority"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`))];
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };

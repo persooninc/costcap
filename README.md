@@ -147,6 +147,19 @@ traffic bypasses CostCap.
   (otherwise `"standard"`). Preflight and `costcap pricing show` use the same
   tier. Check `src/pricing-table.json` before
   relying on rates.
+- Premium speed tiers: Anthropic fast mode (response `usage.speed: "fast"`,
+  Claude Opus 5.5 at $8/$40 per M, Claude Opus 5 at $10/$50) and OpenAI priority processing
+  (`service_tier: "priority"`, gpt-4o at $4.25/$17, gpt-4o-mini at $0.25/$1) are
+  priced at the table's `fast` / `priority` rates. The receipt records
+  `pricing_tier: "fast" | "priority"` plus the raw `speed` / `service_tier`.
+  These rates count toward caps and the velocity breaker. `default` and `flex` tiers are priced at
+  standard (flex over-counts, which is the safe direction), and the value is recorded. A premium
+  tier on a model with no published premium rate, including fallback models and cache
+  components with no premium rate, is never priced at standard: the receipt has
+  `cost_usd: null` and `reason: "service_tier_unpriced"`, and the next call gets
+  `accounting_unavailable`. `--preflight` reads `speed` / `service_tier` from
+  the request body and estimates at premium rates (`preflight_unpriced` when
+  no premium rate exists). `costcap pricing show` prints `(fast)` and `(priority)` rows.
 - OpenAI embeddings (`POST /openai/v1/embeddings`, exact path) are metered
   input-only: `text-embedding-3-small` ($0.02/M), `text-embedding-3-large`
   ($0.13/M) and `text-embedding-ada-002` ($0.10/M), with `output_tokens: 0`.

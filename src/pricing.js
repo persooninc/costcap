@@ -67,12 +67,37 @@ export function selectTier(price, prompt_tokens) {
   return { pricing_tier: "standard", rates: price };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0 } = {}) {
+// Premium speed / service tiers (#155): Anthropic fast mode reports usage.speed "fast";
+// OpenAI priority processing reports service_tier "priority". Other values
+// ("standard", "default", "flex", "auto", ...) price at standard and are only recorded.
+export function premiumTier({ speed, service_tier } = {}) {
+  if (speed === "fast") return "fast";
+  if (service_tier === "priority") return "priority";
+  return null;
+}
+
+// Rates for a call: a premium tier uses the model's published premium rate set and
+// never falls back to standard; a model (or fallback) without one is unpriced.
+export function selectRates(price, prompt_tokens, signal = {}) {
+  const premium = premiumTier(signal);
+  if (!premium) return selectTier(price, prompt_tokens);
+  const rates = price?.fallback ? null : price?.[premium];
+  if (!rates || !Number.isFinite(rates.input) || !Number.isFinite(rates.output)) return { pricing_tier: premium, rates: null };
+  return { pricing_tier: premium, rates };
+}
+
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}) {
   const price = lookupPrice(model);
-  const { pricing_tier, rates } = selectTier(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }));
+  const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
+  const { pricing_tier, rates: selected } = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
+  const premium = pricing_tier === "fast" || pricing_tier === "priority";
+  const rates = selected ?? {};
+  // A premium tier, or a cache component of it, with no published rate is unpriced: never standard.
+  const tierUnpriced = premium && (!selected || (cached_input_tokens > 0 && rates.cached_input == null) ||
+    (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null));
   // A cache write with no published rate is unpriced, not guessed at another rate.
-  const unpriced = (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
-  const cost =
+  const unpriced = tierUnpriced || (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
+  const cost = unpriced ? 0 :
     (input_tokens * rates.input +
       cached_input_tokens * rates.cached_input +
       cache_write_input_tokens * (rates.cache_write ?? 0) +
@@ -81,13 +106,15 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   return {
     model,
     cost_usd: unpriced ? null : Number(cost.toFixed(6)),
-    ...(unpriced ? { reason: pricing_tier === "long_context" ? "long_context_cache_write_unpriced" : "cache_write_unpriced" } : {}),
+    ...(unpriced ? { reason: tierUnpriced ? "service_tier_unpriced" : pricing_tier === "long_context" ? "long_context_cache_write_unpriced" : "cache_write_unpriced" } : {}),
     input_tokens,
     output_tokens,
     cached_input_tokens,
     cache_write_input_tokens,
     cache_write_1h_input_tokens,
     pricing_tier,
+    ...(signal.speed !== undefined && { speed: signal.speed }),
+    ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
     table_version: price.table_version,
     table_sha256: price.table_sha256,
     fallback: price.fallback,

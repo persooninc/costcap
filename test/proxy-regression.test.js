@@ -394,3 +394,15 @@ test("#148 AC4: a usage.cost on /openai is ignored; table pricing applies", asyn
     assert.equal(extractUsage(p, JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1, cost: 9 }, usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, cost: 9 } })).providerCost, undefined);
   }
 });
+
+test("#155 standard receipts unchanged: no speed/service_tier keys, pricing_tier standard", async (t) => {
+  const receipts = [];
+  const call = await fixture(t, (req, res) => { req.resume(); req.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1000, completion_tokens: 100 } }))); }, { onReceipt: (r) => receipts.push(r) });
+  assert.equal((await call()).status, 200);
+  await new Promise((r) => setImmediate(r));
+  const r = receipts[0];
+  assert.equal(r.pricing_tier, "standard");
+  assert.equal(r.cost_usd, Number(((1000 * 0.15 + 100 * 0.6) / 1e6).toFixed(6)));
+  assert.ok(!("speed" in r) && !("service_tier" in r) && !("reason" in r));
+  assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100 }), { ...costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100, speed: undefined }) });
+});

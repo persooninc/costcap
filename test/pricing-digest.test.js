@@ -193,5 +193,16 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.1");
+  assert.equal(TABLE_VERSION, "2026-11-16.2");
+});
+
+test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
+  const t = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
+  const tiers = Object.entries(t.models).flatMap(([m, r]) => ["fast", "priority"].filter((k) => r[k]).map((k) => [m, r, r[k]]));
+  assert.ok(tiers.length >= 4);
+  for (const [m, std, p] of tiers) {
+    for (const k of ["input", "cached_input", "output"]) assert.ok(Number.isFinite(p[k]) && p[k] > std[k], `${m} ${k}`);
+    for (const k of ["cache_write", "cache_write_1h"]) if (p[k] != null) assert.ok(p[k] > std[k], `${m} ${k}`);
+  }
+  assert.ok(t.sources.includes("https://platform.claude.com/docs/en/build-with-claude/fast-mode"));
 });
