@@ -139,3 +139,14 @@ test("apply contacts the host only when the key and commit are present", () => {
   assert.equal(applyDeploy({ host: "deploy@example", key: marker, sha, cwd: repo, run: refuse, knownHostsPath }), 4);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("apex costcap.dev serves /pricing directly instead of redirecting (costcap#141)", () => {
+  const text = readFileSync(join(repo, "compose.production.yaml"), "utf8");
+  const label = (k) => text.match(new RegExp(`traefik\\.http\\.routers\\.cc-apex-pricing\\.${k.replace(/\./g, "\\.")}=(.*)`))?.[1]?.trim();
+  assert.match(label("rule"), /Host\(`costcap\.dev`\)/);
+  assert.match(label("rule"), /Path\(`\/pricing`\)/);
+  assert.equal(label("service"), "cc");
+  assert.equal(label("entryPoints"), "https");
+  assert.ok(Number(label("priority")) > 100, "must outrank the apex redirect router");
+  assert.doesNotMatch(label("middlewares"), /cc-apex/);
+});

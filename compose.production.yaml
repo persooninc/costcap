@@ -59,6 +59,14 @@ services:
       - traefik.http.routers.cc-apex-https.tls.certresolver=letsencrypt
       - traefik.http.routers.cc-apex-https.middlewares=cc-apex
       - traefik.http.routers.cc-apex-https.service=cc
+      # costcap#141: the apex serves /pricing itself (200, no redirect); everything else still 308s to app.
+      - traefik.http.routers.cc-apex-pricing.entryPoints=https
+      - traefik.http.routers.cc-apex-pricing.rule=(Host(`costcap.dev`) || Host(`www.costcap.dev`)) && Path(`/pricing`)
+      - traefik.http.routers.cc-apex-pricing.priority=1000
+      - traefik.http.routers.cc-apex-pricing.tls=true
+      - traefik.http.routers.cc-apex-pricing.tls.certresolver=letsencrypt
+      - traefik.http.routers.cc-apex-pricing.middlewares=gzip
+      - traefik.http.routers.cc-apex-pricing.service=cc
     deploy:
       replicas: 1
 networks:
