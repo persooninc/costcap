@@ -37,11 +37,26 @@ export function assertTableIntegrity() {
   if (!loaded.verification.ok) throw new Error(integrityError());
 }
 
+// Snapshot suffixes: OpenAI -YYYY-MM-DD (gpt-4.1-2025-04-14), Anthropic -YYYYMMDD
+// (claude-sonnet-4-5-20250929). Only the date suffix is stripped and the remaining
+// id must match exactly, so gpt-5-mini-<date> resolves to gpt-5-mini, never gpt-5.
+const SNAPSHOT_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/;
+// Provider-prefixed ids (OpenRouter style) not in the table fall back to the
+// first-party id, which carries the same list rates for these providers.
+const FIRST_PARTY_PREFIX = /^(?:anthropic|openai)\//;
+
+function resolveEntry(model) {
+  if (typeof model !== "string") return undefined;
+  const base = model.replace(SNAPSHOT_SUFFIX, "");
+  const candidates = [model, base];
+  if (FIRST_PARTY_PREFIX.test(base)) candidates.push(base.replace(FIRST_PARTY_PREFIX, ""));
+  for (const id of candidates) if (Object.hasOwn(table.models, id)) return table.models[id];
+  return undefined;
+}
+
 export function lookupPrice(model) {
   assertTableIntegrity();
-  // OpenAI returns dated snapshot ids (gpt-4o-mini-2024-07-18); price them as their base model.
-  const base = typeof model === "string" ? model.replace(/-\d{4}-\d{2}-\d{2}$/, "") : model;
-  const entry = table.models[model] ?? table.models[base];
+  const entry = resolveEntry(model);
   const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
   if (entry) return { model, ...entry, ...pin, fallback: false };
   return { model, ...table.fallback, ...pin, fallback: true };
