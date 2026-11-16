@@ -141,7 +141,10 @@ export async function wrap(argv) {
   let cap, agentBudgets;
   let proxySettle = () => {}; // #171: bound once the proxy is listening
   // #176: fleet and shared-ledger settlements share one helper (batch_pending aware).
-  const settleReceipt = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle });
+  // #178: settlements of this run's receipts also feed the run summary.
+  const runSettlements = [];
+  const settleReceipt = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle,
+    onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); } });
   const sharedLedger = shared ? openSharedLedger(receiptsPath, {
     onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); },
     // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
@@ -151,7 +154,7 @@ export async function wrap(argv) {
   const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
-  cap = createCapEngine({ caps, history });
+  cap = createCapEngine({ caps, history, runId: who.run_id });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -216,7 +219,7 @@ export async function wrap(argv) {
   const s = cap.spend();
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
   const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
-    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted });
+    receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted });
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
   return code;

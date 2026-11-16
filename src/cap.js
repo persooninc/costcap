@@ -59,7 +59,9 @@ export const HOUR_MS = 60 * 60 * 1000;
 
 // caps: { run, hour, day, month } in USD; any may be undefined.
 // hour (#172) is a rolling window: spend with now - 60min < ts <= now. It never latches.
-export function createCapEngine({ caps = {}, history = [], now = () => new Date() } = {}) {
+// runId (#178): this wrapper's run id; a settlement of a receipt with that run_id
+// also counts toward the run cap.
+export function createCapEngine({ caps = {}, history = [], now = () => new Date(), runId = null } = {}) {
   for (const scope of CAP_SCOPES) {
     if (caps[scope] != null && (!Number.isFinite(caps[scope]) || caps[scope] <= 0)) throw new Error(`Invalid ${scope} cap`);
   }
@@ -67,6 +69,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     if (!Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) throw new Error("Invalid receipt history; reconcile before running");
   }
   let run = 0;
+  const settledIds = new Set();
   // A pending batch (#160) is unknown until its results settle it, but it does not
   // stop synchronous calls: its cost arrives through a batch_results settlement.
   let unknown = history.filter((r) => r.cost_usd === null && !isPendingBatch(r)).length;
@@ -119,6 +122,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   }
 
   return {
+    runId,
     spend,
     limits: () => ({ ...caps }),
     updateCaps(next) {
@@ -146,10 +150,15 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       return null;
     },
     // Issue #162: a hosted settlement of an unknown-cost receipt this engine already
-    // counted as unknown. The cost lands in the receipt's original day/month.
+    // counted as unknown. The cost lands in the receipt's original day/month, and
+    // in run when the receipt belongs to this wrapper's run (#178). Each receipt id
+    // settles once.
     settle(receipt) {
       if (unknown <= 0 || typeof receipt?.cost_usd !== "number" || !Number.isFinite(receipt.cost_usd) || receipt.cost_usd < 0) return false;
+      const id = receipt.receipt_id ?? receipt.id;
+      if (typeof id === "string" && id) { if (settledIds.has(id)) return false; settledIds.add(id); }
       unknown -= 1;
+      if (runId != null && receipt.run_id === runId) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);
       return true;
     },

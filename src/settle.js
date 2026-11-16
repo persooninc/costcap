@@ -3,7 +3,8 @@
 // receipt was never counted as unknown, so its settled cost is recorded on the
 // cap engine (receipt's original ts) instead of decrementing the unknown count,
 // which belongs to some other receipt. Each receipt id settles at most once.
-export function createSettler({ cap, agentBudgets, proxySettle } = {}) {
+// onSettled (#178) sees each applied settlement, e.g. for the run summary.
+export function createSettler({ cap, agentBudgets, proxySettle, onSettled = () => {} } = {}) {
   const done = new Set();
   return (settlement, receipt = settlement) => {
     const id = settlement?.receipt_id ?? settlement?.id ?? receipt?.id;
@@ -12,10 +13,12 @@ export function createSettler({ cap, agentBudgets, proxySettle } = {}) {
     done.add(id);
     const r = cap();
     // Fleet passes the receipt with its settled cost already merged, so test reason only.
-    if (receipt?.reason === "batch_pending") r?.record({ ts: receipt.ts, cost_usd: cost }, { external: true });
+    // #178: a settled batch of this wrapper's own run also counts toward run.
+    if (receipt?.reason === "batch_pending") r?.record({ ts: receipt.ts, cost_usd: cost }, { external: !(r.runId != null && receipt.run_id === r.runId) });
     else r?.settle({ ...receipt, cost_usd: cost });
     agentBudgets()?.settle?.({ receipt_id: id, cost_usd: cost });
     proxySettle()?.({ receipt_id: id, batch_id: receipt?.batch_id ?? null });
+    onSettled({ event: "reconciliation", receipt_id: id, cost_usd: cost, run_id: receipt?.run_id ?? null });
     return true;
   };
 }

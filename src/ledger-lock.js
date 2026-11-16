@@ -91,7 +91,8 @@ function breakStale(lock, host) {
 // wrapper appended since this wrapper last looked (never for its own).
 // onExternalSettle(settlement, receipt) (#174) is called once when a later chunk
 // settles an unknown-cost receipt (incl. batch_pending) this wrapper folded in
-// from the ledger; settlements of its own or already-costed receipts are ignored.
+// from the ledger or wrote itself and passed to track() (#178); settlements of
+// already-costed or untracked receipts are ignored.
 export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, timeoutMs } = {}) {
   mkdirSync(dirname(path), { recursive: true });
   const dir = `${path}.shared`;
@@ -156,6 +157,9 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
         return out;
       } finally { release(); }
     },
+    // #178: track this wrapper's own unknown-cost receipt so a later
+    // reconcile --apply from another process settles it via onExternalSettle.
+    track(r) { if (r?.cost_usd === null && typeof r.id === "string") unknown.set(r.id, r); },
     close: unregister,
   };
 }

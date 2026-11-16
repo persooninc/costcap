@@ -368,6 +368,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
+    sharedLedger?.track?.(complete);
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
