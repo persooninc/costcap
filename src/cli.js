@@ -129,7 +129,8 @@ export async function wrap(argv) {
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
-  const who = agentId ? { agent_id: agentId, run_id: runId ?? randomUUID() } : {};
+  // #170: every receipt carries run_id, with or without --agent.
+  const who = { ...(agentId ? { agent_id: agentId } : {}), run_id: runId ?? randomUUID() };
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
   let cap, agentBudgets;
   const sharedLedger = shared ? openSharedLedger(receiptsPath, { onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); } }) : null;
@@ -160,7 +161,7 @@ export async function wrap(argv) {
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const runReceipts = [];
-  const summaryRunId = who.run_id ?? randomUUID();
+  const summaryRunId = who.run_id;
   const startedAt = new Date().toISOString();
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
