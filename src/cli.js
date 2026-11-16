@@ -18,6 +18,7 @@ import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
 import { agentBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run-summary.js";
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
@@ -27,6 +28,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
+  "       costcap runs [--json] [--receipts FILE]\n" +
   "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
 
@@ -115,7 +117,10 @@ export async function wrap(argv) {
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
+  const runReceipts = [];
+  const summaryRunId = who.run_id ?? randomUUID();
+  const startedAt = new Date().toISOString();
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
@@ -144,6 +149,10 @@ export async function wrap(argv) {
   server.close();
   const s = cap.spend();
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
+  const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
+    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap });
+  try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
+  console.error(rollupLine(summary));
   return code;
   } finally { release(); }
 }
@@ -191,6 +200,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.log(JSON.stringify(result));
       process.exitCode = result.ok ? 0 : 1;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
+  } else if (cmd === "runs") {
+    runsCommand(rest);
   } else if (cmd === "kill" || cmd === "resume") {
     const { file, receipts, words } = parseKillArgs(rest);
     const logEvent = (note) => {

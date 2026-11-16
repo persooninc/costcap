@@ -51,6 +51,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
 
   return {
     spend,
+    limits: () => ({ ...caps }),
     updateCaps(next) {
       for (const scope of ["run", "day", "month"]) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
       caps = { ...next };
