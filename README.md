@@ -247,6 +247,17 @@ follows a provider redirect, so your API key is not sent to another host. A 3xx
 returns 502 `upstream_redirect` to the client, with a $0 receipt because nothing
 was generated.
 
+Provider-side tools are never silently free. Anthropic `server_tool_use`
+requests (for example `web_search_requests`) and OpenAI Responses
+`web_search_call` / `file_search_call` items are billed per call at rates the
+pricing table does not carry, so the call is recorded as `cost_usd: null`,
+`reason: "tool_use_unpriced"`, and the run pauses until you reconcile it. Gemini
+`toolUsePromptTokenCount` is counted as input tokens. The free token-count
+endpoints (`POST /anthropic/v1/messages/count_tokens`, Gemini
+`models/<model>:countTokens`, `POST /openai/v1/responses/input_tokens`) record a
+$0 `non_billable_request` on 2xx and do not pause. Only these exact paths are
+exempt; dot segments or percent-encoded paths are not.
+
 Team budgets share one cap across a group of agents:
 `"teams": { "ops": { "agents": ["release-bot", "triage-bot"], "day": 30, "month": 400 } }`.
 Each agent's own cap applies first, then the team's summed spend. A team cap

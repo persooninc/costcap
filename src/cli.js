@@ -124,7 +124,7 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM]].filter(([, v]) => v));
+  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM]].filter(([, v]) => v));
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const runReceipts = [];

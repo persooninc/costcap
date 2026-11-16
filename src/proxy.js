@@ -27,6 +27,22 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   return lines;
 }
 
+const UNPRICED_RESPONSES_ITEMS = new Set(["web_search_call", "file_search_call"]);
+
+// Free token-count endpoints (exact paths only). Checked against the raw request
+// path so dot segments or percent-encoding can never reach the allowlist.
+const COUNT_TOKENS_PATHS = [
+  /^\/anthropic\/v1\/messages\/count_tokens$/,
+  /^\/openai\/v1\/responses\/input_tokens$/,
+  /^\/gemini\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*:countTokens$/,
+];
+export function isCountTokensPath(rawUrl) {
+  if (typeof rawUrl !== "string") return false;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
+  return COUNT_TOKENS_PATHS.some((re) => re.test(pathname));
+}
+
 const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
@@ -36,12 +52,21 @@ export function createUsageAccumulator(provider, requestedModel) {
   // OpenAI Responses API streams nest model/usage under `response` and end with
   // a terminal event (response.completed / response.incomplete / response.failed).
   let responsesStream = false, responsesTerminal = false;
+  // Provider-side tools billed per request/call have no published rate in the table: never priced as $0.
+  let toolUseUnpriced = false;
+  const noteResponsesItems = (items) => {
+    if (Array.isArray(items) && items.some((it) => it && UNPRICED_RESPONSES_ITEMS.has(it.type))) toolUseUnpriced = true;
+  };
   const add = (chunk) => {
     if (!chunk || typeof chunk !== "object") return;
+    if (provider !== "anthropic" && provider !== "gemini") {
+      noteResponsesItems(chunk.output);
+      if (chunk.item) noteResponsesItems([chunk.item]);
+    }
     if (provider !== "anthropic" && provider !== "gemini" && typeof chunk.type === "string" && chunk.type.startsWith("response.")) {
       responsesStream = true;
       if (/^response\.(completed|incomplete|failed)$/.test(chunk.type)) responsesTerminal = true;
-      if (chunk.response && typeof chunk.response === "object") chunk = chunk.response;
+      if (chunk.response && typeof chunk.response === "object") { chunk = chunk.response; noteResponsesItems(chunk.output); }
       else return;
     }
     if (chunk.model || chunk.modelVersion || chunk.message?.model) model = chunk.model ?? chunk.modelVersion ?? chunk.message.model;
@@ -49,13 +74,16 @@ export function createUsageAccumulator(provider, requestedModel) {
       const u = chunk.usageMetadata;
       // Known only with both required counters; {} or partial shapes are unpriceable (never $0).
       if (u && !(isCount(u.promptTokenCount) && isCount(u.candidatesTokenCount))) usage = { unpriceable: NaN };
-      else if (u) usage = { input_tokens: (u.promptTokenCount ?? 0) - (u.cachedContentTokenCount ?? 0),
+      // toolUsePromptTokenCount (tool results fed back to the model) is billed as input.
+      else if (u) usage = { input_tokens: (u.promptTokenCount ?? 0) + (isCount(u.toolUsePromptTokenCount) ? u.toolUsePromptTokenCount : 0) - (u.cachedContentTokenCount ?? 0),
         cached_input_tokens: u.cachedContentTokenCount ?? 0,
         output_tokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0) };
     } else if (provider === "anthropic") {
       // message_start contains input usage; message_delta carries final output.
       const u = chunk.usage ?? chunk.message?.usage;
       if (u) {
+        const stu = u.server_tool_use;
+        if (stu && typeof stu === "object" && Object.entries(stu).some(([k, v]) => k.endsWith("_requests") && typeof v === "number" && v > 0)) toolUseUnpriced = true;
         if (u.input_tokens != null) usage.input_tokens = u.input_tokens;
         if (u.cache_creation_input_tokens != null) {
           // Without the 5m/1h breakdown every write is priced at the 5-minute rate.
@@ -80,7 +108,7 @@ export function createUsageAccumulator(provider, requestedModel) {
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
-    return { model, usage: { ...usage } };
+    return { model, usage: { ...usage }, ...(toolUseUnpriced && { toolUseUnpriced: true }) };
   };
   // A Responses stream that never reached a terminal event is incomplete.
   return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
@@ -278,8 +306,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           res.off("close", onClientClose);
           if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
+            if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             cap?.record(receipt);
-            if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
+            if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);
           } else if (streamCut || sseIncomplete) {
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
@@ -288,8 +318,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
-          } else if (raw && ["GET", "HEAD"].includes(req.method)) {
-            // Metadata reads (models list/retrieve) never generate tokens.
+          } else if (raw && (["GET", "HEAD"].includes(req.method) ||
+            (req.method === "POST" && upstreamRes.status >= 200 && upstreamRes.status < 300 && isCountTokensPath(req.url)))) {
+            // Metadata reads (models list/retrieve) and token-count endpoints never generate tokens.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.

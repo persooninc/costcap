@@ -4,7 +4,8 @@ import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractUsage, isProviderError, startMeteringProxy } from "../src/proxy.js";
+import { extractUsage, isCountTokensPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
+import { costForUsage } from "../src/pricing.js";
 import { createCapEngine } from "../src/cap.js";
 
 async function fixture(t, handler, options = {}) {
@@ -246,4 +247,75 @@ test("#138 anthropic usage needs both input and output counters", () => {
   assert.equal(extractUsage("anthropic", '[{"type":"message_delta","usage":{"output_tokens":7}}]'), null);
   const known = extractUsage("anthropic", '{"model":"claude-x","usage":{"input_tokens":0,"output_tokens":0}}');
   assert.deepEqual(known.usage, { input_tokens: 0, output_tokens: 0 });
+});
+
+// #142: provider tool billing is never silently free; count-tokens calls don't pause.
+test("#142 Gemini toolUsePromptTokenCount is billed as input", () => {
+  const m = extractUsage("gemini", JSON.stringify({ modelVersion: "gemini-2.5-flash", usageMetadata: { promptTokenCount: 100, toolUsePromptTokenCount: 50, candidatesTokenCount: 10 } }));
+  assert.equal(m.usage.input_tokens, 150);
+  const cached = extractUsage("gemini", JSON.stringify({ usageMetadata: { promptTokenCount: 100, toolUsePromptTokenCount: 50, cachedContentTokenCount: 20, candidatesTokenCount: 10 } }));
+  assert.equal(cached.usage.input_tokens, 130);
+  assert.ok(costForUsage("gemini-2.5-flash", m.usage).cost_usd > costForUsage("gemini-2.5-flash", { input_tokens: 100, output_tokens: 10 }).cost_usd);
+});
+
+test("#142 tool-use detection: Anthropic server_tool_use and Responses search items", () => {
+  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 2 } } })).toolUseUnpriced, true);
+  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 0 } } })).toolUseUnpriced, undefined);
+  for (const type of ["web_search_call", "file_search_call"])
+    assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type }, { type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolUseUnpriced, true);
+  assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolUseUnpriced, undefined);
+});
+
+test("#142 isCountTokensPath allows only exact, normalized paths", () => {
+  for (const ok of ["/anthropic/v1/messages/count_tokens", "/openai/v1/responses/input_tokens", "/gemini/v1beta/models/gemini-2.5-flash:countTokens?key=k"]) assert.equal(isCountTokensPath(ok), true, ok);
+  for (const bad of ["/anthropic/v1/messages/count_tokens/../messages", "/anthropic/v1/messages/count_tokens/%2e%2e/messages", "/anthropic/v1/messages/count%5Ftokens",
+    "/anthropic/v1/messages", "/anthropic//v1/messages/count_tokens", "/openai/v1/responses", "/gemini/v1beta/models/x:generateContent", undefined]) assert.equal(isCountTokensPath(bad), false, String(bad));
+});
+
+async function multi(t, handler) {
+  const up = http.createServer(handler);
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${up.address().port}`;
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: base, anthropic: base, gemini: base }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const post = (path, body = { model: "x" }) => fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: JSON.stringify(body) });
+  return { post, receipts };
+}
+
+test("#142 Anthropic web search and Responses web_search_call → tool_use_unpriced and the next call is paused", async (t) => {
+  for (const [path, body] of [
+    ["/anthropic/v1/messages", { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_search_requests: 2 } } }],
+    ["/openai/v1/responses", { model: "gpt-4o-mini", output: [{ type: "web_search_call", status: "completed" }], usage: { input_tokens: 10, output_tokens: 5 } }],
+  ]) {
+    let hits = 0;
+    const { post, receipts } = await multi(t, (req, res) => { hits++; req.resume(); res.end(JSON.stringify(body)); });
+    assert.equal((await post(path)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "tool_use_unpriced"]);
+    const next = await post(path);
+    assert.equal(next.status, 429);
+    assert.equal((await next.json()).error, "accounting_unavailable");
+    assert.equal(hits, 1);
+  }
+});
+
+test("#142 count-tokens 2xx is non_billable and the next call reaches upstream; traversal is not exempt", async (t) => {
+  for (const path of ["/anthropic/v1/messages/count_tokens", "/gemini/v1beta/models/gemini-2.5-flash:countTokens", "/openai/v1/responses/input_tokens"]) {
+    let hits = 0;
+    const { post, receipts } = await multi(t, (req, res) => { hits++; req.resume(); res.end(hits === 1 ? '{"input_tokens":12,"totalTokens":12}' : '{"model":"gpt-4o-mini","usage":{"prompt_tokens":1,"completion_tokens":1}}'); });
+    assert.equal((await post(path)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [0, "non_billable_request"], path);
+    assert.equal((await post("/openai/v1/chat/completions")).status, 200);
+    assert.equal(hits, 2);
+  }
+  for (const path of ["/anthropic/v1/messages/count_tokens/../messages", "/anthropic/v1/messages/count_tokens/%2e%2e/messages"]) {
+    const { post, receipts } = await multi(t, (req, res) => { req.resume(); res.end('{"input_tokens":12}'); });
+    assert.equal((await post(path)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"], path);
+    assert.equal((await post(path)).status, 429);
+  }
+  // A non-2xx count-tokens reply without a provider error body is still unknown.
+  const { post, receipts } = await multi(t, (req, res) => { req.resume(); res.writeHead(500).end("oops"); });
+  await post("/anthropic/v1/messages/count_tokens");
+  assert.equal(receipts[0].reason, "usage_unavailable");
 });

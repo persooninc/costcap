@@ -180,3 +180,41 @@ test("#138 a streamed final chunk with usage: {} is unknown (usage_unavailable),
   const r2 = await fetch(`http://127.0.0.1:${proxy.port}/openai/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini","stream":true}' });
   assert.equal(r2.status, 429);
 });
+
+// #142: tool billing in streams.
+test("#142 Anthropic stream with server_tool_use in message_delta → tool_use_unpriced, next call paused", async (t) => {
+  const events = [ANTHROPIC_EVENTS[0], ANTHROPIC_EVENTS[1],
+    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"web_search_requests":1}}}\n\n', ANTHROPIC_EVENTS[3]];
+  const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
+  const { res } = await streamCall(proxy, "/anthropic/v1/messages");
+  assert.equal(res.status, 200);
+  await tick();
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "tool_use_unpriced"]);
+  const next = await fetch(`http://127.0.0.1:${proxy}/anthropic/v1/messages`, { method: "POST", body: "{}" });
+  assert.equal(next.status, 429);
+  assert.equal((await next.json()).error, "accounting_unavailable");
+});
+
+test("#142 Responses stream with a web_search_call item → tool_use_unpriced; parser sees item events and completed output", () => {
+  const usage = '"usage":{"input_tokens":10,"output_tokens":5}';
+  const viaItem = createSseUsageParser("openai");
+  viaItem.push('data: {"type":"response.output_item.done","item":{"type":"web_search_call"}}\n\n');
+  viaItem.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini",${usage}}}\n\n`);
+  assert.equal(viaItem.end().toolUseUnpriced, true);
+  const viaCompleted = createSseUsageParser("openai");
+  viaCompleted.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini","output":[{"type":"file_search_call"}],${usage}}}\n\n`);
+  assert.equal(viaCompleted.end().toolUseUnpriced, true);
+  const plain = createSseUsageParser("openai");
+  plain.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini","output":[{"type":"message"}],${usage}}}\n\n`);
+  assert.equal(plain.end().toolUseUnpriced, undefined);
+});
+
+test("#142 Responses stream through the proxy with web_search_call pauses the run", async (t) => {
+  const events = ['data: {"type":"response.output_item.added","item":{"type":"web_search_call"}}\n\n',
+    'data: {"type":"response.completed","response":{"model":"gpt-4o-mini","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'];
+  const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
+  await streamCall(proxy, "/openai/v1/responses");
+  await tick();
+  assert.equal(receipts[0].reason, "tool_use_unpriced");
+  assert.equal((await fetch(`http://127.0.0.1:${proxy}/openai/v1/responses`, { method: "POST", body: "{}" })).status, 429);
+});
