@@ -73,7 +73,8 @@ export function rollupLine(s) {
     : `$${s.total_cost_usd.toFixed(4)}`;
   const saved = s.cache?.hits > 0 ? ` · cache: ${s.cache.hits} hit${s.cache.hits === 1 ? "" : "s"}, saved $${s.cache.saved_usd.toFixed(4)}` : "";
   const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
-  return `costcap: run ${s.run_id} calls=${s.calls}${s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : ""} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}`;
+  const otlp = s.otlp ? ` otlp=${s.otlp.spans_exported} exported/${s.otlp.spans_dropped} dropped` : "";
+  return `costcap: run ${s.run_id} calls=${s.calls}${s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : ""} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}${otlp}`;
 }
 
 export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");

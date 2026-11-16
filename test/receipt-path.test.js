@@ -69,3 +69,15 @@ test("#188 x-amz-* presigned query parameters are redacted", () => {
   assert.equal(receiptPath("/model/m/invoke", "?X-Amz-Signature=abc&X-Amz-Credential=AK%2F1&X-Amz-Security-Token=t&X-Amz-Date=1"),
     "/model/m/invoke?X-Amz-Signature=REDACTED&X-Amz-Credential=REDACTED&X-Amz-Security-Token=REDACTED&X-Amz-Date=1");
 });
+
+test("#239 the OTLP span exports the redacted path (never the ?key= secret)", async (t) => {
+  const { receiptToSpan, encodeRequest } = await import("../src/otlp.js");
+  const spans = [];
+  const f = await gemini(t, { cap: createCapEngine({ caps: { run: 100 } }), onReceipt: (r, meta) => spans.push(receiptToSpan(r, meta)) });
+  assert.equal((await f.call()).status, 200);
+  const body = JSON.stringify(encodeRequest(spans));
+  assert.doesNotMatch(body, /SECRET123/);
+  assert.equal(spans[0].attributes.find((a) => a.key === "costcap.path").value.stringValue, EXPECTED);
+  assert.equal(spans[0].name, "generate_content gemini-test");
+  assert.ok(BigInt(spans[0].startTimeUnixNano) <= BigInt(spans[0].endTimeUnixNano));
+});

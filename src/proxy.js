@@ -523,7 +523,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     if (!sharedLedger || held) return fn();
     return sharedLedger.withLock(() => { held = true; try { return fn(); } finally { held = false; } });
   };
-  const emitBase = (receipt) => guarded(() => {
+  const emitBase = (receipt, startMs) => guarded(() => {
     const complete = { id: randomUUID(), ts: new Date(now()).toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     tagCaps?.record(complete);
@@ -531,7 +531,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     sharedLedger?.track?.(complete);
-    try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
+    // #239: request-arrival time is passed in memory only (span start); the ledger shape is unchanged.
+    try { Promise.resolve(onReceipt?.(complete, { startMs })).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
   // Batch state (#160): pending batch_id -> receipt, OpenAI output_file_id -> batch_id.
@@ -631,7 +632,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // #184: x-costcap-cache is CostCap's; never forwarded.
     const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
     delete req.headers[CACHE_HEADER];
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, reqAt);
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
       req.resume();
@@ -1209,6 +1210,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     killTimer.unref?.();
   };
   server.on("upgrade", (req, socket, head) => {
+    const reqAt = now();
     socket.on("error", () => {});
     const url = new URL(req.url, "http://localhost");
     const rawPathname = req.url.split(/[?#]/, 1)[0];
@@ -1222,7 +1224,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       writeHttpJson(socket, 400, { error: "invalid_tags", message: `CostCap: ${e.message}. The upstream call was not made.` });
       return;
     }
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, reqAt);
     const storedPath = receiptPath("/v1/realtime", url.search);
     const queryModel = url.searchParams.get("model") || undefined;
     let model = queryModel ?? "unknown";

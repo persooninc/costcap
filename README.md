@@ -994,9 +994,32 @@ bash scripts/setup.sh
 
 Requires: Node 20+, and access to `gitdhillonai/dotenv` for `.env.local`.
 
+## OpenTelemetry export
+
+`costcap wrap --otlp URL` (or `COSTCAP_OTLP_ENDPOINT=URL`) pushes OTLP/HTTP JSON traces to
+`<URL>/v1/traces`: one `CLIENT` span per metered, unknown-cost or refused call (named
+`"<gen_ai.operation.name> <model>"`, with `gen_ai.usage.input_tokens`/`output_tokens`/`cache_read.input_tokens`,
+`gen_ai.usage.cost` when the cost is known, and `costcap.*` attributes), plus one `costcap.run` root span
+at exit (`costcap.total_cost_usd` is omitted when any call has unknown cost). All spans of a run share a
+trace id derived from `run_id`. No prompt, completion or request body is ever exported.
+
+```bash
+# Collector or Langfuse (OTLP endpoint); headers come only from the environment and are never logged
+export COSTCAP_OTLP_HEADERS="authorization=Basic <base64 pk:sk>,x-tenant=team-a"
+npx costcap wrap --cap 5 --otlp https://cloud.langfuse.com/api/public/otel -- node agent.js
+```
+
+- Opt-in only; CostCap ignores `OTEL_EXPORTER_OTLP_*` (those belong to your agent's SDK).
+- `--otlp` must be http(s) without `user:pass@`; plain http to a non-loopback host prints a warning.
+- Export never delays a call or a cap decision: batches of at most 100 spans every 5 s, a 10,000-span
+  queue, 10 s per POST with no retries, final flush capped at 5 s. The first failure prints one
+  `costcap: warning: otlp` line; the run summary records `otlp: {spans_exported, spans_dropped}`.
+- Not included: metrics/logs signals, protobuf/gRPC, retries across runs, re-export on later settlement.
+
 ## Environment
 
 See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
+`COSTCAP_OTLP_ENDPOINT` and `COSTCAP_OTLP_HEADERS` enable OpenTelemetry export (see above).
 
 ## Docs
 

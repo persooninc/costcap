@@ -229,3 +229,9 @@ test("#184 wrap --cache: repeated temperature-0 calls hit the cache, summary and
   assert.match(r.err, / · cache: 2 hits, saved \$/);
   assert.ok(readdirSync(path.join(dir, "cache")).length === 1, "default cache dir is <ledger-dir>/cache");
 });
+
+test("#239 rollup line reports otlp counts when present", () => {
+  const s = buildRunSummary({ run_id: "R", receipts: [] });
+  assert.doesNotMatch(rollupLine(s), /otlp/);
+  assert.match(rollupLine({ ...s, otlp: { spans_exported: 3, spans_dropped: 1 } }), / otlp=3 exported\/1 dropped$/);
+});
