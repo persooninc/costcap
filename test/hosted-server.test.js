@@ -439,7 +439,7 @@ test("receipt csv is the signed-in org only and ignores an agent bearer", async 
   assert.match(mine.body, /plain,0\.5/);
   assert.match(mine.body, /'=1\+1,,,,,budget_exceeded,day/);
   const theirs = await pull(other.cookie);
-  assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope");
+  assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome");
 });
 
 test("#149: receipts.csv since/until/agent_id filters, 400s, tenant isolation and total header", async (t) => {
@@ -784,7 +784,7 @@ test("regression #118: evidence export carries the audit trail with before/after
   assert.equal((await f.request("/v1/evidence.json")).status, 401);
   const doc = (await f.request("/v1/evidence.json", undefined, viewer.cookie)).body;
   const change = doc.audit.find((e) => e.action === "policy.change" && e.target === a.agentId);
-  assert.deepEqual(change.detail.previous, { caps: { day: 1 }, killed: false, maxSteps: null, silentAfterHours: null });
+  assert.deepEqual(change.detail.previous, { caps: { day: 1 }, killed: false, maxSteps: null, silentAfterHours: null, models: null });
   assert.deepEqual(change.detail.policy.caps, { day: 5 });
   assert.equal(change.detail.policy.maxSteps, 9);
   assert.equal(change.detail.reason, "batch");
@@ -1131,4 +1131,31 @@ test("legacy alert records (keyed by alert key, no timestamps) are kept with fir
   // A since/until filter cannot place an unknown time, so it excludes legacy rows.
   assert.equal((await f.request("/v1/alerts?since=2020-01-01T00:00:00Z", undefined, owner.cookie)).body.alerts.length, 0);
   assert.equal((await f.request(`/v1/alerts/${encodeURIComponent("cap_hit:old:day")}/ack`, {}, owner.cookie)).status, 200);
+});
+
+test("#153 hosted models allowlist: validation, versioning, keep/clear, audited before/after, synced to the agent", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("models-owner@example.invalid");
+  assert.equal((await f.request("/v1/enrollment-tokens", { caps: {}, models: [] }, owner.cookie)).status, 400);
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: {}, models: ["gpt-4o-mini"] }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "modeler" }, null, tok)).body;
+  assert.deepEqual(agent.policy.models, ["gpt-4o-mini"]);
+  const set = (body) => f.request(`/v1/agents/${agent.agentId}/policy`, body, owner.cookie);
+  for (const bad of [[], [""], "gpt-4o", [1]]) assert.equal((await set({ models: bad })).status, 400, JSON.stringify(bad));
+  let r = await set({ models: ["gpt-4o-mini", "claude-haiku-4-5"] });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.version, 2);
+  assert.equal((await f.request("/v1/policy", undefined, null, agent.token)).body.models.length, 2);
+  // Omitting models keeps it; null clears it.
+  assert.deepEqual((await set({ caps: { day: 3 } })).body.models, ["gpt-4o-mini", "claude-haiku-4-5"]);
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  const change = fleet.audit.filter((x) => x.action === "policy.change").at(-2);
+  assert.deepEqual(change.detail.previous.models, ["gpt-4o-mini"]);
+  assert.deepEqual(change.detail.policy.models, ["gpt-4o-mini", "claude-haiku-4-5"]);
+  r = await set({ models: null });
+  assert.equal("models" in r.body, false);
+  // Blocked-model receipts show in evidence and the CSV.
+  await f.request("/v1/receipts", { receipts: [{ id: "bm1", ts: new Date().toISOString(), cost_usd: 0, blocked: true, reason: "model_not_allowed", outcome: "blocked_model", model: "gpt-4o" }] }, null, agent.token);
+  const ev = (await f.request("/v1/evidence.json", undefined, owner.cookie)).body;
+  assert.equal(ev.receipts.find((x) => x.receipt_id === "bm1").outcome, "blocked_model");
 });

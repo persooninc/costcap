@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage } from "./pricing.js";
+import { costForUsage, isPricedModel } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck } from "./preflight.js";
@@ -202,7 +202,7 @@ export function isProviderError(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -243,11 +243,31 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           send(429, response);
           return "blocked";
         };
+        let requestedModel;
+        try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
+        if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
+        if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
+        const modelRefusal = (status, error, message) => {
+          emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
+          send(status, { error, model: requestedModel ?? null, message });
+          return "blocked";
+        };
         let preflightEst;
         const verdict = guarded(() => {
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
+          const generates = !["GET", "HEAD"].includes(req.method);
+          const allow = generates ? allowedModels?.() ?? null : null;
+          if (allow && (!requestedModel || !allow.includes(requestedModel))) {
+            return modelRefusal(403, "model_not_allowed", allow.length
+              ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
+              : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
+          }
+          if (generates && unknownModels === "refuse" && !isPricedModel(requestedModel)) {
+            return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
+          }
           const agentHit = agentBudgets?.check(who);
           if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
           const teamHit = teamCheck?.();
@@ -271,9 +291,6 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         if (verdict === "blocked") return;
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
-        let requestedModel;
-        try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
-        if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
         try {
           const abort = new AbortController();
           const onClientClose = () => { if (!res.writableFinished) abort.abort(); };

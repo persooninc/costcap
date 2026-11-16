@@ -13,7 +13,7 @@ import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadSettledReceipts } from "./cap.js";
 import { createVelocityBreaker } from "./velocity.js";
-import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
+import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -25,8 +25,8 @@ import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
-  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--run-id ID] [--receipts FILE] [--github-output]\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
+  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
@@ -67,6 +67,14 @@ export function parseWrapArgs(argv) {
       const n = Number(v);
       if (!Number.isFinite(n) || n <= 1) throw new Error(`--velocity-multiple must be a number greater than 1, got "${v}"`);
       opts.velocityMultiple = n;
+    } else if (f === "--models") {
+      // #153: exact model ids, comma separated; most restrictive wins with fleet/agent policy.
+      const list = v.split(",").map((m) => m.trim()).filter(Boolean);
+      if (!list.length) throw new Error(`--models needs at least one model id, got "${v}"`);
+      opts.models = [...new Set(list)];
+    } else if (f === "--unknown-models") {
+      if (v !== "refuse" && v !== "fallback") throw new Error(`--unknown-models must be refuse or fallback, got "${v}"`);
+      opts.unknownModels = v;
     } else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
@@ -93,7 +101,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
   // --preflight or COSTCAP_PREFLIGHT=1 (CC-9): refuse calls whose estimated worst case cannot fit.
@@ -112,11 +120,13 @@ export async function wrap(argv) {
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
+  let fleetModels = models ?? null;
   const setPolicy = (p) => {
     fleetPolicy = p;
-    const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined } });
+    const resolved = resolvePolicy({ local: { ...caps, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
     cap.updateCaps(resolved.caps);
     velocity.setMaxSteps(resolved.maxSteps);
+    fleetModels = resolved.models;
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy });
@@ -132,7 +142,9 @@ export async function wrap(argv) {
   const runReceipts = [];
   const summaryRunId = who.run_id ?? randomUUID();
   const startedAt = new Date().toISOString();
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight });
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight,
+    // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
+    allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
@@ -185,7 +197,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else if (cmd === "check" || cmd === "mcp") {
     try {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
-      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined };
+      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined, ...(parsed.models ? { models: parsed.models } : {}) };
       if (cmd === "check" && parsed.runId !== undefined) options.runId = parsed.runId;
       if (cmd === "mcp") serveMcp({ ...options, killFile: parsed.killFile, enrollmentPath: parsed.enrollmentPath });
       else {

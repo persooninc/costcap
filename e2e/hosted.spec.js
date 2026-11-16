@@ -89,6 +89,12 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     const fleetView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
     expect(fleetView.agents[0].policy.maxSteps).toBe(5);
     expect(fleetView.audit.filter((x) => x.action === "policy.change").at(-1).detail.policy.maxSteps).toBe(5);
+    // #153: the dashboard edits the model allowlist; it saves and shows on the agent.
+    await page.locator("#agents input[name=models]").fill("gpt-4o-mini, claude-haiku-4-5");
+    await page.locator("#agents button[type=submit]").click();
+    await expect(page.locator("#agents small")).toContainText("Policy v6 · max 5 steps per run · models: gpt-4o-mini, claude-haiku-4-5");
+    const modelsView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
+    expect(modelsView.agents[0].policy.models).toEqual(["gpt-4o-mini", "claude-haiku-4-5"]);
     await page.locator("#agents .danger").nth(1).click();
     await expect(page.locator("#agents strong")).toHaveText("REVOKED");
     await page.locator("#invite input[name=email]").fill("teammate@example.invalid");

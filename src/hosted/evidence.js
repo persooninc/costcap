@@ -40,6 +40,7 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     blocked: Boolean(item.receipt?.blocked),
     reason: item.receipt?.reason ?? null,
     scope: item.receipt?.scope ?? null,
+    outcome: item.receipt?.outcome ?? null,
   }));
   // Audit trail (#118): org-scoped, oldest first. Fleet freeze/resume detail is
   // normalized to snake_case agent_ids; policy.change carries previous + policy.

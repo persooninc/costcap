@@ -297,7 +297,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/enrollment-tokens" && req.method === "POST") {
         const raw = token();
-        const policy = { version: 1, caps: body.caps ?? {}, killed: false, ...(body.maxSteps != null ? { maxSteps: body.maxSteps } : {}) };
+        const policy = { version: 1, caps: body.caps ?? {}, killed: false, ...(body.maxSteps != null ? { maxSteps: body.maxSteps } : {}), ...(body.models != null ? { models: body.models } : {}) };
         if (validatePolicy(policy).length) fail(400, "Invalid caps");
         store.transaction((s) => {
           const user = admin(s, req);
@@ -363,6 +363,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             settle_source: item.settlement?.source ?? "",
             reason: item.receipt?.reason ?? "",
             scope: item.receipt?.scope ?? "",
+            outcome: item.receipt?.outcome ?? "",
           }));
           return receiptsCsv(rows, query);
         });
@@ -567,10 +568,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
           // silentAfterHours (issue #134): omitted keeps, null resets to the 6h default, 0 turns silence alerts off.
           const silentAfterHours = body.silentAfterHours === undefined ? a.policy.silentAfterHours : body.silentAfterHours;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}) };
+          // models (issue #153): omitted keeps the allowlist, null clears it.
+          const models = body.models === undefined ? a.policy.models : body.models;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
-          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null };
+          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null };
           a.policy = policy;
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;

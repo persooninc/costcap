@@ -1,6 +1,6 @@
 // Read-only CI guard: rejects unknown cost rather than treating it as free.
 import { loadSettledReceipts as loadReceipts, createCapEngine } from "./cap.js";
-import { budgetRemaining, createAgentBudgets } from "./agent-budget.js";
+import { budgetRemaining, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { createKillCheck } from "./kill.js";
 import { createFleetClient } from "./hosted/client.js";
 export function checkBudget({ receiptsPath, caps = {}, now, runId }) {
@@ -17,6 +17,7 @@ export function checkBudget({ receiptsPath, caps = {}, now, runId }) {
     if (total >= caps.run) hit = { scope: "run", cap: caps.run, spent: total };
   }
   return { ok: !hit, receipt_count: history.length, total_usd: Number(total.toFixed(6)), unknown_cost_count,
+    blocked_model_count: history.filter((r) => r.outcome === "blocked_model").length,
     unknown_cost_counted_as_zero: false, spend: s, hit,
     estimate_only: true, scope: "all receipts in selected ledger; run total is not a reconstructed process run" };
 }
@@ -73,15 +74,22 @@ export function fleetGuard({ killFile, enrollmentPath, receiptsPath, now }) {
   const policy = fleet.policy();
   if (policy.killed || fleet.revoked()) return { killed: { reason: "killed", note: "fleet policy or revoked credentials", enrollment: enrollmentPath } };
   const nowMs = now ? now().getTime() : Date.now();
-  return { fleetCaps: policy.caps, fleetHit: fleet.agentCheck(nowMs) ?? fleet.teamCheck(nowMs) };
+  return { fleetCaps: policy.caps, fleetModels: policy.models ?? null, fleetHit: fleet.agentCheck(nowMs) ?? fleet.teamCheck(nowMs) };
 }
 
 const killedResult = (killed, extra = {}) => ({ ok: false, verdict: "killed", reason: "killed", kill: killed, hit: { verdict: "killed", ...killed }, ...extra, estimate_only: true });
 const applyFleetHit = (result, hit) => (hit ? { ...result, ok: false, verdict: hit.verdict, reason: hit.reason, hit, ...(hit.scope ? { scope: hit.scope } : {}) } : result);
 
+// Effective model allowlist (#153): local --models ∩ cached fleet models (∩ agent policy models).
+const withModels = (result, models) => (models ? { ...result, allowed_models: models } : result);
+
 export function guardedBudgetStatus(options) {
   const g = fleetGuard(options);
   if (g.killed) return killedResult(g.killed);
+  return withModels(guardedBudgetBase(options, g), intersectModels(options.models ?? null, g.fleetModels ?? null));
+}
+
+function guardedBudgetBase(options, g) {
   if (!options.enrollmentPath) return checkBudget(options);
   const caps = { ...(options.caps ?? {}) };
   for (const k of ["day", "month"]) {
@@ -100,6 +108,7 @@ export function guardedAgentStatus(options) {
   const g = fleetGuard(options);
   if (g.killed) return killedResult(g.killed, { agent_id: options.agent_id, run_id: options.run_id ?? null });
   const base = agentBudgetStatus(options);
-  if (!base.ok || !options.enrollmentPath) return base;
-  return applyFleetHit(base, g.fleetHit);
+  const models = intersectModels(options.models ?? null, g.fleetModels ?? null, base.budget_remaining?.models ?? null);
+  if (!base.ok || !options.enrollmentPath) return withModels(base, models);
+  return withModels(applyFleetHit(base, g.fleetHit), models);
 }

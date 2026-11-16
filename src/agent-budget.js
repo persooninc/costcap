@@ -15,6 +15,22 @@ function assertLimits(limits, label) {
   }
   const steps = limits?.maxSteps;
   if (steps != null && (!Number.isInteger(steps) || steps <= 0)) throw new Error(`Invalid ${label} maxSteps`);
+  if (limits?.models !== undefined && !isModelList(limits.models)) throw new Error(`Invalid ${label} models`);
+}
+
+// Model allowlist (#153): a non-empty array of non-empty model id strings (exact ids, no wildcards).
+export function isModelList(models) {
+  return Array.isArray(models) && models.length > 0 && models.every((m) => typeof m === "string" && m.trim() !== "" && m === m.trim());
+}
+
+// Intersection of allowlists; null/undefined entries mean "no restriction". Returns null when nothing restricts.
+export function intersectModels(...lists) {
+  let out = null;
+  for (const list of lists) {
+    if (list == null) continue;
+    out = out == null ? [...new Set(list)] : out.filter((m) => list.includes(m));
+  }
+  return out;
 }
 
 function assertReceipt(r) {
@@ -23,8 +39,8 @@ function assertReceipt(r) {
 }
 
 const POLICY_KEYS = new Set(["default", "agents", "teams"]);
-const TEAM_KEYS = new Set([...SCOPES, "agents"]);
-const LIMIT_KEYS = new Set([...SCOPES, "maxSteps"]);
+const TEAM_KEYS = new Set([...SCOPES, "agents", "models"]);
+const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models"]);
 
 // Unknown keys are refused: a misspelled limit must not silently mean "no limit".
 export function assertAgentPolicy(policy) {
@@ -52,7 +68,7 @@ export function assertAgentPolicy(policy) {
 }
 
 // policy: { default?: Limits, agents?: { [agentId]: Limits } }
-// Limits: { run?, day?, month? (USD), maxSteps? (upstream calls per run) }
+// Limits: { run?, day?, month? (USD), maxSteps? (upstream calls per run), models? (allowlist, #153) }
 // An agent with no entry and no default has no budget, which is a refusal.
 export function createAgentBudgets({ policy = {}, history = [], now = () => new Date() } = {}) {
   assertAgentPolicy(policy);
@@ -92,10 +108,15 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     return out;
   }
 
+  // Effective model allowlist (#153): intersection of the agent's, its team's and the default lists.
+  // null = unrestricted; [] = every model refused.
+  const modelsFor = (agentId = UNKNOWN_AGENT) => intersectModels(policy.agents?.[agentId]?.models, teamFor(agentId)?.models, policy.default?.models);
+
   return {
     spend,
     limitsFor,
     teamFor,
+    modelsFor,
     teamSpend(who) {
       const team = teamFor(who.agent_id ?? UNKNOWN_AGENT);
       return team ? spend(who, team.agents) : null;
@@ -150,5 +171,6 @@ export function budgetRemaining(budgets, who) {
     if (own == null) return shared;
     return shared == null ? own : Math.min(own, shared);
   };
-  return { run_usd: tight("run"), day_usd: tight("day"), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps) };
+  const models = budgets.modelsFor?.(who.agent_id) ?? null;
+  return { run_usd: tight("run"), day_usd: tight("day"), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
 }

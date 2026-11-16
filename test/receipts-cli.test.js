@@ -63,7 +63,7 @@ test("CSV export escapes formula cells (=, +, -, @)", () => {
   const r = run(["--receipts", file, "--export", "csv"]);
   assert.equal(r.code, 0);
   const rows = r.out.split("\n");
-  assert.equal(rows[0], "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope");
+  assert.equal(rows[0], "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome");
   assert.equal(rows.length, 6);
   assert.match(r.out, /'=HYPERLINK/);
   assert.match(r.out, /,'@evil,/);

@@ -47,6 +47,11 @@ export function lookupPrice(model) {
   return { model, ...table.fallback, ...pin, fallback: true };
 }
 
+// True when a model (or its dated snapshot base) has a published rate (#153: --unknown-models refuse).
+export function isPricedModel(model) {
+  return typeof model === "string" && model !== "" && !lookupPrice(model).fallback;
+}
+
 // Long-context tier (#151): a model may publish a higher rate set once the whole
 // prompt (uncached input + cache read + cache writes) exceeds a threshold. Every
 // component of that call is then priced at the long-context rates.
