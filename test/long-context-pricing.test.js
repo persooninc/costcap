@@ -145,7 +145,7 @@ test("proxy: anthropic JSON and SSE over 200K yield the same long_context receip
   const events = [
     `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: "claude-sonnet-4-6", usage: { ...start, output_tokens: 1 } } })}`,
     `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens } })}`,
-    "", ""].join("\n\n");
+    'event: message_stop\ndata: {"type":"message_stop"}', ""].join("\n\n");
   const sse = await through(t, "anthropic", "/v1/messages", events, "text/event-stream");
   assert.equal(await sse.call(), 200);
   for (const r of [json.receipts[0], sse.receipts[0]]) {

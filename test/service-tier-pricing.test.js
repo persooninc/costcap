@@ -133,7 +133,7 @@ async function through(t, provider, path, body, type, opts = {}) {
   return { receipts, call };
 }
 
-const FAST_SSE = `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 100_000, output_tokens: 1, speed: "fast" } } })}\n\nevent: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 20_000, speed: "fast" } })}\n\n`;
+const FAST_SSE = `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5", usage: { input_tokens: 100_000, output_tokens: 1, speed: "fast" } } })}\n\nevent: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 20_000, speed: "fast" } })}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`;
 const FAST_COST = usd((100_000 * OPUS.fast.input + 20_000 * OPUS.fast.output) / 1e6);
 
 test("proxy e2e: fast-mode SSE receipt at fast rates; crossing --cap blocks the next call 429", async (t) => {

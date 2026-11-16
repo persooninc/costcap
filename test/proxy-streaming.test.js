@@ -219,3 +219,83 @@ test("#142 Responses stream through the proxy with web_search_call pauses the ru
   assert.equal(receipts[0].reason, "tool_use_unpriced");
   assert.equal((await fetch(`http://127.0.0.1:${proxy}/openai/v1/responses`, { method: "POST", body: "{}" })).status, 429);
 });
+
+// #166: Anthropic message_start carries placeholder usage; only message_stop makes the stream complete.
+const ANT_DELTA = (n) => `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tok${n}"}}\n\n`;
+const ANT_OVERLOADED = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n';
+
+async function expectBlocked(proxy, receipts) {
+  for (let i = 0; i < 50 && !receipts.length; i++) await tick();
+  assert.equal(receipts.length, 1);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "stream_incomplete"]);
+  const next = await fetch(`http://127.0.0.1:${proxy}/anthropic/v1/messages`, { method: "POST", body: "{}" });
+  assert.equal(next.status, 429);
+  assert.equal((await next.json()).error, "accounting_unavailable");
+}
+
+test("#166 Anthropic client abort after message_start → stream_incomplete (not priced at placeholder usage), next call blocked", async (t) => {
+  let upstreamClosed;
+  const closed = new Promise((r) => { upstreamClosed = r; });
+  const { proxy, receipts } = await setup(t, ANTHROPIC_EVENTS, { gapMs: 300, onClose: () => upstreamClosed() });
+  const ac = new AbortController();
+  const res = await fetch(`http://127.0.0.1:${proxy}/anthropic/v1/messages`, { method: "POST", body: "{}", signal: ac.signal });
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  assert.match(Buffer.from(first.value).toString(), /message_start/);
+  ac.abort();
+  await closed;
+  await expectBlocked(proxy, receipts);
+});
+
+test("#166 Anthropic upstream close after content_block_deltas → stream_incomplete, next call blocked", async (t) => {
+  const events = [ANTHROPIC_EVENTS[0], ANT_DELTA(1), ANT_DELTA(2), ANT_DELTA(3), ANTHROPIC_EVENTS[2], ANTHROPIC_EVENTS[3]];
+  const { proxy, receipts } = await setup(t, events, { gapMs: 10, cutAfter: 4 });
+  await assert.rejects(streamCall(proxy, "/anthropic/v1/messages"));
+  await expectBlocked(proxy, receipts);
+});
+
+test("#166 Anthropic stream that ends cleanly without message_stop → stream_incomplete", async (t) => {
+  const { proxy, receipts } = await setup(t, [ANTHROPIC_EVENTS[0], ANT_DELTA(1)], { gapMs: 5 });
+  const { res } = await streamCall(proxy, "/anthropic/v1/messages");
+  assert.equal(res.status, 200);
+  await expectBlocked(proxy, receipts);
+});
+
+test("#166 Anthropic mid-stream overloaded_error → stream_incomplete even if message_stop follows", async (t) => {
+  for (const tail of [[], [ANTHROPIC_EVENTS[3]]]) {
+    const { proxy, receipts } = await setup(t, [ANTHROPIC_EVENTS[0], ANT_DELTA(1), ANT_OVERLOADED, ...tail], { gapMs: 5 });
+    const { res, body } = await streamCall(proxy, "/anthropic/v1/messages");
+    assert.equal(res.status, 200);
+    assert.match(body, /overloaded_error/);
+    await expectBlocked(proxy, receipts);
+  }
+});
+
+test("#166 complete Anthropic stream is priced from message_delta's final output_tokens", async (t) => {
+  const { proxy, receipts } = await setup(t, ANTHROPIC_EVENTS, { gapMs: 5 });
+  await streamCall(proxy, "/anthropic/v1/messages");
+  for (let i = 0; i < 50 && !receipts.length; i++) await tick();
+  assert.equal(receipts[0].output_tokens, 2000);
+  assert.equal(receipts[0].cost_usd, costForUsage("claude-sonnet-4-6", { input_tokens: 1000, output_tokens: 2000 }).cost_usd);
+  const p = createSseUsageParser("anthropic");
+  p.push(ANTHROPIC_EVENTS.slice(0, 3).join(""));
+  assert.equal(p.incomplete, true, "no message_stop yet");
+  p.push(ANTHROPIC_EVENTS[3]);
+  assert.equal(p.incomplete, false);
+});
+
+test("#166 Gemini stream: cumulative usageMetadata without finishReason is incomplete; finishReason or prompt block completes it", () => {
+  const usage = '"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}';
+  const p = createSseUsageParser("gemini", "gemini-2.5-pro");
+  p.push(`data: {"candidates":[{"content":{"parts":[{"text":"a"}]}}],${usage}}\n\n`);
+  assert.equal(p.incomplete, true);
+  p.push(`data: {"candidates":[{"content":{"parts":[{"text":"b"}]},"finishReason":"STOP"}],${usage}}\n\n`);
+  assert.equal(p.incomplete, false);
+  const blocked = createSseUsageParser("gemini", "gemini-2.5-pro");
+  blocked.push(`data: {"promptFeedback":{"blockReason":"SAFETY"},${usage}}\n\n`);
+  assert.equal(blocked.incomplete, false);
+  // Non-streamed JSON bodies never consult incomplete; usage-only chunks (no candidates) are not treated as streams.
+  const bare = createSseUsageParser("gemini", "gemini-2.5-pro");
+  bare.push(`data: {${usage}}\n\n`);
+  assert.equal(bare.incomplete, false);
+});

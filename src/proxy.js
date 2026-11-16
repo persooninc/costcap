@@ -113,6 +113,11 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   // OpenAI Responses API streams nest model/usage under `response` and end with
   // a terminal event (response.completed / response.incomplete / response.failed).
   let responsesStream = false, responsesTerminal = false;
+  // #166: Anthropic streams carry placeholder usage on message_start; only message_stop (with no
+  // prior `error` event) means message_delta's final usage was seen. Gemini streams send cumulative
+  // usageMetadata on every chunk; only a candidate finishReason (or a prompt block) ends them.
+  let anthropicStream = false, anthropicStopped = false, anthropicErrored = false;
+  let geminiStream = false, geminiFinished = false;
   // Provider-side tools billed per request/call have no published rate in the table: never priced as $0.
   let toolUseUnpriced = false;
   // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
@@ -134,6 +139,16 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       else return;
     }
     if (chunk.model || chunk.modelVersion || chunk.message?.model) model = chunk.model ?? chunk.modelVersion ?? chunk.message.model;
+    if (provider === "anthropic" && typeof chunk.type === "string") {
+      if (chunk.type === "message_start") anthropicStream = true;
+      else if (chunk.type === "message_stop") anthropicStopped = true;
+      else if (chunk.type === "error" && anthropicStream && !anthropicStopped) anthropicErrored = true;
+    }
+    if (provider === "gemini" && Array.isArray(chunk.candidates)) {
+      geminiStream = true;
+      if (chunk.candidates.some((c) => c && typeof c.finishReason === "string")) geminiFinished = true;
+    }
+    if (provider === "gemini" && chunk.promptFeedback?.blockReason) geminiFinished = true;
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
       // Known only with both required counters; {} or partial shapes are unpriceable (never $0).
@@ -207,8 +222,11 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
     return { model, usage: { ...usage, ...signal }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
-  // A Responses stream that never reached a terminal event is incomplete.
-  return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
+  // A stream that never reached its provider's terminal event (or errored first) is incomplete.
+  return { add, result, get incomplete() {
+    return (responsesStream && !responsesTerminal) || (anthropicStream && (!anthropicStopped || anthropicErrored))
+      || (geminiStream && !geminiFinished);
+  } };
 }
 
 export function extractUsage(provider, text, requestedModel, opts = {}) {
@@ -545,7 +563,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               reader.cancel().catch(() => {});
             }
             metered = parser.end();
-            // Responses stream ended without a terminal event: usage may be partial or absent.
+            // Stream ended without its terminal event (Responses, Anthropic message_stop, Gemini finishReason): usage is partial or absent.
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());

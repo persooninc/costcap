@@ -233,7 +233,10 @@ traffic bypasses CostCap.
   blocks the **next** call; a call already in flight can overshoot the cap. A
   stream cut (upstream error, client abort or timeout) before usage arrives
   records `cost_usd: null` with `reason: "stream_incomplete"` and blocks further
-  calls. Timeouts match the official SDKs: the proxy waits up to 600s for the
+  calls. A stream also counts as cut if it ends without its provider's final
+  event, even when early usage was seen: Anthropic without `message_stop` (or
+  with a mid-stream `event: error`), Gemini without a `finishReason`, OpenAI
+  Responses without `response.completed`/`incomplete`/`failed`. Timeouts match the official SDKs: the proxy waits up to 600s for the
   first response byte (`wrap --timeout <seconds>` or `COSTCAP_UPSTREAM_TIMEOUT_S`),
   then a stream is cut only after it goes silent for 300s
   (`COSTCAP_STREAM_IDLE_TIMEOUT_S`), so long streams that keep sending chunks are
