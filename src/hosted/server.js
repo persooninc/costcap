@@ -19,6 +19,7 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
+import { isApiKey, parseApiKeyInput, createApiKey, publicApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -184,14 +185,27 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     if (!user?.verified) fail(401, "Email verification required");
     return user;
   };
+  const bearer = (req) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
   const agentUser = (s, req) => {
     const credential = (req.headers.authorization ?? "").replace(/^Bearer /, "");
+    // Issue #203: an org API key is never an agent credential.
+    if (isApiKey(credential)) fail(401, "Agent credential invalid or revoked");
     const hashed = hashToken(credential);
     const agent = Object.values(s.agents).find((a) => a.hash === hashed && !a.revoked);
     if (!agent) fail(401, "Agent credential invalid or revoked");
     return agent;
   };
   const admin = (s, req) => { const u = sessionUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
+  // Issue #203: routes that accept an org API key (`Authorization: Bearer cck_…`) as well as
+  // a session. An agent token or any other bearer falls through to the session check (401).
+  const memberUser = (s, req) => {
+    const raw = bearer(req);
+    if (!isApiKey(raw)) return sessionUser(s, req);
+    const k = findApiKey(s, raw, now(), hashToken);
+    if (!k || !s.orgs[k.orgId]) fail(401, "API key invalid, expired or revoked");
+    return apiKeyPrincipal(k);
+  };
+  const memberAdmin = (s, req) => { const u = memberUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
   const ownerOnly = (s, req) => { const u = sessionUser(s, req); if (u.role !== "owner") fail(403, "Workspace owner required"); return u; };
   const orgMembers = (s, orgId) => Object.values(s.users).filter((m) => m.orgId === orgId).map((m) => ({ id: m.id, email: m.email, role: m.role, verified: Boolean(m.verified) })).sort((a, b) => a.email.localeCompare(b.email));
   // Issue #123: org teams and their verdicts from synced receipts.
@@ -315,6 +329,43 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, { ok: true }, { "set-cookie": "costcap_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
       }
+      // Issue #203: record last use of a live org API key (best effort, its own transaction).
+      if (isApiKey(bearer(req))) {
+        store.transaction((s) => { const k = findApiKey(s, bearer(req), now(), hashToken); if (k) k.last_used_at = new Date(now()).toISOString(); });
+      }
+      const keyRevoke = /^\/v1\/api-keys\/([^/]+)\/revoke$/.exec(path);
+      if ((path === "/v1/api-keys" && ["GET", "POST"].includes(req.method)) || (keyRevoke && req.method === "POST")) {
+        // Keys are managed only from a signed-in session: a key can never create, list or revoke keys.
+        if (req.headers.authorization) fail(401, "API keys are managed from a signed-in session");
+        if (req.method === "GET") {
+          return json(200, store.read((s) => {
+            const u = admin(s, req);
+            return { keys: Object.values(s.apiKeys ?? {}).filter((k) => k.orgId === u.orgId).sort((a, b) => b.created_at.localeCompare(a.created_at)).map((k) => publicApiKey(k, now())) };
+          }));
+        }
+        if (keyRevoke) {
+          const id = decodeURIComponent(keyRevoke[1]);
+          return json(200, store.transaction((s) => {
+            const u = admin(s, req);
+            const k = Object.hasOwn(s.apiKeys ?? {}, id) ? s.apiKeys[id] : null;
+            if (!k || k.orgId !== u.orgId) fail(404, "API key not found");
+            if (!k.revoked_at) {
+              k.revoked_at = new Date(now()).toISOString();
+              audit(s, u.orgId, u.id, "api_key.revoke", `apikey:${k.id}`, { name: k.name, role: k.role });
+            }
+            return { key: publicApiKey(k, now()) };
+          }));
+        }
+        const input = parseApiKeyInput(body, now());
+        return json(201, store.transaction((s) => {
+          const u = admin(s, req);
+          const { raw, record } = createApiKey({ orgId: u.orgId, createdBy: u.id, ...input, nowMs: now(), hash: hashToken });
+          s.apiKeys ??= {};
+          s.apiKeys[record.id] = record;
+          audit(s, u.orgId, u.id, "api_key.create", `apikey:${record.id}`, { name: record.name, role: record.role, expires_at: record.expires_at });
+          return { ...publicApiKey(record, now()), secret: raw };
+        }));
+      }
       if (path === "/v1/enrollment-tokens" && req.method === "POST") {
         const raw = token();
         const policy = { version: 1, caps: body.caps ?? {}, killed: false, ...(body.maxSteps != null ? { maxSteps: body.maxSteps } : {}), ...(body.models != null ? { models: body.models } : {}) };
@@ -371,7 +422,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
-          const u = sessionUser(s, req);
+          const u = memberUser(s, req);
           const orgAgents = new Set(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => a.id));
           const query = parseReceiptsQuery(new URL(req.url, origin).searchParams, orgAgents, parseAuditRange);
           const rows = visibleReceipts(s, u.orgId).map((item) => ({
@@ -403,7 +454,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/audit.csv" && req.method === "GET") {
         const csv = store.read((s) => {
-          const u = sessionUser(s, req);
+          const u = memberUser(s, req);
           const range = parseAuditRange(new URL(req.url, origin).searchParams);
           return auditCsv(labelAudit(s, u.orgId, s.audit), range);
         });
@@ -416,7 +467,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/evidence.json" && req.method === "GET") {
         return json(200, store.read((s) => {
-          const u = sessionUser(s, req);
+          const u = memberUser(s, req);
           return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
@@ -427,7 +478,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/spend" && req.method === "GET") {
         return json(200, store.read((s) => {
-          const u = sessionUser(s, req);
+          const u = memberUser(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams);
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
           return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names });
@@ -618,7 +669,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
         const freeze = path.endsWith("/freeze");
         const result = store.transaction((s) => {
-          const u = admin(s, req);
+          const u = memberAdmin(s, req);
           const reason = fleetReason(body?.reason, true);
           return freeze ? freezeFleet(s, u, reason) : resumeFleet(s, u, reason);
         });
@@ -627,7 +678,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       const update = /^\/v1\/agents\/([^/]+)\/(policy|revoke)$/.exec(path);
       if (update && req.method === "POST") {
         const result = store.transaction((s) => {
-          const u = admin(s, req), a = s.agents[update[1]];
+          const u = memberAdmin(s, req), a = s.agents[update[1]];
           if (!a || a.orgId !== u.orgId) fail(404, "Agent not found");
           if (update[2] === "revoke") { a.revoked = true; audit(s, u.orgId, u.id, "agent.revoke", a.id); return { revoked: true }; }
           const reason = fleetReason(body.reason, false);
@@ -681,7 +732,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         if (!ALERT_STATUSES.includes(status)) fail(400, "status must be active, acknowledged, resolved or all");
         const range = parseAuditRange(params);
         return json(200, store.read((s) => {
-          const u = sessionUser(s, req);
+          const u = memberUser(s, req);
           return { alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId), { status, ...range }) };
         }));
       }
@@ -689,7 +740,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (ackRoute && req.method === "POST") {
         const id = decodeURIComponent(ackRoute[1]);
         return json(200, store.transaction((s) => {
-          const u = admin(s, req);
+          const u = memberAdmin(s, req);
           const record = Object.hasOwn(s.alerts, id) ? s.alerts[id] : null;
           if (!record || record.orgId !== u.orgId) fail(404, "Alert not found");
           if (!record.acknowledged_at) {
@@ -705,7 +756,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const input = settleInput(body);
         const receiptId = decodeURIComponent(settleRoute[1]);
         const result = store.transaction((s) => {
-          const u = admin(s, req);
+          const u = memberAdmin(s, req);
           const matches = Object.values(s.receipts).filter((r) => r.orgId === u.orgId && r.receipt?.id === receiptId && (input.agentId === undefined || r.agentId === input.agentId));
           if (!matches.length) fail(404, "Receipt not found");
           if (matches.length > 1) fail(409, "Receipt id is ambiguous; pass agent_id");

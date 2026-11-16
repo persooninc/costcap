@@ -13,10 +13,14 @@ export function auditLabeler(s, orgId) {
   for (const a of Object.values(s.agents ?? {})) if (a.orgId === orgId) agents.set(a.id, a.name);
   for (const t of Object.values(s.teams ?? {})) if (t.orgId === orgId) teams.set(t.name, t.name);
   for (const i of Object.values(s.invitations ?? {})) if (i.orgId === orgId) invites.set(i.id, i.email);
+  // Issue #203: actions taken with an org API key are audited as `apikey:<id>`.
+  const keys = new Map();
+  for (const k of Object.values(s.apiKeys ?? {})) if (k.orgId === orgId) keys.set(`apikey:${k.id}`, `api-key:${k.name}`);
   const org = s.orgs?.[orgId];
-  const actorLabel = (actor) => users.get(actor) ?? agents.get(actor) ?? SYSTEM_ACTORS[actor] ?? "unknown";
+  const actorLabel = (actor) => users.get(actor) ?? agents.get(actor) ?? keys.get(actor) ?? SYSTEM_ACTORS[actor] ?? "unknown";
   const targetLabel = (target) => {
     if (target == null) return null;
+    if (keys.has(target)) return keys.get(target);
     if (agents.has(target)) return agents.get(target);
     if (teams.has(target)) return teams.get(target);
     if (users.has(target)) return users.get(target);

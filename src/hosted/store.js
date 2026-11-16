@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, chmodSy
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
-export const EMPTY_STATE = Object.freeze({ version: 1, orgs: {}, users: {}, sessions: {}, challenges: {}, enrollments: {}, agents: {}, receipts: {}, audit: [], alerts: {}, fleetFreezes: {}, teams: {} });
+export const EMPTY_STATE = Object.freeze({ version: 1, orgs: {}, users: {}, sessions: {}, challenges: {}, enrollments: {}, agents: {}, receipts: {}, audit: [], alerts: {}, fleetFreezes: {}, teams: {}, apiKeys: {} });
 
 /**
  * In-memory state with synchronous, all-or-nothing transactions. `commit(next)` runs
