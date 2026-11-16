@@ -341,6 +341,8 @@ node src/cli.js wrap --agent release-bot --policy .costcap/policy.json -- node y
 node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 ```
 
+**Per-agent caps on `POST /v1/agents/:id/policy` (#175):** `caps` (`run`, `hour`, `day`, `month`) replaces the whole caps object, so a key you leave out is removed; omitting `caps` keeps the saved caps. The dashboard agent card shows Per run / Per hour / Per day / Per month and its "Save caps" always sends every key, so an API-set `caps.hour` survives a save that only changes models or steps; clearing a field removes that cap.
+
 Enrolled agents can also get a fleet step budget: an admin sets "Max steps per run" in the dashboard (`maxSteps` on `POST /v1/agents/:id/policy`). The wrapper enforces it per run from its cached policy, even offline. A local `--max-steps` can tighten it, never loosen it.
 
 ### Model allowlist
