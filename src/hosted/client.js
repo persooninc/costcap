@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts } from "../cap.js";
+import { validTeamPolicy, cachedTeamVerdict } from "./teams.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -56,19 +57,20 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
   const policy = () => resolvePolicy({ lastKnown: data.policy });
   return {
     policy,
+    team: () => data.team ?? null,
+    // Team budget (#123), enforced offline from the cached team policy. Spend this
+    // agent has not synced yet is added on top of the server's synced team spend.
+    teamCheck(nowMs = Date.now()) {
+      if (!data.team) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedTeamVerdict(data.team, loadReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+    },
     revoked: () => revoked,
     async sync() {
       if (busy) return { skipped: true };
       busy = true;
       try {
-        const fetched = await request(data.url, data.token, "/v1/policy");
-        if (validatePolicy(fetched).length) throw new Error("Invalid fleet policy response");
-        // Only strictly newer valid versions can replace a cached policy.
-        if (fetched.version > data.policy.version) {
-          data.policy = fetched;
-          saveEnrollment(path, data);
-          onPolicy(policy());
-        }
+        // Receipts go up first so the team spend fetched next already includes them (#123).
         const synced = new Set(data.syncedIds ?? []);
         const pending = loadReceipts(receiptsPath).filter((r) => r.id && !synced.has(r.id)).slice(0, 100);
         if (pending.length) {
@@ -78,6 +80,17 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
           for (const id of result.acceptedIds) synced.add(id);
           data.syncedIds = [...synced];
           saveEnrollment(path, data);
+        }
+        const fetched = await request(data.url, data.token, "/v1/policy");
+        const { team = null, ...fetchedPolicy } = fetched ?? {};
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team)) throw new Error("Invalid fleet policy response");
+        // Team membership and spend refresh on every poll; removal (null) stops team enforcement.
+        if (JSON.stringify(team) !== JSON.stringify(data.team ?? null)) { data.team = team; saveEnrollment(path, data); }
+        // Only strictly newer valid versions can replace a cached policy.
+        if (fetchedPolicy.version > data.policy.version) {
+          data.policy = fetchedPolicy;
+          saveEnrollment(path, data);
+          onPolicy(policy());
         }
         return { online: true, version: data.policy.version };
       } catch (err) {

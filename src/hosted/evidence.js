@@ -5,7 +5,7 @@ export const EVIDENCE_SCHEMA = "costcap.evidence/v1";
 
 const known = (unknown) => unknown === 0;
 
-export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], audit = [], nowMs, spendFor }) {
+export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], audit = [], nowMs, spendFor, teams = [] }) {
   if (typeof orgId !== "string" || !orgId) throw new Error("orgId required");
   if (!Number.isFinite(nowMs)) throw new Error("nowMs required");
   if (typeof spendFor !== "function") throw new Error("spendFor required");
@@ -17,6 +17,7 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
       revoked: Boolean(a.revoked),
       killed: Boolean(a.policy?.killed),
       caps: { ...(a.policy?.caps ?? {}) },
+      team: teams.find((t) => t.agents.includes(a.id))?.name ?? null,
       spend: Object.fromEntries(["day", "month"].map((w) => [w, {
         usd_known: Number(spend[w].usd.toFixed(6)),
         unknown_count: spend[w].unknown,
@@ -50,6 +51,8 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     org_id: orgId,
     agents: out,
     alerts: alerts.map((a) => ({ kind: a.kind ?? null, key: a.key ?? null, agent_id: a.agentId ?? null, scope: a.scope ?? null })),
+    // Team budgets (#123): shared cap, synced spend and verdict per team.
+    teams: teams.map((t) => ({ name: t.name, agents: [...t.agents], caps: { ...t.caps }, spend: { ...t.spend }, verdict: t.verdict, scope: t.scope ?? null })),
     receipts: rows,
     audit: trail,
     totals: { agents: out.length, receipts: rows.length, unknown_cost_receipts: unknownTotal, cost_complete: known(unknownTotal) },

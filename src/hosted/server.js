@@ -14,6 +14,7 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { maskAlertSettings, validSlackWebhook } from "./delivery.js";
+import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
 
@@ -134,6 +135,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     return agent;
   };
   const admin = (s, req) => { const u = sessionUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
+  // Issue #123: org teams and their verdicts from synced receipts.
+  const orgTeams = (s, orgId) => Object.values(s.teams ?? {}).filter((t) => t.orgId === orgId).sort((a, b) => a.name.localeCompare(b.name));
+  const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map((r) => r.receipt);
+  const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
     let logged = false;
@@ -270,7 +275,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); return a.policy; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -321,7 +326,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
             alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active),
-            audit: s.audit.filter((e) => e.org_id === u.orgId) });
+            audit: s.audit.filter((e) => e.org_id === u.orgId),
+            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)) });
         }));
       }
       if (path === "/v1/fleet" && req.method === "GET") {
@@ -331,6 +337,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             receipts: visibleReceipts(s, u.orgId),
             audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
+            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
             beta: true, billing: billing ? "enabled" : "disabled",
             plan: { ...entitlements(s, u.orgId), usage: planUsage(s, u.orgId, now(), { pending: false }), upgradeUrl },
@@ -405,6 +412,30 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      if (path === "/v1/teams" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = sessionUser(s, req); return { teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)), canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/teams" && req.method === "POST") {
+        const result = store.transaction((s) => {
+          s.teams ??= {};
+          const u = admin(s, req);
+          const input = parseTeamInput(body, { orgId: u.orgId, orgAgents: Object.values(s.agents).filter((a) => !a.revoked), teams: Object.values(s.teams) });
+          const key = teamKey(u.orgId, input.name);
+          const current = s.teams[key] ?? null;
+          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, month: t.month ?? null } : null);
+          if (input.remove) {
+            if (!current) fail(404, "Team not found");
+            delete s.teams[key];
+            audit(s, u.orgId, u.id, "team.change", input.name, { previous: strip(current), next: null });
+            return { removed: true, name: input.name };
+          }
+          const { name, agents, day, month } = input;
+          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}) };
+          audit(s, u.orgId, u.id, "team.change", name, { previous: strip(current), next: strip(s.teams[key]) });
+          return verdictOf(s, s.teams[key]);
+        });
+        return json(200, result);
+      }
       const budgetRoute = /^\/v1\/agents\/([^/]+)\/budget$/.exec(path);
       if (budgetRoute && req.method === "GET") {
         return json(200, store.read((s) => {
@@ -415,7 +446,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
           const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
           const runId = new URL(req.url, origin).searchParams.get("run_id");
-          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null });
+          const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id);
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null, team: t ? verdictOf(s, t) : null });
         }));
       }
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {

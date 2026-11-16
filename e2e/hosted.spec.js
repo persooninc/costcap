@@ -254,3 +254,53 @@ test("#121 admin saves alert destinations, dashboard shows masked webhook, viewe
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+test("#123 admin creates a team in the dashboard and sees the team spend card", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-team-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key",
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#email").fill("team-admin@example.invalid");
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    const agents = await page.evaluate(async (base) => {
+      const out = [];
+      for (const name of ["release-bot", "triage-bot"]) {
+        const t = await (await fetch("/v1/enrollment-tokens", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+        out.push(await (await fetch(base + "/v1/enroll", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + t.token }, body: JSON.stringify({ name }) })).json());
+      }
+      return out;
+    }, origin);
+    await page.request.post(`${origin}/v1/receipts`, { headers: { authorization: `Bearer ${agents[0].token}`, "content-type": "application/json" },
+      data: { receipts: [{ id: "r1", ts: new Date().toISOString(), cost_usd: 12.5 }] } });
+    await page.locator("#refresh").click();
+    await expect(page.locator("#teams")).toContainText("No teams yet.");
+    await page.locator("#teamForm input[name=name]").fill("ops");
+    await page.locator("#teamAgents label", { hasText: "release-bot" }).locator("input").check();
+    await page.locator("#teamAgents label", { hasText: "triage-bot" }).locator("input").check();
+    await page.locator("#teamForm input[name=day]").fill("30");
+    await page.locator("#teamForm button").click();
+    const card = page.locator('#teams [data-team="ops"]');
+    await expect(card).toContainText("today $12.50 of $30.00");
+    await expect(card).toContainText("release-bot, triage-bot");
+    await expect(card.locator("strong")).toHaveText("OK");
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

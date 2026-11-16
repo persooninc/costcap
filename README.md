@@ -210,6 +210,14 @@ return the same verdict with `budget_remaining`. Run and step budgets are per
 `run_id`, which the wrapper assigns. Figures are estimates, the same limits above
 apply, and the policy file must be protected from the agent it limits.
 
+### Hosted team budgets
+
+In the hosted workspace an owner or admin defines teams with `POST /v1/teams` (`{"name": "ops", "agents": [agentId, ...], "day": 30, "month": 500}`; `{"name": "ops", "remove": true}` deletes). Any member can read `GET /v1/teams`. Viewers get 403 on writes, and an agent from another org gets 400. An agent belongs to at most one team. Every change is audited as `team.change`, with the previous and new values.
+
+Each enrolled wrapper gets its team's caps and the team's synced spend with every `/v1/policy` poll. It enforces them offline from that cache, adding its own unsynced spend on top. Its own caps apply first, then the team's. A refusal reads `budget_exceeded` with `scope: "team:ops:day"`. An unknown cost (`cost_usd: null`) from any member makes the team verdict `accounting_unavailable`. It is never counted as $0.
+
+**Overshoot:** team spend comes from synced receipts. Spend another member has not synced yet (up to one poll interval, 60s) is not seen, so the team can go over its cap by that amount. Removing an agent from a team stops its team enforcement at its next poll. `GET /v1/agents/:id/budget`, `/v1/evidence.json` (`teams[]`, `agents[].team`) and the dashboard's Team budgets card show each team's cap, spend and verdict.
+
 ## Run summaries
 
 Every `costcap wrap` run writes `<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`) when it ends, including after a cap stop, breaker stop or `costcap kill`. It holds `calls`, `blocked_calls`, `by_model` (calls, input/output/cache-read/cache-write tokens, `cost_usd`), `total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope) and `stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`, plus `stopped_scope`). If any call has unknown cost, `total_cost_usd` is `null`, never a silent $0. A one-line roll-up is printed to stderr.

@@ -118,7 +118,7 @@ export function createSseUsageParser(provider, requestedModel) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -164,6 +164,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const agentHit = agentBudgets?.check(who);
           if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
+          const teamHit = teamCheck?.();
+          if (teamHit) return block(teamHit.reason, teamHit, { error: teamHit.verdict, ...teamHit });
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
