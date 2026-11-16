@@ -11,6 +11,7 @@ import { diffRecords, fromRecords, toRecords } from "../src/hosted/store-records
 import { createHostedServer } from "../src/hosted/server.js";
 import { applyMigrations } from "../scripts/db-apply.mjs";
 import { psql } from "../scripts/db-migrate.mjs";
+import { hashToken } from "../src/hosted/policy.js";
 import { skipUnlessDocker } from "./support/docker.js";
 import { startPostgres } from "./support/postgres.js";
 
@@ -21,6 +22,13 @@ async function healthOf(store) {
   const service = createHostedServer({ store, origin: "http://localhost", secureCookies: false, verifyChallenge: async () => false, sendCode: async () => {} });
   await new Promise((resolve) => service.server.listen(0, "127.0.0.1", resolve));
   try { return await (await fetch(`http://127.0.0.1:${service.server.address().port}/health`)).json(); }
+  finally { service.server.closeAllConnections(); service.server.close(); }
+}
+
+async function policyOf(store, token) {
+  const service = createHostedServer({ store, origin: "http://localhost", secureCookies: false, verifyChallenge: async () => false, sendCode: async () => {} });
+  await new Promise((resolve) => service.server.listen(0, "127.0.0.1", resolve));
+  try { return await (await fetch(`http://127.0.0.1:${service.server.address().port}/v1/policy`, { headers: { authorization: `Bearer ${token}` } })).json(); }
   finally { service.server.closeAllConnections(); service.server.close(); }
 }
 
@@ -58,6 +66,15 @@ async function contract(open, mode) {
   // #123: org teams survive a restart on both stores.
   assert.deepEqual(reopened.read((s) => s.teams[`${ORG_A}:ops`]), { orgId: ORG_A, name: "ops", agents: ["ag1"], day: 30 });
   assert.equal((await healthOf(reopened)).persistence, mode);
+  // #127: /v1/policy agent_spend is org-scoped. A same-id agent row planted under org B never counts.
+  const day = new Date().toISOString();
+  reopened.transaction((s) => {
+    s.agents.ag1 = { id: "ag1", orgId: ORG_A, name: "a", hash: hashToken("ag1-token"), policy: { version: 1, caps: { day: 1 }, killed: false }, lastSeen: 1, revoked: false };
+    s.receipts["ag1:today"] = { orgId: ORG_A, agentId: "ag1", receipt: { id: "today", ts: day, cost_usd: 0.4 } };
+    s.receipts["ag1:foreign"] = { orgId: ORG_B, agentId: "ag1", receipt: { id: "foreign", ts: day, cost_usd: 99 } };
+  });
+  await reopened.flush();
+  assert.deepEqual((await policyOf(reopened, "ag1-token")).agent_spend.spent.day, 0.4);
   return { store, reopened };
 }
 
