@@ -27,6 +27,7 @@ import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, cre
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
+import { DOWNGRADE_HEADER, capScopes, downgradeLine, rewriteModel, triggerScope } from "./downgrade.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -416,7 +417,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrade = null, downgradeScopes = null, downgradeTracker = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -560,7 +561,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         }).catch(() => { send(503, { error: "receipt_ledger_unavailable" }); });
         return;
       }
-      const body = Buffer.concat(chunks);
+      let body = Buffer.concat(chunks);
       const run = async () => {
         let failMsg = null;
         if (res.destroyed) return;
@@ -626,12 +627,45 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           return "blocked";
         };
         let preflightEst;
+        // #207: receipt fields when a budget-triggered downgrade applies (or cannot on this route).
+        let downgradeInfo = null;
         const verdict = guarded(() => {
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
           const accountingFailure = accountingFailureNow();
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const generates = !["GET", "HEAD"].includes(req.method);
+          // #207: past the configured fraction of any cap, rewrite FROM -> TO before every
+          // model check, so the allowlist, unknown-models, preflight, tag caps and cache key use TO.
+          const dg = generates && requestedModel ? downgrade?.() : null;
+          if (dg && Object.hasOwn(dg.map, requestedModel)) {
+            const from = requestedModel, to = dg.map[from];
+            const scopes = [...(cap ? capScopes(cap.limits(), cap.spend()) : [])];
+            if (agentBudgets?.limitsFor) {
+              const own = agentBudgets.limitsFor(who.agent_id ?? "unknown");
+              if (own) scopes.push(...capScopes(own, agentBudgets.spend(who), "agent:"));
+              const team = agentBudgets.teamFor?.(who.agent_id ?? "unknown");
+              if (team) scopes.push(...capScopes(team, agentBudgets.teamSpend(who), "team:"));
+            }
+            try { scopes.push(...(downgradeScopes?.() ?? [])); } catch { /* fleet cache unreadable: local scopes only */ }
+            const hit = triggerScope(scopes, dg.at);
+            if (hit) {
+              const supported = !cloud && !custom ? ["openai", "anthropic", "openrouter"].includes(provider) && !audio && !batchCreate && !Array.isArray(parsedBody?.models) : custom && !batchCreate;
+              const rewritten = supported ? rewriteModel(body, to) : null;
+              if (!rewritten) downgradeInfo = { downgrade: "unsupported_route" };
+              else {
+                body = rewritten;
+                requestedModel = to;
+                downgradeInfo = { requested_model: from, downgrade: { scope: hit.scope, fraction: hit.fraction } };
+                res.setHeader(DOWNGRADE_HEADER, `${from}->${to}`);
+                const ev = downgradeTracker?.observe(hit, from, to);
+                if (ev) {
+                  const done = emitEvent(ev);
+                  try { onWarning(downgradeLine(done)); } catch { /* stderr is best effort */ }
+                }
+              }
+            }
+          }
           const allow = generates ? allowedModels?.() ?? null : null;
           if (generates && routerModels === null) {
             emit({ provider, path: storedPath, blocked: true, reason: "invalid_models", outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
@@ -739,7 +773,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               cache.hit(entry.cost_usd);
               velocity?.step?.();
               emit({ provider, path: storedPath, status: entry.status, blocked: false, model: entry.model ?? requestedModel ?? "unknown",
-                cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id });
+                cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id, ...downgradeInfo });
               flushWarnings();
               if (!res.destroyed) res.writeHead(entry.status, { "content-type": entry.content_type, [CACHE_HEADER]: "hit" }).end(entry.body);
               return;
@@ -793,7 +827,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
-          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }), ...downgradeInfo,
             ...(preflightEst?.pass ? { preflight_estimate: false } : preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, audioCost, streamCut = false, sseIncomplete = false;
           // #196: Responses background create / read / cancel on the first-party OpenAI route.

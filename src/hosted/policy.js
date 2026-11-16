@@ -8,6 +8,7 @@
 
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
+import { downgradeError, mergeDowngrade } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 // Enrollment tokens are shown once. Only the SHA-256 hash is stored.
@@ -82,6 +83,9 @@ export function validatePolicy(p) {
   // Rate limits (issue #192): optional positive integers per 60 s.
   for (const k of ["rpm", "tpm"]) if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] > 0)) errors.push(`${k} must be a positive integer`);
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
+  // Budget-triggered model downgrade (issue #207): optional { at, map }.
+  const dgErr = downgradeError(p.downgrade);
+  if (dgErr) errors.push(dgErr);
   const raiseErr = raiseError(p.raise);
   if (raiseErr) errors.push(raiseErr);
   return errors;
@@ -98,6 +102,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   for (const k of CAP_KEYS) if (local[k] != null && (!Number.isFinite(local[k]) || local[k] <= 0)) throw new Error(`Invalid local cap ${k}`);
   if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");
   if (local.models != null && !isModelList(local.models)) throw new Error("Invalid local models");
+  if (downgradeError(local.downgrade)) throw new Error("Invalid local downgrade");
   for (const k of ["rpm", "tpm"]) if (local[k] != null && !(Number.isInteger(local[k]) && local[k] > 0)) throw new Error(`Invalid local ${k}`);
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
@@ -118,5 +123,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   const models = intersectModels(server?.models ?? null, local?.models ?? null);
   // #192: rate limits: the minimum wins, so local can tighten but never loosen.
   const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
-  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+  // #207: local downgrade settings only add mappings or lower the trigger fraction.
+  const downgrade = mergeDowngrade(server?.downgrade ?? null, local?.downgrade ?? null);
+  return { caps, maxSteps, models, ...(downgrade && { downgrade }), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }
