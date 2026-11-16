@@ -22,11 +22,12 @@ import { createRateLimiter, minLimit } from "./rate-limit.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { buildRunSummary, rollupLine, runsCommand, writeRunSummary, runEndRecord } from "./run-summary.js";
 import { createKillCheck, hostKillFile, kill, killStatus, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
+import { summaryCommand, diffCommand, summarizeLedger, stableStringify, readSummary, diffSummaries, formatDiffText, parseThresholds } from "./cost-diff.js";
 import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
@@ -41,7 +42,9 @@ import { isPricedModel } from "./pricing.js";
 const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
-  "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
+  "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output] [--baseline FILE] [--max-increase-pct N] [--max-increase-usd N] [--summary-out FILE]\n" +
+  "       costcap summary [--receipts FILE] [--run-id ID] --json\n" +
+  "       costcap diff --baseline FILE --current FILE [--max-increase-pct N] [--max-increase-usd N] [--markdown] [--json]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap bill-check --receipts FILE --provider openai|anthropic (--provider-export FILE | --fetch) [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tolerance-pct 5] [--project ID] [--workspace ID] [--json]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
@@ -115,6 +118,9 @@ export function parseWrapArgs(argv) {
     else if (f === "--cache-max-mb") opts.cacheMaxMb = positiveNumber(f, v);
     else if (f === "--upstream") opts.upstreamSpecs = [...(opts.upstreamSpecs ?? []), v];
     else if (f === "--upstream-prices") opts.upstreamPricesPath = v;
+    else if (f === "--baseline") opts.baselinePath = v;
+    else if (f === "--summary-out") opts.summaryOut = v;
+    else if (f === "--max-increase-pct" || f === "--max-increase-usd") Object.assign(opts.thresholds ??= {}, parseThresholds((n) => (n === f ? v : undefined)));
     else throw new Error(`unknown flag ${f}`);
   }
   // #169: validated here so a bad --tag exits 2 before anything is spawned.
@@ -347,9 +353,18 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       else {
         // The host kill file always applies; the project kill file only with an explicit --kill-file.
         const result = guardedBudgetStatus({ ...options, killFile: rest.includes("--kill-file") ? parsed.killFile : null });
-        if (parsed.githubOutput) writeGithubOutputs(result, parsed.caps);
-        console.log(JSON.stringify(result));
-        process.exitCode = result.ok ? 0 : 1;
+        // #229: optional cost diff vs a baseline summary, plus the current summary for the next baseline.
+        let diff = null;
+        if (parsed.thresholds && !parsed.baselinePath) throw new Error("--max-increase-pct/--max-increase-usd need --baseline FILE");
+        if (parsed.baselinePath || parsed.summaryOut) {
+          const current = summarizeLedger(parsed.receiptsPath, parsed.runId !== undefined ? { runId: parsed.runId } : {});
+          if (parsed.summaryOut) writeFileSync(parsed.summaryOut, stableStringify(current));
+          if (parsed.baselinePath) diff = diffSummaries(readSummary(parsed.baselinePath, "baseline"), current, parsed.thresholds ?? {});
+        }
+        if (parsed.githubOutput) writeGithubOutputs(result, parsed.caps, process.env, diff);
+        if (diff) console.error(formatDiffText(diff));
+        console.log(JSON.stringify(diff ? { ...result, cost_diff: { verdict: diff.verdict, delta_usd: diff.total.delta, delta_pct: String(diff.total.pct), baseline_usd: diff.total.baseline, reasons: diff.reasons, warnings: diff.warnings } } : result));
+        process.exitCode = result.ok && (!diff || diff.verdict === "ok") ? 0 : 1;
       }
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
   } else if (cmd === "agent-status") {
@@ -397,6 +412,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
   } else if (cmd === "receipts") {
     process.exitCode = receiptsCommand(rest);
+  } else if (cmd === "summary") {
+    process.exitCode = summaryCommand(rest);
+  } else if (cmd === "diff") {
+    process.exitCode = diffCommand(rest);
   } else if (cmd === "runs") {
     runsCommand(rest);
   } else if (cmd === "kill" || cmd === "resume") {

@@ -1,0 +1,1 @@
+{"version":1,"total_usd":0.95,"calls":3,"tokens":{"in":300,"out":75,"cached":10},"unknown_cost_count":0,"by_model":{"claude-sonnet":{"calls":2,"cost_usd":0.35,"unknown_cost_count":0},"gpt-4o":{"calls":1,"cost_usd":0.6,"unknown_cost_count":0}},"by_tag":{}}

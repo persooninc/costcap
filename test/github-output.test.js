@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkOutputs, formatOutputFile, formatSummary, writeGithubOutputs, OUTPUT_NAMES } from "../src/github-output.js";
+import { checkOutputs, formatOutputFile, formatSummary, writeGithubOutputs, OUTPUT_NAMES, DIFF_OUTPUT_NAMES } from "../src/github-output.js";
 
 const CLI = new URL("../src/cli.js", import.meta.url).pathname;
 const now = new Date().toISOString();
@@ -102,7 +102,7 @@ test("regression: every output declared in action.yml is written by the CLI and 
   const yml = readFileSync(new URL("../action.yml", import.meta.url), "utf8");
   const block = yml.split(/^outputs:\n/m)[1].split(/^runs:/m)[0];
   const declared = [...block.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
-  assert.deepEqual(declared.sort(), [...OUTPUT_NAMES].sort());
+  assert.deepEqual(declared.sort(), [...OUTPUT_NAMES, ...DIFF_OUTPUT_NAMES].sort());
   for (const n of declared) assert.ok(block.includes(`steps.check.outputs.${n} }}`), n);
   assert.match(yml, /- id: check/); assert.match(yml, /--github-output/);
 });

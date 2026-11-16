@@ -26,9 +26,21 @@ inputs:
   tag-caps:
     description: Optional per-tag caps, space separated KEY:SCOPE=USD rules (e.g. "customer:day=5 customer:month=50"); each tag value gets its own cap
     required: false
+  baseline:
+    description: Optional path to a baseline summary JSON (costcap summary --json, e.g. downloaded from the last main run); enables the cost diff
+    required: false
+  max-increase-pct:
+    description: Optional; with baseline, fail with cost_regression when total spend rises more than this percent (not gated when the baseline has unknown cost)
+    required: false
+  max-increase-usd:
+    description: Optional; with baseline, fail with cost_regression when total spend rises more than this many USD
+    required: false
+  summary-out:
+    description: Optional path to write the current summary JSON, usable as the next baseline
+    required: false
 outputs:
   verdict:
-    description: ok, budget_exceeded, tag_budget_exceeded or accounting_unavailable
+    description: ok, budget_exceeded, tag_budget_exceeded, accounting_unavailable or cost_regression
     value: ${{ steps.check.outputs.verdict }}
   spent-usd:
     description: Estimated USD across the receipt file; empty when any cost is unknown
@@ -60,6 +72,18 @@ outputs:
   tag-caps:
     description: Tag values at or over a tag-caps rule, as key=value:scope:spent/cap pairs; empty if none
     value: ${{ steps.check.outputs.tag-caps }}
+  delta-usd:
+    description: With baseline, current minus baseline USD; empty when current cost is unknown
+    value: ${{ steps.check.outputs.delta-usd }}
+  delta-pct:
+    description: With baseline, percent change (inf when the baseline is $0); empty when current cost is unknown
+    value: ${{ steps.check.outputs.delta-pct }}
+  baseline-usd:
+    description: With baseline, the baseline total USD
+    value: ${{ steps.check.outputs.baseline-usd }}
+  diff-markdown:
+    description: With baseline, a Markdown cost diff table to post in your own PR comment step
+    value: ${{ steps.check.outputs.diff-markdown }}
 runs:
   using: composite
   steps:
@@ -76,6 +100,10 @@ runs:
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
         COSTCAP_RUN_ID: ${{ inputs.run-id }}
         COSTCAP_TAG_CAPS: ${{ inputs.tag-caps }}
+        COSTCAP_BASELINE: ${{ inputs.baseline }}
+        COSTCAP_MAX_INCREASE_PCT: ${{ inputs.max-increase-pct }}
+        COSTCAP_MAX_INCREASE_USD: ${{ inputs.max-increase-usd }}
+        COSTCAP_SUMMARY_OUT: ${{ inputs.summary-out }}
         COSTCAP_ACTION_PATH: ${{ github.action_path }}
       run: |
         args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP" --github-output)
@@ -84,4 +112,8 @@ runs:
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
         if [ -n "$COSTCAP_RUN_ID" ]; then args+=(--run-id "$COSTCAP_RUN_ID"); fi
         for rule in $COSTCAP_TAG_CAPS; do args+=(--tag-cap "$rule"); done
+        if [ -n "$COSTCAP_BASELINE" ]; then args+=(--baseline "$COSTCAP_BASELINE"); fi
+        if [ -n "$COSTCAP_MAX_INCREASE_PCT" ]; then args+=(--max-increase-pct "$COSTCAP_MAX_INCREASE_PCT"); fi
+        if [ -n "$COSTCAP_MAX_INCREASE_USD" ]; then args+=(--max-increase-usd "$COSTCAP_MAX_INCREASE_USD"); fi
+        if [ -n "$COSTCAP_SUMMARY_OUT" ]; then args+=(--summary-out "$COSTCAP_SUMMARY_OUT"); fi
         node "$COSTCAP_ACTION_PATH/src/cli.js" "${args[@]}"

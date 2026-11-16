@@ -25,6 +25,54 @@ jobs:
       - run: npm run acceptance:runaway
       - run: npm pack --dry-run
       - run: node scripts/pack-check.mjs
+  action-self-test:
+    runs-on: [self-hosted, dev-home-01]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: pass
+        uses: ./
+        with:
+          receipts: test/fixtures/cost-diff/ledger.jsonl
+          cap: '100'
+          baseline: test/fixtures/cost-diff/base-pass.json
+          max-increase-pct: '25'
+          summary-out: ${{ runner.temp }}/next-baseline.json
+      - id: regress
+        continue-on-error: true
+        uses: ./
+        with:
+          receipts: test/fixtures/cost-diff/ledger.jsonl
+          cap: '100'
+          baseline: test/fixtures/cost-diff/base-fail.json
+          max-increase-pct: '25'
+      - id: next
+        uses: ./
+        with:
+          receipts: test/fixtures/cost-diff/ledger.jsonl
+          cap: '100'
+          baseline: ${{ runner.temp }}/next-baseline.json
+          max-increase-pct: '0'
+      - name: assert outputs
+        env:
+          PASS_VERDICT: ${{ steps.pass.outputs.verdict }}
+          PASS_DELTA: ${{ steps.pass.outputs.delta-usd }}
+          REGRESS_VERDICT: ${{ steps.regress.outputs.verdict }}
+          REGRESS_PCT: ${{ steps.regress.outputs.delta-pct }}
+          REGRESS_OUTCOME: ${{ steps.regress.outcome }}
+          REGRESS_MD: ${{ steps.regress.outputs.diff-markdown }}
+          NEXT_VERDICT: ${{ steps.next.outputs.verdict }}
+          NEXT_DELTA: ${{ steps.next.outputs.delta-usd }}
+        run: |
+          set -eu
+          test "$PASS_VERDICT" = ok
+          test "$PASS_DELTA" = 0.05
+          test "$REGRESS_VERDICT" = cost_regression
+          test "$REGRESS_PCT" = 100
+          test "$REGRESS_OUTCOME" = failure
+          printf '%s' "$REGRESS_MD" | grep -q 'CostCap cost diff: cost_regression'
+          test "$NEXT_VERDICT" = ok
+          test "$NEXT_DELTA" = 0
   e2e:
     runs-on: [self-hosted, dev-home-01]
     timeout-minutes: 30

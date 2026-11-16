@@ -1,0 +1,5 @@
+{"id":"r1","ts":"2026-11-01T00:00:00Z","run_id":"a","model":"gpt-4o","input_tokens":100,"output_tokens":50,"cached_input_tokens":10,"cost_usd":0.6,"tags":{"team":"core"}}
+{"id":"r2","ts":"2026-11-01T00:00:01Z","run_id":"a","model":"claude-sonnet","input_tokens":200,"output_tokens":20,"cost_usd":0.3,"tags":{"team":"growth"}}
+{"id":"r3","ts":"2026-11-01T00:00:02Z","run_id":"b","model":"claude-sonnet","input_tokens":10,"output_tokens":5,"cost_usd":null,"tags":{"team":"growth"}}
+{"event":"reconciliation","receipt_id":"r3","cost_usd":0.1,"source":"provider","ts":"2026-11-02T00:00:00Z"}
+{"id":"r4","ts":"2026-11-01T00:00:03Z","run_id":"b","model":"gpt-4o","blocked":true,"reason":"budget_exceeded","cost_usd":0}

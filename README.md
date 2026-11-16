@@ -865,6 +865,67 @@ The job summary says that totals are estimates and whether any cost is unknown.
 
 <!-- generated-by: workspace-admin/iac-independence -->
 
+## PR cost diff vs main
+
+`costcap summary --json` writes a stable, versioned summary of a receipt ledger (total, calls, tokens, per model, per tag). `costcap diff --baseline base.json --current head.json [--max-increase-pct N] [--max-increase-usd N] [--markdown]` shows the $ and % change and exits 0 (ok), 1 (`cost_regression`) or 3 (`accounting_unavailable`: the current run has unknown cost, so the deltas are lower bounds, shown as "≥"). If only the baseline has unknown cost, the verdict carries a `baseline_incomplete` warning and the % gate is skipped. A $0 baseline reports `+∞%`.
+
+The Action does the same with `baseline`, `max-increase-pct`, `max-increase-usd` and `summary-out` inputs, and adds the `delta-usd`, `delta-pct`, `baseline-usd` and `diff-markdown` outputs. Without `baseline`, its outputs are unchanged. Two-job workflow (also at `docs/examples/cost-diff.yml`, checked by `actionlint`):
+
+```yaml
+name: agent cost diff
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+jobs:
+  baseline:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-agent-evals.sh # your agent, wrapped with: costcap wrap --receipts .costcap/receipts.jsonl -- ...
+      - uses: persooninc/costcap@<sha>
+        with:
+          receipts: .costcap/receipts.jsonl
+          cap: '20'
+          summary-out: costcap-summary.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: costcap-baseline
+          path: costcap-summary.json
+  diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-agent-evals.sh
+      - uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: cost-diff.yml
+          branch: main
+          name: costcap-baseline
+          path: baseline
+      - id: costcap
+        uses: persooninc/costcap@<sha>
+        with:
+          receipts: .costcap/receipts.jsonl
+          cap: '20'
+          baseline: baseline/costcap-summary.json
+          max-increase-pct: '25'
+          max-increase-usd: '1'
+      # Optional: post the table yourself (CostCap never calls the GitHub API).
+      - if: always() && steps.costcap.outputs.diff-markdown != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY: ${{ steps.costcap.outputs.diff-markdown }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR" --body "$BODY"
+```
+
 ## Setup
 
 ```bash

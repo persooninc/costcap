@@ -1,0 +1,1 @@
+{"version":1,"total_usd":1.38,"calls":12,"tokens":{"in":1300,"out":260,"cached":0},"unknown_cost_count":0,"by_model":{"A":{"calls":6,"cost_usd":0.6,"unknown_cost_count":0},"B":{"calls":4,"cost_usd":0.5,"unknown_cost_count":0},"C":{"calls":2,"cost_usd":0.28,"unknown_cost_count":0}},"by_tag":{}}

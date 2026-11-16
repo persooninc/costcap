@@ -1,0 +1,52 @@
+name: agent cost diff
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+jobs:
+  baseline:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-agent-evals.sh # your agent, wrapped with: costcap wrap --receipts .costcap/receipts.jsonl -- ...
+      - uses: persooninc/costcap@<sha>
+        with:
+          receipts: .costcap/receipts.jsonl
+          cap: '20'
+          summary-out: costcap-summary.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: costcap-baseline
+          path: costcap-summary.json
+  diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-agent-evals.sh
+      - uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: cost-diff.yml
+          branch: main
+          name: costcap-baseline
+          path: baseline
+      - id: costcap
+        uses: persooninc/costcap@<sha>
+        with:
+          receipts: .costcap/receipts.jsonl
+          cap: '20'
+          baseline: baseline/costcap-summary.json
+          max-increase-pct: '25'
+          max-increase-usd: '1'
+      # Optional: post the table yourself (CostCap never calls the GitHub API).
+      - if: always() && steps.costcap.outputs.diff-markdown != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BODY: ${{ steps.costcap.outputs.diff-markdown }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR" --body "$BODY"

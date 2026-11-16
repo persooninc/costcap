@@ -2,8 +2,10 @@
 // Values use heredoc delimiter syntax so newlines or `%` cannot break the file.
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { formatDiffMarkdown } from "./cost-diff.js";
 
 export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id", "tag-caps"]);
+export const DIFF_OUTPUT_NAMES = Object.freeze(["delta-usd", "delta-pct", "baseline-usd", "diff-markdown"]);
 
 const usd = (n) => (n == null ? "" : String(Number(Number(n).toFixed(6))));
 
@@ -53,9 +55,22 @@ export function formatSummary(outputs) {
       : "No receipts have unknown cost.\n");
 }
 
-export function writeGithubOutputs(result, caps, env = process.env) {
-  const outputs = checkOutputs(result, caps);
+// #229: with a baseline diff, add delta outputs; an otherwise-ok verdict becomes cost_regression.
+export function diffOutputs(outputs, diff) {
+  const out = { ...outputs };
+  if (out.verdict === "ok" && diff.verdict !== "ok") out.verdict = diff.verdict;
+  const lb = diff.lower_bound ? "" : null;
+  out["delta-usd"] = lb ?? usd(diff.total.delta);
+  out["delta-pct"] = lb ?? (Number.isFinite(diff.total.pct) ? String(diff.total.pct) : diff.total.pct > 0 ? "inf" : "-inf");
+  out["baseline-usd"] = usd(diff.total.baseline);
+  out["diff-markdown"] = formatDiffMarkdown(diff);
+  return out;
+}
+
+export function writeGithubOutputs(result, caps, env = process.env, diff = null) {
+  let outputs = checkOutputs(result, caps);
+  if (diff) outputs = diffOutputs(outputs, diff);
   if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, formatOutputFile(outputs));
-  if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, formatSummary(outputs));
+  if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, formatSummary(outputs) + (diff ? "\n" + outputs["diff-markdown"] : ""));
   return outputs;
 }

@@ -1,0 +1,198 @@
+// #229: PR cost diff vs a baseline. `costcap summary --json` writes a stable,
+// versioned spend summary; `costcap diff` compares two of them and can gate on
+// a $ or % increase. Unknown cost is never treated as $0.
+import { readFileSync } from "node:fs";
+import { loadSettledReceipts } from "./cap.js";
+
+export const SUMMARY_VERSION = 1;
+export const MAX_ROWS = 20;
+export const EXIT = Object.freeze({ ok: 0, cost_regression: 1, accounting_unavailable: 3 });
+const r6 = (n) => Number(Number(n).toFixed(6));
+
+/** Aggregate settled receipts into the v1 summary. Blocked/refused calls are not spend. */
+export function buildCostSummary(receipts, { runId } = {}) {
+  let total = 0, calls = 0, unknown = 0;
+  const tokens = { in: 0, out: 0, cached: 0 };
+  const by_model = {}, by_tag = {};
+  for (const r of receipts) {
+    if (!r || r.event || r.blocked) continue;
+    if (runId != null && r.run_id !== runId) continue;
+    calls++;
+    tokens.in += r.input_tokens ?? 0;
+    tokens.out += r.output_tokens ?? 0;
+    tokens.cached += r.cached_input_tokens ?? 0;
+    const m = (by_model[r.model ?? "unknown"] ??= { calls: 0, cost_usd: 0, unknown_cost_count: 0 });
+    m.calls++;
+    const known = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd);
+    if (known) { total += r.cost_usd; m.cost_usd = r6(m.cost_usd + r.cost_usd); } else { unknown++; m.unknown_cost_count++; }
+    if (r.tags && typeof r.tags === "object" && known) {
+      for (const [k, v] of Object.entries(r.tags)) {
+        const t = (by_tag[k] ??= {});
+        t[v] = r6((t[v] ?? 0) + r.cost_usd);
+      }
+    }
+  }
+  const s = { version: SUMMARY_VERSION, total_usd: r6(total), calls, tokens, unknown_cost_count: unknown, by_model, by_tag };
+  if (runId != null) s.run_id = runId;
+  return s;
+}
+
+export function summarizeLedger(receiptsPath, opts = {}) {
+  return buildCostSummary(loadSettledReceipts(receiptsPath), opts);
+}
+
+/** JSON with keys sorted at every level, so the same receipts give byte-identical output. */
+export function stableStringify(v) {
+  const sort = (x) => (x && typeof x === "object" && !Array.isArray(x)
+    ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sort(x[k])])) : Array.isArray(x) ? x.map(sort) : x);
+  return JSON.stringify(sort(v), null, 2) + "\n";
+}
+
+export function parseSummary(text, label = "summary") {
+  let s;
+  try { s = JSON.parse(text); } catch (e) { throw new Error(`${label} is not valid JSON: ${e.message}`); }
+  if (!s || s.version !== SUMMARY_VERSION || typeof s.total_usd !== "number" || typeof s.by_model !== "object")
+    throw new Error(`${label} is not a costcap summary v${SUMMARY_VERSION} (make it with: costcap summary --json)`);
+  return { calls: 0, tokens: {}, unknown_cost_count: 0, by_tag: {}, ...s };
+}
+
+export const readSummary = (path, label = path) => parseSummary(readFileSync(path, "utf8"), label);
+
+export function pct(base, cur) {
+  if (base === 0) return cur === 0 ? 0 : cur > 0 ? Infinity : -Infinity;
+  return Number((((cur - base) / base) * 100).toFixed(1));
+}
+
+function delta(base, cur) {
+  return { baseline: r6(base), current: r6(cur), delta: r6(cur - base), pct: pct(base, cur) };
+}
+
+function rows(kind, b = {}, c = {}) {
+  const out = [];
+  for (const key of new Set([...Object.keys(b), ...Object.keys(c)])) {
+    const inB = Object.hasOwn(b, key), inC = Object.hasOwn(c, key);
+    const d = delta(inB ? b[key] : 0, inC ? c[key] : 0);
+    const status = !inB ? "added" : !inC ? "removed" : d.delta === 0 ? "unchanged" : "changed";
+    out.push({ kind, key, status, ...d });
+  }
+  return out;
+}
+
+const modelUsd = (s) => Object.fromEntries(Object.entries(s.by_model).map(([k, v]) => [k, v?.cost_usd ?? 0]));
+const tagUsd = (s) => Object.fromEntries(Object.entries(s.by_tag ?? {}).flatMap(([k, vals]) => Object.entries(vals).map(([v, usd]) => [`${k}=${v}`, usd])));
+
+/** Compare two summaries. Thresholds are optional; maxPct/maxUsd fail when the increase is strictly greater. */
+export function diffSummaries(baseline, current, { maxPct, maxUsd } = {}) {
+  const total = delta(baseline.total_usd, current.total_usd);
+  const lower_bound = current.unknown_cost_count > 0;
+  const baseline_incomplete = baseline.unknown_cost_count > 0;
+  const changes = [...rows("model", modelUsd(baseline), modelUsd(current)), ...rows("tag", tagUsd(baseline), tagUsd(current))]
+    .filter((r) => r.status !== "unchanged")
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta) || a.kind.localeCompare(b.kind) || a.key.localeCompare(b.key));
+  const warnings = [];
+  if (baseline_incomplete) warnings.push("baseline_incomplete");
+  const reasons = [];
+  if (!lower_bound) {
+    if (maxPct != null && !baseline_incomplete && total.pct > maxPct) reasons.push(`increase ${fmtPct(total.pct)} > ${maxPct}%`);
+    if (maxUsd != null && total.delta > maxUsd) reasons.push(`increase ${fmtUsd(total.delta, true)} > $${maxUsd}`);
+  }
+  const verdict = lower_bound ? "accounting_unavailable" : reasons.length ? "cost_regression" : "ok";
+  return {
+    verdict, exit_code: EXIT[verdict], reasons, warnings, lower_bound, total,
+    calls: delta(baseline.calls ?? 0, current.calls ?? 0),
+    tokens: Object.fromEntries(["in", "out", "cached"].map((k) => [k, delta(baseline.tokens?.[k] ?? 0, current.tokens?.[k] ?? 0)])),
+    changes,
+  };
+}
+
+export function fmtUsd(n, sign = false) {
+  const a = Math.abs(n);
+  const v = a >= 0.01 || a === 0 ? a.toFixed(2) : String(Number(a.toFixed(6)));
+  return `${sign ? (n < 0 ? "-" : "+") : n < 0 ? "-" : ""}$${v}`;
+}
+
+export function fmtPct(p) {
+  if (p === Infinity) return "+∞%";
+  if (p === -Infinity) return "-∞%";
+  return `${p < 0 ? "" : "+"}${p}%`;
+}
+
+const fmtNum = (n, sign = false) => `${sign && n >= 0 ? "+" : ""}${n}`;
+
+function verdictLine(d) {
+  const lb = d.lower_bound ? " (current has unknown cost; deltas are lower bounds)" : "";
+  const why = d.reasons.length ? `: ${d.reasons.join("; ")}` : "";
+  const warn = d.warnings.length ? ` [warning: ${d.warnings.join(", ")}${d.warnings.includes("baseline_incomplete") ? "; % change not gated" : ""}]` : "";
+  return `verdict: ${d.verdict}${why}${lb}${warn}`;
+}
+
+function totalCell(d) {
+  const ge = d.lower_bound ? "≥" : "";
+  return `${ge}${fmtUsd(d.total.delta, true)} (${ge}${fmtPct(d.total.pct)})`;
+}
+
+export function formatDiffText(d) {
+  const ge = d.lower_bound ? "≥" : "";
+  const lines = [
+    `total: ${fmtUsd(d.total.baseline)} -> ${ge}${fmtUsd(d.total.current)}  ${totalCell(d)}`,
+    `calls: ${d.calls.baseline} -> ${d.calls.current}  ${fmtNum(d.calls.delta, true)} (${fmtPct(d.calls.pct)})`,
+    ...["in", "out", "cached"].map((k) => `tokens ${k}: ${d.tokens[k].baseline} -> ${d.tokens[k].current}  ${fmtNum(d.tokens[k].delta, true)} (${fmtPct(d.tokens[k].pct)})`),
+  ];
+  for (const r of d.changes.slice(0, MAX_ROWS)) lines.push(`${r.kind} ${r.key}: ${r.status} ${fmtUsd(r.delta, true)} (${fmtPct(r.pct)})  ${fmtUsd(r.baseline)} -> ${fmtUsd(r.current)}`);
+  if (d.changes.length > MAX_ROWS) lines.push(`${d.changes.length - MAX_ROWS} more`);
+  lines.push(verdictLine(d));
+  return lines.join("\n");
+}
+
+const md = (s) => String(s).replace(/[|\r\n]/g, " ");
+
+export function formatDiffMarkdown(d) {
+  const ge = d.lower_bound ? "≥" : "";
+  let out = `## CostCap cost diff: ${d.verdict}\n\n| | Baseline | Current | Change |\n| --- | --- | --- | --- |\n` +
+    `| Total | ${fmtUsd(d.total.baseline)} | ${ge}${fmtUsd(d.total.current)} | ${totalCell(d)} |\n` +
+    `| Calls | ${d.calls.baseline} | ${d.calls.current} | ${fmtNum(d.calls.delta, true)} (${fmtPct(d.calls.pct)}) |\n` +
+    ["in", "out", "cached"].map((k) => `| Tokens ${k} | ${d.tokens[k].baseline} | ${d.tokens[k].current} | ${fmtNum(d.tokens[k].delta, true)} (${fmtPct(d.tokens[k].pct)}) |\n`).join("");
+  if (d.changes.length) {
+    out += `\n| Kind | Name | Status | Baseline | Current | Change |\n| --- | --- | --- | --- | --- | --- |\n`;
+    for (const r of d.changes.slice(0, MAX_ROWS)) out += `| ${r.kind} | ${md(r.key)} | ${r.status} | ${fmtUsd(r.baseline)} | ${fmtUsd(r.current)} | ${fmtUsd(r.delta, true)} (${fmtPct(r.pct)}) |\n`;
+    if (d.changes.length > MAX_ROWS) out += `\n${d.changes.length - MAX_ROWS} more\n`;
+  }
+  return out + `\n${md(verdictLine(d))}\n`;
+}
+
+function numFlag(name, v) {
+  const n = Number(v);
+  if (v === undefined || v === "" || !Number.isFinite(n) || n < 0) throw new Error(`${name} must be a non-negative number, got "${v}"`);
+  return n;
+}
+
+export function parseThresholds(get) {
+  const o = {};
+  if (get("--max-increase-pct") !== undefined) o.maxPct = numFlag("--max-increase-pct", get("--max-increase-pct"));
+  if (get("--max-increase-usd") !== undefined) o.maxUsd = numFlag("--max-increase-usd", get("--max-increase-usd"));
+  return o;
+}
+
+const getter = (argv) => (name) => { const i = argv.indexOf(name); return i >= 0 ? (argv[i + 1] ?? "") : undefined; };
+
+/** `costcap summary [--receipts FILE] [--run-id ID] [--json]` → exit code. */
+export function summaryCommand(argv, { log = console.log, warn = console.error } = {}) {
+  try {
+    const get = getter(argv);
+    const runId = get("--run-id");
+    if (runId === "") throw new Error("--run-id needs a non-empty value");
+    log(stableStringify(summarizeLedger(get("--receipts") ?? ".costcap/receipts.jsonl", runId !== undefined ? { runId } : {})).trimEnd());
+    return 0;
+  } catch (e) { warn(`costcap: ${e.message}`); return 2; }
+}
+
+/** `costcap diff --baseline FILE --current FILE [--max-increase-pct N] [--max-increase-usd N] [--markdown] [--json]` → exit code. */
+export function diffCommand(argv, { log = console.log, warn = console.error } = {}) {
+  try {
+    const get = getter(argv);
+    if (!get("--baseline") || !get("--current")) throw new Error("usage: costcap diff --baseline FILE --current FILE [--max-increase-pct N] [--max-increase-usd N] [--markdown] [--json]");
+    const d = diffSummaries(readSummary(get("--baseline"), "baseline"), readSummary(get("--current"), "current"), parseThresholds(get));
+    log(argv.includes("--json") ? JSON.stringify(d, (k, v) => (v === Infinity ? "Infinity" : v === -Infinity ? "-Infinity" : v)) : argv.includes("--markdown") ? formatDiffMarkdown(d).trimEnd() : formatDiffText(d));
+    return d.exit_code;
+  } catch (e) { warn(`costcap: ${e.message}`); return 2; }
+}
