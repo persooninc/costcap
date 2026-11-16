@@ -6,7 +6,8 @@ import { createCapEngine, isPendingBatch, loadSettledReceipts, applySettlements 
 import { checkBudget } from "../src/check.js";
 import { createAgentBudgets } from "../src/agent-budget.js";
 import { createSettler } from "../src/settle.js";
-import { CHAT, CREATE, CREATE_STREAM, EXPECTED, USAGE, ev, resp, setup } from "./support/background.js";
+import { createVelocityBreaker } from "../src/velocity.js";
+import { CHAT, CREATE, CREATE_STREAM, EXPECTED, MODEL, USAGE, ev, resp, setup } from "./support/background.js";
 
 const capOf = (caps, history = []) => createCapEngine({ caps, history });
 const real = (s) => s.lines().filter((l) => !l.event);
@@ -149,4 +150,36 @@ test("applySettlements: an unpriced event never overrides a real settlement", ()
     { event: "reconciliation", receipt_id: "a", cost_usd: 1 }, { event: "background_unpriced", receipt_id: "a" }];
   assert.equal(applySettlements(lines)[0].cost_usd, 1);
   assert.equal(applySettlements([lines[0], lines[2]])[0].reason, "background_unpriced");
+});
+
+// #201: another run's background settle never feeds this run's velocity breaker (batches don't either).
+async function velocityScenario(t, createRun) {
+  const BIG = { input_tokens: 4_000_000, output_tokens: 0, total_tokens: 4_000_000 }; // $0.60
+  const first = await setup(t, { who: { run_id: createRun } });
+  assert.equal((await first.call("POST", "/openai/v1/responses", CREATE)).status, 200);
+  let clock = 1_000_000;
+  const velocity = createVelocityBreaker({ bucketMs: 1000, baselineBuckets: 5, multiple: 3, minSpendUsd: 0.5, now: () => clock });
+  const history = loadSettledReceipts(first.receiptsPath);
+  const cap = createCapEngine({ caps: { day: 5 }, runId: "r2", history });
+  const s = await setup(t, { receiptsPath: first.receiptsPath, cap, velocity, who: { run_id: "r2" } }, { status: "completed", usage: BIG });
+  const chat = (i) => JSON.stringify({ model: MODEL, messages: [{ role: "user", content: `q${i}` }] }); // distinct: no spiral
+  for (let i = 0; i < 5; i++) { assert.equal((await s.call("POST", "/openai/v1/chat/completions", chat(i))).status, 200); clock += 1000; }
+  assert.equal((await s.call("GET", "/openai/v1/responses/resp_bg1")).status, 200);
+  const next = await s.call("POST", "/openai/v1/chat/completions", chat(5));
+  const body = await next.json();
+  return { s, cap, next, body };
+}
+
+test("#201 AC1/AC3: another run's background settle counts toward day, never this run's velocity breaker", async (t) => {
+  const { s, cap, next } = await velocityScenario(t, "r1");
+  assert.equal(next.status, 200);
+  assert.ok(cap.spend().run < 0.001, "r1's settle is not run spend");
+  assert.ok(Math.abs(cap.spend().day - 0.6) < 0.001, "day still sees the $0.60");
+  assert.equal(s.lines().some((l) => l.reason === "breaker_open" || l.reason === "cost_velocity"), false);
+});
+
+test("#201 AC2/AC4: a same-run background settle of the same cost still trips the breaker", async (t) => {
+  const { next, body } = await velocityScenario(t, "r2");
+  assert.equal(next.status, 429);
+  assert.equal(body.reason, "cost_velocity");
 });
