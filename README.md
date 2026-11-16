@@ -141,7 +141,10 @@ CostCap. The local proxy binds to 127.0.0.1.
   blocks the **next** call; a call already in flight can overshoot the cap. A
   stream cut (upstream error, client abort or timeout) before usage arrives
   records `cost_usd: null` with `reason: "stream_incomplete"` and blocks further
-  calls. The proxy timeout covers the whole stream. OpenAI chat/Responses,
+  calls. The proxy timeout covers the whole stream. OpenAI Responses API streams
+  are metered from the terminal `response.completed` / `response.incomplete` /
+  `response.failed` event (cached input priced as cached); a Responses stream that
+  ends without a terminal event records `stream_incomplete`. OpenAI chat/Responses,
   Anthropic start/delta usage, Gemini usageMetadata, and OpenRouter (OpenAI-shape)
   usage have local fixture tests. Provider billing reconciliation and live SDK
   compatibility remain unverified.

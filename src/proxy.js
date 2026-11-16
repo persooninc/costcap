@@ -31,8 +31,17 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
 export function createUsageAccumulator(provider, requestedModel) {
   let model = requestedModel ?? "unknown";
   let usage = {};
+  // OpenAI Responses API streams nest model/usage under `response` and end with
+  // a terminal event (response.completed / response.incomplete / response.failed).
+  let responsesStream = false, responsesTerminal = false;
   const add = (chunk) => {
     if (!chunk || typeof chunk !== "object") return;
+    if (provider !== "anthropic" && provider !== "gemini" && typeof chunk.type === "string" && chunk.type.startsWith("response.")) {
+      responsesStream = true;
+      if (/^response\.(completed|incomplete|failed)$/.test(chunk.type)) responsesTerminal = true;
+      if (chunk.response && typeof chunk.response === "object") chunk = chunk.response;
+      else return;
+    }
     if (chunk.model || chunk.modelVersion || chunk.message?.model) model = chunk.model ?? chunk.modelVersion ?? chunk.message.model;
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
@@ -65,7 +74,8 @@ export function createUsageAccumulator(provider, requestedModel) {
     for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
     return { model, usage: { ...usage } };
   };
-  return { add, result };
+  // A Responses stream that never reached a terminal event is incomplete.
+  return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
 }
 
 export function extractUsage(provider, text, requestedModel) {
@@ -114,6 +124,7 @@ export function createSseUsageParser(provider, requestedModel) {
     },
     end() { if (pending) { line(pending); pending = ""; } dispatch(); return acc.result(); },
     usage: () => acc.result(),
+    get incomplete() { return acc.incomplete; },
     get done() { return done; },
   };
 }
@@ -201,7 +212,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
-          let metered, raw, streamCut = false;
+          let metered, raw, streamCut = false, sseIncomplete = false;
           if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             const parser = createSseUsageParser(provider, requestedModel);
@@ -228,6 +239,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               reader.cancel().catch(() => {});
             }
             metered = parser.end();
+            // Responses stream ended without a terminal event: usage may be partial or absent.
+            if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
             metered = extractUsage(provider, raw.toString("utf8"), requestedModel);
@@ -238,7 +251,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             cap?.record(receipt);
             if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);
-          } else if (streamCut) {
+          } else if (streamCut || sseIncomplete) {
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
             accountingFailure = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
