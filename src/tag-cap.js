@@ -156,6 +156,23 @@ export function createTagCaps({ rules = [], history = [], now = () => new Date()
   return engine;
 }
 
+/**
+ * #204: the local engine (may be null) plus an enrolled fleet's tag caps. Local
+ * rules are checked against the local ledger first, then the fleet rules (each
+ * tightened by a matching local rule) against fleet-wide synced spend.
+ */
+export function withFleetTagCaps(local, fleet, localRules = []) {
+  return {
+    rules: () => local?.rules() ?? [],
+    record: (r) => local?.record(r),
+    settle: (id, cost) => local?.settle(id, cost) ?? false,
+    check: (tags) => local?.check(tags) ?? fleet.tagCheck(tags, localRules),
+    remaining: (tags) => local?.remaining(tags) ?? [],
+    preflight: (tags, est) => local?.preflight(tags, est) ?? null,
+    over: () => local?.over() ?? [],
+  };
+}
+
 export function tagBudgetExceededBody(hit) {
   if (hit.reason === "preflight_estimate") {
     return { error: "tag_budget_exceeded", ...hit,

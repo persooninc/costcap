@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
+import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
 
 export function serviceUrl(value) {
@@ -134,6 +135,14 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         teamName: data.team?.name ?? null,
       };
     },
+    tagCaps: () => data.tagCaps ?? null,
+    // #204: fleet tag caps against the org's synced per-value spend plus this host's
+    // unsynced receipts; local --tag-cap rules tighten a matching fleet rule.
+    tagCheck(tags, localRules = [], nowMs = Date.now()) {
+      if (!data.tagCaps) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedFleetTagVerdict(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+    },
     revoked: () => revoked,
     // wait: true (used at exit) waits for an in-flight sync, then runs a fresh one,
     // so a final sync never gets skipped while the 60s poll is mid-upload (#146).
@@ -165,11 +174,13 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         }
         await uploadSettlements(synced);
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, agent_spend: agentSpend = null, settlements = [], ...fetchedPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, ...fetchedPolicy } = fetched ?? {};
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend)) throw new Error("Invalid fleet policy response");
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps)) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
+        // #204: rules and spend refresh on every poll; a removed rule set (null) lifts enforcement.
+        if (JSON.stringify(tagCaps) !== JSON.stringify(data.tagCaps ?? null)) { data.tagCaps = tagCaps; saveEnrollment(path, data); }
         // Team membership and spend refresh on every poll; removal (null) stops team enforcement.
         if (JSON.stringify(team) !== JSON.stringify(data.team ?? null)) { data.team = team; saveEnrollment(path, data); }
         // Only strictly newer valid versions can replace a cached policy.

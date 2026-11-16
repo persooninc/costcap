@@ -20,6 +20,7 @@ import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
+import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -206,6 +207,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map(costedReceipt);
   // Issue #127: org-scoped, so another org's receipts never count toward agent_spend.
   const orgAgentReceipts = (s, orgId, agentId) => Object.values(s.receipts).filter((r) => r.orgId === orgId && r.agentId === agentId).map(costedReceipt);
+  // Issue #204: settled-aware org receipts for fleet tag caps.
+  const orgReceipts = (s, orgId) => Object.values(s.receipts).filter((r) => r.orgId === orgId).map(costedReceipt);
   const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -384,7 +387,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now()), settlements: agentSettlements(s, a) }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now()), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now()) }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -591,6 +594,24 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           org.alertSettings = next;
           audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next), ...(issued ? { webhookSecret: "issued" } : {}) });
           return { ...maskAlertSettings(next), canEdit: true, ...(issued ? { webhookSecret: issued } : {}) };
+        });
+        return json(200, result);
+      }
+      // Issue #204: org-level fleet tag caps. Owner/admin write, any member reads.
+      if (path === "/v1/tag-caps" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = sessionUser(s, req); return { tagCaps: s.orgs[u.orgId]?.tagCaps ?? [], canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/tag-caps" && req.method === "PUT") {
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const parsed = parseFleetTagCaps(body.tagCaps);
+          if (parsed.error) fail(400, parsed.error);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const previous = org.tagCaps ?? [];
+          org.tagCaps = parsed.rules;
+          audit(s, u.orgId, u.id, "tag_caps.change", u.orgId, { previous, next: parsed.rules });
+          return { tagCaps: parsed.rules, canEdit: true };
         });
         return json(200, result);
       }

@@ -260,3 +260,77 @@ test("e2e: a --shared-ledger sibling's tagged spend counts without a restart (AC
   assert.deepEqual(res.lines[0], { a: 200, b: 429 });
   appendFileSync(receipts, "");
 });
+
+// #204: fleet tag caps (pure parts).
+import { parseFleetTagCaps, fleetTagCapsPolicy, validFleetTagCaps, mergeTagCapRules, cachedFleetTagVerdict } from "../src/hosted/tag-caps.js";
+import { withFleetTagCaps } from "../src/tag-cap.js";
+
+test("#204 fleet rules: validation, merge (lower cap wins) and composite engine", () => {
+  assert.deepEqual(parseFleetTagCaps([{ key: "customer", scope: "day", usd: 1, extra: 1 }]), { rules: [{ key: "customer", scope: "day", usd: 1 }] });
+  for (const bad of [null, [null], [{ key: "x", scope: "day", usd: Infinity }], [{ key: "x", scope: "week", usd: 1 }]]) assert.ok(parseFleetTagCaps(bad).error);
+  assert.deepEqual(mergeTagCapRules([{ key: "customer", scope: "day", usd: 1 }, { key: "customer", scope: "month", usd: 9 }], [{ key: "customer", scope: "day", cap: 0.5 }, { key: "customer", scope: "month", cap: 20 }]),
+    [{ key: "customer", scope: "day", cap: 0.5 }, { key: "customer", scope: "month", cap: 9 }]);
+  const calls = [];
+  const fleet = { tagCheck: (tags, rules) => { calls.push([tags, rules]); return { fleet: true }; } };
+  const bare = withFleetTagCaps(null, fleet, []);
+  assert.deepEqual(bare.check({ customer: "a" }), { fleet: true });
+  assert.deepEqual([bare.rules(), bare.remaining({}), bare.preflight({}, 1), bare.over(), bare.settle("x", 1), bare.record({})], [[], [], null, [], false, undefined]);
+  const local = createTagCaps({ rules: [{ key: "customer", scope: "day", cap: 0.1 }], now: at(T0) });
+  const both = withFleetTagCaps(local, fleet, local.rules());
+  both.record(r(0.2, { customer: "a" }, ago(1)));
+  assert.equal(both.check({ customer: "a" }).fleet, undefined); // local hit first
+  assert.equal(both.check({ customer: "b" }).fleet, true);
+  assert.equal(both.rules().length, 1);
+  assert.equal(both.remaining({ customer: "a" })[0].remaining_usd, 0);
+  assert.equal(both.preflight({ customer: "a" }, 1).reason, "preflight_estimate");
+  assert.equal(both.over().length, 1);
+  assert.equal(both.settle("nope", 1), false);
+});
+
+test("#204 fleet policy payload: windows, unknown, untagged and truncation at the lowest listed spend", () => {
+  const rules = [{ key: "customer", scope: "day", usd: 1 }];
+  assert.equal(fleetTagCapsPolicy([], [], T0), null);
+  const now = new Date(T0).toISOString();
+  const yesterday = new Date(T0 - 86_400_000).toISOString();
+  const p = fleetTagCapsPolicy(rules, [
+    r(0.5, { customer: "acme" }, now), r(0.25, { customer: "acme" }, yesterday), r(null, { customer: "zed" }, now), r(0.1, null, now),
+    r(9, { customer: "old" }, "2026-10-01T00:00:00Z"), r(9, { customer: "blk" }, now, { blocked: true }), null, r(1, { customer: "bad" }, "nope"),
+    r(null, { customer: "bat" }, now, { reason: "batch_pending" }),
+  ], T0);
+  assert.deepEqual(p.spend.customer.acme, { day: 0.5, month: 0.75, unknown: 0 });
+  assert.equal(Object.keys(p.spend.customer)[0], "zed"); // unknown first
+  assert.equal(p.spend.customer[UNTAGGED].day, 0.1);
+  assert.equal(p.spend.customer.old, undefined);
+  assert.equal(p.truncated, false);
+  assert.equal(validFleetTagCaps(p), true);
+  for (const bad of [5, { ...p, truncated: "no" }, { ...p, rules: [] }, { ...p, spend: null }, { ...p, spend: { customer: null } }, { ...p, spend: { customer: { a: { day: -1, month: 0, unknown: 0 } } } }, { ...p, spend: { customer: { a: { day: 0, month: 0, unknown: 0.5 } } } }]) assert.equal(validFleetTagCaps(bad), false);
+
+  // AC6: 1001 values -> truncated, 1000 entries; an unlisted value counts at the 1000th entry's spend.
+  const many = Array.from({ length: 1001 }, (_, i) => r(0.001 * (i + 1), { customer: `c${i}` }, now));
+  const big = fleetTagCapsPolicy(rules, many, T0);
+  assert.equal(big.truncated, true);
+  assert.equal(Object.keys(big.spend.customer).length, 1000);
+  assert.equal(big.spend.customer.c0, undefined);
+  const floor = Object.values(big.spend.customer).at(-1).month;
+  assert.equal(floor, 0.002);
+  const tiny = { ...big, rules: [{ key: "customer", scope: "day", usd: 0.002 }] };
+  assert.equal(cachedFleetTagVerdict(tiny, [], { customer: "never-seen" }, [], T0).spend_usd, 0.002);
+  assert.equal(cachedFleetTagVerdict({ ...tiny, spend: {} }, [], { customer: "x" }, [], T0), null);
+});
+
+test("#204 cached fleet verdict: pending receipts, UTC rollover and unknown for one value only", () => {
+  const now = new Date(T0).toISOString();
+  const policy = { rules: [{ key: "customer", scope: "day", usd: 1 }], spend: { customer: { acme: { day: 0.8, month: 0.8, unknown: 0 } } }, truncated: false, as_of: now };
+  assert.equal(cachedFleetTagVerdict(null, [], {}, [], T0), null);
+  assert.equal(cachedFleetTagVerdict(policy, [], { customer: "acme" }, [], T0), null);
+  const pending = [r(0.4, { customer: "acme" }, now), r(5, { customer: "acme" }, now, { blocked: true }), r(5, { customer: "acme" }, "2026-10-01T00:00:00Z"), r(5, { customer: "acme" }, "bad"), r(null, { customer: "acme" }, now, { reason: "batch_pending" }), r(5, { customer: "acme" }, new Date(T0 - 86_400_000).toISOString())];
+  const hit = cachedFleetTagVerdict(policy, [], { customer: "acme" }, pending, T0);
+  assert.deepEqual([hit.verdict, hit.spend_usd, hit.fleet], ["tag_budget_exceeded", 1.2, true]);
+  // Next UTC day: synced day spend no longer counts.
+  assert.equal(cachedFleetTagVerdict(policy, [], { customer: "acme" }, [], T0 + 86_400_000), null);
+  const nextMonth = Date.parse("2026-12-01T01:00:00Z");
+  assert.equal(cachedFleetTagVerdict({ ...policy, spend: { customer: { acme: { day: 0, month: 0, unknown: 3 } } } }, [], { customer: "acme" }, [], nextMonth), null);
+  const unk = cachedFleetTagVerdict(policy, [], { customer: "acme" }, [r(null, { customer: "acme" }, now)], T0);
+  assert.deepEqual([unk.verdict, unk.unknown_receipts], ["accounting_unavailable", 1]);
+  assert.equal(cachedFleetTagVerdict(policy, [], { customer: "globex" }, [r(null, { customer: "acme" }, now)], T0), null);
+});

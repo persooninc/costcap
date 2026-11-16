@@ -660,6 +660,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           // #191: per-tag caps refuse one tag value without latching the run.
           const tagHit = tagCaps?.check(reqTags);
+          if (tagHit?.verdict === "accounting_unavailable") return block("accounting_unavailable", tagHit, { error: "accounting_unavailable", ...tagHit });
           if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
           if (preflight) {
             // #188: cloud preflight prices the mapped path model, with the regional premium.
@@ -1021,6 +1022,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const hit = cap?.check();
     if (hit) return { status: 429, reason: "budget_exceeded", detail: hit, body: budgetExceededBody(hit) };
     const tagHit = tagCaps?.check(tags);
+    if (tagHit?.verdict === "accounting_unavailable") return { status: 429, reason: "accounting_unavailable", detail: tagHit, body: { error: "accounting_unavailable", ...tagHit } };
     if (tagHit) return { status: 429, reason: "tag_budget_exceeded", detail: tagHit, body: tagBudgetExceededBody(tagHit) };
     void model;
     return null;

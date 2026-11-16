@@ -689,7 +689,28 @@ refusal never latches: other values, and this value once its window rolls over, 
 invalid key, the `run` scope, a cap that is not `> 0` or a duplicate `KEY:SCOPE` exits 2 before
 anything is spawned. `costcap check --tag-cap customer:day=5` exits 1 when any value is at or over
 its cap and lists them in `tag_caps: [{key, value, scope, spend_usd, cap_usd, verdict}]` (Action
-input `tag-caps`, output `tag-caps`). Fleet/hosted tag caps are not supported yet.
+input `tag-caps`, output `tag-caps`).
+
+#### Fleet tag caps (hosted)
+
+An org owner or admin can set up to 10 fleet-wide tag caps in the dashboard's
+**Tag caps** card, or with `PUT /v1/tag-caps` and a body like
+`{"tagCaps":[{"key":"customer","scope":"day","usd":5}]}`. The scope is `day` or
+`month` (UTC). Viewers can read the rules but can't change them. Each change is
+audited as `tag_caps.change`, with the rules before and after.
+
+Every enrolled `costcap wrap` gets the rules in `GET /v1/policy` (`tag_caps`), together with the
+org's synced, settled-aware spend per tag value for the current UTC month. It
+enforces each rule against that spend plus its own unsynced receipts. A value at
+or over its cap gets `429 tag_budget_exceeded` with `"fleet": true`. A value with
+an unknown-cost receipt gets `accounting_unavailable`, and only that value is
+refused. A local `--tag-cap` on the same `KEY:SCOPE` can tighten a fleet rule but
+never loosen it. Offline, the wrapper keeps enforcing the last rules and spend it
+received. Removing a rule takes effect at the next successful poll. The payload
+lists at most 1000 values per key. When the list is truncated, an unlisted value
+counts at the lowest listed month spend, an upper bound, so the cap is never
+under-counted. Not covered yet: the `hour` scope, per-tag alerts, per-team or
+per-agent tag caps, and `--preflight` against fleet tag remainders.
 With `--preflight`, a call whose estimated worst case exceeds a matching value's remaining budget
 (including `(untagged)`) is refused the same way, with `reason: "preflight_estimate"`, `estimate: true`,
 `estimate_usd` and `remaining_usd`, before any upstream call.

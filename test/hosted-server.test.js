@@ -1320,3 +1320,51 @@ test("signed webhook: roles, isolation, SSRF, masking, rotation, audit, delivery
   const cleared = await f.request("/v1/alert-settings", { webhook: null }, owner.cookie);
   assert.equal(cleared.body.webhook, null);
 });
+
+// Issue #204: fleet tag caps API, roles, audit and the /v1/policy payload.
+test("#204: PUT /v1/tag-caps validates, enforces roles, audits, and ships tag_caps in /v1/policy", async (t) => {
+  const f = await fixture(t);
+  const put = async (body, cookie) => {
+    const r = await fetch(`http://127.0.0.1:${f.service().server.address().port}/v1/tag-caps`, { method: "PUT", headers: { origin: "http://localhost", "content-type": "application/json", cookie }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json() };
+  };
+  const owner = await f.login("owner@example.invalid");
+  await f.request("/v1/invitations", { email: "viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("viewer@example.invalid");
+  const rule = (key, scope, usd) => ({ key, scope, usd });
+  for (const bad of [rule("Bad Key", "day", 1), rule("customer", "hour", 1), rule("customer", "run", 1), rule("customer", "day", 0), rule("customer", "day", -1)]) assert.equal((await put({ tagCaps: [bad] }, owner.cookie)).status, 400, JSON.stringify(bad));
+  assert.equal((await put({ tagCaps: [rule("customer", "day", 1), rule("customer", "day", 2)] }, owner.cookie)).status, 400);
+  assert.equal((await put({ tagCaps: Array.from({ length: 11 }, (_, i) => rule(`k${i}`, "day", 1)) }, owner.cookie)).status, 400);
+  assert.equal((await put({ tagCaps: "nope" }, owner.cookie)).status, 400);
+  assert.equal((await put({ tagCaps: [rule("customer", "day", 1)] }, viewer.cookie)).status, 403);
+  const ok = await put({ tagCaps: [rule("customer", "day", 1), rule("customer", "month", 20)] }, owner.cookie);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.tagCaps.length, 2);
+  const read = await f.request("/v1/tag-caps", undefined, viewer.cookie);
+  assert.equal(read.status, 200);
+  assert.equal(read.body.canEdit, false);
+  assert.equal(read.body.tagCaps.length, 2);
+  assert.equal((await f.request("/v1/tag-caps", undefined, owner.cookie)).body.canEdit, true);
+  const fleet = await f.request("/v1/fleet", undefined, owner.cookie);
+  const entry = fleet.body.audit.find((e) => e.action === "tag_caps.change");
+  assert.deepEqual(entry.detail.previous, []);
+  assert.deepEqual(entry.detail.next, [rule("customer", "day", 1), rule("customer", "month", 20)]);
+
+  const enrollment = await f.request("/v1/enrollment-tokens", { caps: { day: 100 } }, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "worker" }, null, enrollment.body.token)).body;
+  const ts = new Date().toISOString();
+  const receipts = [
+    { id: "t1", ts, cost_usd: 0.4, model: "m", tags: { customer: "acme" } },
+    { id: "t2", ts, cost_usd: 0.4, model: "m", tags: { customer: "acme" } },
+    { id: "t3", ts, cost_usd: null, model: "m", tags: { customer: "globex" } },
+    { id: "t4", ts, cost_usd: 0.1, model: "m" },
+  ];
+  assert.equal((await f.request("/v1/receipts", { receipts }, null, agent.token)).status, 200);
+  const policy = (await f.request("/v1/policy", undefined, null, agent.token)).body;
+  assert.equal(policy.tag_caps.truncated, false);
+  assert.deepEqual(policy.tag_caps.spend.customer.acme, { day: 0.8, month: 0.8, unknown: 0 });
+  assert.equal(policy.tag_caps.spend.customer.globex.unknown, 1);
+  assert.equal(policy.tag_caps.spend.customer["(untagged)"].month, 0.1);
+  assert.equal((await put({ tagCaps: [] }, owner.cookie)).status, 200);
+  assert.equal((await f.request("/v1/policy", undefined, null, agent.token)).body.tag_caps, null);
+});

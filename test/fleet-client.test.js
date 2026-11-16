@@ -159,3 +159,43 @@ test("#129 AC6: an older server without the settlement route does not fail recei
   assert.deepEqual(loadEnrollment(f.path).syncedIds.sort(), ["u1", "u2"]);
   assert.equal(loadEnrollment(f.path).syncedSettlementIds, undefined);
 });
+
+// #204: fleet tag caps are cached, enforced offline, refreshed and lifted by a newer poll.
+test("#204 fleet tag caps: cached offline, merged with local rules, invalid payload rejected, removal lifts", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-tags-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  const now = new Date().toISOString();
+  let tagCaps = { rules: [{ key: "customer", scope: "day", usd: 1 }], spend: { customer: { acme: { day: 0.9, month: 0.9, unknown: 0 } } }, truncated: false, as_of: now };
+  let status = 200;
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.setHeader("content-type", "application/json");
+    if (status !== 200) { res.writeHead(status).end("{}"); return; }
+    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: {}, killed: false } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version: 1, caps: {}, killed: false, tag_caps: tagCaps }));
+    else res.end(JSON.stringify({ acceptedIds: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "e", name: "x", path });
+  const client = createFleetClient({ path, receiptsPath });
+  assert.equal(client.tagCheck({ customer: "acme" }), null); // nothing cached yet
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.tagCheck({ customer: "acme" }), null);
+  assert.equal(client.tagCheck({ customer: "acme" }, [{ key: "customer", scope: "day", cap: 0.5 }]).cap_usd, 0.5);
+  appendFileSync(receiptsPath, JSON.stringify({ id: "p1", ts: now, cost_usd: 0.2, tags: { customer: "acme" } }) + "\n");
+  assert.equal(client.tagCheck({ customer: "acme" }).spend_usd, 1.1);
+  // Offline: the cached rules and spend keep enforcing, also after a restart.
+  status = 503;
+  assert.equal((await client.sync()).online, false);
+  assert.equal(createFleetClient({ path, receiptsPath }).tagCheck({ customer: "acme" }).fleet, true);
+  // An invalid payload is refused and the cache kept.
+  status = 200;
+  tagCaps = { rules: [{ key: "customer", scope: "hour", usd: 1 }], spend: {}, truncated: false, as_of: now };
+  assert.equal((await client.sync()).online, false);
+  assert.equal(client.tagCheck({ customer: "acme" }).fleet, true);
+  tagCaps = null;
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.tagCaps(), null);
+  assert.equal(client.tagCheck({ customer: "acme" }), null);
+});
