@@ -187,6 +187,23 @@ return the same verdict with `budget_remaining`. Run and step budgets are per
 `run_id`, which the wrapper assigns. Figures are estimates, the same limits above
 apply, and the policy file must be protected from the agent it limits.
 
+## Run summaries
+
+Every `costcap wrap` run, including one that exits non-zero, hits a cap, trips
+the breaker or is stopped by `costcap kill`, writes
+`<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`): `run_id`,
+`started_at`, `ended_at`, `exit_code`, `calls`, `blocked_calls`, `by_model`
+(calls, input/output/cache read/cache write tokens, cost per model),
+`total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope),
+`stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`) and
+`stopped_scope`. If any call has unknown cost, `total_cost_usd` is `null`, never
+$0. A one-line roll-up is printed to stderr when the run ends.
+
+```sh
+node src/cli.js runs            # recent runs, newest first
+node src/cli.js runs --json     # the summaries as JSON; corrupt files are reported and skipped
+```
+
 ## CI check and local MCP
 
 ```sh
