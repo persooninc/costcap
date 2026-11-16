@@ -13,6 +13,7 @@ import { receiptsCsv } from "./receipts-csv.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
+import { maskAlertSettings, validSlackWebhook } from "./delivery.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
 
@@ -376,6 +377,34 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, { revoked: true });
       }
+      // Issue #121: per-org alert destinations. Any member reads the masked view;
+      // owner/admin writes. The full Slack webhook is never returned or audited.
+      if (path === "/v1/alert-settings" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = sessionUser(s, req); return { ...maskAlertSettings(s.orgs[u.orgId]?.alertSettings), canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/alert-settings" && req.method === "POST") {
+        if (body.emails !== undefined && (!Array.isArray(body.emails) || body.emails.length > 20 || body.emails.some((e) => typeof e !== "string"))) fail(400, "emails must be a list of up to 20 addresses");
+        if (body.slackWebhook !== undefined && body.slackWebhook !== null && body.slackWebhook !== "" && !validSlackWebhook(body.slackWebhook)) fail(400, "Slack webhook must be https://hooks.slack.com/services/...");
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const current = org.alertSettings ?? { emails: [], slackWebhook: null };
+          let emails = current.emails ?? [];
+          if (body.emails !== undefined) {
+            emails = [...new Set(body.emails.map((e) => e.toLowerCase().trim()).filter(Boolean))];
+            const members = new Set(Object.values(s.users).filter((m) => m.orgId === u.orgId && m.verified).map((m) => m.email));
+            const bad = emails.filter((e) => !members.has(e));
+            if (bad.length) fail(400, "Alert emails must be verified members of this organization");
+          }
+          const slackWebhook = body.slackWebhook === undefined ? (current.slackWebhook ?? null) : (body.slackWebhook || null);
+          const next = { emails, slackWebhook };
+          org.alertSettings = next;
+          audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next) });
+          return { ...maskAlertSettings(next), canEdit: true };
+        });
+        return json(200, result);
+      }
       const budgetRoute = /^\/v1\/agents\/([^/]+)\/budget$/.exec(path);
       if (budgetRoute && req.method === "GET") {
         return json(200, store.read((s) => {
@@ -452,7 +481,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     });
     for (const a of queued) {
       let result;
-      try { result = deliverAlert ? await deliverAlert(a) : [{ status: "unconfigured" }]; }
+      try { // Only addresses that are still verified members of the org receive the alert.
+        const settings = store.read((s) => {
+          const saved = s.orgs[a.orgId]?.alertSettings;
+          if (!saved) return null;
+          const members = new Set(Object.values(s.users).filter((m) => m.orgId === a.orgId && m.verified).map((m) => m.email));
+          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null };
+        });
+        result = deliverAlert ? await deliverAlert(a, settings) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
         s.alerts[a.key].delivery = alertDeliveryState(result);

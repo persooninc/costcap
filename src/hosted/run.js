@@ -1,7 +1,7 @@
 import { createStripeBilling, createTestModeStripeBilling } from "./billing.js";
 import { createTransactionalEmail } from "./email.js";
 import { createHostedServer } from "./server.js";
-import { createAlertDelivery } from "./delivery.js";
+import { createOrgAlertRouter } from "./delivery.js";
 import { verifyProductionChallenge } from "./turnstile.js";
 import { openPostgresStore } from "./store-postgres.js";
 const required = (key) => { if (!process.env[key]) throw new Error(`${key} required`); return process.env[key]; };
@@ -22,7 +22,9 @@ const from = required("COSTCAP_EMAIL_FROM");
 const emailTo = process.env.COSTCAP_ALERT_EMAILS?.split(",").map((x) => x.trim()).filter(Boolean);
 const authorizedOrg = process.env.COSTCAP_ALERT_ORG_ID;
 const sendEmail = createTransactionalEmail({ provider: "brevo", apiKey: emailKey, from });
-const delivery = createAlertDelivery({ emailKey, emailFrom: from, emailTo, slackWebhook: process.env.COSTCAP_SLACK_WEBHOOK });
+// Issue #121: each org's alerts go to that org's saved settings. COSTCAP_ALERT_ORG_ID
+// (+ COSTCAP_ALERT_EMAILS / COSTCAP_SLACK_WEBHOOK) is a documented fallback for that one org only.
+const deliverAlert = createOrgAlertRouter({ emailKey, emailFrom: from, fallback: authorizedOrg ? { orgId: authorizedOrg, emailTo, slackWebhook: process.env.COSTCAP_SLACK_WEBHOOK } : undefined });
 // FA-CC-04: COSTCAP_DATABASE_URL (application role, not the migration role) switches the
 // datastore to Postgres. Unset keeps the JSON file. A database that cannot be read stops startup.
 const databaseUrl = process.env.COSTCAP_DATABASE_URL || "";
@@ -56,7 +58,7 @@ const { server, evaluateFleetAlerts, billingReady } = createHostedServer({
   sendInvite: async ({ email, role, orgName }) => {
     await sendEmail({ to: [email], subject: "CostCap organization invitation", text: `You were invited to the ${orgName} CostCap organization as ${role}. Sign in with this email address. The invitation expires in 7 days. If you did not expect it, ignore it. Guardrails, not guarantees.` });
   },
-  deliverAlert: (alert) => authorizedOrg && alert.orgId === authorizedOrg ? delivery(alert) : [{ status: "unconfigured" }],
+  deliverAlert,
   requestLog: (line) => process.stderr.write(`${line}\n`),
 });
 try { await billingReady; }

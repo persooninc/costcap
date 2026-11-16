@@ -55,7 +55,9 @@ needs all of the following before a new container can replace the running one:
 - `BREVO_API_KEY` and `COSTCAP_EMAIL_FROM` for a verified Brevo sender.
   Do not set a Resend key. The process will not start with another provider.
 - Optional `COSTCAP_ALERT_EMAILS`, `COSTCAP_SLACK_WEBHOOK`, and
-  `COSTCAP_ALERT_ORG_ID` only when that org was explicitly authorized.
+  `COSTCAP_ALERT_ORG_ID` only when that org was explicitly authorized. This env
+  destination is a fallback for that org only; every org (including it) can set
+  its own destinations via `/v1/alert-settings`, which take precedence (#121).
 - Names and empty values are listed in `env.example`. Secrets stay out of git.
 
 ## Still required before acceptance

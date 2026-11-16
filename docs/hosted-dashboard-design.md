@@ -20,6 +20,7 @@ Draft. Nothing here is deployed. The hosted stack depends on epic #16 (adopt Ope
 ## #14 Alerts + audit log
 - Rules: cap_approaching (80%), cap_hit, loop_detected, agent_silent (default 6h). Fire once, re-arm after clearing (src/hosted/alerts.js). `loop_detected` names one guardrail: `spiral_detected`, then `cost_velocity`, then `step_budget`. Non-finite spend does not page.
 - Channels: Brevo email to the configured alert recipients, Slack webhook per configured org. Missing delivery is logged, never silent. Billing stays disabled.
+- Alert destinations (#121): an owner or admin sets the org's own recipients with `GET`/`POST /v1/alert-settings` or the dashboard "Alert destinations" card. Emails must be verified members of the org; the Slack webhook must be `https://hooks.slack.com/services/…`, is stored on the org record and is only ever returned masked (`…` + last 4). Every change writes an `alert_settings.change` audit entry with masked before/after. The alert worker routes each org's alerts to that org's settings; `COSTCAP_ALERT_ORG_ID` (+ `COSTCAP_ALERT_EMAILS`, `COSTCAP_SLACK_WEBHOOK`) remains a fallback for that one org only while it has no saved settings. An org with no settings stays `unconfigured` and is not retried.
 - Audit log is append-only: who raised a cap, who killed an agent, when (auditEntry).
 - Copy everywhere: guardrails, not guarantees.
 

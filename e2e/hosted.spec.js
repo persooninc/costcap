@@ -202,3 +202,55 @@ test("#113 freeze all agents from the dashboard with a reason, then resume", asy
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+test("#121 admin saves alert destinations, dashboard shows masked webhook, viewer is read-only", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const hook = "https://hooks.slack.com/services/T0E2E/B0E2E/e2eFullSecretZ9Q1";
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-alert-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key",
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    const signIn = async (email) => {
+      await page.goto(origin);
+      await expect(page.locator("#requestButton")).toBeEnabled();
+      await page.locator("#email").fill(email);
+      await page.locator("#requestButton").click();
+      await expect(page.locator("#verify")).toBeVisible();
+      await page.locator("#code").fill(codes.at(-1).code);
+      await page.locator("#verify button[type=submit]").click();
+      await expect(page.locator("#workspace")).toBeVisible();
+    };
+    await signIn("admin@example.invalid");
+    await page.locator("#invite input[name=email]").fill("viewer@example.invalid");
+    await page.locator("#invite button").click();
+    await expect(page.locator("#invites")).toContainText("viewer@example.invalid");
+    await expect(page.locator("#alertSlack")).toHaveText("not set");
+    await page.locator("#alertForm input[name=emails]").fill("admin@example.invalid");
+    await page.locator("#alertForm input[name=slack]").fill(hook);
+    await page.locator("#alertForm button").click();
+    await expect(page.locator("#alertSlack")).toHaveText("https://hooks.slack.com/services/…Z9Q1");
+    await expect(page.locator("#alertEmails")).toHaveText("admin@example.invalid");
+    expect(await page.content()).not.toContain("e2eFullSecretZ9Q1");
+    await page.locator("#logout").click();
+    await expect(page.locator("#login")).toBeVisible();
+    await signIn("viewer@example.invalid");
+    await expect(page.locator("#alertSlack")).toHaveText("https://hooks.slack.com/services/…Z9Q1");
+    await expect(page.locator("#alertForm")).toBeHidden();
+    expect(await page.evaluate(async () => (await fetch("/v1/alert-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ emails: [] }) })).status)).toBe(403);
+    expect(await page.content()).not.toContain("e2eFullSecretZ9Q1");
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

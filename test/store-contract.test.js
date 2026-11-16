@@ -33,6 +33,7 @@ async function contract(open, mode) {
     s.users.u1 = { id: "u1", email: "a@a.example", orgId: ORG_A, role: "owner", verified: true };
     s.users.u2 = { id: "u2", email: "b@b.example", orgId: ORG_B, role: "owner", verified: true };
     s.sessions.h1 = { userId: "u1", expires: 9 };
+    s.orgs[ORG_A].alertSettings = { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract" };
     s.receipts["ag1:r1"] = { orgId: ORG_A, agentId: "ag1", receipt: { id: "r1", ts: "2026-11-13T00:00:00Z", model: "m", cost_usd: 0.25, z: 1, a: 2 } };
     s.receipts["ag2:r1"] = { orgId: ORG_B, agentId: "ag2", receipt: { id: "r1", ts: "2026-11-13T00:00:00Z", model: "m", cost_usd: null } };
     for (let i = 0; i < 12; i += 1) s.audit.push({ ts: `t${i}`, org_id: i % 2 ? ORG_B : ORG_A, actor: "u", action: `a${i}`, target: null, detail: {} });
@@ -50,6 +51,9 @@ async function contract(open, mode) {
   assert.equal(reopened.read((s) => s.audit.map((e) => e.action).join()), Array.from({ length: 12 }, (_, i) => `a${i}`).join());
   assert.equal(reopened.read((s) => s.receipts["ag2:r1"]), undefined);
   assert.equal(reopened.read((s) => s.users.u1.role), "admin");
+  // #121: per-org alert settings survive a restart and stay on their own org.
+  assert.deepEqual(reopened.read((s) => s.orgs[ORG_A].alertSettings), { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract" });
+  assert.equal(reopened.read((s) => s.orgs[ORG_B].alertSettings), undefined);
   assert.equal((await healthOf(reopened)).persistence, mode);
   return { store, reopened };
 }
