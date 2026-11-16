@@ -48,6 +48,20 @@ export function isCountTokensPath(rawUrl) {
   return COUNT_TOKENS_PATHS.some((re) => re.test(pathname));
 }
 
+// Files API management (#158): upload and delete are free on Anthropic and OpenAI
+// (https://platform.claude.com/docs/en/build-with-claude/files#usage-and-billing).
+// Exact paths only, same hardening as count_tokens. GET is covered by the GET/HEAD rule.
+const FILES_UPLOAD_PATHS = [/^\/anthropic\/v1\/files$/, /^\/openai\/v1\/files$/];
+const FILES_DELETE_PATHS = [/^\/anthropic\/v1\/files\/[A-Za-z0-9_-]+$/, /^\/openai\/v1\/files\/[A-Za-z0-9_-]+$/];
+export function isNonBillableFilesRequest(method, rawUrl) {
+  if (typeof rawUrl !== "string") return false;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
+  if (method === "POST") return FILES_UPLOAD_PATHS.some((re) => re.test(pathname));
+  if (method === "DELETE") return FILES_DELETE_PATHS.some((re) => re.test(pathname));
+  return false;
+}
+
 // OpenAI embeddings (#145): billed on input only. Exact path, same hardening as count_tokens.
 export function isEmbeddingsPath(rawUrl) {
   if (typeof rawUrl !== "string") return false;
@@ -447,8 +461,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
           } else if (raw && (["GET", "HEAD"].includes(req.method) ||
-            (req.method === "POST" && upstreamRes.status >= 200 && upstreamRes.status < 300 && isCountTokensPath(req.url)))) {
-            // Metadata reads (models list/retrieve) and token-count endpoints never generate tokens.
+            (upstreamRes.status >= 200 && upstreamRes.status < 300 &&
+              ((req.method === "POST" && isCountTokensPath(req.url)) || isNonBillableFilesRequest(req.method, req.url))))) {
+            // Metadata reads, token-count endpoints and Files upload/delete never generate tokens.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.

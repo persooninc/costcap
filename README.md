@@ -185,7 +185,11 @@ traffic bypasses CostCap.
 - A provider 4xx rejection (400, 401, 403, 404, 409, 413, 422, 429) whose body is a
   provider error object is recorded at `cost_usd: 0` with `reason: "upstream_rejected"`
   and does not pause the run; GET/HEAD metadata calls such as `GET /v1/models` are
-  `reason: "non_billable_request"`. 5xx, 2xx without usage and cut streams stay unknown
+  `reason: "non_billable_request"`. Files API upload/delete (`POST /v1/files`,
+  `DELETE /v1/files/{id}` on Anthropic and OpenAI) 2xx replies are also
+  `non_billable_request`: Anthropic documents "Files API operations are free"; file
+  content is billed as input tokens when used in a Messages call. Batch APIs
+  (`/v1/messages/batches`, `/v1/batches`) are still unknown cost. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
