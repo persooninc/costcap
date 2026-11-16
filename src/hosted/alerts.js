@@ -22,7 +22,16 @@ export function projectMonthSpend(spent, nowMs, { minElapsedMs = 24 * 3600_000 }
   return spent * ((end - start) / elapsed);
 }
 
-export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = 6 * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
+export const DEFAULT_SILENT_AFTER_HOURS = 6;
+
+// Issue #134: per-agent override. null/undefined -> default, 0 -> off (returns Infinity).
+export function silentAfterMsFor(policy) {
+  const h = policy?.silentAfterHours;
+  if (h == null) return DEFAULT_SILENT_AFTER_HOURS * 3600_000;
+  return h === 0 ? Infinity : h * 3600_000;
+}
+
+export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
   const out = [];
   for (const scope of ["run", "day", "month"]) {
     const cap = state.caps?.[scope];
@@ -58,7 +67,7 @@ export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = 
       out.push({ kind: "cap_hit", scope, key: `cap_hit:${state.agentId}:${scope}`, cap: state.caps?.[scope] ?? null, spent: state.spend?.[scope] ?? null });
     }
   }
-  if (state.lastSeenMs != null && state.nowMs - state.lastSeenMs > silentAfterMs) {
+  if (Number.isFinite(silentAfterMs) && state.lastSeenMs != null && state.nowMs - state.lastSeenMs > silentAfterMs) {
     out.push({ kind: "agent_silent", key: `agent_silent:${state.agentId}`, silentMs: state.nowMs - state.lastSeenMs });
   }
   return out;

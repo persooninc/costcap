@@ -6,7 +6,7 @@ import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { evaluateAlerts, auditEntry } from "./alerts.js";
+import { evaluateAlerts, auditEntry, silentAfterMsFor } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
@@ -518,10 +518,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const reason = fleetReason(body.reason, false);
           // maxSteps: omitted keeps the current value, null clears it (issue #114).
           const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
+          // silentAfterHours (issue #134): omitted keeps, null resets to the 6h default, 0 turns silence alerts off.
+          const silentAfterHours = body.silentAfterHours === undefined ? a.policy.silentAfterHours : body.silentAfterHours;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
-          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null };
+          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null };
           a.policy = policy;
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;
@@ -586,7 +588,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (r.reason === "budget_exceeded" && ["run", "day", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
-        const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() });
+        const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy) });
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));

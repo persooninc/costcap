@@ -752,7 +752,7 @@ test("regression #118: evidence export carries the audit trail with before/after
   assert.equal((await f.request("/v1/evidence.json")).status, 401);
   const doc = (await f.request("/v1/evidence.json", undefined, viewer.cookie)).body;
   const change = doc.audit.find((e) => e.action === "policy.change" && e.target === a.agentId);
-  assert.deepEqual(change.detail.previous, { caps: { day: 1 }, killed: false, maxSteps: null });
+  assert.deepEqual(change.detail.previous, { caps: { day: 1 }, killed: false, maxSteps: null, silentAfterHours: null });
   assert.deepEqual(change.detail.policy.caps, { day: 5 });
   assert.equal(change.detail.policy.maxSteps, 9);
   assert.equal(change.detail.reason, "batch");
@@ -890,4 +890,56 @@ test("regression #130: legacy receipt with ?key= is stored, listed, exported and
   assert.equal(store.read((s) => s.receipts.a.receipt.path), "/p?token=REDACTED&x=1");
   assert.equal(scrubStoredReceipts(store), 0);
   assert.equal(commits, 1);
+});
+
+test("#134 per-agent silentAfterHours: validation, audit, worker threshold, off, clears without re-send", async (t) => {
+  let clock = Date.parse("2026-10-12T12:00:00.000Z");
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("silent134@example.invalid");
+  const enroll = async (name) => { const tok = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token; return (await f.request("/v1/enroll", { name }, null, tok)).body; };
+  const nightly = await enroll("nightly"), off = await enroll("off"), dflt = await enroll("default");
+  const set = (id, body, cookie = owner.cookie) => f.request(`/v1/agents/${id}/policy`, body, cookie);
+  for (const bad of [-1, 721, "24", true]) assert.equal((await set(nightly.agentId, { silentAfterHours: bad })).status, 400, String(bad));
+  let r = await set(nightly.agentId, { silentAfterHours: 24 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.silentAfterHours, 24);
+  assert.equal(r.body.version, 2);
+  assert.equal((await set(off.agentId, { silentAfterHours: 0 })).body.silentAfterHours, 0);
+  // Omitting keeps it; /v1/policy and /v1/fleet return it.
+  assert.equal((await set(nightly.agentId, { caps: { day: 3 } })).body.silentAfterHours, 24);
+  assert.equal((await f.request("/v1/policy", undefined, null, nightly.token)).body.silentAfterHours, 24);
+  let fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal(fleet.agents.find((a) => a.id === nightly.agentId).policy.silentAfterHours, 24);
+  // null resets to the default (round-trip on a throwaway agent).
+  const tmp = await enroll("tmp");
+  await set(tmp.agentId, { silentAfterHours: 3 });
+  assert.equal("silentAfterHours" in (await set(tmp.agentId, { silentAfterHours: null })).body, false);
+  assert.equal((await f.request(`/v1/agents/${tmp.agentId}/revoke`, {}, owner.cookie)).status, 200);
+  const change = fleet.audit.filter((x) => x.action === "policy.change" && x.target === off.agentId).at(-1);
+  assert.equal(change.detail.previous.silentAfterHours, null);
+  assert.equal(change.detail.policy.silentAfterHours, 0);
+  // Viewer 403, other org 404.
+  assert.equal((await f.request("/v1/invitations", { email: "viewer134@example.invalid", role: "viewer" }, owner.cookie)).status, 201);
+  const viewer = await f.login("viewer134@example.invalid");
+  assert.equal((await set(nightly.agentId, { silentAfterHours: 1 }, viewer.cookie)).status, 403);
+  const other = await f.login("other134@example.invalid");
+  assert.equal((await set(nightly.agentId, { silentAfterHours: 1 }, other.cookie)).status, 404);
+  // 7h: only the default agent pages.
+  clock += 7 * 3600_000;
+  await f.service().evaluateFleetAlerts();
+  assert.deepEqual(f.delivery.map((d) => d.kind), ["agent_silent"]);
+  // Raising the default agent's threshold clears its alert on the next tick, no re-send.
+  assert.equal((await set(dflt.agentId, { silentAfterHours: 48 })).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, 1);
+  fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal(fleet.alerts.find((a) => a.agentId === dflt.agentId && a.kind === "agent_silent").active, false);
+  // >24h: nightly pages; the 0 agent never does.
+  clock += 18 * 3600_000;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, 2);
+  clock += 1000 * 3600_000;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.filter((d) => d.kind === "agent_silent").length, 3); // default re-arms past 48h; off never
+  assert.equal(f.delivery.some((d) => d.agentId === off.agentId), false);
 });

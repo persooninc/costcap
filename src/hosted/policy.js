@@ -36,6 +36,8 @@ export function validatePolicy(p) {
   }
   // Step budget (issue #114): upstream calls one run may make. Optional positive integer.
   if (p.maxSteps !== undefined && p.maxSteps !== null && !(Number.isInteger(p.maxSteps) && p.maxSteps > 0)) errors.push("maxSteps must be a positive integer");
+  // Per-agent agent_silent threshold (issue #134): null/missing = 6h default, 0 = off, else 0 < n <= 720.
+  if (p.silentAfterHours !== undefined && p.silentAfterHours !== null && !(typeof p.silentAfterHours === "number" && Number.isFinite(p.silentAfterHours) && p.silentAfterHours >= 0 && p.silentAfterHours <= 720)) errors.push("silentAfterHours must be 0 (off) or a number up to 720");
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   return errors;
 }

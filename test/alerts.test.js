@@ -98,3 +98,20 @@ test("cap_projected fires when the burn rate reaches the month cap", () => {
   assert.deepEqual(kinds(evaluateAlerts(state({ caps: { month: 20 }, spend: {}, nowMs: mid }))), []);
   assert.deepEqual(kinds(evaluateAlerts(state({ caps: { month: 20 }, spend: { month: 2 }, nowMs: Date.parse("2026-11-01T06:00:00.000Z") }), { minProjectionMs: 0 })), ["cap_projected"]);
 });
+
+test("#134 per-agent silent threshold: default 6h, override, 0 = off", async () => {
+  const { evaluateAlerts, silentAfterMsFor } = await import("../src/hosted/alerts.js");
+  const { validatePolicy } = await import("../src/hosted/policy.js");
+  const H = 3600_000, base = { agentId: "a", caps: {}, lastSeenMs: 0 };
+  assert.equal(silentAfterMsFor({}), 6 * H);
+  assert.equal(silentAfterMsFor({ silentAfterHours: null }), 6 * H);
+  assert.equal(silentAfterMsFor({ silentAfterHours: 24 }), 24 * H);
+  assert.equal(silentAfterMsFor({ silentAfterHours: 0 }), Infinity);
+  const silent = (nowMs, policy) => evaluateAlerts({ ...base, nowMs }, { silentAfterMs: silentAfterMsFor(policy) }).some((a) => a.kind === "agent_silent");
+  assert.equal(silent(7 * H, {}), true);
+  assert.equal(silent(7 * H, { silentAfterHours: 24 }), false);
+  assert.equal(silent(24 * H + 1, { silentAfterHours: 24 }), true);
+  assert.equal(silent(10_000 * H, { silentAfterHours: 0 }), false);
+  for (const ok of [undefined, null, 0, 0.5, 24, 720]) assert.deepEqual(validatePolicy({ version: 1, caps: {}, silentAfterHours: ok }), [], String(ok));
+  for (const bad of [-1, 721, "6", NaN, Infinity, true]) assert.equal(validatePolicy({ version: 1, caps: {}, silentAfterHours: bad }).length, 1, String(bad));
+});
