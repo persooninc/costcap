@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
@@ -16,12 +16,17 @@ import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResu
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
+import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
+import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
   anthropic: "https://api.anthropic.com",
   openrouter: "https://openrouter.ai/api",
   gemini: "https://generativelanguage.googleapis.com",
+  // #188: the real host is derived per request (Bedrock region, Vertex path location).
+  bedrock: BEDROCK_UPSTREAM,
+  vertex: VERTEX_UPSTREAM,
 };
 
 export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
@@ -35,6 +40,9 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
     lines.push(`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
     lines.push(`GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
   }
+  // #188: read by Claude Code (CLAUDE_CODE_USE_BEDROCK / _VERTEX) and the Anthropic Bedrock/Vertex SDKs.
+  if (providers.includes("bedrock")) lines.push(`ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:${port}/bedrock`);
+  if (providers.includes("vertex")) lines.push(`ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:${port}/vertex/v1`);
   return lines;
 }
 
@@ -283,6 +291,26 @@ export function createSseUsageParser(provider, requestedModel) {
   };
 }
 
+// #188: Bedrock eventstream -> Anthropic usage accumulator. A bad CRC, an exception frame or
+// trailing partial bytes make the stream incomplete (never priced).
+export function createEventStreamUsageParser(requestedModel) {
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  const decoder = createEventStreamDecoder((event) => acc.add(event));
+  return {
+    push(bytes) { decoder.push(bytes); },
+    end() { return acc.result(); },
+    get incomplete() { return decoder.corrupt || decoder.partial || acc.incomplete || !acc.result(); },
+  };
+}
+
+// Bedrock/Vertex errors are {message} or {error:{...}} objects with no usage.
+export function isCloudError(raw) {
+  let body;
+  try { body = JSON.parse(raw.toString("utf8")); } catch { return false; }
+  if (Array.isArray(body) && body.length === 1) body = body[0];
+  return Boolean(body) && typeof body === "object" && !Array.isArray(body) && !body.usage && (typeof body.message === "string" || typeof body.Message === "string" || (body.error && typeof body.error === "object"));
+}
+
 const REJECTED_STATUSES = new Set([400, 401, 403, 404, 409, 413, 422, 429]);
 
 /** True when a body is a provider error object ({error:{...}}, Gemini may wrap it in an array) with no usage. */
@@ -350,7 +378,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -432,6 +460,17 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; } : undefined;
     const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
+    // #188: Bedrock/Vertex serve only the Anthropic Messages routes. Anything else is answered
+    // locally (never forwarded, never unmetered), including Claude Code's inference-profile probe.
+    const cloud = isCloudProvider(provider);
+    const rawPathname = req.url.split(/[?#]/, 1)[0];
+    const cloudPath = cloud ? rawPathname.slice(provider.length + 1) : null;
+    const cloudRoute = cloud ? classifyCloudRoute(provider, req.method, cloudPath) : null;
+    if (cloud && !cloudRoute) {
+      req.resume();
+      send(404, { error: "cloud_route_unsupported", message: `CostCap meters only Claude Messages routes on ${provider}. The upstream call was not made.` });
+      return;
+    }
     // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
     let reqTags = null, tagError = null;
     try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
@@ -481,6 +520,32 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        // #188: cloud routes carry the model in the path (Vertex count-tokens: in the body).
+        let cloudModel = null, providerModel = null;
+        if (cloud) {
+          providerModel = cloudRoute.modelId ?? requestedModel ?? null;
+          cloudModel = mapCloudModel(provider, providerModel);
+          requestedModel = cloudModel ?? providerModel ?? undefined;
+        }
+        // #188: SigV4 requests are verified with wrap's static credentials, then re-signed for the real host.
+        let cloudAuth = null;
+        if (provider === "bedrock") {
+          const authz = getHeader(req.headers, "authorization");
+          if (isSigV4(authz)) {
+            const creds = awsCredentials(cloudEnv);
+            if (!creds) {
+              send(502, { error: "bedrock_credentials_unavailable", message: "CostCap re-signs Bedrock requests and needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) in wrap's environment. Try: eval \"$(aws configure export-credentials --format env)\". The upstream call was not made." });
+              return;
+            }
+            const v = verifyRequest({ method: req.method, path: rawPathname, search: url.search, headers: req.headers, body }, creds);
+            if (!v.ok) { send(403, { error: "bedrock_signature_invalid", message: "CostCap could not verify this request's AWS signature against wrap's credentials. The upstream call was not made." }); return; }
+            cloudAuth = { creds, region: v.region };
+          } else {
+            const region = cloudEnv.AWS_REGION || cloudEnv.AWS_DEFAULT_REGION;
+            if (!region && upstream === BEDROCK_UPSTREAM) { send(502, { error: "bedrock_region_unavailable", message: "Set AWS_REGION for Bedrock. The upstream call was not made." }); return; }
+            cloudAuth = { region };
+          }
+        }
         const batchCreate = batchCreateProvider(req.method, req.url);
         // #160: an Anthropic batch names its models per request; every one is checked.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
@@ -514,8 +579,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
           }
-          if (generates && unknownModels === "refuse" && offending(priced) !== -1) {
-            refuse(offending(priced));
+          if (generates && unknownModels === "refuse" && offending(cloud ? () => cloudModel !== null : priced) !== -1) {
+            refuse(offending(cloud ? () => cloudModel !== null : priced));
             return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
           }
           const agentHit = agentBudgets?.check(who);
@@ -525,7 +590,13 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
-            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, priceFor);
+            // #188: cloud preflight prices the mapped path model, with the regional premium.
+            const cloudPrice = cloud ? () => {
+              if (!cloudModel) return null;
+              const rm = cloudRoute.scope === "regional" ? regionalMultiplier(cloudModel) : null;
+              return rm ? scalePrice(lookupPrice(cloudModel), rm) : lookupPrice(cloudModel);
+            } : undefined;
+            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -542,7 +613,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         // #184: lookup only after the full verdict, so a hit never skips a refusal.
         let cacheMode = null, cacheKeyHex = null;
         if (cache) {
-          cacheMode = cacheBypass || isStreamRequest({ path, body }) || !isCacheable({ method: req.method, path, body }) ? "bypass" : "miss";
+          cacheMode = cloud || cacheBypass || isStreamRequest({ path, body }) || !isCacheable({ method: req.method, path, body }) ? "bypass" : "miss";
           if (cacheMode === "miss") {
             cacheKeyHex = cacheKey({ provider, upstream, method: req.method, path, body, headers: req.headers });
             const entry = cache.get(cacheKeyHex);
@@ -559,8 +630,20 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         }
         const cacheHeaders = cacheMode ? { [CACHE_HEADER]: cacheMode } : {};
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
-        const headers = { ...req.headers };
+        let headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
+        let target = `${upstream}${path}`;
+        if (cloud) {
+          const origin = upstream === BEDROCK_UPSTREAM ? `https://${bedrockHost(cloudAuth.region)}`
+            : upstream === VERTEX_UPSTREAM ? `https://${vertexHost(cloudRoute.location)}` : upstream;
+          target = `${origin}${cloudPath}${url.search}`;
+          if (cloudAuth?.creds) {
+            const t = new URL(target);
+            headers = signRequest({ method: req.method, path: t.pathname, search: t.search, headers, body, host: t.host, region: cloudAuth.region, service: "bedrock" }, cloudAuth.creds);
+            delete headers.host; // fetch derives Host from the URL; it matches the signed value
+          }
+        }
+        const meterAs = cloud ? "anthropic" : provider;
         try {
           const abort = new AbortController();
           let timer;
@@ -568,7 +651,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           arm(timeoutMs);
           const onClientClose = () => { if (!res.writableFinished) abort.abort(); };
           res.once("close", onClientClose);
-          const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
+          const upstreamRes = await fetch(target, { method: req.method, headers,
             body: ["GET", "HEAD"].includes(req.method) ? undefined : (injected ?? body),
             // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
             redirect: "manual",
@@ -587,9 +670,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false, sseIncomplete = false;
-          if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
+          const eventStream = cloud && /^application\/vnd\.amazon\.eventstream/i.test(contentType);
+          if ((/^text\/event-stream/i.test(contentType) || eventStream) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
-            const parser = createSseUsageParser(provider, requestedModel);
+            // #188: Bedrock eventstream frames are forwarded byte-for-byte and decoded on the side.
+            const parser = eventStream ? createEventStreamUsageParser(requestedModel) : createSseUsageParser(meterAs, requestedModel);
             const decoder = new TextDecoder();
             arm(streamIdleMs);
             const filter = injected ? createUsageChunkFilter() : null;
@@ -615,12 +700,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                   parser.push(text);
                   await forward(Buffer.from(filter.push(text)));
                 } else {
-                  parser.push(decoder.decode(value, { stream: true }));
+                  parser.push(eventStream ? value : decoder.decode(value, { stream: true }));
                   await forward(value);
                 }
               }
-              const tail = decoder.decode();
-              parser.push(tail);
+              const tail = eventStream ? "" : decoder.decode();
+              if (!eventStream) parser.push(tail);
               if (filter) await forward(Buffer.from(filter.push(tail) + filter.end()));
             } catch {
               streamCut = true;
@@ -632,13 +717,21 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
+            metered = extractUsage(meterAs, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           clearTimeout(timer);
           res.off("close", onClientClose);
-          if (metered) {
-            Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage) : costForUsage(metered.model, metered.usage));
+          if (cloud) Object.assign(receipt, { provider_model: providerModel, endpoint_scope: cloudRoute.scope });
+          if (metered && cloud && !cloudModel) {
+            // #188: an unmapped cloud model is unknown, never the fallback rate.
+            Object.assign(receipt, { model: providerModel ?? "unknown", cost_usd: null, reason: "cloud_model_unpriced" });
+            recordSpend(receipt);
+            failMsg = `Model ${providerModel} on ${provider} has no published rate. Restart only after reconciling this request.`;
+          } else if (metered) {
+            if (cloud) metered.model = cloudModel;
+            Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
+              : costForUsage(metered.model, metered.usage, cloud ? { regional: cloudRoute.scope === "regional" } : {}));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);
@@ -652,7 +745,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
             failMsg = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
-          } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
+          } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && (isProviderError(raw) || (cloud && isCloudError(raw)))) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
           } else if (raw && batchCreate && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchIdOf(raw)) {
@@ -697,7 +790,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
           } else if (raw && (["GET", "HEAD"].includes(req.method) ||
             (upstreamRes.status >= 200 && upstreamRes.status < 300 &&
-              ((req.method === "POST" && isCountTokensPath(req.url)) || isNonBillableFilesRequest(req.method, req.url))))) {
+              ((req.method === "POST" && (isCountTokensPath(req.url) || cloudRoute?.countTokens)) || isNonBillableFilesRequest(req.method, req.url))))) {
             // Metadata reads, token-count endpoints and Files upload/delete never generate tokens.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else {

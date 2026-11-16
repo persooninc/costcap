@@ -1,0 +1,182 @@
+// Claude on Amazon Bedrock and Google Vertex AI (#188): route classification, upstream
+// host derivation, path-model mapping and a real-time AWS eventstream decoder.
+// Only the Anthropic Messages wire format is metered (invoke / rawPredict and their
+// streaming forms). Anything else is answered locally with 404 cloud_route_unsupported.
+import { resolveModelId } from "./pricing.js";
+
+export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
+export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
+
+// Placeholder upstreams: the real host depends on the region (Bedrock) or path location (Vertex).
+export const BEDROCK_UPSTREAM = "aws:bedrock-runtime";
+export const VERTEX_UPSTREAM = "gcp:aiplatform";
+
+const BEDROCK_ROUTE = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens)$/;
+const VERTEX_ROUTE = /^\/v1(?:beta1)?\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):(rawPredict|streamRawPredict)$/;
+const REGION = /^[a-z]+-[a-z]+\d+$/; // GCP regions: us-east5, europe-west1
+
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return null; } };
+
+/**
+ * Classifies a cloud path (the part after /bedrock or /vertex, no query).
+ * Returns null for unsupported routes, else
+ * { modelId, stream, countTokens, scope: "global"|"regional", location? }.
+ */
+export function classifyCloudRoute(provider, method, pathname) {
+  if (method !== "POST") return null;
+  if (/\/\.{1,2}(?:\/|$)|\/\/|\\/.test(pathname)) return null;
+  if (provider === "bedrock") {
+    const m = BEDROCK_ROUTE.exec(pathname);
+    if (!m) return null;
+    const modelId = safeDecode(m[1]);
+    if (!modelId) return null;
+    return { modelId, stream: m[2] === "invoke-with-response-stream", countTokens: m[2] === "count-tokens",
+      scope: /^global\./.test(modelId) ? "global" : "regional" };
+  }
+  if (provider === "vertex") {
+    const m = VERTEX_ROUTE.exec(pathname);
+    if (!m) return null;
+    const location = m[2];
+    if (location !== "global" && !REGION.test(location)) return null; // multi-region hosts are out of scope
+    const countTokens = m[4] === "count-tokens";
+    if (countTokens && m[5] !== "rawPredict") return null;
+    return { modelId: countTokens ? null : `${m[3] === "anthropic" ? "" : `${m[3]}/`}${m[4]}`, publisher: m[3], stream: m[5] === "streamRawPredict",
+      countTokens, scope: location === "global" ? "global" : "regional", location };
+  }
+  return null;
+}
+
+/** Real upstream origin for a Vertex location. */
+export function vertexHost(location) {
+  return location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
+}
+
+export function bedrockHost(region) {
+  return `bedrock-runtime.${region}.amazonaws.com`;
+}
+
+const BEDROCK_GEO = /^(?:global|us|eu|apac|jp|au)\./;
+
+/**
+ * Maps a raw Bedrock/Vertex model id to the pricing-table id, or null when it is not an
+ * Anthropic model we can price (non-Anthropic, ARN, unlisted). Never the fallback.
+ */
+export function mapCloudModel(provider, rawId) {
+  if (typeof rawId !== "string" || !rawId) return null;
+  let id = rawId;
+  if (provider === "bedrock") {
+    if (id.startsWith("arn:")) return null;
+    id = id.replace(BEDROCK_GEO, "");
+    if (!id.startsWith("anthropic.")) return null;
+    id = id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, "");
+  } else if (provider === "vertex") {
+    if (id.includes("/")) return null; // non-Anthropic publisher
+    id = id.replace(/@(?:\d{8}|latest)$/, "");
+  } else return null;
+  if (!id.startsWith("claude-")) return null;
+  return resolveModelId(id);
+}
+
+// ---- AWS eventstream (application/vnd.amazon.eventstream) ----
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+export function crc32(buf, start = 0, end = buf.length) {
+  let c = 0xffffffff;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+const HEADER_FIXED = { 0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16 };
+
+export function parseEventHeaders(buf) {
+  const out = {};
+  let i = 0;
+  while (i < buf.length) {
+    const nameLen = buf[i]; i += 1;
+    const name = buf.subarray(i, i + nameLen).toString("utf8"); i += nameLen;
+    const type = buf[i]; i += 1;
+    if (type === 6 || type === 7) {
+      const len = buf.readUInt16BE(i); i += 2;
+      const raw = buf.subarray(i, i + len); i += len;
+      out[name] = type === 7 ? raw.toString("utf8") : raw;
+    } else if (type in HEADER_FIXED) {
+      out[name] = type === 0 ? true : type === 1 ? false : null;
+      i += HEADER_FIXED[type];
+    } else throw new Error("bad header type");
+    if (i > buf.length) throw new Error("truncated header");
+  }
+  return out;
+}
+
+/** Encodes one frame (used by tests and fakes). Headers are string-valued. */
+export function encodeEventFrame(headers, payload) {
+  const hparts = [];
+  for (const [k, v] of Object.entries(headers)) {
+    const name = Buffer.from(k, "utf8"), val = Buffer.from(String(v), "utf8");
+    const h = Buffer.alloc(1 + name.length + 1 + 2 + val.length);
+    h[0] = name.length; name.copy(h, 1); h[1 + name.length] = 7;
+    h.writeUInt16BE(val.length, 2 + name.length); val.copy(h, 4 + name.length);
+    hparts.push(h);
+  }
+  const hbuf = Buffer.concat(hparts), body = Buffer.from(payload);
+  const total = 12 + hbuf.length + body.length + 4;
+  const frame = Buffer.alloc(total);
+  frame.writeUInt32BE(total, 0); frame.writeUInt32BE(hbuf.length, 4);
+  frame.writeUInt32BE(crc32(frame, 0, 8), 8);
+  hbuf.copy(frame, 12); body.copy(frame, 12 + hbuf.length);
+  frame.writeUInt32BE(crc32(frame, 0, total - 4), total - 4);
+  return frame;
+}
+
+/** A Bedrock chunk frame wrapping one Anthropic stream event. */
+export function bedrockChunkFrame(event) {
+  return encodeEventFrame({ ":event-type": "chunk", ":content-type": "application/json", ":message-type": "event" },
+    JSON.stringify({ bytes: Buffer.from(JSON.stringify(event)).toString("base64") }));
+}
+
+/**
+ * Incremental decoder. push(bytes) accepts arbitrary splits; each complete, CRC-valid
+ * chunk frame's decoded Anthropic event is passed to onEvent. A bad CRC, a malformed
+ * frame or an exception frame marks the stream corrupt (never priced).
+ */
+export function createEventStreamDecoder(onEvent) {
+  let pending = Buffer.alloc(0);
+  let corrupt = false;
+  const frame = (f) => {
+    const total = f.readUInt32BE(0), hlen = f.readUInt32BE(4);
+    if (crc32(f, 0, 8) !== f.readUInt32BE(8) || crc32(f, 0, total - 4) !== f.readUInt32BE(total - 4) || 12 + hlen + 4 > total) { corrupt = true; return; }
+    let headers;
+    try { headers = parseEventHeaders(f.subarray(12, 12 + hlen)); } catch { corrupt = true; return; }
+    if (headers[":message-type"] !== "event") { corrupt = true; return; }
+    if (headers[":event-type"] !== "chunk") return;
+    try {
+      const outer = JSON.parse(f.subarray(12 + hlen, total - 4).toString("utf8"));
+      onEvent(JSON.parse(Buffer.from(outer.bytes, "base64").toString("utf8")));
+    } catch { corrupt = true; }
+  };
+  return {
+    push(chunk) {
+      if (corrupt) return;
+      pending = pending.length ? Buffer.concat([pending, chunk]) : Buffer.from(chunk);
+      while (!corrupt && pending.length >= 12) {
+        const total = pending.readUInt32BE(0);
+        if (total < 16 || total > 16 * 1024 * 1024) { corrupt = true; break; }
+        if (pending.length < total) break;
+        frame(pending.subarray(0, total));
+        pending = pending.subarray(total);
+      }
+    },
+    get corrupt() { return corrupt; },
+    /** True when bytes remain that never formed a whole frame. */
+    get partial() { return pending.length > 0; },
+  };
+}

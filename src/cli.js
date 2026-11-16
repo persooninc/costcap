@@ -30,6 +30,7 @@ import { receiptsCommand } from "./receipts-cli.js";
 import { createResponseCache, parseTtl } from "./response-cache.js";
 import { dirname, join } from "node:path";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
+import { awsCredentials } from "./sigv4.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
@@ -194,7 +195,7 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM]].filter(([, v]) => v));
+  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const runReceipts = [];
@@ -215,6 +216,10 @@ export async function wrap(argv) {
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
     env[k] = v.join("=");
+  }
+  // #188: the proxy re-signs SigV4 Bedrock calls only with static credentials from this env.
+  if (process.env.CLAUDE_CODE_USE_BEDROCK === "1" && !awsCredentials(process.env) && !process.env.AWS_BEARER_TOKEN_BEDROCK) {
+    console.error("costcap: note: CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials or AWS_BEARER_TOKEN_BEDROCK are set; signed Bedrock calls will be refused. Run: eval \"$(aws configure export-credentials --format env)\"");
   }
   const custom = upstreamEnv(customList, port);
   for (const note of custom.notes) console.error(note);

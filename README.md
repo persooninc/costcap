@@ -80,6 +80,8 @@ CostCap. The local proxy binds to 127.0.0.1.
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
+| Claude on Amazon Bedrock | `ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:<port>/bedrock` |
+| Claude on Google Vertex AI | `ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex/v1` |
 
 The Python `google-genai` SDK has no base-URL environment variable; set
 `http_options={"base_url": os.environ["GOOGLE_GEMINI_BASE_URL"]}` in code or its
@@ -119,8 +121,43 @@ A priced receipt carries `cost_source: "user_prices"`, `prices_version` and
 and pauses the run until `costcap reconcile --apply` settles it.
 `--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
 request with no body `model` (Azure deployments) is model-less and refused when
-an allowlist is set. Native non-OpenAI wire formats (Bedrock, Vertex, Cohere v2)
-and embeddings/batch/files billing on custom upstreams stay unknown.
+an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere v2)
+and embeddings/batch/files billing on custom upstreams stay unknown. Claude on
+Bedrock and Vertex has its own built-in routes (next section).
+
+## Claude on Bedrock / Vertex
+
+`costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL` and `ANTHROPIC_VERTEX_BASE_URL`, so
+Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
+Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
+
+- **Routes.** Bedrock `POST /model/{id}/invoke`, `invoke-with-response-stream` and
+  `count-tokens` go to `bedrock-runtime.<region>.amazonaws.com`. Vertex
+  `…/locations/<loc>/publishers/anthropic/models/{id}:rawPredict` and `:streamRawPredict`
+  go to `<loc>-aiplatform.googleapis.com` (`global` goes to `aiplatform.googleapis.com`).
+  Any other path (Converse, `GET /inference-profiles`, multi-region Vertex hosts such as
+  `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
+- **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes
+  through unchanged; the region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`. A SigV4
+  request is signed by the child for the local proxy, so CostCap verifies it with the static
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` in wrap's environment
+  (bad signature: `403 bedrock_signature_invalid`) and re-signs it for the real host. Without
+  static credentials a signed call gets `502 bedrock_credentials_unavailable` and nothing is
+  forwarded. Profiles, SSO and IMDS are not resolved inside the proxy; export them first:
+  `eval "$(aws configure export-credentials --format env)"`. Keys never reach receipts.
+- **Vertex credentials.** The OAuth `Authorization` header passes through unchanged.
+- **Metering.** JSON, Vertex SSE and Bedrock's binary `application/vnd.amazon.eventstream`
+  are metered in real time (frames forwarded byte-for-byte, CRC-checked). A cut stream or a
+  bad CRC is `stream_incomplete`. `count-tokens` is free.
+- **Models.** The model comes from the path: Bedrock geo prefixes (`global.`, `us.`, `eu.`,
+  `apac.`, `jp.`, `au.`), `anthropic.` and `-vN[:M]` are stripped; Vertex `@YYYYMMDD` is
+  stripped. Receipts carry `provider`, `model` (table id), `provider_model` (raw id) and
+  `endpoint_scope`. A non-Anthropic id, an ARN or an unlisted id records
+  `cost_usd: null, reason: "cloud_model_unpriced"` and pauses; it never uses the fallback rate.
+- **Regional premium.** Claude 4.5+ on regional endpoints costs 10% over global (Bedrock
+  `global.` ids and Vertex `locations/global` are global). The table's `regional_endpoint`
+  multiplier stacks with long context and batch; receipts record `regional_multiplier`.
+- Cloud routes always bypass the response cache (`x-costcap-cache: bypass`).
 
 ## Enforcement limits
 

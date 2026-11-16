@@ -279,3 +279,19 @@ test("proxy: --unknown-models refuse applies to every OpenRouter fallback", asyn
   assert.equal(r.body.model, "made-up/secret-9");
   assert.equal(f.seen.length, 0);
 });
+
+test("#188 the allowlist sees the mapped Bedrock path model, not the raw provider id", async (t) => {
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => { q.resume(); res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } })); });
+    s.listen(0, "127.0.0.1", () => r({ s, url: `http://127.0.0.1:${s.address().port}` }));
+  });
+  const { server, port } = await startMeteringProxy({ upstreams: { bedrock: up.url }, cloudEnv: { AWS_REGION: "us-east-1" }, allowedModels: () => ["claude-haiku-4-5"] });
+  t.after(() => { server.close(); up.s.close(); });
+  const call = (id) => fetch(`http://127.0.0.1:${port}/bedrock/model/${encodeURIComponent(id)}/invoke`, { method: "POST", headers: { authorization: "Bearer k" }, body: "{}" });
+  assert.equal((await call("us.anthropic.claude-haiku-4-5-20251001-v1:0")).status, 200);
+  const no = await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
+  assert.equal(no.status, 403);
+  assert.equal((await no.json()).model, "claude-sonnet-4-5");
+  const raw = await call("meta.llama3-70b-instruct-v1:0");
+  assert.equal((await raw.json()).model, "meta.llama3-70b-instruct-v1:0");
+});

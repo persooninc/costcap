@@ -461,3 +461,96 @@ test("wrap exits 2 and spawns nothing for a bad --upstream or prices file", () =
   }
   assert.throws(() => readFileSync(marker));
 });
+
+// #188: spawned wrap against local fake Bedrock / Vertex upstreams.
+const SIGV4 = new URL("../src/sigv4.js", import.meta.url).href;
+async function fakeBedrock(t) {
+  const { verifyRequest } = await import(SIGV4);
+  const hits = [];
+  const s = http.createServer((q, res) => {
+    const chunks = []; q.on("data", (c) => chunks.push(c));
+    q.on("end", () => {
+      const [p, qs = ""] = q.url.split("?");
+      const v = verifyRequest({ method: q.method, path: p, search: qs ? `?${qs}` : "", headers: q.headers, body: Buffer.concat(chunks) },
+        { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" });
+      hits.push({ url: q.url, ok: v.ok, region: v.region });
+      res.writeHead(v.ok ? 200 : 403, { "content-type": "application/json" })
+        .end(JSON.stringify(v.ok ? { usage: { input_tokens: 40_000, output_tokens: 1000 } } : { message: "bad signature" }));
+    });
+  });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  t.after(() => s.close());
+  return { hits, url: `http://127.0.0.1:${s.address().port}` };
+}
+function cloudWrap(args, env, script) {
+  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AWS_|^CLAUDE_CODE_USE_/.test(k)));
+  return new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--", process.execPath, "--input-type=module", "-e", script], { env: { ...base, ...env } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim(), err }));
+  });
+}
+const signedCallScript = (ids) => `
+  import { signRequest } from ${JSON.stringify(SIGV4)};
+  const base = new URL(process.env.ANTHROPIC_BEDROCK_BASE_URL);
+  const creds = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" };
+  const out = [process.env.ANTHROPIC_BEDROCK_BASE_URL.endsWith("/bedrock"), process.env.ANTHROPIC_VERTEX_BASE_URL.endsWith("/vertex/v1")];
+  for (const id of ${JSON.stringify(ids)}) {
+    const path = base.pathname + "/model/" + encodeURIComponent(id) + "/invoke";
+    const body = JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 1000, messages: [] });
+    const headers = signRequest({ method: "POST", path, headers: { "content-type": "application/json" }, body, host: base.host, region: "us-east-1", service: "bedrock" }, creds);
+    delete headers.host;
+    const r = await fetch(base.origin + path, { method: "POST", headers, body });
+    out.push(r.status);
+  }
+  console.log(out.join(" "));`;
+
+test("#188 wrap: child sees the Bedrock/Vertex base URLs, SigV4 call is re-signed and priced 1.1x/1.0x, cap hit is 429", async (t) => {
+  const up = await fakeBedrock(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+  const res = await cloudWrap(["--cap", "0.25", "--receipts", receipts],
+    { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, AWS_REGION: "us-east-1", AWS_ACCESS_KEY_ID: "AKIDEXAMPLE", AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" },
+    signedCallScript([id, id.replace(/^us\./, "global."), id]));
+  assert.equal(res.out, "true true 200 200 429");
+  assert.deepEqual(up.hits.map((h) => [h.ok, h.region]), [[true, "us-east-1"], [true, "us-east-1"]]);
+  const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
+  // 40k in * $3 + 1k out * $15 = $0.135 global; regional is 1.1x.
+  assert.deepEqual(rows.slice(0, 2).map((r) => [r.provider, r.model, r.endpoint_scope, r.cost_usd]),
+    [["bedrock", "claude-sonnet-4-5", "regional", 0.1485], ["bedrock", "claude-sonnet-4-5", "global", 0.135]]);
+  assert.equal(rows[2].reason, "budget_exceeded");
+  assert.ok(!readFileSync(receipts, "utf8").includes("wJalrXUtnFEMI"));
+});
+
+test("#188 wrap: CLAUDE_CODE_USE_BEDROCK without static creds prints a note; a signed call gets 502 and never reaches the fake", async (t) => {
+  const up = await fakeBedrock(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const res = await cloudWrap(["--receipts", path.join(dir, "r.jsonl")],
+    { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, AWS_REGION: "us-east-1", CLAUDE_CODE_USE_BEDROCK: "1" },
+    signedCallScript(["us.anthropic.claude-sonnet-4-5-20250929-v1:0"]));
+  assert.equal(res.out, "true true 502");
+  assert.match(res.err, /CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials/);
+  assert.match(res.err, /aws configure export-credentials/);
+  assert.equal(up.hits.length, 0);
+  const quiet = await cloudWrap(["--receipts", path.join(dir, "r2.jsonl")], { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, CLAUDE_CODE_USE_BEDROCK: "1", AWS_BEARER_TOKEN_BEDROCK: "x" }, "console.log(1)");
+  assert.doesNotMatch(quiet.err, /CLAUDE_CODE_USE_BEDROCK/);
+});
+
+test("#188 wrap: Vertex rawPredict through COSTCAP_TEST_VERTEX_UPSTREAM keeps the path and Authorization", async (t) => {
+  const hits = [];
+  const s = http.createServer((q, res) => { q.resume(); hits.push([q.url, q.headers.authorization]);
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } })); });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  t.after(() => s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await cloudWrap(["--receipts", receipts], { COSTCAP_TEST_VERTEX_UPSTREAM: `http://127.0.0.1:${s.address().port}` }, `
+    const r = await fetch(process.env.ANTHROPIC_VERTEX_BASE_URL + "/projects/p/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict",
+      { method: "POST", headers: { authorization: "Bearer ya29.x" }, body: "{}" });
+    console.log(r.status);`);
+  assert.equal(res.out, "200");
+  assert.deepEqual(hits, [["/v1/projects/p/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict", "Bearer ya29.x"]]);
+  const row = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).find((r) => r.provider === "vertex");
+  assert.deepEqual([row.model, row.endpoint_scope, row.regional_multiplier], ["claude-haiku-4-5", "global", undefined]);
+});

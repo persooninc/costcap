@@ -8,7 +8,7 @@
 import { lookupPrice, selectRates, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // Conservative default output ceilings when the request sets no limit.
-export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, gemini: 65_536 };
+export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, bedrock: 64_000, vertex: 64_000, gemini: 65_536 };
 
 export function requestedOutputTokens(provider, req) {
   const n = provider === "gemini"
@@ -19,7 +19,7 @@ export function requestedOutputTokens(provider, req) {
 
 // Max completions per request the provider accepts; larger values are clamped
 // to it (the provider would reject them) and flagged output_multiplier_clamped.
-export const MAX_OUTPUT_MULTIPLIER = { openai: 128, openrouter: 128, gemini: 8, anthropic: 1 };
+export const MAX_OUTPUT_MULTIPLIER = { openai: 128, openrouter: 128, gemini: 8, anthropic: 1, bedrock: 1, vertex: 1 };
 
 // OpenAI-compatible n / best_of (best_of bills every candidate, so the larger
 // wins) and Gemini candidateCount multiply billed output tokens. A missing
@@ -28,7 +28,7 @@ export const MAX_OUTPUT_MULTIPLIER = { openai: 128, openrouter: 128, gemini: 8, 
 export function outputMultiplier(provider, req) {
   const raw = provider === "gemini"
     ? [req?.generationConfig?.candidateCount ?? req?.generation_config?.candidate_count]
-    : provider === "anthropic" ? [] : [req?.n, req?.best_of];
+    : ["anthropic", "bedrock", "vertex"].includes(provider) ? [] : [req?.n, req?.best_of];
   let multiplier = 1, defaulted = false;
   for (const v of raw) {
     if (v === undefined || v === null) continue;
@@ -43,11 +43,13 @@ export function outputMultiplier(provider, req) {
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
 // #167: an OpenRouter `models` fallback list may route to any entry, so the
 // worst case is the max over every candidate (any unpriced candidate refuses).
-export function estimateWorstCase(provider, body, path = "", priceFor) {
+// #188: pathModel (cloud routes) is the model from the request path, used over the body.
+export function estimateWorstCase(provider, body, path = "", priceFor, pathModel) {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
   const candidates = provider === "openrouter" ? openRouterModels(req) : null;
+  if (pathModel !== undefined) return estimateOne(provider, req, text, path, pathModel ?? "unknown", priceFor);
   if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0], priceFor);
   let worst;
   for (const m of candidates) {
@@ -92,14 +94,14 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
   const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(priceFor ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(priceFor && !price.table_version ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
 }
 
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor) {
-  const est = estimateWorstCase(provider, body, path, priceFor);
+export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel) {
+  const est = estimateWorstCase(provider, body, path, priceFor, pathModel);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "hour", "day", "month"]) {

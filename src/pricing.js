@@ -45,13 +45,19 @@ const SNAPSHOT_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/;
 // first-party id, which carries the same list rates for these providers.
 const FIRST_PARTY_PREFIX = /^(?:anthropic|openai)\//;
 
-function resolveEntry(model) {
-  if (typeof model !== "string") return undefined;
+// The table key a model id resolves to (exact, dated snapshot base or first-party id), or null.
+export function resolveModelId(model) {
+  if (typeof model !== "string" || !model) return null;
   const base = model.replace(SNAPSHOT_SUFFIX, "");
   const candidates = [model, base];
   if (FIRST_PARTY_PREFIX.test(base)) candidates.push(base.replace(FIRST_PARTY_PREFIX, ""));
-  for (const id of candidates) if (Object.hasOwn(table.models, id)) return table.models[id];
-  return undefined;
+  for (const id of candidates) if (Object.hasOwn(table.models, id)) return id;
+  return null;
+}
+
+function resolveEntry(model) {
+  const id = resolveModelId(model);
+  return id === null ? undefined : table.models[id];
 }
 
 export function lookupPrice(model) {
@@ -108,6 +114,22 @@ export function batchMultiplier(provider) {
   return typeof m === "number" && Number.isFinite(m) && m > 0 ? m : null;
 }
 
+// #188: Claude 4.5+ on Bedrock/Vertex regional (non-global) endpoints costs a published
+// premium over global. Returns the multiplier for a model, or null when none applies.
+export function regionalMultiplier(model) {
+  const r = table.regional_endpoint;
+  const id = resolveModelId(model);
+  if (!r || id === null || !Array.isArray(r.models) || !r.models.includes(id)) return null;
+  return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
+}
+
+// Every numeric rate (including the long-context set) times m; thresholds unchanged.
+export function scalePrice(price, m) {
+  const out = scaleRates(price, m);
+  if (price.long_context) out.long_context = scaleRates(price.long_context, m);
+  return out;
+}
+
 const scaleRates = (rates, m) => Object.fromEntries(Object.entries(rates).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v]));
 
 // #163: non-text modality slices. Returns { delta, unpriced } where delta is the extra USD
@@ -135,12 +157,15 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch } = {}) {
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false } = {}) {
   const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
-  const multiplier = batch ? batchMultiplier(batch) : null;
-  if (batch && multiplier === null) throw new Error(`no batch rate for provider ${batch}`);
+  const batchM = batch ? batchMultiplier(batch) : null;
+  if (batch && batchM === null) throw new Error(`no batch rate for provider ${batch}`);
+  // Regional premium stacks with batch and long-context like batch_multiplier (#188).
+  const regionalM = regional && !price.fallback ? regionalMultiplier(model) : null;
+  const multiplier = batchM === null && regionalM === null ? null : (batchM ?? 1) * (regionalM ?? 1);
   const pricing_tier = tiered.pricing_tier;
   const selected = tiered.rates && multiplier !== null ? scaleRates(tiered.rates, multiplier) : tiered.rates;
   const premium = pricing_tier === "fast" || pricing_tier === "priority";
@@ -168,7 +193,8 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     cache_write_1h_input_tokens,
     pricing_tier,
     ...(modality_tokens && { modality_tokens }),
-    ...(multiplier !== null && { batch_multiplier: multiplier }),
+    ...(batchM !== null && { batch_multiplier: batchM }),
+    ...(regionalM !== null && { regional_multiplier: regionalM }),
     ...(signal.speed !== undefined && { speed: signal.speed }),
     ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
     table_version: price.table_version,

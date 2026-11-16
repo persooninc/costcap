@@ -263,3 +263,17 @@ test("#186: estimateWorstCase with a user price resolver never reads the shipped
   assert.equal(ok.table_sha256, undefined);
   assert.equal(estimateWorstCase("u/groq", JSON.stringify({ model: "gpt-4o" }), "/v1/chat/completions", priceFor).reason, "preflight_unpriced");
 });
+
+test("#188 path model overrides the body model; cloud providers default to 64k output and no n multiplier", () => {
+  assert.equal(DEFAULT_MAX_OUTPUT.bedrock, 64_000);
+  assert.equal(DEFAULT_MAX_OUTPUT.vertex, 64_000);
+  const body = JSON.stringify({ model: "gpt-4o", n: 5, messages: [] });
+  const est = estimateWorstCase("bedrock", body, "/model/x/invoke", undefined, "claude-haiku-4-5");
+  assert.equal(est.ok, true);
+  assert.equal(est.model, "claude-haiku-4-5");
+  assert.equal(est.output_tokens, 64_000);
+  assert.equal(est.cost_source, "table");
+  assert.deepEqual(estimateWorstCase("vertex", body, "/x", () => null, null), { ok: false, reason: "preflight_unpriced", model: "unknown" });
+  const cap = createCapEngine({ caps: { run: 0.0001 } });
+  assert.equal(preflightCheck(cap, "bedrock", "{}", "/x", undefined, undefined, "claude-haiku-4-5").reason, "preflight_estimate");
+});

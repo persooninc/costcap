@@ -63,3 +63,9 @@ test("#186: Azure api-key query parameter is redacted", () => {
   assert.ok(CREDENTIAL_PARAMS.includes("api-key"));
   assert.equal(receiptPath("/openai/deployments/d/chat/completions", "?api-version=2024-10-21&api-key=s3cret"), "/openai/deployments/d/chat/completions?api-version=2024-10-21&api-key=REDACTED");
 });
+
+test("#188 x-amz-* presigned query parameters are redacted", () => {
+  for (const k of ["x-amz-signature", "x-amz-security-token", "x-amz-credential"]) assert.ok(CREDENTIAL_PARAMS.includes(k));
+  assert.equal(receiptPath("/model/m/invoke", "?X-Amz-Signature=abc&X-Amz-Credential=AK%2F1&X-Amz-Security-Token=t&X-Amz-Date=1"),
+    "/model/m/invoke?X-Amz-Signature=REDACTED&X-Amz-Credential=REDACTED&X-Amz-Security-Token=REDACTED&X-Amz-Date=1");
+});

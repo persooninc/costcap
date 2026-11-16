@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.5");
+  assert.equal(TABLE_VERSION, "2026-11-16.6");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -223,4 +223,10 @@ test("#163: a table with modalities canonicalises, matches its digest, and a tam
   const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "verify"], { encoding: "utf8", env: { ...process.env, COSTCAP_PRICING_TABLE: tp } });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /MISMATCH/);
+});
+
+test("#188 the bumped table declares the regional endpoint premium with a source", () => {
+  assert.equal(table.regional_endpoint.multiplier, 1.1);
+  for (const m of table.regional_endpoint.models) assert.ok(Object.hasOwn(table.models, m), m);
+  assert.ok(table.sources.some((s) => /Regional and multi-region endpoint pricing/.test(s)));
 });

@@ -1,7 +1,7 @@
 // Issue #130: the one path format every receipt stores (success, blocked, unknown outcome).
 // Path plus query, with credential-like query parameters redacted. Upstream forwarding
 // still uses the original URL; only what is persisted goes through this helper.
-export const CREDENTIAL_PARAMS = Object.freeze(["key", "api_key", "apikey", "access_token", "token", "sig", "signature", "api-key"]);
+export const CREDENTIAL_PARAMS = Object.freeze(["key", "api_key", "apikey", "access_token", "token", "sig", "signature", "api-key", "x-amz-signature", "x-amz-security-token", "x-amz-credential"]);
 export const REDACTED = "REDACTED";
 const isCredential = (name) => CREDENTIAL_PARAMS.includes(name.toLowerCase());
 
