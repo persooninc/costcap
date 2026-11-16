@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
@@ -16,12 +16,17 @@ import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResu
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
+import { cloudUpstream, createEventStreamDecoder, isCloudProvider, mapVertexModel, parseCloudRoute } from "./cloud.js";
+import { verifyRequest, signRequest } from "./sigv4.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
   anthropic: "https://api.anthropic.com",
   openrouter: "https://openrouter.ai/api",
   gemini: "https://generativelanguage.googleapis.com",
+  // #188: the real host is derived per request (region / location); a test hook URL is used as-is.
+  bedrock: "cloud:bedrock",
+  vertex: "cloud:vertex",
 };
 
 export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
@@ -35,6 +40,9 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
     lines.push(`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
     lines.push(`GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
   }
+  // #188: Claude Code and the Anthropic Bedrock/Vertex SDKs read these.
+  if (providers.includes("bedrock")) lines.push(`ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:${port}/bedrock`);
+  if (providers.includes("vertex")) lines.push(`ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:${port}/vertex/v1`);
   return lines;
 }
 
@@ -350,7 +358,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, awsCredentials = null, awsRegion = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -429,15 +437,33 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     }
     // Custom upstreams price only from --upstream-prices, never the shipped table or fallback.
     const priced = (m) => (custom ? userPrice(userPrices, provider, m) !== null : isPricedModel(m));
+    // Cloud routes: only a path model that mapped to a table id is priced (never the fallback).
     const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; } : undefined;
     const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
+    // #188: Bedrock / Vertex. Anything outside the supported surface is answered locally:
+    // not forwarded, no receipt, no pause, never unmetered.
+    const cloud = isCloudProvider(provider);
+    const route = cloud ? parseCloudRoute(provider, `/${rest.join("/")}`) : null;
+    if (route && !route.ok) {
+      req.resume();
+      send(404, { error: "cloud_route_unsupported", message: `CostCap meters ${provider} only for Anthropic Claude ${provider === "bedrock" ? "InvokeModel / InvokeModelWithResponseStream / CountTokens" : "rawPredict / streamRawPredict on a single-region or global location"}. The upstream call was not made.` });
+      return;
+    }
+    const cloudPrice = route && ((m) => {
+      const p = lookupPrice(m), mult = route.scope === "regional" ? regionalMultiplier(m) : null;
+      if (!mult) return p;
+      const scale = (r) => r && { ...r, input: r.input * mult, output: r.output * mult };
+      return { ...p, ...scale(p), ...(p.long_context && { long_context: scale(p.long_context) }) };
+    });
+    const inboundHeaders = { ...req.headers };
     // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
     let reqTags = null, tagError = null;
     try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
     delete req.headers[TAG_HEADER];
     // #184: x-costcap-cache is CostCap's; never forwarded.
-    const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
+    // #188: cloud routes are never served from the response cache.
+    const cacheBypass = cloud || String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
     delete req.headers[CACHE_HEADER];
     const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
     if (tagError) {
@@ -470,7 +496,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const path = `/${rest.join("/")}${url.search}`;
         const storedPath = receiptPath(`/${rest.join("/")}`, url.search);
         const block = (reason, detail, response) => {
-          emit({ provider, path: storedPath, blocked: true, reason, cost_usd: 0, ...detail });
+          emit({ provider, path: storedPath, blocked: true, reason, cost_usd: 0, ...cloudFields, ...detail });
           // #172: an hour-cap refusal says when enough spend ages out of the window.
           send(429, response, detail?.retry_after_s != null ? { "retry-after": String(detail.retry_after_s) } : {});
           return "blocked";
@@ -481,13 +507,43 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        // #188: Bedrock/Vertex carry the model in the path; checks use the mapped table id.
+        // Vertex count-tokens names the model in the body.
+        if (route) requestedModel = route.countTokens && provider === "vertex"
+          ? (typeof parsedBody?.model === "string" && parsedBody.model ? mapVertexModel(parsedBody.model) ?? parsedBody.model : undefined)
+          : (route.model ?? route.rawModel);
+        const cloudFields = route ? { provider_model: route.rawModel, endpoint_scope: route.scope } : {};
+        let target = upstream, cloudSigned = null;
+        if (provider === "bedrock") {
+          const authz = inboundHeaders.authorization;
+          let region = awsRegion;
+          if (typeof authz === "string" && authz.startsWith("AWS4-HMAC-SHA256 ")) {
+            if (!awsCredentials) {
+              try { onWarning('costcap: a SigV4-signed Bedrock request arrived but wrap has no AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY. Export static credentials first, e.g. eval "$(aws configure export-credentials --format env)", or use AWS_BEARER_TOKEN_BEDROCK.'); } catch { /* stderr is best effort */ }
+              send(502, { error: "bedrock_credentials_unavailable", message: 'CostCap needs static AWS credentials in its own environment to re-sign Bedrock requests. Run eval "$(aws configure export-credentials --format env)" before costcap wrap. The upstream call was not made.' });
+              return;
+            }
+            const [rawPath, ...q] = req.url.split("?");
+            const v = verifyRequest({ method: req.method, path: rawPath, search: q.join("?"), headers: inboundHeaders, body, credentials: awsCredentials });
+            if (!v.ok || v.service !== "bedrock") {
+              send(403, { error: "bedrock_signature_invalid", message: "CostCap could not verify this request's AWS signature with wrap's credentials. The upstream call was not made." });
+              return;
+            }
+            region = v.region;
+            cloudSigned = { region };
+          }
+          target = cloudUpstream("bedrock", { region, override: upstream.startsWith("cloud:") ? undefined : upstream });
+          if (!target) { send(502, { error: "bedrock_region_unavailable", message: "CostCap could not determine the Bedrock region: set AWS_REGION. The upstream call was not made." }); return; }
+        } else if (provider === "vertex") {
+          target = cloudUpstream("vertex", { location: route.location, override: upstream.startsWith("cloud:") ? undefined : upstream });
+        }
         const batchCreate = batchCreateProvider(req.method, req.url);
         // #160: an Anthropic batch names its models per request; every one is checked.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
         if (batchModels && !requestedModel) requestedModel = batchModels.find(Boolean);
         // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
         const modelRefusal = (status, error, message) => {
-          emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
+          emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0, ...cloudFields });
           send(status, { error, model: requestedModel ?? null, message });
           return "blocked";
         };
@@ -514,8 +570,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
           }
-          if (generates && unknownModels === "refuse" && offending(priced) !== -1) {
-            refuse(offending(priced));
+          const pricedHere = route ? (m) => (route.countTokens ? isPricedModel(m) : route.model !== null && m === route.model) : priced;
+          if (generates && unknownModels === "refuse" && offending(pricedHere) !== -1) {
+            refuse(offending(pricedHere));
             return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
           }
           const agentHit = agentBudgets?.check(who);
@@ -525,7 +582,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
-            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, priceFor);
+            const pf = route
+              ? preflightCheck(cap, "anthropic", body, path, (est) => { preflightEst = est; }, cloudPrice, route.model ?? "")
+              : preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, priceFor);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -561,6 +620,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
+        if (cloudSigned) {
+          // #188: re-sign for the real host; the client's signature covered 127.0.0.1.
+          for (const key of ["authorization", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"]) delete headers[key];
+          const signed = signRequest({ method: req.method, host: new URL(target).host, path: `/${rest.join("/")}`, search: url.search, headers, body,
+            credentials: awsCredentials, region: cloudSigned.region, service: "bedrock", extraSigned: ["content-type", "accept"] });
+          delete signed.host;
+          Object.assign(headers, signed);
+        }
         try {
           const abort = new AbortController();
           let timer;
@@ -568,7 +635,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           arm(timeoutMs);
           const onClientClose = () => { if (!res.writableFinished) abort.abort(); };
           res.once("close", onClientClose);
-          const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
+          const upstreamRes = await fetch(`${target}${path}`, { method: req.method, headers,
             body: ["GET", "HEAD"].includes(req.method) ? undefined : (injected ?? body),
             // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
             redirect: "manual",
@@ -584,12 +651,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
-          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...cloudFields, ...(cacheMode && { cache: cacheMode }),
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false, sseIncomplete = false;
-          if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
+          const meterAs = route ? "anthropic" : provider;
+          const eventStream = /^application\/vnd\.amazon\.eventstream/i.test(contentType);
+          if ((eventStream || /^text\/event-stream/i.test(contentType)) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
-            const parser = createSseUsageParser(provider, requestedModel);
+            // #188: Bedrock's binary eventstream is forwarded byte-for-byte and decoded on the side.
+            const parser = eventStream ? eventStreamParser(requestedModel) : createSseUsageParser(meterAs, requestedModel);
             const decoder = new TextDecoder();
             arm(streamIdleMs);
             const filter = injected ? createUsageChunkFilter() : null;
@@ -601,7 +671,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
             };
             if (!res.destroyed) {
-              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache", ...(cacheMode && { [CACHE_HEADER]: "bypass" }) });
+              res.writeHead(upstreamRes.status, { "content-type": contentType, ...(!eventStream && { "cache-control": "no-cache" }), ...(cacheMode && { [CACHE_HEADER]: "bypass" }) });
               res.flushHeaders();
             }
             const reader = upstreamRes.body.getReader();
@@ -610,7 +680,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 const { done, value } = await reader.read();
                 if (done) break;
                 arm(streamIdleMs);
-                if (filter) {
+                if (eventStream) {
+                  parser.pushBytes(value);
+                  await forward(value);
+                } else if (filter) {
                   const text = decoder.decode(value, { stream: true });
                   parser.push(text);
                   await forward(Buffer.from(filter.push(text)));
@@ -619,8 +692,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                   await forward(value);
                 }
               }
-              const tail = decoder.decode();
-              parser.push(tail);
+              const tail = eventStream ? "" : decoder.decode();
+              if (!eventStream) parser.push(tail);
               if (filter) await forward(Buffer.from(filter.push(tail) + filter.end()));
             } catch {
               streamCut = true;
@@ -632,12 +705,25 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
+            metered = extractUsage(meterAs, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           clearTimeout(timer);
           res.off("close", onClientClose);
-          if (metered) {
+          if (metered && route && !route.countTokens && route.model === null) {
+            // #188: a cloud model with no table id is unknown, never the fallback rate.
+            Object.assign(receipt, { model: route.rawModel, cost_usd: null, reason: "cloud_model_unpriced", input_tokens: metered.usage.input_tokens ?? 0, output_tokens: metered.usage.output_tokens ?? 0 });
+            recordSpend(receipt);
+            failMsg = `Model ${route.rawModel} on ${provider} has no published rate. Restart only after reconciling this request.`;
+          } else if (metered && route && !route.countTokens) {
+            Object.assign(receipt, costForUsage(route.model, metered.usage, { regional: route.scope === "regional" }), { model: route.model });
+            if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
+            recordSpend(receipt);
+            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
+            else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";
+            else velocity?.record(receipt.cost_usd);
+          } else if (metered && !route) {
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage) : costForUsage(metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
@@ -655,6 +741,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
+          } else if (raw && route?.countTokens && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+            // #188: Bedrock count-tokens and Vertex count-tokens:rawPredict are free (#142).
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else if (raw && batchCreate && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchIdOf(raw)) {
             // #160: a batch is billed when it runs. Pending, unknown (never $0), and the run continues.
             const batch_id = batchIdOf(raw);
@@ -700,6 +789,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ((req.method === "POST" && isCountTokensPath(req.url)) || isNonBillableFilesRequest(req.method, req.url))))) {
             // Metadata reads, token-count endpoints and Files upload/delete never generate tokens.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
+          } else if (raw && route && route.model === null) {
+            // #188: non-Anthropic / ARN / unlisted cloud model: unknown, never the fallback.
+            Object.assign(receipt, { model: route.rawModel, cost_usd: null, reason: "cloud_model_unpriced" });
+            failMsg = `Model ${route.rawModel} on ${provider} has no published rate. Restart only after reconciling this request.`;
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "usage_unavailable" });
@@ -748,6 +841,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   };
   server.accountingFailure = accountingFailureNow;
   return server;
+}
+
+// #188: AWS eventstream metering: decoded Bedrock chunks feed the Anthropic accumulator.
+// A bad CRC / malformed frame / exception, or a missing message_stop, is incomplete.
+export function eventStreamParser(requestedModel) {
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  const dec = createEventStreamDecoder((event) => acc.add(event));
+  return { pushBytes: (v) => dec.push(v), end: () => { dec.end(); return acc.result(); }, get incomplete() { return dec.corrupt || acc.incomplete; } };
 }
 
 export function startMeteringProxy(opts = {}, port = 0) {

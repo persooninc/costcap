@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.5",
+  "version": "2026-11-16.6",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -16,7 +16,9 @@
     "https://developers.openai.com/api/docs/guides/batch (Batch API: 50% cost discount; retrieved 2026-11-16)",
     "https://ai.google.dev/gemini-api/docs/pricing (Gemini 2.5 Flash / Flash-Lite audio input and audio cache rates; text/image/video share the text rate; retrieved 2026-11-16)",
     "https://platform.openai.com/docs/models/gpt-image-1 (text $5 / cached $1.25, image input $10 / cached $2.50, image output $40; retrieved 2026-11-16)"
+    ,"https://platform.claude.com/docs/en/about-claude/pricing (Regional and multi-region endpoint pricing: Claude 4.5+ on Bedrock/Vertex regional endpoints cost 10% over global; retrieved 2026-11-16)"
   ],
+  "regional_endpoint": { "multiplier": 1.1, "models": ["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-5", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-haiku-4-5"] },
   "batch": { "openai": 0.5, "anthropic": 0.5 },
   "currency": "usd_per_1m_tokens",
   "fallback": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "cache_write": 3.125, "cache_write_1h": 5.00 },

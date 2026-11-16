@@ -461,3 +461,55 @@ test("wrap exits 2 and spawns nothing for a bad --upstream or prices file", () =
   }
   assert.throws(() => readFileSync(marker));
 });
+
+test("#188 wrap: Bedrock SigV4 + Vertex through the proxy, env vars, 1.1x regional receipt, cap hit, startup note", async (t) => {
+  const { verifyRequest } = await import("../src/sigv4.js");
+  const CREDS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" };
+  const msg = { model: "claude-sonnet-4-5-20250929", usage: { input_tokens: 2000, output_tokens: 6000 } }; // $0.096 global
+  const sigs = [];
+  const start = (handler) => new Promise((r) => { const s = http.createServer(handler); s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port })); });
+  const bed = await start((q, res) => {
+    const chunks = []; q.on("data", (c) => chunks.push(c));
+    q.on("end", () => {
+      const [p, ...qs] = q.url.split("?");
+      sigs.push(verifyRequest({ method: q.method, path: p, search: qs.join("?"), headers: q.headers, body: Buffer.concat(chunks).toString(), credentials: CREDS }));
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(msg));
+    });
+  });
+  const vtx = await start((q, res) => { q.resume(); q.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...msg, usage: { input_tokens: 1, output_tokens: 1 } }))); });
+  t.after(() => { bed.s.close(); vtx.s.close(); });
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const sig = new URL("../src/sigv4.js", import.meta.url).href;
+  const script = `
+    const { signRequest } = await import(${JSON.stringify(sig)});
+    const base = new URL(process.env.ANTHROPIC_BEDROCK_BASE_URL);
+    const call = async (id) => {
+      const p = base.pathname + "/model/" + encodeURIComponent(id) + "/invoke", body = JSON.stringify({ max_tokens: 10 });
+      const h = signRequest({ method: "POST", host: base.host, path: p, body, headers: { "content-type": "application/json" }, extraSigned: ["content-type"],
+        credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY }, region: process.env.AWS_REGION, service: "bedrock" });
+      delete h.host;
+      return (await fetch(base.origin + p, { method: "POST", headers: { ...h, "content-type": "application/json" }, body })).status;
+    };
+    const v = await fetch(process.env.ANTHROPIC_VERTEX_BASE_URL + "/projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict", { method: "POST", headers: { authorization: "Bearer t" }, body: "{}" });
+    console.log(process.env.ANTHROPIC_VERTEX_BASE_URL.endsWith("/vertex/v1"), v.status, await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0"), await call("global.anthropic.claude-sonnet-4-5-20250929-v1:0"));`;
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_BEDROCK_UPSTREAM: `http://127.0.0.1:${bed.port}`, COSTCAP_TEST_VERTEX_UPSTREAM: `http://127.0.0.1:${vtx.port}`,
+        AWS_REGION: "us-east-1", AWS_ACCESS_KEY_ID: CREDS.accessKeyId, AWS_SECRET_ACCESS_KEY: CREDS.secretAccessKey, AWS_SESSION_TOKEN: "", CLAUDE_CODE_USE_BEDROCK: "1" } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "true 200 200 429");
+  assert.doesNotMatch(res.err, /export-credentials/);
+  assert.equal(sigs.length, 1); assert.equal(sigs[0].ok, true);
+  const lines = readFileSync(receipts, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.provider);
+  const b = lines.find((r) => r.provider === "bedrock" && !r.blocked);
+  assert.equal(b.model, "claude-sonnet-4-5"); assert.equal(b.endpoint_scope, "regional"); assert.equal(b.regional_multiplier, 1.1);
+  assert.ok(Math.abs(b.cost_usd - 0.1056) < 1e-6);
+  assert.doesNotMatch(readFileSync(receipts, "utf8"), /wJalrXUtnFEMI/);
+  // Startup note: Bedrock on, no creds or bearer token.
+  const note = spawnSync(process.execPath, ["src/cli.js", "wrap", "--receipts", path.join(dir, "n.jsonl"), "--", process.execPath, "-e", ""],
+    { encoding: "utf8", env: { ...process.env, CLAUDE_CODE_USE_BEDROCK: "1", AWS_ACCESS_KEY_ID: "", AWS_SECRET_ACCESS_KEY: "", AWS_BEARER_TOKEN_BEDROCK: "" } });
+  assert.match(note.stderr, /CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials/);
+});

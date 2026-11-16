@@ -119,8 +119,55 @@ A priced receipt carries `cost_source: "user_prices"`, `prices_version` and
 and pauses the run until `costcap reconcile --apply` settles it.
 `--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
 request with no body `model` (Azure deployments) is model-less and refused when
-an allowlist is set. Native non-OpenAI wire formats (Bedrock, Vertex, Cohere v2)
-and embeddings/batch/files billing on custom upstreams stay unknown.
+an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere
+v2) and embeddings/batch/files billing on custom upstreams stay unknown; Claude
+on Bedrock and Vertex has its own built-in routes (below).
+
+### Claude on Amazon Bedrock / Google Vertex AI
+
+`wrap` also sets the variables Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` /
+`CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic Bedrock/Vertex SDKs read:
+
+| Provider | Child env | Upstream |
+|---|---|---|
+| Bedrock | `ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:<port>/bedrock` | `https://bedrock-runtime.<region>.amazonaws.com` |
+| Vertex AI | `ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex/v1` | `https://<location>-aiplatform.googleapis.com` (`global`: `aiplatform.googleapis.com`) |
+
+- **Routes.** Bedrock `/model/{id}/invoke`, `/invoke-with-response-stream` and
+  `/count-tokens`; Vertex `…/publishers/anthropic/models/{id}:rawPredict` /
+  `:streamRawPredict` on a single-region or `global` location. Anything else
+  (Converse, `GET /inference-profiles`, multi-region `locations/us|eu`) is
+  answered locally with `404 cloud_route_unsupported`: never forwarded, never
+  unmetered, no receipt, no pause.
+- **Bedrock credentials.** A Bedrock API key (`Authorization: Bearer`,
+  `AWS_BEARER_TOKEN_BEDROCK`) passes through; the region is `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`. A SigV4-signed request is verified with wrap's own
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+  (`403 bedrock_signature_invalid` on mismatch) and re-signed for the real host
+  (region from the credential scope). The proxy does not resolve `AWS_PROFILE`,
+  SSO or IMDS: without static credentials a signed call gets
+  `502 bedrock_credentials_unavailable`. Export them first:
+  `eval "$(aws configure export-credentials --format env)"`.
+- **Vertex credentials.** The OAuth bearer `Authorization` header passes through unchanged.
+- **Metering.** JSON and Vertex SSE use the Anthropic usage rules (cache
+  read/write, 1h writes, fast mode, long context). Bedrock's binary
+  `application/vnd.amazon.eventstream` is forwarded byte-for-byte in real time
+  and decoded on the side (CRC-checked); a stream cut before `message_stop` or a
+  bad CRC is `stream_incomplete`. `count-tokens` is free.
+- **Model ids** come from the path. Bedrock strips the geo prefix
+  (`global.|us.|eu.|apac.|jp.|au.`), `anthropic.` and `-vN[:M]`; Vertex strips
+  `@YYYYMMDD`. Non-Anthropic ids, inference-profile ARNs and unlisted ids record
+  `cost_usd: null, reason: "cloud_model_unpriced"` (never the fallback rate) and
+  pause the run. `--models`, policy allowlists, `--unknown-models refuse` and
+  `--preflight` use the mapped id.
+- **Regional premium.** Claude 4.5+ on regional (non-global) endpoints costs
+  10% more than global (table key `regional_endpoint`). Bedrock `global.` ids and
+  Vertex `locations/global` are global; every other request is regional and is
+  billed at 1.1x on every rate component, stacking with long context. Receipts
+  carry `provider: "bedrock"|"vertex"`, `model` (table id), `provider_model`,
+  `endpoint_scope` and `regional_multiplier`.
+- Cloud routes never use the response cache (`x-costcap-cache: bypass`).
+  Private-offer / negotiated cloud rates are not modelled.
 
 ## Enforcement limits
 

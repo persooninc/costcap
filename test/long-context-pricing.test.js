@@ -168,3 +168,11 @@ test("regression: a standard-tier proxy receipt only gains pricing_tier: standar
   assert.equal(p.receipts[0].pricing_tier, "standard");
   assert.equal(p.receipts[0].cost_usd, usd(1000 * 1.25 / 1e6 + 100 * 10 / 1e6));
 });
+
+test("#188: the regional multiplier stacks with the long-context tier", () => {
+  const usage = { input_tokens: 210_000, output_tokens: 1000, cached_input_tokens: 1000 };
+  const g = costForUsage("claude-sonnet-4-5", usage), r = costForUsage("claude-sonnet-4-5", usage, { regional: true });
+  assert.equal(g.pricing_tier, "long_context"); assert.equal(r.pricing_tier, "long_context");
+  assert.equal(r.regional_multiplier, 1.1);
+  assert.ok(Math.abs(r.cost_usd - g.cost_usd * 1.1) < 1e-6);
+});

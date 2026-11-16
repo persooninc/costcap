@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.5");
+  assert.equal(TABLE_VERSION, "2026-11-16.6");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -223,4 +223,14 @@ test("#163: a table with modalities canonicalises, matches its digest, and a tam
   const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "verify"], { encoding: "utf8", env: { ...process.env, COSTCAP_PRICING_TABLE: tp } });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /MISMATCH/);
+});
+
+test("#188: the bumped table carries regional_endpoint with a source and verifies", () => {
+  const t = JSON.parse(readFileSync(tablePath, "utf8"));
+  assert.equal(t.regional_endpoint.multiplier, 1.1);
+  assert.ok(t.regional_endpoint.models.includes("claude-sonnet-4-5"));
+  for (const m of t.regional_endpoint.models) assert.ok(Object.hasOwn(t.models, m), m);
+  assert.ok(t.sources.some((s) => /Regional and multi-region endpoint pricing/.test(s)));
+  assert.equal(tableIntegrity().ok, true);
+  assert.equal(digestScript(["--check"], tablePath).code, 0);
 });

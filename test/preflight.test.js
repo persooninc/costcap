@@ -263,3 +263,12 @@ test("#186: estimateWorstCase with a user price resolver never reads the shipped
   assert.equal(ok.table_sha256, undefined);
   assert.equal(estimateWorstCase("u/groq", JSON.stringify({ model: "gpt-4o" }), "/v1/chat/completions", priceFor).reason, "preflight_unpriced");
 });
+
+test("#188: a path model wins over the body; unpriced or missing path models refuse", () => {
+  const body = JSON.stringify({ max_tokens: 100, model: "gpt-4o" });
+  const e = estimateWorstCase("anthropic", body, "/model/x/invoke", undefined, "claude-sonnet-4-5");
+  assert.equal(e.ok, true); assert.equal(e.model, "claude-sonnet-4-5"); assert.equal(e.output_tokens, 100);
+  assert.equal(estimateWorstCase("anthropic", body, "/", undefined, "").reason, "preflight_unpriced");
+  const cap = createCapEngine({ caps: { run: 0.0001 } });
+  assert.equal(preflightCheck(cap, "anthropic", body, "/", undefined, undefined, "claude-sonnet-4-5").reason, "preflight_estimate");
+});

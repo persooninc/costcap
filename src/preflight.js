@@ -43,11 +43,13 @@ export function outputMultiplier(provider, req) {
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
 // #167: an OpenRouter `models` fallback list may route to any entry, so the
 // worst case is the max over every candidate (any unpriced candidate refuses).
-export function estimateWorstCase(provider, body, path = "", priceFor) {
+// #188: `pathModel` (Bedrock/Vertex carry the model in the path) wins over the body's model.
+export function estimateWorstCase(provider, body, path = "", priceFor, pathModel) {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
   const candidates = provider === "openrouter" ? openRouterModels(req) : null;
+  if (pathModel !== undefined) return estimateOne(provider, req, text, path, pathModel ?? "", priceFor);
   if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0], priceFor);
   let worst;
   for (const m of candidates) {
@@ -72,6 +74,7 @@ export function openRouterModels(req) {
 
 function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   let model = forcedModel ?? (typeof req.model === "string" ? req.model : undefined);
+  if (model === "") model = undefined;
   if (!model && provider === "gemini") model = /models\/([^/:]+)/.exec(path)?.[1];
   // #186: a custom upstream estimates only from user prices (priceFor), never the shipped table.
   const price = model ? (priceFor ? priceFor(model) : lookupPrice(model)) : null;
@@ -98,8 +101,8 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor) {
-  const est = estimateWorstCase(provider, body, path, priceFor);
+export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel) {
+  const est = estimateWorstCase(provider, body, path, priceFor, pathModel);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "hour", "day", "month"]) {

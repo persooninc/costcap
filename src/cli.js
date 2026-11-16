@@ -30,6 +30,8 @@ import { receiptsCommand } from "./receipts-cli.js";
 import { createResponseCache, parseTtl } from "./response-cache.js";
 import { dirname, join } from "node:path";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
+import { credentialsFromEnv } from "./sigv4.js";
+import { bedrockStartupNote } from "./cloud.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
@@ -194,7 +196,7 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM]].filter(([, v]) => v));
+  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const runReceipts = [];
@@ -207,6 +209,8 @@ export async function wrap(argv) {
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
   const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
+    // #188: Bedrock SigV4 re-signing uses wrap's own static credentials (never logged).
+    awsCredentials: credentialsFromEnv(process.env), awsRegion: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);
@@ -216,6 +220,8 @@ export async function wrap(argv) {
     const [k, ...v] = line.split("=");
     env[k] = v.join("=");
   }
+  const note = bedrockStartupNote(process.env);
+  if (note) console.error(note);
   const custom = upstreamEnv(customList, port);
   for (const note of custom.notes) console.error(note);
   Object.assign(env, custom.env);

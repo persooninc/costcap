@@ -279,3 +279,16 @@ test("proxy: --unknown-models refuse applies to every OpenRouter fallback", asyn
   assert.equal(r.body.model, "made-up/secret-9");
   assert.equal(f.seen.length, 0);
 });
+
+test("#188: allowlist checks use the mapped Bedrock path model", async (t) => {
+  const up = http.createServer((q, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "x", usage: { input_tokens: 1, output_tokens: 1 } })));
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const { server, port } = await startMeteringProxy({ upstreams: { bedrock: `http://127.0.0.1:${up.address().port}` }, awsRegion: "us-east-1", allowedModels: () => ["claude-sonnet-4-5"] });
+  t.after(() => server.close());
+  const call = (id) => fetch(`http://127.0.0.1:${port}/bedrock/model/${encodeURIComponent(id)}/invoke`, { method: "POST", headers: { authorization: "Bearer k" }, body: "{}" });
+  assert.equal((await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0")).status, 200);
+  const r = await call("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+  assert.equal(r.status, 403);
+  assert.equal((await r.json()).model, "claude-haiku-4-5");
+});
