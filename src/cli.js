@@ -11,7 +11,8 @@ import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
-import { createCapEngine, loadSettledReceipts } from "./cap.js";
+import { createCapEngine, loadSettledReceipts, loadEvents } from "./cap.js";
+import { DEFAULT_WARN_AT, createCapWarner, parseWarnAt } from "./cap-warn.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
@@ -25,9 +26,9 @@ import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
-  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--github-output]\n" +
+  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
@@ -44,7 +45,7 @@ export function parseWrapArgs(argv) {
   if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] -- <command...>");
   const flags = argv.slice(0, sep);
   const command = argv.slice(sep + 1);
-  const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", killFile: DEFAULT_KILL_FILE, command };
+  const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", warnAt: [...DEFAULT_WARN_AT], killFile: DEFAULT_KILL_FILE, command };
   const money = (name, v) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number of USD, got "${v}"`);
@@ -77,6 +78,7 @@ export function parseWrapArgs(argv) {
       if (v !== "refuse" && v !== "fallback") throw new Error(`--unknown-models must be refuse or fallback, got "${v}"`);
       opts.unknownModels = v;
     } else if (f === "--timeout") opts.timeoutS = positiveNumber(f, v);
+    else if (f === "--warn-at") opts.warnAt = parseWarnAt(v);
     else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
@@ -118,7 +120,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt } = parseWrapArgs(argv);
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
@@ -160,7 +162,10 @@ export async function wrap(argv) {
   const runReceipts = [];
   const summaryRunId = who.run_id ?? randomUUID();
   const startedAt = new Date().toISOString();
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
+  let priorEvents = [];
+  try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
+  const capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   const env = { ...process.env };
@@ -195,7 +200,7 @@ export async function wrap(argv) {
   const s = cap.spend();
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
   const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
-    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo });
+    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted });
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
   return code;
@@ -215,7 +220,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else if (cmd === "check" || cmd === "mcp") {
     try {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
-      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined, ...(parsed.models ? { models: parsed.models } : {}) };
+      const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, warnAt: parsed.warnAt, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined, ...(parsed.models ? { models: parsed.models } : {}) };
       if (cmd === "check" && parsed.runId !== undefined) options.runId = parsed.runId;
       if (cmd === "mcp") serveMcp({ ...options, killFile: parsed.killFile, enrollmentPath: parsed.enrollmentPath });
       else {

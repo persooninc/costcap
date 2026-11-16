@@ -67,7 +67,7 @@ test("integration 1+4: under cap writes ok, spend, cap and summary; exits 0", ()
   const p = run(["check", "--receipts", t.r, "--cap", "5", "--day-cap", "10", "--github-output"], { GITHUB_OUTPUT: t.out, GITHUB_STEP_SUMMARY: t.sum });
   assert.equal(p.status, 0, p.stderr);
   const o = parseOutputFile(readFileSync(t.out, "utf8"));
-  assert.deepEqual(o, { verdict: "ok", "spent-usd": "0.75", "cap-usd": "5", "day-spent-usd": "0.75", "month-spent-usd": "0.75", "unknown-receipts": "0", "receipts-count": "2" });
+  assert.deepEqual(o, { verdict: "ok", "spent-usd": "0.75", "cap-usd": "5", "day-spent-usd": "0.75", "month-spent-usd": "0.75", "unknown-receipts": "0", "receipts-count": "2", warnings: "" });
   const s = readFileSync(t.sum, "utf8");
   assert.match(s, /\| verdict \| ok \|/); assert.match(s, /\| spent-usd \| 0\.75 \|/); assert.match(s, /estimates/);
 });
@@ -105,4 +105,28 @@ test("regression: every output declared in action.yml is written by the CLI and 
   assert.deepEqual(declared.sort(), [...OUTPUT_NAMES].sort());
   for (const n of declared) assert.ok(block.includes(`steps.check.outputs.${n} }}`), n);
   assert.match(yml, /- id: check/); assert.match(yml, /--github-output/);
+});
+
+test("#164: check --day-cap 1 at $0.85 is ok with warnings=day:0.8 and a summary row; --warn-at off is empty", () => {
+  const t = setup([{ cost_usd: 0.85 }]);
+  const p = run(["check", "--receipts", t.r, "--day-cap", "1", "--github-output"], { GITHUB_OUTPUT: t.out, GITHUB_STEP_SUMMARY: t.sum });
+  assert.equal(p.status, 0, p.stderr);
+  const j = JSON.parse(p.stdout);
+  assert.equal(j.ok, true);
+  assert.deepEqual(j.warnings, [{ scope: "day", fraction: 0.8, cap: 1, spent_usd: 0.85, lower_bound: false }]);
+  assert.equal(parseOutputFile(readFileSync(t.out, "utf8")).warnings, "day:0.8");
+  assert.match(readFileSync(t.sum, "utf8"), /\| warnings \| day:0\.8 \|/);
+  const t2 = setup([{ cost_usd: 0.85 }]);
+  const off = run(["check", "--receipts", t2.r, "--day-cap", "1", "--warn-at", "off", "--github-output"], { GITHUB_OUTPUT: t2.out, GITHUB_STEP_SUMMARY: t2.sum });
+  assert.equal(off.status, 0, off.stderr);
+  assert.deepEqual(JSON.parse(off.stdout).warnings, []);
+  assert.equal(parseOutputFile(readFileSync(t2.out, "utf8")).warnings, "");
+  assert.match(readFileSync(t2.sum, "utf8"), /\| warnings \| none \|/);
+});
+
+test("#164 unit: warnings output joins scope:fraction pairs", () => {
+  const o = checkOutputs({ ok: true, unknown_cost_count: 0, receipt_count: 1, total_usd: 1, spend: { day: 1, month: 1 },
+    warnings: [{ scope: "day", fraction: 0.8 }, { scope: "month", fraction: 0.5 }] }, {});
+  assert.equal(o.warnings, "day:0.8,month:0.5");
+  assert.ok(OUTPUT_NAMES.includes("warnings"));
 });

@@ -46,7 +46,10 @@ function scenario(name, flags, count, distinct = true, extraEnv = {}, code) {
   return new Promise((resolve) => {
     child.on("exit", (status) => {
       assert.equal(status, 0, err);
-      const ledger = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
+      const lines = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
+      // #164: cap_warning event lines are never spend; report them separately.
+      const ledger = lines.filter((row) => !row.event);
+      const warnings = lines.filter((row) => row.event === "cap_warning");
       assert.equal(ledger.at(-1).blocked, true, name);
       resolve({
         scenario: name,
@@ -58,6 +61,8 @@ function scenario(name, flags, count, distinct = true, extraEnv = {}, code) {
         reportedCost: Number(ledger.reduce((n, row) => n + (typeof row.cost_usd === "number" ? row.cost_usd : 0), 0).toFixed(6)),
         unknownCostCount: ledger.filter((row) => row.cost_usd === null).length,
         receipts: ledger,
+        warnings,
+        stderr: err,
       });
     });
   });
@@ -67,6 +72,9 @@ try {
   const cap = await scenario("cap", ["--cap", "0.10"], 20);
   assert.equal(cap.upstreamCalls, 1);
   assert.equal(cap.blockedReason, "budget_exceeded");
+  // #164: the default 0.8 soft warning fires once before the block.
+  assert.deepEqual(cap.warnings.map((w) => [w.scope, w.fraction]), [["run", 0.8]]);
+  assert.equal((cap.stderr.match(/costcap: warning: run spend/g) ?? []).length, 1);
   const spiral = await scenario("retry-spiral", [], 20, false);
   assert.equal(spiral.upstreamCalls, 5);
   assert.equal(spiral.blockedReason, "spiral_detected");
@@ -122,7 +130,7 @@ ${lines.join("\n")}
 Checked at ${checkedAt}. Node ${process.version}.
 `;
   writeFileSync(join(outDir, `${dayName}-runaway-acceptance.md`), markdown);
-  console.log(JSON.stringify({ checkedAt, provider: report.provider, paidCalls: 0, results: results.map(({ receipts, ...rest }) => rest) }, null, 2));
+  console.log(JSON.stringify({ checkedAt, provider: report.provider, paidCalls: 0, results: results.map(({ receipts, stderr, ...rest }) => rest) }, null, 2));
 } finally {
   up.closeAllConnections();
   up.close();

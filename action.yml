@@ -36,6 +36,9 @@ outputs:
   month-spent-usd:
     description: Estimated USD for the current UTC month; empty when any cost is unknown
     value: ${{ steps.check.outputs.month-spent-usd }}
+  warnings:
+    description: Soft cap warnings reached while still under the cap, as scope:fraction pairs (e.g. day:0.8,month:0.5); empty if none
+    value: ${{ steps.check.outputs.warnings }}
   unknown-receipts:
     description: Number of receipts with unknown (null) cost
     value: ${{ steps.check.outputs.unknown-receipts }}

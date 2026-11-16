@@ -8,6 +8,7 @@ import { receiptPath } from "./receipt-path.js";
 import { randomUUID } from "node:crypto";
 import { costForUsage, isPricedModel } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
+import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck } from "./preflight.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
@@ -328,7 +329,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -370,6 +371,25 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
+  // #164: record spend and queue one cap_warning per newly crossed fraction.
+  // flushWarnings() appends them after the receipt that caused them.
+  let pendingWarnings = [];
+  const recordSpend = (receipt) => {
+    if (!cap) return;
+    const before = cap.spend();
+    cap.record(receipt);
+    if (!capWarner) return;
+    const after = cap.spend();
+    pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: after.unknown > 0 }));
+  };
+  const flushWarnings = () => {
+    const evs = pendingWarnings;
+    pendingWarnings = [];
+    for (const ev of evs) {
+      const done = emitEvent(ev);
+      try { onWarning(warningLine(done)); } catch { /* stderr is best effort */ }
+    }
+  };
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     const [, provider, ...rest] = url.pathname.split("/");
@@ -538,7 +558,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
-            cap?.record(receipt);
+            recordSpend(receipt);
             if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
             else if (receipt.reason === "modality_unpriced") accountingFailure = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
             else if (receipt.reason === "service_tier_unpriced") accountingFailure = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
@@ -579,7 +599,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
                   succeeded: folded.succeeded, not_billed: folded.free });
-                cap?.record({ cost_usd: folded.cost_usd, ts: pending.ts });
+                recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts });
+                flushWarnings();
               } else {
                 // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.
                 Object.assign(receipt, { cost_usd: null, reason: "batch_unpriced" });
@@ -597,6 +618,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             accountingFailure = "Provider returned no usable token usage. Restart only after reconciling this request.";
           }
           emit(receipt);
+          flushWarnings();
           if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw); }
           else if (streamCut) res.destroy();
           else if (!res.destroyed) res.end();

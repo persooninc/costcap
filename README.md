@@ -393,6 +393,21 @@ Each enrolled wrapper gets its team's caps and the team's synced spend with ever
 
 **Team alerts:** each alert sweep checks every team against its own day and month caps. At 80% of a cap it raises `cap_approaching`, and at 100% it raises `cap_hit` (keys `cap_approaching:team:<orgId>:<name>:<scope>` and `cap_hit:team:<orgId>:<name>:<scope>`). A member receipt blocked with `scope: "team:<name>:<scope>"` in the last hour also raises that team's `cap_hit`, even when synced totals lag. A team with unknown cost raises no cap alert. Team alerts fire once, re-arm after the condition clears, go to the org's alert destinations, and carry `team`, `scope`, `cap` and `spent`. Deleting the team deactivates them.
 
+## Soft warnings
+
+`wrap` and `check` warn before the hard stop. By default, a warning fires when run, day or month spend reaches 80% of its cap:
+
+```sh
+costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
+# costcap: warning: day spend $8.0123 is 80% of $10 cap (2026-11-16 UTC)
+```
+
+- `--warn-at F[,F...]` takes fractions with 0 < F < 1. The default is `0.8`, and `--warn-at off` disables warnings. A bad value exits `2`.
+- The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`.
+- Warnings never block a call and are never spend. Receipts, runs and check totals ignore `cap_warning` lines.
+- When a scope has an unknown-cost receipt, its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
+- `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
+
 ## Run summaries
 
 Every `costcap wrap` run writes `<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`) when it ends, including after a cap stop, breaker stop or `costcap kill`. It holds `calls`, `blocked_calls`, `by_model` (calls, input/output/cache-read/cache-write tokens, `cost_usd`), `total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope) and `stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`, plus `stopped_scope`). If any call has unknown cost, `total_cost_usd` is `null`, never a silent $0. A one-line roll-up is printed to stderr.

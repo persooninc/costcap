@@ -104,3 +104,23 @@ test("#160 check: a pending batch fails the run as incomplete, then passes once 
   assert.deepEqual([done.ok, done.unknown_cost_count, done.total_usd], [true, 0, 0.3]);
   assert.equal(checkBudget({ receiptsPath: r, caps: { run: 0.25 }, runId: "b" }).ok, false);
 });
+
+test("#164: check warnings field, lower bound on unknown cost, and --warn-at usage errors exit 2", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-warn-"));
+  const r = join(dir, "r.jsonl");
+  writeFileSync(r, [{ ts, cost_usd: 0.6, run_id: "a" }, { ts, cost_usd: 0.3, run_id: "a" }].map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const res = checkBudget({ receiptsPath: r, caps: { day: 1, run: 2 }, warnAt: [0.5, 0.8] });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.warnings.map((w) => [w.scope, w.fraction]), [["day", 0.5], ["day", 0.8]]);
+  const runRes = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "a", warnAt: [0.8] });
+  assert.deepEqual(runRes.warnings, [{ scope: "run", fraction: 0.8, cap: 1, spent_usd: 0.9, lower_bound: false }]);
+  // Unknown cost: lower_bound, and the unknown is not counted as $0 toward a warning that wasn't reached.
+  writeFileSync(r, [{ ts, cost_usd: 0.85 }, { ts, cost_usd: null }].map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const lb = checkBudget({ receiptsPath: r, caps: { day: 1 } });
+  assert.equal(lb.warnings[0].lower_bound, true);
+  for (const bad of ["0", "1", "1.5", "abc", "0.8,0.8", ""]) {
+    const p = spawnSync(process.execPath, [CLI, "check", "--receipts", r, "--day-cap", "1", "--warn-at", bad], { encoding: "utf8" });
+    assert.equal(p.status, 2, bad);
+    assert.match(p.stderr, /--warn-at/);
+  }
+});
