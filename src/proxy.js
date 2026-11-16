@@ -304,7 +304,7 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
 // cache_write_tokens with an optional cache_write_tokens_details { ttl_30m_tokens, ttl_12h_tokens }.
 // 30m -> cache_write_input_tokens, 12h -> cache_write_1h_input_tokens; no breakdown -> all 30m.
 // A breakdown that does not sum, or cached + writes over the total, is unknown, never guessed.
-const PROVIDER_COST_SETTLES = new Set(["cache_write_unpriced", "long_context_cache_write_unpriced", "service_tier_unpriced"]);
+const PROVIDER_COST_SETTLES = new Set(["cache_write_unpriced", "long_context_cache_write_unpriced", "service_tier_unpriced", "modality_unpriced", "user_price_unpriced"]);
 
 export function openaiTextUsage(u) {
   const total = u.prompt_tokens ?? u.input_tokens ?? 0;
@@ -1071,7 +1071,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional", undated: true })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: reqAt }));
             rateLimit?.record(usageTokens(metered.usage));
-            // #235: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier).
+            // #235/#242: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier / modality / --price gap).
             if (metered.providerCost !== undefined && (receipt.cost_usd !== null || PROVIDER_COST_SETTLES.has(receipt.reason))) {
               delete receipt.reason;
               Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
