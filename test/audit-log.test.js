@@ -143,3 +143,13 @@ test("integration: fleet, evidence and audit.csv label who did what; org isolati
   assert.doesNotMatch(otherCsv, /audit-owner@example\.invalid|builder|policy\.change/);
   assert.equal((await f.request("/v1/audit.csv")).status, 401);
 });
+
+// Issue #240: org_budget.change rows label the org target and keep before/after in the CSV.
+test("unit: org_budget.change audit row labels the org and exports before/after", () => {
+  const rows = labelAudit(state, "o1", [{ ts: "2026-11-16T00:00:00Z", org_id: "o1", actor: "u1", action: "org_budget.change", target: "o1", detail: { before: null, after: { day: 1 } } }]);
+  assert.equal(rows[0].target_label, "acme.test");
+  assert.equal(rows[0].actor_label, "admin@acme.test");
+  const csv = auditCsv(rows, {});
+  assert.match(csv.body ?? csv, /org_budget\.change/);
+  assert.match(csv.body ?? csv, /""after"":\{""day"":1\}/);
+});

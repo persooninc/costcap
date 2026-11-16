@@ -119,7 +119,7 @@ export function validTeamPolicy(t) {
 // UTC by default). Shared by team (#123) and per-agent (#127) cached
 // enforcement. Synced spend from an earlier day/month period than now no
 // longer counts in that window.
-function cachedTotals(entry, pending, nowMs, budgetPeriod) {
+export function cachedTotals(entry, pending, nowMs, budgetPeriod) {
   const asOfMs = Date.parse(entry.as_of);
   const total = {};
   let unknown = entry.unknown;

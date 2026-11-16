@@ -828,14 +828,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
               // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
               const fr = fleetRemaining?.();
-              for (const [kind, left] of [["agent", fr?.agent], ["team", fr?.team]]) {
+              for (const [kind, left] of [["agent", fr?.agent], ["team", fr?.team], ["org", fr?.org]]) {
                 const sc = left && ["day", "month"].find((x) => left[x] != null && est > left[x]);
                 if (!sc) continue;
-                const isTeam = kind === "team";
+                const isTeam = kind === "team", isOrg = kind === "org";
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, fleet: true,
-                  scope: isTeam ? teamScope(fr.teamName, sc) : sc, estimate_usd: est, remaining_usd: left[sc],
-                  ...(isTeam ? { team: fr.teamName } : {}), ...who };
-                const what = isTeam ? `team "${fr.teamName}"` : "fleet agent";
+                  scope: isTeam ? teamScope(fr.teamName, sc) : isOrg ? `org:${sc}` : sc, estimate_usd: est, remaining_usd: left[sc],
+                  ...(isTeam ? { team: fr.teamName } : {}), ...(isOrg ? { org: true } : {}), ...who };
+                const what = isTeam ? `team "${fr.teamName}"` : isOrg ? "org" : "fleet agent";
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
                   message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.` });
               }

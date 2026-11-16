@@ -108,7 +108,7 @@ export function fleetGuard({ killFile, enrollmentPath, receiptsPath, now }) {
   const policy = fleet.policy();
   if (policy.killed || fleet.revoked()) return { killed: { reason: "killed", note: "fleet policy or revoked credentials", enrollment: enrollmentPath } };
   const nowMs = now ? now().getTime() : Date.now();
-  return { fleetCaps: policy.caps, fleetModels: policy.models ?? null, fleetHit: fleet.agentCheck(nowMs) ?? fleet.teamCheck(nowMs) };
+  return { fleetCaps: policy.caps, fleetModels: policy.models ?? null, fleetHit: fleet.fleetCheck(nowMs) };
 }
 
 const killedResult = (killed, extra = {}) => ({ ok: false, verdict: "killed", reason: "killed", kill: killed, hit: { verdict: "killed", ...killed }, ...extra, estimate_only: true });

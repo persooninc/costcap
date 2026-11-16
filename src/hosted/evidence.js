@@ -6,7 +6,7 @@ export const EVIDENCE_SCHEMA = "costcap.evidence/v1";
 
 const known = (unknown) => unknown === 0;
 
-export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], audit = [], nowMs, spendFor, teams = [] }) {
+export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], audit = [], nowMs, spendFor, teams = [], orgBudget = null }) {
   if (typeof orgId !== "string" || !orgId) throw new Error("orgId required");
   if (!Number.isFinite(nowMs)) throw new Error("nowMs required");
   if (typeof spendFor !== "function") throw new Error("spendFor required");
@@ -71,6 +71,8 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
       ...(a.kind === "spend_anomaly" ? { date: a.date ?? null, today: a.today ?? null, baseline: a.baseline ?? null, multiplier: a.multiplier ?? null, lower_bound: Boolean(a.lower_bound), baseline_lower_bound: Boolean(a.baseline_lower_bound) } : {}) })),
     // Team budgets (#123): shared cap, synced spend and verdict per team.
     teams: teams.map((t) => ({ name: t.name, agents: [...t.agents], caps: { ...t.caps }, spend: { ...t.spend }, verdict: t.verdict, scope: t.scope ?? null })),
+    // Org-wide budget (#240): cap, synced spend and verdict; null when unset.
+    org_budget: orgBudget ? { caps: { ...orgBudget.caps }, spend: { ...orgBudget.spend }, verdict: orgBudget.verdict, scope: orgBudget.scope ?? null } : null,
     receipts: rows,
     audit: trail,
     totals: { agents: out.length, receipts: rows.length, unknown_cost_receipts: unknownTotal, cost_complete: known(unknownTotal) },

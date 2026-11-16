@@ -9,7 +9,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -28,6 +28,7 @@ import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, a
 import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
 import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
 import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
+import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy } from "./org-budget.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -294,6 +295,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     });
   }
   const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), budgetPeriod: orgPeriod(s, team.orgId), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
+  // Issue #240: the org-wide budget over every agent of the org (revoked ones' spend included).
+  const orgBudgetOfOrg = (s, orgId) => {
+    const budget = orgBudgetOf(s.orgs?.[orgId]);
+    if (!budget) return null;
+    const receiptsByAgent = {};
+    for (const item of Object.values(s.receipts)) if (item.orgId === orgId) (receiptsByAgent[item.agentId] ??= []).push(costedReceipt(item));
+    const agentIds = [...new Set([...Object.values(s.agents).filter((a) => a.orgId === orgId).map((a) => a.id), ...Object.keys(receiptsByAgent)])];
+    return orgBudgetVerdict({ budget, agentIds, receiptsByAgent, nowMs: now(), budgetPeriod: orgPeriod(s, orgId) });
+  };
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
     let logged = false;
@@ -471,7 +481,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -552,7 +562,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             receipts: visibleReceipts(s, u.orgId),
             alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
             audit: labelAudit(s, u.orgId, s.audit),
-            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)) });
+            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)), orgBudget: orgBudgetOfOrg(s, u.orgId) });
         }));
       }
       if (path === "/v1/spend" && req.method === "GET") {
@@ -810,6 +820,23 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      // Issue #240: org-wide day/month budget. Owner/admin (and admin keys) write, any member reads.
+      if (path === "/v1/org-budget" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = member(s, req); return { org_budget: orgBudgetOfOrg(s, u.orgId), canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/org-budget" && req.method === "PUT") {
+        const result = store.transaction((s) => {
+          const u = memberAdmin(s, req);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const previous = orgBudgetOf(org);
+          const next = parseOrgBudget(body, previous);
+          if (next) org.orgBudget = next; else delete org.orgBudget;
+          audit(s, u.orgId, u.id, "org_budget.change", u.orgId, { before: previous ? { ...previous } : null, after: next ? { ...next } : null });
+          return { org_budget: orgBudgetOfOrg(s, u.orgId), canEdit: true };
+        });
+        return json(200, result);
+      }
       // Issue #204: org-level fleet tag caps. Owner/admin write, any member reads.
       if (path === "/v1/tag-caps" && req.method === "GET") {
         return json(200, store.read((s) => { const u = sessionUser(s, req); return { tagCaps: s.orgs[u.orgId]?.tagCaps ?? [], canEdit: ["owner", "admin"].includes(u.role) }; }));
@@ -924,7 +951,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const receipts = agentReceipts(s, a.id);
           const runId = new URL(req.url, origin).searchParams.get("run_id");
           const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id);
-          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), budgetPeriod: orgPeriod(s, a.orgId), runId: runId || null, team: t ? verdictOf(s, t) : null });
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), budgetPeriod: orgPeriod(s, a.orgId), runId: runId || null, team: t ? verdictOf(s, t) : null, orgBudget: orgBudgetOfOrg(s, a.orgId) });
         }));
       }
       // Issue #208: time-boxed cap raise requests.
@@ -1191,6 +1218,26 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         }
       }
       for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) resolveAlert(prior, now());
+      // Issue #240: org-wide budget alerts, keyed per org; resolved once the condition clears.
+      const orgKeys = new Set();
+      for (const orgId of Object.keys(s.orgs ?? {})) {
+        const verdict = orgBudgetOfOrg(s, orgId);
+        if (!verdict) continue;
+        const bp = orgPeriod(s, orgId);
+        const blockedScopes = Object.values(s.receipts).filter((i) => i.orgId === orgId).map((i) => i.receipt)
+          .filter((r) => r && Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith("org:"))
+          .map((r) => r.scope.slice(4));
+        const warnOk = gateWarnings(s, `org:${orgId}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, verdict.warnFractions, bp);
+        for (const alert of evaluateOrgAlerts({ orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: bp }, { warnFractions: verdict.warnFractions })) {
+          orgKeys.add(alert.key);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior && !warnOk(alert)) continue;
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId, agentId: null, period: capPeriod(alert.scope, now(), bp) }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
+        }
+      }
+      // A new period is a new firing: an alert from an earlier period resolves even if the key matches again.
+      for (const prior of Object.values(s.alerts).filter((x) => x.org && x.active && (!orgKeys.has(x.key) || (x.period && x.period !== capPeriod(x.scope, now(), orgPeriod(s, x.orgId)))))) resolveAlert(prior, now());
       return out;
     });
     for (const queuedAlert of queued) {
@@ -1208,8 +1255,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         result = deliverAlert ? await deliverAlert({ ...a, agentName }, settings, requested ? { channels: requested } : undefined) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
-        const target = a.agentId ?? `team:${a.team}`;
-        const extra = a.team ? { team: a.team, scope: a.scope } : {};
+        const target = a.agentId ?? (a.org ? `org:${a.orgId}` : `team:${a.team}`);
+        const extra = a.team ? { team: a.team, scope: a.scope } : a.org ? { org: true, scope: a.scope } : {};
         const rec = s.alerts[a.id];
         if (rec) delete rec.delivery_claimed_at;
         const gaveUp = rec ? applyDeliveryResult(rec, result, requested, now()) : [];

@@ -84,7 +84,7 @@ test("signed webhook: one POST per alert kind with documented fields and a verif
     assert.equal(options.redirect, "error");
     assert.ok(options.signal);
     const body = JSON.parse(options.body);
-    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
+    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "org", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
     assert.equal(body.id, alerts[i].id);
     assert.equal(body.spent_usd, alerts[i].spent ?? null);
     assert.equal(body.cap_usd, alerts[i].cap ?? null);

@@ -18,7 +18,7 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
   // channels are not sent and not reported.
   return async (alert, { channels } = {}) => {
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
-    const text = `CostCap ${alert.kind}: ${alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team || alert.org ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (!want("email")) { /* already settled for this occurrence */ }
     else if (emailKey && emailFrom && emailTo?.length) {
@@ -90,7 +90,7 @@ const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 export function webhookPayload(alert, { dashboardUrl } = {}) {
   return {
     id: alert.id ?? null, kind: alert.kind, org_id: alert.orgId ?? null,
-    agent_id: alert.agentId ?? null, agent_name: alert.agentName ?? null, team: alert.team ?? null,
+    agent_id: alert.agentId ?? null, agent_name: alert.agentName ?? null, team: alert.team ?? null, org: Boolean(alert.org),
     run_id: alert.run_id ?? null, scope: alert.scope ?? null, period: alert.period ?? null,
     fraction: num(alert.fraction), spent_usd: num(alert.spent), cap_usd: num(alert.cap),
     unknown_count: Number.isInteger(alert.unknown_count) ? alert.unknown_count : Number.isInteger(alert.unknownCount) ? alert.unknownCount : null,

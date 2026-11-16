@@ -1514,3 +1514,61 @@ test("issue #210: dueRetryChannels honours the claim lease", async () => {
   assert.deepEqual(dueRetryChannels({ delivery: "failed", delivery_claimed_at: fresh }, now), []);
   assert.deepEqual(dueRetryChannels({ delivery: "accepted" }, now), []);
 });
+
+// Issue #240 AC1 + AC5: /v1/org-budget validation, roles, audit, restart, and org alerts.
+test("#240 /v1/org-budget: validation, viewer 403 (session and key), audit, restart and alert lifecycle", async (t) => {
+  let clock = Date.parse("2026-11-16T12:00:00.000Z");
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("ob-owner@example.invalid");
+  await f.request("/v1/invitations", { email: "ob-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("ob-viewer@example.invalid");
+  const outsider = await f.login("ob-out@example.invalid");
+  const put = async (body, { cookie, key } = {}) => {
+    const r = await fetch(`http://127.0.0.1:${f.service().server.address().port}/v1/org-budget`, { method: "PUT", headers: { origin: "http://localhost", "content-type": "application/json", ...(cookie ? { cookie } : {}), ...(key ? { authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json() };
+  };
+  for (const bad of [{ day: 0 }, { day: -5 }, { hour: 1 }, { day: 1, bogus: true }]) assert.equal((await put(bad, { cookie: owner.cookie })).status, 400);
+  assert.equal((await put({ day: 1 }, { cookie: viewer.cookie })).status, 403);
+  const viewerKey = (await f.request("/v1/api-keys", { name: "ro", role: "viewer" }, owner.cookie)).body.key;
+  const adminKey = (await f.request("/v1/api-keys", { name: "rw", role: "admin" }, owner.cookie)).body.key;
+  assert.equal((await put({ day: 1 }, { key: viewerKey })).status, 403);
+  assert.equal((await put({ day: 1 })).status, 401);
+  const saved = await put({ day: 1, month: 10 }, { key: adminKey });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.org_budget.caps, { day: 1, month: 10 });
+  const view = await f.request("/v1/org-budget", undefined, viewer.cookie);
+  assert.equal(view.body.canEdit, false);
+  assert.deepEqual(view.body.org_budget.caps, { day: 1, month: 10 });
+  assert.equal((await f.request("/v1/org-budget", undefined, outsider.cookie)).body.org_budget, null);
+  const entries = (await f.request("/v1/evidence.json", undefined, owner.cookie)).body.audit.filter((e) => e.action === "org_budget.change");
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].detail, { before: null, after: { day: 1, month: 10 } });
+  await f.restart();
+  assert.deepEqual((await f.request("/v1/org-budget", undefined, owner.cookie)).body.org_budget.caps, { day: 1, month: 10 });
+  // AC5: $0.85 -> cap_approaching once; $1.10 -> cap_hit once; raising the cap resolves it.
+  const token = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "ob" }, null, token)).body;
+  await f.request("/v1/receipts", { receipts: [{ id: "o1", ts: new Date(clock).toISOString(), cost_usd: 0.85, model: "test" }] }, null, agent.token);
+  await f.service().evaluateFleetAlerts();
+  await f.service().evaluateFleetAlerts();
+  const orgAlerts = () => f.delivery.filter((a) => a.org);
+  assert.deepEqual(orgAlerts().map((a) => a.key), [`cap_approaching:org:${owner.body.orgId}:day`]);
+  await f.request("/v1/receipts", { receipts: [{ id: "o2", ts: new Date(clock).toISOString(), cost_usd: 0.25, model: "test" }] }, null, agent.token);
+  await f.service().evaluateFleetAlerts();
+  await f.service().evaluateFleetAlerts();
+  assert.deepEqual(orgAlerts().map((a) => a.kind), ["cap_approaching", "cap_hit"]);
+  assert.equal((await put({ day: 5 }, { cookie: owner.cookie })).status, 200);
+  await f.service().evaluateFleetAlerts();
+  const list = (await f.request("/v1/alerts?status=all", undefined, owner.cookie)).body;
+  const recs = (list.alerts ?? list).filter((a) => a.org);
+  assert.ok(recs.every((a) => !a.active), "raising the cap resolves the org alerts");
+  // Month projection: $6 of a $10 month cap by mid-month pages cap_projected once.
+  await f.request("/v1/receipts", { receipts: [{ id: "o3", ts: new Date(clock).toISOString(), cost_usd: 4.9, model: "test" }] }, null, agent.token);
+  assert.equal((await put({ day: null }, { cookie: owner.cookie })).status, 200);
+  await f.service().evaluateFleetAlerts();
+  await f.service().evaluateFleetAlerts();
+  assert.equal(orgAlerts().filter((a) => a.kind === "cap_projected").length, 1);
+  // The day rolls over: a fresh day starts clean.
+  clock += 86_400_000;
+  await f.service().evaluateFleetAlerts();
+});

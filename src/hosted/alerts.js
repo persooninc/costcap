@@ -209,6 +209,34 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { app
   return out;
 }
 
+// Issue #240: the org-wide budget alerts like a team cap, keyed
+// `<kind>:org:<orgId>:<scope>`, plus a month cap_projected. Unknown cost raises
+// no spend alert (never $0).
+export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, budgetPeriod = null }, { approachFraction = 0.8, warnFractions, minProjectionMs = 24 * 3600_000 } = {}) {
+  if (!verdict || verdict.spend?.unknown_count !== 0 || verdict.verdict === "accounting_unavailable") return [];
+  const out = [];
+  const id = `org:${orgId}`;
+  const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
+  for (const scope of ["day", "month"]) {
+    const cap = verdict.caps?.[scope];
+    if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
+    const spent = verdict.spend[`${scope}_usd`];
+    if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
+    const base = { org: true, scope, cap, spent };
+    if (spent >= cap || blockedScopes.includes(scope)) out.push({ kind: "cap_hit", key: `cap_hit:${id}:${scope}`, ...base });
+    else {
+      const warn = approaching(id, scope, cap, spent, fractions, explicit, {});
+      if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, ...(explicit ? { fraction: warn.fraction } : {}) });
+    }
+  }
+  const monthCap = verdict.caps?.month;
+  if (typeof monthCap === "number" && !out.some((a) => a.scope === "month" && a.kind === "cap_hit")) {
+    const projected = projectMonthSpend(verdict.spend.month_usd, nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+    if (projected !== null && projected >= monthCap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, org: true, scope: "month", cap: monthCap, spent: verdict.spend.month_usd, projected: Number(projected.toFixed(6)), lowerBound: false });
+  }
+  return out;
+}
+
 // Issue #143: alert lifecycle. s.alerts holds one record per firing (occurrence),
 // keyed by occurrence id. Records never get deleted: clearing sets resolved_at.
 // Legacy records (keyed by alert key, no id/fired_at) keep fired_at null.

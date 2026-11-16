@@ -287,12 +287,14 @@ export async function wrap(argv) {
     if (fr?.agent) rows.push(...scopeUsage(fleetPolicy?.caps, spentOf(fleetPolicy?.caps, fr.agent), "fleet"));
     const team = fleet?.team?.();
     if (fr?.team && team) { const tc = team.caps ?? {}; rows.push(...scopeUsage(tc, spentOf(tc, fr.team), `team ${team.name}`)); }
+    const org = fleet?.orgBudget?.();
+    if (fr?.org && org) rows.push(...scopeUsage(org.caps, spentOf(org.caps, fr.org), "org"));
     return rows;
   };
   downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });

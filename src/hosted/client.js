@@ -8,6 +8,7 @@ import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
+import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -145,6 +146,17 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       const synced = new Set(data.syncedIds ?? []);
       return cachedTeamVerdict(data.team, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
+    orgBudget: () => data.orgBudget ?? null,
+    // Org-wide budget (#240): the org's synced spend plus this host's unsynced spend.
+    orgCheck(nowMs = Date.now()) {
+      if (!data.orgBudget) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedOrgVerdict(data.orgBudget, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+    },
+    // Agent caps, then team, then org (#240): the narrowest hit is reported with its own scope.
+    fleetCheck(nowMs = Date.now()) {
+      return this.agentCheck(nowMs) ?? this.teamCheck(nowMs) ?? this.orgCheck(nowMs);
+    },
     agentSpend: () => data.agentSpend ?? null,
     // Per-agent fleet caps (#127) against the agent's fleet-wide synced spend plus
     // this host's unsynced receipts. No agent_spend from the server: no-op.
@@ -155,13 +167,14 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     },
     // #195: fleet agent / hosted team remainders for --preflight.
     preflightRemaining(nowMs = Date.now()) {
-      if (!data.agentSpend && !data.team) return null;
+      if (!data.agentSpend && !data.team && !data.orgBudget) return null;
       const synced = new Set(data.syncedIds ?? []);
       const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
       return {
         agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs, data.budgetPeriod) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs, data.budgetPeriod) : null,
         teamName: data.team?.name ?? null,
+        org: data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null,
       };
     },
     tagCaps: () => data.tagCaps ?? null,
@@ -210,15 +223,17 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         await uploadSettlements(synced);
         await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, budget_period: budgetPeriod = null, ...fetchedPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, budget_period: budgetPeriod = null, org_budget: orgBudget = null, ...fetchedPolicy } = fetched ?? {};
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps) || !validOrgBudgetPolicy(orgBudget) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
         // #204: rules and spend refresh on every poll; a removed rule set (null) lifts enforcement.
         if (JSON.stringify(tagCaps) !== JSON.stringify(data.tagCaps ?? null)) { data.tagCaps = tagCaps; saveEnrollment(path, data); }
         // #209: the org budget period, so offline windows roll over on the org's clock.
         if (JSON.stringify(budgetPeriod) !== JSON.stringify(data.budgetPeriod ?? null)) { data.budgetPeriod = budgetPeriod; saveEnrollment(path, data); }
+        // #240: org budget caps and spend refresh on every poll; null lifts enforcement.
+        if (JSON.stringify(orgBudget) !== JSON.stringify(data.orgBudget ?? null)) { data.orgBudget = orgBudget; saveEnrollment(path, data); }
         // Team membership and spend refresh on every poll; removal (null) stops team enforcement.
         if (JSON.stringify(team) !== JSON.stringify(data.team ?? null)) { data.team = team; saveEnrollment(path, data); }
         // Only strictly newer valid versions can replace a cached policy.

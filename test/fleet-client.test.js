@@ -276,3 +276,42 @@ test("#209 offline cachedTotals zero synced spend at the configured period rollo
   assert.equal(client.budgetPeriod(), null);
   assert.equal(client.agentCheck(Date.parse("2026-11-16T08:30:00Z")).verdict, "budget_exceeded");
 });
+
+// Issue #240: orgCheck enforces the cached org budget offline, adding unsynced spend.
+test("#240 orgCheck: cached org budget plus unsynced receipts, offline; null lifts it", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-org-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  const asOf = new Date().toISOString();
+  let orgBudget = { caps: { day: 1 }, spend: { day_usd: 0.8, month_usd: 0.8, unknown_count: 0 }, verdict: "ok", as_of: asOf };
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: {}, killed: false } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version: 1, caps: {}, killed: false, org_budget: orgBudget }));
+    else res.end(JSON.stringify({ acceptedIds: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "e", name: "x", path });
+  const client = createFleetClient({ path, receiptsPath });
+  assert.equal(client.orgCheck(), null); // nothing cached yet
+  assert.equal((await client.sync()).online, true);
+  assert.deepEqual(client.orgBudget(), orgBudget);
+  assert.equal(client.orgCheck(), null);
+  assert.deepEqual(client.preflightRemaining().org, { day: 0.2, month: null });
+  // This host spends $0.40 that has not synced yet (the server acks nothing).
+  writeFileSync(receiptsPath, JSON.stringify({ id: "u1", ts: new Date().toISOString(), cost_usd: 0.4 }) + "\n");
+  const cold = createFleetClient({ path, receiptsPath });
+  const hit = cold.orgCheck();
+  assert.equal(hit.verdict, "budget_exceeded");
+  assert.equal(hit.scope, "org:day");
+  assert.equal(hit.spent_usd, 1.2);
+  assert.equal(cold.fleetCheck().scope, "org:day");
+  // An invalid payload is refused and the cache kept; null lifts enforcement.
+  orgBudget = { caps: {}, spend: {}, verdict: "ok", as_of: asOf };
+  assert.equal((await cold.sync()).online, false);
+  assert.equal(cold.orgCheck().scope, "org:day");
+  orgBudget = null;
+  assert.equal((await cold.sync()).online, true);
+  assert.equal(cold.orgCheck(), null);
+});

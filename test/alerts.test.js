@@ -188,3 +188,28 @@ test("regression #223: cap alerts unchanged with anomaly on; under-cap agent sti
   assert.equal(anomaly.kind, "spend_anomaly");
   assert.deepEqual(evaluateAlerts({ ...state, spend: { day: 85, month: 35 } }).map((x) => x.kind), ["cap_approaching"]);
 });
+
+// Issue #240: org-wide budget alerts.
+test("evaluateOrgAlerts: org keys, warn fractions, cap_hit, cap_projected, unknown raises nothing", async () => {
+  const { evaluateOrgAlerts } = await import("../src/hosted/alerts.js");
+  const nowMs = Date.parse("2026-11-16T12:00:00Z");
+  const v = (day, month, caps = { day: 1, month: 10 }, unknown = 0) => ({ caps, spend: { day_usd: day, month_usd: month, unknown_count: unknown }, verdict: "ok" });
+  assert.deepEqual(evaluateOrgAlerts({ orgId: "o", verdict: null, nowMs }), []);
+  assert.deepEqual(evaluateOrgAlerts({ orgId: "o", verdict: v(5, 5, { day: 1 }, 1), nowMs }), []);
+  const warn = evaluateOrgAlerts({ orgId: "o", verdict: v(0.85, 0.85), nowMs });
+  assert.deepEqual(warn.map((a) => a.key), ["cap_approaching:org:o:day"]);
+  assert.equal(warn[0].org, true);
+  const hit = evaluateOrgAlerts({ orgId: "o", verdict: v(1, 1), nowMs });
+  assert.deepEqual(hit.map((a) => a.key), ["cap_hit:org:o:day"]);
+  const blocked = evaluateOrgAlerts({ orgId: "o", verdict: v(0.1, 0.1), blockedScopes: ["month"], nowMs });
+  assert.deepEqual(blocked.map((a) => a.key), ["cap_hit:org:o:month"]);
+  const custom = evaluateOrgAlerts({ orgId: "o", verdict: v(0.6, 0.6), nowMs }, { warnFractions: [0.5] });
+  assert.equal(custom[0].key, "cap_approaching:org:o:day:p50");
+  assert.equal(custom[0].fraction, 0.5);
+  // $6 by Nov 16 12:00Z projects ~$11.6 for the month: at or above a $10 cap.
+  const proj = evaluateOrgAlerts({ orgId: "o", verdict: v(0, 6, { month: 10 }), nowMs });
+  assert.deepEqual(proj.map((a) => a.kind), ["cap_projected"]);
+  assert.equal(proj[0].key, "cap_projected:org:o:month");
+  assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 3, { month: 10 }), nowMs }).length, 0);
+  assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 6, { month: 10 }), nowMs: Date.parse("2026-11-01T06:00:00Z") }).length, 0);
+});
