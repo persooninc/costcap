@@ -67,3 +67,29 @@ test("o1-pro spend is metered at list price, not the fallback floor", () => {
   assert.equal(c.fallback, false);
   assert.equal(c.cost_usd, 750);
 });
+
+// #232: current OpenAI models are priced from the table, not the fallback.
+const GPT_232 = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"];
+test("#232 AC1: GPT-6 / GPT-5.6 / gpt-5.2-5.5 rows and dated snapshots are priced", () => {
+  for (const m of [...GPT_232, "gpt-6-astra-2026-04-30"]) {
+    assert.equal(lookupPrice(m).fallback, false, m);
+    assert.equal(isPricedModel(m), true, m);
+    const p = lookupPrice(m);
+    assert.equal(p.long_context.threshold_input_tokens, 272000, m);
+    assert.equal(p.long_context.input, Number((p.input * 2).toFixed(6)), m);
+    assert.equal(p.long_context.output, Number((p.output * 1.5).toFixed(6)), m);
+    assert.ok(p.priority, m);
+  }
+  const a = lookupPrice("gpt-6-astra");
+  assert.deepEqual([a.input, a.cached_input, a.output, a.cache_write, a.cache_write_1h], [10, 1, 50, 12.5, 25]);
+  assert.equal(costForUsage("gpt-6-astra", { output_tokens: 1_000_000 }).cost_usd, 50);
+  assert.equal(costForUsage("gpt-6-astra-2026-04-30", { output_tokens: 1_000_000 }).fallback, false);
+  // GPT-6 / GPT-5.6 cache writes are 1.25x (30m) and 2.5x (12h) input; older rows publish none.
+  for (const m of GPT_232.filter((m) => /^gpt-(6|5\.6)/.test(m))) {
+    const p = lookupPrice(m);
+    assert.equal(p.cache_write, Number((p.input * 1.25).toFixed(6)), m);
+    assert.equal(p.cache_write_1h, Number((p.input * 2.5).toFixed(6)), m);
+  }
+  assert.equal(lookupPrice("gpt-5.5").cache_write, undefined);
+  assert.equal(costForUsage("gpt-5.5", { cache_write_input_tokens: 10 }).reason, "cache_write_unpriced");
+});

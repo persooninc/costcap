@@ -4,6 +4,7 @@
 // Results are priced at the provider's batch multiplier (pricing table `batch`).
 import { createUsageAccumulator } from "./proxy.js";
 import { costWithOverrides, withToolCost } from "./price-overrides.js";
+import { premiumTier } from "./pricing.js";
 
 const unsafe = (pathname) => /%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname);
 const pathOf = (rawUrl) => {
@@ -102,7 +103,7 @@ function priceLine(provider, body, userPrices, model) {
   const metered = acc.result();
   if (!metered || metered.toolUseUnpriced) return null;
   // A premium speed/service tier has no published batch rate: unknown, never standard.
-  if (metered.usage.speed === "fast" || metered.usage.service_tier === "priority") return null;
+  if (premiumTier(metered.usage)) return null;
   // #189: a discount stacks on the batch multiplier; an absolute override has no batch rate (unknown).
   const tokens = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider });
   if (tokens.fallback || tokens.cost_usd === null) return null;

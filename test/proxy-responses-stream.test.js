@@ -151,3 +151,45 @@ test("#196 a cut non-background Responses stream is still stream_incomplete", as
     const x = createResponsesStreamTracker(); x.push(terminal(type)); assert.equal(x.terminal, type.slice(9));
   }
 });
+
+// #232: streamed response.completed with OpenAI cache-write usage.
+const SOL_USAGE = { input_tokens: 12000, input_tokens_details: { cached_tokens: 4000, cache_write_tokens: 7000, cache_write_tokens_details: { ttl_30m_tokens: 3000, ttl_12h_tokens: 4000 } }, output_tokens: 1000 };
+const solStream = (usage, extra = {}) => [...START, ev({ type: "response.completed", response: { ...resp("completed", usage), model: "gpt-6.1-sol", ...extra } })];
+
+test("#232 AC2: streamed cache writes split into 30m / 12h and priced", async (t) => {
+  const { receipts, call } = await setup(t, solStream(SOL_USAGE));
+  await call(); await tick();
+  const r = receipts[0];
+  assert.deepEqual([r.cost_usd, r.input_tokens, r.cached_input_tokens, r.cache_write_input_tokens, r.cache_write_1h_input_tokens, r.fallback],
+    [0.0399, 1000, 4000, 3000, 4000, false]);
+});
+
+test("#232 AC3: streamed service_tier fast prices at priority and keeps the raw value", async (t) => {
+  const { receipts, call } = await setup(t, solStream(SOL_USAGE, { service_tier: "fast" }));
+  await call(); await tick();
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].pricing_tier, receipts[0].service_tier], [0.0798, "priority", "fast"]);
+});
+
+test("#232 AC2: an inconsistent cache-write breakdown is unknown and pauses the run", async (t) => {
+  const bad = { ...SOL_USAGE, input_tokens_details: { ...SOL_USAGE.input_tokens_details, cache_write_tokens_details: { ttl_30m_tokens: 3000, ttl_12h_tokens: 3000 } } };
+  const { receipts, call } = await setup(t, solStream(bad));
+  await call(); await tick();
+  assert.equal(receipts[0].cost_usd, null);
+  assert.equal((await call()).status, 429);
+});
+
+test("#232 chat body cache_write_tokens without breakdown prices all writes at 1.25x; overflow is unknown", () => {
+  const m = extractUsage("openai", JSON.stringify({ model: "gpt-6.1-sol", usage: { prompt_tokens: 4000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 3000 } } }));
+  assert.deepEqual([m.usage.input_tokens, m.usage.cache_write_input_tokens, m.usage.cache_write_1h_input_tokens], [1000, 3000, 0]);
+  assert.equal(costForUsage(m.model, m.usage).cost_usd, Number(((1000 * 2 + 3000 * 2.5) / 1e6).toFixed(6)));
+  assert.equal(extractUsage("openai", JSON.stringify({ model: "gpt-6.1-sol", usage: { prompt_tokens: 4000, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 2000, cache_write_tokens: 3000 } } })), null);
+});
+
+test("#232 AC5: a gpt-6-astra Responses web_search_call adds $0.01 and does not pause", async (t) => {
+  const usage = { input_tokens: 1000, output_tokens: 1000 };
+  const events = [...START, ev({ type: "response.completed", response: { ...resp("completed", usage), model: "gpt-6-astra", output: [{ type: "web_search_call", status: "completed" }] } })];
+  const { receipts, call } = await setup(t, events);
+  await call(); await tick();
+  assert.equal(receipts[0].cost_usd, 0.07);
+  assert.equal((await call()).status, 200);
+});

@@ -53,7 +53,7 @@ export function pricingCommand(args, { tablePath } = {}) {
   const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of audio`
     : `${name}: ${fmt(r.per_million_characters)} per 1M characters of input text`);
   const rowsFor = (name, r) => (Number.isFinite(r.per_minute) || Number.isFinite(r.per_million_characters)) && !Number.isFinite(r.input) ? [unitRow(name, r)] : [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
-    ...["fast", "priority"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
+    ...["fast", "priority", "ultrafast"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
     // Modality rates (#163) print as (audio) / (image) rows; uniform / text-rate notes follow.
     ...Object.entries(r.modalities ?? {}).map(([m, mr]) => `${name} (${m}): input ${fmt(mr.input)}, cached_input ${fmt(mr.cached_input)}, output ${fmt(mr.output)}`),
     ...(r.uniform_modalities ? [`${name}: all input modalities at the input rate`] : []),

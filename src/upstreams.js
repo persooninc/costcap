@@ -4,6 +4,7 @@
 // rate. Rates come only from --upstream-prices FILE; anything else is unknown (cost_usd null).
 import { readFileSync } from "node:fs";
 import { tableDigest } from "./pricing-digest.js";
+import { premiumTier } from "./pricing.js";
 import { OVERRIDE_PROVIDERS, validateBuiltinPrices, validateToolPrices } from "./price-overrides.js";
 
 export const BUILTIN_PROVIDERS = Object.freeze(["openai", "anthropic", "openrouter", "gemini", "bedrock", "vertex"]);
@@ -114,7 +115,7 @@ export function costForUserPrices(prices, provider, model, usage = {}) {
     ...(modality_tokens && { modality_tokens }), ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const unpricedReason = !rate || (cached_input_tokens > 0 && rate.cached_input === undefined) ? "upstream_model_unpriced"
     : modality_tokens ? "modality_unpriced"
-    : speed === "fast" || service_tier === "priority" ? "service_tier_unpriced" : null;
+    : premiumTier({ speed, service_tier }) ? "service_tier_unpriced" : null;
   if (unpricedReason) return { ...base, cost_usd: null, reason: unpricedReason };
   const cost = (input_tokens * rate.input + cached_input_tokens * (rate.cached_input ?? 0) + output_tokens * rate.output) / 1_000_000;
   return { ...base, cost_usd: Number(cost.toFixed(6)), cost_source: "user_prices", prices_version: prices.version, prices_sha256: prices.sha256 };

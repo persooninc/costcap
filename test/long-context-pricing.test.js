@@ -179,3 +179,18 @@ test("#188 regional endpoint premium stacks with the long-context tier", () => {
   const r = lookupPrice("claude-sonnet-4-5").long_context;
   assert.equal(reg.cost_usd, Number(((u.input_tokens * r.input * 1.1 + u.cached_input_tokens * r.cached_input * 1.1 + u.output_tokens * r.output * 1.1) / 1e6).toFixed(6)));
 });
+
+// #232: OpenAI >272K tier; Fast is 2x the applicable (long-context) rates where published.
+test("#232 AC4: gpt-6.1-sol long context standard and fast", async () => {
+  const { costForUsage } = await import("../src/pricing.js");
+  const lc = costForUsage("gpt-6.1-sol", { input_tokens: 300_000, output_tokens: 1000 });
+  assert.deepEqual([lc.cost_usd, lc.pricing_tier], [1.215, "long_context"]);
+  const fast = costForUsage("gpt-6.1-sol", { input_tokens: 300_000, output_tokens: 1000, service_tier: "fast" });
+  assert.deepEqual([fast.cost_usd, fast.pricing_tier, fast.long_context], [2.43, "priority", true]);
+  assert.equal(costForUsage("gpt-6.1-sol", { input_tokens: 272_000, output_tokens: 1000 }).pricing_tier, "standard");
+  // No stated multiple: ultrafast over 272K, and gpt-5.5 (Fast is 2.5x) Fast over 272K, are unpriced.
+  for (const [m, t] of [["gpt-6.1-sol", "ultrafast"], ["gpt-5.5", "priority"]]) {
+    const r = costForUsage(m, { input_tokens: 300_000, output_tokens: 1, service_tier: t });
+    assert.deepEqual([r.cost_usd, r.reason], [null, "service_tier_unpriced"], m);
+  }
+});

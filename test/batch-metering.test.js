@@ -181,3 +181,10 @@ test("#230 Gemini look-alike batch paths are not batch creates and still pause",
     assert.equal(JSON.parse(readFileSync(receiptsPath, "utf8").trim().split("\n")[0]).reason, "usage_unavailable", path);
   }
 });
+
+test("#232 AC1: a gpt-6-astra batch line settles at 0.5x standard; ultrafast stays unknown", () => {
+  const line = (extra = {}) => JSON.stringify({ response: { status_code: 200, body: { model: "gpt-6-astra-2026-04-30", ...extra, usage: { prompt_tokens: 1000, completion_tokens: 1000 } } } });
+  const r = foldBatchResults("openai", line());
+  assert.deepEqual([r.ok, r.cost_usd, r.succeeded], [true, 0.03, 1]); // (1000*10 + 1000*50)/1e6 * 0.5
+  for (const t of ["fast", "ultrafast", "turbo"]) assert.equal(foldBatchResults("openai", line({ service_tier: t })).ok, false, t);
+});

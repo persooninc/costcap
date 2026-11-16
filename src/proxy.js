@@ -269,15 +269,13 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       }
       // Both prompt/input and completion/output counters are required; duration-billed or empty shapes are unknown.
       if (u && !(isCount(u.prompt_tokens ?? u.input_tokens) && isCount(u.completion_tokens ?? u.output_tokens))) usage = { unpriceable: NaN };
-      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.input_token_details?.cached_tokens ?? 0),
-        output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
-        cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.input_token_details?.cached_tokens ?? 0 };
+      else if (u) usage = openaiTextUsage(u);
       if (u && usage.input_tokens !== undefined) {
         // #198: transcription usage spells it input_token_details.
         const inDetails = u.prompt_tokens_details ?? u.input_tokens_details ?? u.input_token_details;
         const cachedDetails = inDetails?.cached_tokens_details;
         const cached = openaiModalitySlice(cachedDetails, usage.cached_input_tokens);
-        const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens);
+        const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens + (usage.cache_write_input_tokens ?? 0) + (usage.cache_write_1h_input_tokens ?? 0));
         const input = all ? Object.fromEntries(Object.keys(all).map((k) => [k, Math.max(0, all[k] - (cached?.[k] ?? (k === "text" ? usage.cached_input_tokens : 0)))])) : null;
         const output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details, usage.output_tokens);
         const mt = modalityTokens({ input, cached_input: cached, output });
@@ -299,6 +297,27 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     return (responsesStream && !responsesTerminal) || (anthropicStream && (!anthropicStopped || anthropicErrored))
       || (geminiStream && !geminiFinished);
   } };
+}
+
+// #232: OpenAI prompt-cache writes. input_tokens_details / prompt_tokens_details carry
+// cache_write_tokens with an optional cache_write_tokens_details { ttl_30m_tokens, ttl_12h_tokens }.
+// 30m -> cache_write_input_tokens, 12h -> cache_write_1h_input_tokens; no breakdown -> all 30m.
+// A breakdown that does not sum, or cached + writes over the total, is unknown, never guessed.
+export function openaiTextUsage(u) {
+  const total = u.prompt_tokens ?? u.input_tokens ?? 0;
+  const d = u.prompt_tokens_details ?? u.input_tokens_details ?? u.input_token_details;
+  const cached = d?.cached_tokens ?? 0;
+  const out = { output_tokens: u.completion_tokens ?? u.output_tokens ?? 0, cached_input_tokens: cached };
+  const writes = d?.cache_write_tokens;
+  if (writes == null) return { input_tokens: total - cached, ...out };
+  const bd = d.cache_write_tokens_details;
+  let w30 = writes, w12 = 0;
+  if (bd != null) {
+    w30 = bd.ttl_30m_tokens ?? 0; w12 = bd.ttl_12h_tokens ?? 0;
+    if (!isCount(w30) || !isCount(w12) || w30 + w12 !== writes) return { unpriceable: NaN };
+  }
+  if (!isCount(writes) || cached + writes > total) return { unpriceable: NaN };
+  return { input_tokens: total - cached - writes, ...out, cache_write_input_tokens: w30, cache_write_1h_input_tokens: w12 };
 }
 
 export function extractUsage(provider, text, requestedModel, opts = {}) {

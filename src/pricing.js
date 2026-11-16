@@ -88,22 +88,38 @@ export function selectTier(price, prompt_tokens) {
   return { pricing_tier: "standard", rates: price };
 }
 
-// Premium speed / service tiers (#155): Anthropic fast mode reports usage.speed "fast";
-// OpenAI priority processing reports service_tier "priority". Other values
-// ("standard", "default", "flex", "auto", ...) price at standard and are only recorded.
+// Premium speed / service tiers (#155, #232): Anthropic fast mode reports usage.speed "fast";
+// OpenAI Fast (renamed from Priority on 2026-07-30) reports service_tier "fast" (GPT-6) or
+// "priority" (GPT-5.6 and earlier); both price at the model's `priority` set. "ultrafast"
+// uses the model's `ultrafast` set. Known standard values are only recorded; any other
+// value is "unrecognised" and unpriced, never standard.
+export const STANDARD_SERVICE_TIERS = Object.freeze(["default", "auto", "flex", "scale", "standard", "batch"]);
+export const PREMIUM_TIERS = Object.freeze(["fast", "priority", "ultrafast", "unrecognised"]);
 export function premiumTier({ speed, service_tier } = {}) {
   if (speed === "fast") return "fast";
-  if (service_tier === "priority") return "priority";
-  return null;
+  if (typeof service_tier !== "string") return null;
+  if (service_tier === "priority" || service_tier === "fast") return "priority";
+  if (service_tier === "ultrafast") return "ultrafast";
+  return STANDARD_SERVICE_TIERS.includes(service_tier) ? null : "unrecognised";
 }
+
+const validRates = (r) => !!r && Number.isFinite(r.input) && Number.isFinite(r.output);
 
 // Rates for a call: a premium tier uses the model's published premium rate set and
 // never falls back to standard; a model (or fallback) without one is unpriced.
+// Over the long-context threshold a premium tier is priced only where the model page
+// states it is a fixed multiple of the applicable rates (premium_long_context_multiplier,
+// "Fast" only); otherwise it is unpriced.
 export function selectRates(price, prompt_tokens, signal = {}) {
   const premium = premiumTier(signal);
   if (!premium) return selectTier(price, prompt_tokens);
-  const rates = price?.fallback ? null : price?.[premium];
-  if (!rates || !Number.isFinite(rates.input) || !Number.isFinite(rates.output)) return { pricing_tier: premium, rates: null };
+  const rates = price?.fallback || premium === "unrecognised" ? null : price?.[premium];
+  if (!validRates(rates)) return { pricing_tier: premium, rates: null };
+  if (selectTier(price, prompt_tokens).pricing_tier === "long_context") {
+    const m = price.premium_long_context_multiplier;
+    if (premium !== "priority" || !(typeof m === "number" && Number.isFinite(m) && m > 0)) return { pricing_tier: premium, rates: null };
+    return { pricing_tier: premium, rates: scaleRates(price.long_context, m), long_context: true };
+  }
   return { pricing_tier: premium, rates };
 }
 
@@ -181,7 +197,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   const multiplier = batchM === null && regionalM === null && userM === null ? null : (batchM ?? 1) * (regionalM ?? 1) * (userM ?? 1);
   const pricing_tier = tiered.pricing_tier;
   const selected = tiered.rates && multiplier !== null ? scaleRates(tiered.rates, multiplier) : tiered.rates;
-  const premium = pricing_tier === "fast" || pricing_tier === "priority";
+  const premium = PREMIUM_TIERS.includes(pricing_tier);
   const rates = selected ?? {};
   // A premium tier, or a cache component of it, with no published rate is unpriced: never standard.
   const tierUnpriced = premium && (!selected || (cached_input_tokens > 0 && rates.cached_input == null) ||
@@ -205,6 +221,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     cache_write_input_tokens,
     cache_write_1h_input_tokens,
     pricing_tier,
+    ...(tiered.long_context && { long_context: true }),
     ...(modality_tokens && { modality_tokens }),
     ...(batchM !== null && { batch_multiplier: batchM }),
     ...(regionalM !== null && { regional_multiplier: regionalM }),

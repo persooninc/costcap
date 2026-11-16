@@ -172,3 +172,55 @@ test("proxy e2e: --preflight blocks a fast request over budget with pricing_tier
   assert.equal(un.status, 429);
   assert.deepEqual([h.receipts[1].reason, h.receipts[1].pricing_tier], ["preflight_unpriced", "fast"]);
 });
+
+// #232: OpenAI Fast (renamed from Priority) and Ultrafast; unrecognised tiers are never standard.
+const AC2 = { input_tokens: 1000, cached_input_tokens: 4000, cache_write_input_tokens: 3000, cache_write_1h_input_tokens: 4000, output_tokens: 1000 };
+test("#232 premiumTier value set", () => {
+  assert.equal(premiumTier({ service_tier: "fast" }), "priority");
+  assert.equal(premiumTier({ service_tier: "priority" }), "priority");
+  assert.equal(premiumTier({ service_tier: "ultrafast" }), "ultrafast");
+  for (const s of ["default", "auto", "flex", "scale", "standard", "batch"]) assert.equal(premiumTier({ service_tier: s }), null, s);
+  assert.equal(premiumTier({ service_tier: "turbo" }), "unrecognised");
+  assert.equal(premiumTier({ service_tier: 3 }), null);
+});
+
+test("#232 AC3: fast / ultrafast / unpriced tiers on GPT-6", () => {
+  assert.equal(costForUsage("gpt-6.1-sol", AC2).cost_usd, 0.0399);
+  const fast = costForUsage("gpt-6.1-sol", { ...AC2, service_tier: "fast" });
+  assert.deepEqual([fast.cost_usd, fast.pricing_tier, fast.service_tier], [0.0798, "priority", "fast"]);
+  const uf = costForUsage("gpt-6-astra", { input_tokens: 1000, output_tokens: 1000, service_tier: "ultrafast" });
+  assert.deepEqual([uf.cost_usd, uf.pricing_tier], [0.36, "ultrafast"]);
+  for (const [m, t] of [["gpt-6-luna", "ultrafast"], ["gpt-6-luna", "turbo"], ["gpt-4o", "ultrafast"], ["made-up-model", "fast"]]) {
+    const r = costForUsage(m, { input_tokens: 1000, output_tokens: 1000, service_tier: t });
+    assert.deepEqual([r.cost_usd, r.reason], [null, "service_tier_unpriced"], `${m} ${t}`);
+  }
+  for (const t of ["default", "flex"]) {
+    const r = costForUsage("gpt-6.1-sol", { ...AC2, service_tier: t });
+    assert.deepEqual([r.cost_usd, r.pricing_tier, r.service_tier], [0.0399, "standard", t]);
+  }
+  // gpt-4o service_tier "fast" now prices at its priority rates.
+  assert.equal(costForUsage("gpt-4o", { input_tokens: 1e6, service_tier: "fast" }).cost_usd, GPT.priority.input);
+});
+
+test("#232 accumulator records service_tier fast and ultrafast from Responses bodies", () => {
+  const m = extractUsage("openai", JSON.stringify({ model: "gpt-6-astra", service_tier: "ultrafast", usage: { input_tokens: 1000, output_tokens: 1000 } }));
+  assert.equal(m.usage.service_tier, "ultrafast");
+  assert.equal(costForUsage(m.model, m.usage).cost_usd, 0.36);
+});
+
+test("#232 pricing show gpt-6-astra lists (priority) and (ultrafast) rows", () => {
+  const r = pricingCommand(["show", "gpt-6-astra"]);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /\(priority\)/);
+  assert.match(r.out, /\(ultrafast\)/);
+});
+
+test("#232 preflight: ultrafast estimates at premium rates; unrecognised tier refused", () => {
+  const std = estimateWorstCase("openai", JSON.stringify({ model: "gpt-6-astra", max_output_tokens: 1000, input: "hi" }), "/v1/responses");
+  const uf = estimateWorstCase("openai", JSON.stringify({ model: "gpt-6-astra", max_output_tokens: 1000, input: "hi", service_tier: "ultrafast" }), "/v1/responses");
+  assert.equal(uf.pricing_tier, "ultrafast");
+  assert.equal(uf.estimate_usd, Number(((uf.input_tokens * 60 + 1000 * 300) / 1e6).toFixed(6)));
+  assert.ok(uf.estimate_usd > std.estimate_usd * 5);
+  const un = estimateWorstCase("openai", JSON.stringify({ model: "gpt-6-astra", service_tier: "turbo" }), "/v1/responses");
+  assert.equal(un.reason, "preflight_unpriced");
+});

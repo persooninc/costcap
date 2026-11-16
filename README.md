@@ -325,11 +325,26 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   (otherwise `"standard"`). Preflight and `costcap pricing show` use the same
   tier. Check `src/pricing-table.json` before
   relying on rates.
+- Current OpenAI models (#232): `gpt-6-astra` ($10/$50 per M), `gpt-6.1-sol`, `gpt-6.1-terra`,
+  `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol/terra/luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and
+  `gpt-5.2` (plus dated `-YYYY-MM-DD` snapshots) are priced from the table, not the fallback.
+  OpenAI prompt-cache writes (`input_tokens_details.cache_write_tokens` /
+  `prompt_tokens_details.cache_write_tokens`) are split by `cache_write_tokens_details` into
+  30-minute writes (1.25x input, receipt `cache_write_input_tokens`) and 12-hour writes (2.5x
+  input, `cache_write_1h_input_tokens`); with no breakdown every write is priced as 30-minute.
+  A breakdown that doesn't sum, or cached + writes above the prompt total, is unknown
+  (`cost_usd: null`), never guessed. Prompts over 272K input tokens use the model's
+  `long_context` rates (2x input/cache, 1.5x output). GPT-6 web search is $0.01 per call.
 - Premium speed tiers: Anthropic fast mode (response `usage.speed: "fast"`,
-  Claude Opus 5.5 at $8/$40 per M, Claude Opus 5 at $10/$50) and OpenAI priority processing
-  (`service_tier: "priority"`, gpt-4o at $4.25/$17, gpt-4o-mini at $0.25/$1) are
-  priced at the table's `fast` / `priority` rates. The receipt records
-  `pricing_tier: "fast" | "priority"` plus the raw `speed` / `service_tier`.
+  Claude Opus 5.5 at $8/$40 per M, Claude Opus 5 at $10/$50), OpenAI Fast (formerly Priority:
+  `service_tier: "fast"` on GPT-6, `"priority"` on GPT-5.6 and earlier; gpt-4o at $4.25/$17,
+  gpt-6-astra at $20/$100) and OpenAI Ultrafast (`service_tier: "ultrafast"`, gpt-6-astra and
+  gpt-6.1-sol only, 6x standard) are priced at the table's `fast` / `priority` / `ultrafast`
+  rates. The receipt records `pricing_tier: "fast" | "priority" | "ultrafast"` plus the raw
+  `speed` / `service_tier`. Fast over 272K uses 2x the long-context rates where the model page
+  states it (every new row except `gpt-5.5`); any other premium tier over 272K is unpriced.
+  `default`, `auto`, `flex`, `scale`, `standard` and `batch` price at standard; any other
+  `service_tier` value is `service_tier_unpriced`.
   These rates count toward caps and the velocity breaker. `default` and `flex` tiers are priced at
   standard (flex over-counts, which is the safe direction), and the value is recorded. A premium
   tier on a model with no published premium rate, including fallback models and cache
@@ -337,7 +352,7 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `cost_usd: null` and `reason: "service_tier_unpriced"`, and the next call gets
   `accounting_unavailable`. `--preflight` reads `speed` / `service_tier` from
   the request body and estimates at premium rates (`preflight_unpriced` when
-  no premium rate exists). `costcap pricing show` prints `(fast)` and `(priority)` rows.
+  no premium rate exists). `costcap pricing show` prints `(fast)`, `(priority)` and `(ultrafast)` rows.
 - OpenAI embeddings (`POST /openai/v1/embeddings`, exact path) are metered
   input-only: `text-embedding-3-small` ($0.02/M), `text-embedding-3-large`
   ($0.13/M) and `text-embedding-ada-002` ($0.10/M), with `output_tokens: 0`.

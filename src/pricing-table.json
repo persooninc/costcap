@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.13",
+  "version": "2026-11-16.14",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -24,15 +24,18 @@
     "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool (web search $10 per 1,000 searches plus tokens; errored searches not billed; retrieved 2026-11-16)",
     "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/web-search (#222: Claude web search on Vertex AI is GA for Claude 4+ and billed per search as an add-on, same $10 per 1,000 as the Claude API; no regional multiplier on the tool rate; Gemini grounding stays unpriced; retrieved 2026-11-16)",
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (Gemini 2.5 Pro / Flash / Flash-Lite on Vertex AI: same per-token, cached-input and >200K long-context rates as the Gemini API; retrieved 2026-11-16)",
-    "https://developers.openai.com/api/docs/pricing (Built-in tools: web search $10.00/1k calls; web search preview $10/1k reasoning models, $25/1k other models; file search $2.50/1k tool calls; retrieved 2026-11-16)"
+    "https://developers.openai.com/api/docs/pricing (Built-in tools: web search $10.00/1k calls; web search preview $10/1k reasoning models, $25/1k other models; file search $2.50/1k tool calls; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/pricing (#232: gpt-6-astra, gpt-6.1-sol/terra, gpt-6-sol/luna, gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4(-mini), gpt-5.2 Standard / Fast / Ultrafast; cache writes 30m 1.25x and 12h 2.5x input; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/models/gpt-6-astra (#232: >272K input tokens: 2x input/cache, 1.5x output; Fast is 2x the applicable rates; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
   "tools": {
     "unit": "usd_per_call",
     "anthropic": { "web_search": { "usd_per_call": 0.01 } },
     "vertex": { "web_search": { "families": { "claude": 0.01 } } },
     "openai": {
-      "web_search": { "families": { "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.01, "gpt-4.1": 0.01 } },
-      "web_search_preview": { "families": { "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.025, "gpt-4.1": 0.025 } },
+      "web_search": { "families": { "gpt-6": 0.01, "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.01, "gpt-4.1": 0.01 } },
+      "web_search_preview": { "families": { "gpt-6": 0.01, "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.025, "gpt-4.1": 0.025 } },
       "file_search": { "usd_per_call": 0.0025 }
     }
   },
@@ -47,6 +50,18 @@
     "text-embedding-ada-002": { "input": 0.10, "cached_input": 0.10, "output": 0, "input_only": true },
     "gpt-4o": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "priority": { "input": 4.25, "cached_input": 2.125, "output": 17.00 } },
     "gpt-4o-mini": { "input": 0.15, "cached_input": 0.075, "output": 0.60, "priority": { "input": 0.25, "cached_input": 0.125, "output": 1.00 } },
+    "gpt-6-astra": { "input": 10, "cached_input": 1, "output": 50, "cache_write": 12.5, "cache_write_1h": 25, "long_context": { "threshold_input_tokens": 272000, "input": 20, "cached_input": 2, "output": 75, "cache_write": 25, "cache_write_1h": 50 }, "priority": { "input": 20, "cached_input": 2, "output": 100, "cache_write": 25, "cache_write_1h": 50 }, "premium_long_context_multiplier": 2, "ultrafast": { "input": 60, "cached_input": 6, "output": 300, "cache_write": 75, "cache_write_1h": 150 } },
+    "gpt-6.1-sol": { "input": 2, "cached_input": 0.1, "output": 10, "cache_write": 2.5, "cache_write_1h": 5, "long_context": { "threshold_input_tokens": 272000, "input": 4, "cached_input": 0.2, "output": 15, "cache_write": 5, "cache_write_1h": 10 }, "priority": { "input": 4, "cached_input": 0.2, "output": 20, "cache_write": 5, "cache_write_1h": 10 }, "premium_long_context_multiplier": 2, "ultrafast": { "input": 12, "cached_input": 0.6, "output": 60, "cache_write": 15, "cache_write_1h": 30 } },
+    "gpt-6.1-terra": { "input": 1, "cached_input": 0.05, "output": 5, "cache_write": 1.25, "cache_write_1h": 2.5, "long_context": { "threshold_input_tokens": 272000, "input": 2, "cached_input": 0.1, "output": 7.5, "cache_write": 2.5, "cache_write_1h": 5 }, "priority": { "input": 2, "cached_input": 0.1, "output": 10, "cache_write": 2.5, "cache_write_1h": 5 }, "premium_long_context_multiplier": 2 },
+    "gpt-6-luna": { "input": 0.1, "cached_input": 0.01, "output": 0.5, "cache_write": 0.125, "cache_write_1h": 0.25, "long_context": { "threshold_input_tokens": 272000, "input": 0.2, "cached_input": 0.02, "output": 0.75, "cache_write": 0.25, "cache_write_1h": 0.5 }, "priority": { "input": 0.2, "cached_input": 0.02, "output": 1, "cache_write": 0.25, "cache_write_1h": 0.5 }, "premium_long_context_multiplier": 2 },
+    "gpt-6-sol": { "input": 2, "cached_input": 0.2, "output": 10, "cache_write": 2.5, "cache_write_1h": 5, "long_context": { "threshold_input_tokens": 272000, "input": 4, "cached_input": 0.4, "output": 15, "cache_write": 5, "cache_write_1h": 10 }, "priority": { "input": 4, "cached_input": 0.4, "output": 20, "cache_write": 5, "cache_write_1h": 10 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.6-sol": { "input": 4, "cached_input": 0.4, "output": 20, "cache_write": 5, "cache_write_1h": 10, "long_context": { "threshold_input_tokens": 272000, "input": 8, "cached_input": 0.8, "output": 30, "cache_write": 10, "cache_write_1h": 20 }, "priority": { "input": 8, "cached_input": 0.8, "output": 40, "cache_write": 10, "cache_write_1h": 20 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.6-terra": { "input": 2, "cached_input": 0.2, "output": 12, "cache_write": 2.5, "cache_write_1h": 5, "long_context": { "threshold_input_tokens": 272000, "input": 4, "cached_input": 0.4, "output": 18, "cache_write": 5, "cache_write_1h": 10 }, "priority": { "input": 4, "cached_input": 0.4, "output": 24, "cache_write": 5, "cache_write_1h": 10 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.6-luna": { "input": 0.2, "cached_input": 0.02, "output": 1.2, "cache_write": 0.25, "cache_write_1h": 0.5, "long_context": { "threshold_input_tokens": 272000, "input": 0.4, "cached_input": 0.04, "output": 1.8, "cache_write": 0.5, "cache_write_1h": 1 }, "priority": { "input": 0.4, "cached_input": 0.04, "output": 2.4, "cache_write": 0.5, "cache_write_1h": 1 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.5": { "input": 5, "cached_input": 0.5, "output": 30, "long_context": { "threshold_input_tokens": 272000, "input": 10, "cached_input": 1, "output": 45 }, "priority": { "input": 12.5, "cached_input": 1.25, "output": 75 } },
+    "gpt-5.4": { "input": 2.5, "cached_input": 0.25, "output": 15, "long_context": { "threshold_input_tokens": 272000, "input": 5, "cached_input": 0.5, "output": 22.5 }, "priority": { "input": 5, "cached_input": 0.5, "output": 30 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.4-mini": { "input": 0.75, "cached_input": 0.075, "output": 4.5, "long_context": { "threshold_input_tokens": 272000, "input": 1.5, "cached_input": 0.15, "output": 6.75 }, "priority": { "input": 1.5, "cached_input": 0.15, "output": 9 }, "premium_long_context_multiplier": 2 },
+    "gpt-5.2": { "input": 1.75, "cached_input": 0.175, "output": 14, "long_context": { "threshold_input_tokens": 272000, "input": 3.5, "cached_input": 0.35, "output": 21 }, "priority": { "input": 3.5, "cached_input": 0.35, "output": 28 }, "premium_long_context_multiplier": 2 },
     "gpt-5": { "input": 1.25, "cached_input": 0.125, "output": 10.00 },
     "gpt-5-mini": { "input": 0.25, "cached_input": 0.025, "output": 2.00 },
     "gpt-5-nano": { "input": 0.05, "cached_input": 0.005, "output": 0.40 },

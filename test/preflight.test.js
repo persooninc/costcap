@@ -296,3 +296,16 @@ test("#202 AC6 OpenRouter embeddings preflight estimates input only", () => {
   assert.equal(e.output_tokens, 0);
   assert.ok(estimateWorstCase("openrouter", Buffer.from(JSON.stringify({ model: "openai/gpt-4o", messages: [] })), "/v1/chat/completions").output_tokens > 0);
 });
+
+test("#232 AC5: --preflight refuses a gpt-6-astra ultrafast request over a $0.10 cap before sending", async () => {
+  const h = await harness({ preflight: true, caps: { run: 0.10 } });
+  try {
+    const std = await h.call(body({ model: "gpt-6-astra", max_output_tokens: 1000, input: "hi" }));
+    assert.equal(std.status, 200); // standard worst case ≈ $0.05 fits
+    const r = await h.call(body({ model: "gpt-6-astra", max_output_tokens: 1000, input: "hi", service_tier: "ultrafast" }));
+    assert.equal(r.status, 429);
+    assert.equal(h.hits(), 1);
+    const last = h.ledger().at(-1);
+    assert.deepEqual([last.reason, last.pricing_tier], ["preflight_estimate", "ultrafast"]);
+  } finally { h.close(); }
+});
