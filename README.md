@@ -362,6 +362,8 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   create's `ts` (once, including across restarts). A terminal reply with null or
   unpriceable usage appends `{"event":"background_unpriced"}`: the receipt becomes an
   unknown `background_unpriced` and the run pauses.
+  Another run's background settle counts toward day/month and `--policy`/`--tag-cap`
+  budgets, never toward this run's velocity breaker (matching batches).
 - Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
   OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
   (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the

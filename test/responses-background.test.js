@@ -7,6 +7,7 @@ import { checkBudget } from "../src/check.js";
 import { createAgentBudgets } from "../src/agent-budget.js";
 import { createSettler } from "../src/settle.js";
 import { CHAT, CREATE, CREATE_STREAM, EXPECTED, USAGE, ev, resp, setup } from "./support/background.js";
+import { createVelocityBreaker } from "../src/velocity.js";
 
 const capOf = (caps, history = []) => createCapEngine({ caps, history });
 const real = (s) => s.lines().filter((l) => !l.event);
@@ -149,4 +150,38 @@ test("applySettlements: an unpriced event never overrides a real settlement", ()
     { event: "reconciliation", receipt_id: "a", cost_usd: 1 }, { event: "background_unpriced", receipt_id: "a" }];
   assert.equal(applySettlements(lines)[0].cost_usd, 1);
   assert.equal(applySettlements([lines[0], lines[2]])[0].reason, "background_unpriced");
+});
+
+// #201: velocity breaker vs background settles from another run / the same run.
+async function velocityRun(t, settleRunId) {
+  let clock = 1_000_000;
+  const velocity = createVelocityBreaker({ bucketMs: 1000, baselineBuckets: 5, multiple: 3, minSpendUsd: 0.5, now: () => clock });
+  const first = await setup(t, { who: { agent_id: "worker", run_id: settleRunId } });
+  await first.call("POST", "/openai/v1/responses", CREATE);
+  const history = loadSettledReceipts(first.receiptsPath);
+  const cap = createCapEngine({ caps: { day: 5 }, runId: "r2", history });
+  const big = { input_tokens: 4_000_000, output_tokens: 0, total_tokens: 4_000_000 };
+  const s = await setup(t, { receiptsPath: first.receiptsPath, cap, velocity, spiral: null, who: { agent_id: "worker", run_id: "r2" } }, { status: "completed", usage: big });
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await s.call("POST", "/openai/v1/chat/completions", CHAT)).status, 200);
+    clock += 1000;
+  }
+  assert.equal((await s.call("GET", "/openai/v1/responses/resp_bg1")).status, 200);
+  const next = await s.call("POST", "/openai/v1/chat/completions", CHAT);
+  return { s, cap, next };
+}
+
+test("#201: another run's background settle never trips this run's velocity breaker", async (t) => {
+  const { s, cap, next } = await velocityRun(t, "r1");
+  assert.equal(next.status, 200, await next.clone().text());
+  assert.ok(cap.spend().run < 0.001);
+  assert.ok(cap.spend().day >= 0.6);
+  assert.ok(!s.lines().some((r) => r.blocked && r.reason === "cost_velocity"));
+});
+
+test("#201: a same-run background settle of the same cost still trips the breaker", async (t) => {
+  const { s, next } = await velocityRun(t, "r2");
+  assert.equal(next.status, 429);
+  assert.equal((await next.json()).reason, "cost_velocity");
+  assert.ok(s.lines().some((r) => r.blocked && r.reason === "cost_velocity"));
 });
