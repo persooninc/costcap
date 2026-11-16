@@ -142,8 +142,9 @@ Compared the README's promises, category expectations, and the agent-to-agent ne
 ### CC-2 Per-agent step budgets in fleet policy
 - Acceptance: policy carries `maxSteps`, the dashboard edits it, and an enrolled wrapper enforces it offline from cache. A local value can tighten it, not loosen it.
 
-### CC-3 Kill one agent or all from the dashboard, with audit
+### CC-3 Kill one agent or all from the dashboard, with audit — DONE (#113)
 - Acceptance: both actions write an audit entry with who and why. A wrapper honors them within one poll. Resume is explicit. The UI states that remote kill is not instant and doesn't undo accepted requests.
+- Shipped (#113): `POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (admin, required reason), per-agent kill `reason`, dashboard "Freeze all agents" card.
 
 ### CC-4 Kill and resume receipts in the local ledger
 - Acceptance: `costcap kill` and `resume` append an event with note and time, excluded from spend. A ledger write failure still leaves the kill file in place.

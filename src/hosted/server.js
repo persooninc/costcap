@@ -25,6 +25,43 @@ export function planUsage(s, orgId, nowMs, { pending = true } = {}) {
   const invites = pending ? Object.values(s.invitations ?? {}).filter((i) => i.orgId === orgId && i.expires > nowMs).length : 0;
   return { agents: agents + tokens, seats: users + invites };
 }
+// CC-3: fleet-wide freeze/resume. A reason is required (1-500 chars after trimming).
+export function fleetReason(value, required) {
+  if (value === undefined || value === null) { if (required) fail(400, "A reason is required"); return null; }
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 500) fail(400, "Reason must be 1-500 characters");
+  return value.trim();
+}
+// Freeze kills every non-revoked agent in the org in the caller's transaction. Only the
+// agents this freeze killed are recorded, so resume never revives an agent killed on its own.
+export function freezeFleet(s, u, reason) {
+  s.fleetFreezes ??= {};
+  const current = s.fleetFreezes[u.orgId];
+  if (current?.active) return { frozen: true, alreadyFrozen: true, count: 0, agentIds: [] };
+  const agentIds = [];
+  for (const a of Object.values(s.agents)) {
+    if (a.orgId !== u.orgId || a.revoked || a.policy.killed) continue;
+    a.policy = { ...a.policy, version: a.policy.version + 1, killed: true };
+    agentIds.push(a.id);
+  }
+  s.fleetFreezes[u.orgId] = { orgId: u.orgId, active: true, reason, agentIds, by: u.id, at: new Date().toISOString() };
+  audit(s, u.orgId, u.id, "fleet.freeze", null, { reason, agentIds });
+  return { frozen: true, alreadyFrozen: false, count: agentIds.length, agentIds };
+}
+export function resumeFleet(s, u, reason) {
+  s.fleetFreezes ??= {};
+  const current = s.fleetFreezes[u.orgId];
+  if (!current?.active) return { frozen: false, notFrozen: true, count: 0, agentIds: [] };
+  const agentIds = [];
+  for (const id of current.agentIds) {
+    const a = s.agents[id];
+    if (!a || a.orgId !== u.orgId || a.revoked || !a.policy.killed) continue;
+    a.policy = { ...a.policy, version: a.policy.version + 1, killed: false };
+    agentIds.push(a.id);
+  }
+  s.fleetFreezes[u.orgId] = { ...current, active: false, resumedBy: u.id, resumeReason: reason };
+  audit(s, u.orgId, u.id, "fleet.resume", null, { reason, agentIds });
+  return { frozen: false, notFrozen: false, count: agentIds.length, agentIds };
+}
 const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(auditEntry({ orgId, actor, action, target, detail }));
 
 // A missing channel is not a failed send. Retry only when a configured
@@ -291,6 +328,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
             receipts: visibleReceipts(s, u.orgId),
             audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
+            fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
             beta: true, billing: billing ? "enabled" : "disabled",
             plan: { ...entitlements(s, u.orgId), usage: planUsage(s, u.orgId, now(), { pending: false }), upgradeUrl },
@@ -349,16 +387,26 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return hostedAgentVerdict({ agent: a, receipts, nowMs: now() });
         }));
       }
+      if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
+        const freeze = path.endsWith("/freeze");
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const reason = fleetReason(body?.reason, true);
+          return freeze ? freezeFleet(s, u, reason) : resumeFleet(s, u, reason);
+        });
+        return json(200, result);
+      }
       const update = /^\/v1\/agents\/([^/]+)\/(policy|revoke)$/.exec(path);
       if (update && req.method === "POST") {
         const result = store.transaction((s) => {
           const u = admin(s, req), a = s.agents[update[1]];
           if (!a || a.orgId !== u.orgId) fail(404, "Agent not found");
           if (update[2] === "revoke") { a.revoked = true; audit(s, u.orgId, u.id, "agent.revoke", a.id); return { revoked: true }; }
+          const reason = fleetReason(body.reason, false);
           const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           a.policy = policy;
-          audit(s, u.orgId, u.id, "policy.change", a.id, { policy });
+          audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { policy, reason } : { policy });
           return policy;
         });
         return json(200, result);

@@ -135,3 +135,56 @@ test("#112 a signed-in org reads its agent budget verdict; cross-org read is 404
     service.server.close();
   }
 });
+
+test("#113 freeze all agents from the dashboard with a reason, then resume", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-freeze-")), "data.json"),
+    origin, secureCookies: false, stripeEnv: {}, turnstileSiteKey: "fixture-public-key",
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    const dialogs = [];
+    page.on("dialog", (dialog) => { dialogs.push(dialog.message()); dialog.accept(); });
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("freeze@example.invalid");
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    for (const name of ["alpha", "beta"]) {
+      await page.locator("#enroll button").click();
+      await expect(page.locator("#token")).not.toHaveText("");
+      const token = (await page.locator("#token").innerText()).trim();
+      await page.locator("#hideToken").click();
+      expect(await page.evaluate(async ([credential, n]) => (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: n }) })).status, [token, name])).toBe(201);
+    }
+    await page.locator("#refresh").click();
+    await expect(page.locator("#agents strong")).toHaveText(["ACTIVE", "ACTIVE"]);
+    await expect(page.locator("#fleetFreeze")).toContainText("not instant");
+    await page.locator("#freezeReason").fill("runaway spend incident");
+    await page.locator("#freezeAll").click();
+    await expect(page.locator("#fleetState")).toHaveText("FROZEN");
+    await expect(page.locator("#agents strong")).toHaveText(["FROZEN", "FROZEN"]);
+    await expect(page.locator("#audit")).toContainText("fleet.freeze");
+    await expect(page.locator("#audit")).toContainText("reason: runaway spend incident");
+    expect(dialogs.at(-1)).toContain("next policy poll");
+    await expect(page.locator("#resumeFleet")).toBeVisible();
+    await page.locator("#freezeReason").fill("incident resolved");
+    await page.locator("#resumeFleet").click();
+    await expect(page.locator("#fleetState")).toHaveText("ACTIVE");
+    await expect(page.locator("#agents strong")).toHaveText(["ACTIVE", "ACTIVE"]);
+    await expect(page.locator("#audit")).toContainText("reason: incident resolved");
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

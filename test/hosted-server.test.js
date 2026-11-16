@@ -546,3 +546,94 @@ test("#112 a viewer may read an agent budget verdict", async (t) => {
   assert.equal(r.body.verdict, "ok");
   assert.deepEqual(r.body.budget_remaining, { day_usd: null, month_usd: 2 });
 });
+
+test("#113 fleet freeze: admin only, required reason, org-scoped, audited, idempotent", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("freeze-owner@example.invalid");
+  const outsider = await f.login("freeze-outsider@example.invalid");
+  const enrollAgent = async (who, name) => {
+    const e = await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, who.cookie);
+    return (await f.request("/v1/enroll", { name }, null, e.body.token)).body;
+  };
+  const a = await enrollAgent(owner, "a"), b = await enrollAgent(owner, "b"), gone = await enrollAgent(owner, "gone");
+  const other = await enrollAgent(outsider, "other");
+  await f.request(`/v1/agents/${gone.agentId}/revoke`, {}, owner.cookie);
+  await f.request("/v1/invitations", { email: "freeze-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("freeze-viewer@example.invalid");
+  const snapshot = async () => JSON.stringify((await f.request("/v1/fleet", undefined, owner.cookie)).body.agents.map((x) => x.policy));
+  const before = await snapshot();
+  // Criterion 2: no state change on 401/403/400.
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: "x" })).status, 401);
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: "x" }, viewer.cookie)).status, 403);
+  assert.equal((await f.request("/v1/fleet/resume", { reason: "x" }, viewer.cookie)).status, 403);
+  assert.equal((await f.request("/v1/fleet/freeze", {}, owner.cookie)).status, 400);
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: "   " }, owner.cookie)).status, 400);
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: "y".repeat(501) }, owner.cookie)).status, 400);
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: 7 }, owner.cookie)).status, 400);
+  assert.equal(await snapshot(), before);
+  // Criterion 5 setup: b killed individually, with a recorded reason (criterion 3).
+  assert.equal((await f.request(`/v1/agents/${b.agentId}/policy`, { killed: true, reason: "b loops" }, owner.cookie)).status, 200);
+  assert.equal((await f.request(`/v1/agents/${b.agentId}/policy`, { killed: true, reason: "" }, owner.cookie)).status, 400);
+  // Criterion 1.
+  const frozen = await f.request("/v1/fleet/freeze", { reason: "runaway spend" }, owner.cookie);
+  assert.equal(frozen.status, 200);
+  assert.deepEqual(frozen.body, { frozen: true, alreadyFrozen: false, count: 1, agentIds: [a.agentId] });
+  let fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal(fleet.fleetFrozen, true);
+  const byId = Object.fromEntries(fleet.agents.map((x) => [x.id, x.policy]));
+  assert.deepEqual([byId[a.agentId].killed, byId[a.agentId].version], [true, 2]);
+  assert.equal(byId[b.agentId].killed, true);
+  assert.equal(byId[gone.agentId].killed, false);
+  const otherPolicy = (await f.request("/v1/policy", undefined, null, other.token)).body;
+  assert.deepEqual([otherPolicy.killed, otherPolicy.version], [false, 1]);
+  assert.equal((await f.request("/v1/fleet", undefined, outsider.cookie)).body.fleetFrozen, false);
+  // Criterion 6: idempotent.
+  const again = await f.request("/v1/fleet/freeze", { reason: "again" }, owner.cookie);
+  assert.equal(again.body.alreadyFrozen, true);
+  assert.equal((await f.request("/v1/policy", undefined, null, a.token)).body.version, 2);
+  // Criterion 5: resume revives only what the freeze killed.
+  const resumed = await f.request("/v1/fleet/resume", { reason: "fixed" }, owner.cookie);
+  assert.deepEqual(resumed.body, { frozen: false, notFrozen: false, count: 1, agentIds: [a.agentId] });
+  assert.equal((await f.request("/v1/policy", undefined, null, a.token)).body.killed, false);
+  assert.equal((await f.request("/v1/policy", undefined, null, b.token)).body.killed, true);
+  assert.equal((await f.request("/v1/fleet/resume", { reason: "noop" }, owner.cookie)).body.notFrozen, true);
+  // Criterion 3: one audit entry each, with actor, reason and agent ids; survives restart.
+  await f.restart();
+  fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  const freezes = fleet.audit.filter((e) => e.action === "fleet.freeze"), resumes = fleet.audit.filter((e) => e.action === "fleet.resume");
+  assert.equal(freezes.length, 1);
+  assert.deepEqual(freezes[0].detail, { reason: "runaway spend", agentIds: [a.agentId] });
+  assert.equal(freezes[0].actor, owner.body.id ?? freezes[0].actor);
+  assert.ok(freezes[0].actor);
+  assert.deepEqual(resumes.map((e) => e.detail), [{ reason: "fixed", agentIds: [a.agentId] }]);
+  assert.ok(fleet.audit.some((e) => e.action === "policy.change" && e.target === b.agentId && e.detail.reason === "b loops"));
+  assert.equal((await f.request("/v1/fleet", undefined, outsider.cookie)).body.audit.some((e) => e.action.startsWith("fleet.")), false);
+});
+
+test("regression #113: an enrolled wrapper honors a fleet freeze at its next poll and runs after resume", async (t) => {
+  const { createFleetClient, enroll } = await import("../src/hosted/client.js");
+  const f = await fixture(t);
+  const owner = await f.login("freeze-client@example.invalid");
+  const e = await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, owner.cookie);
+  const dir = mkdtempSync(join(tmpdir(), "cc-freeze-client-"));
+  const path = join(dir, "enrollment.json");
+  await enroll({ url: `http://127.0.0.1:${f.service().server.address().port}`, token: e.body.token, name: "wrapped", path });
+  const client = createFleetClient({ path, receiptsPath: join(dir, "receipts.jsonl") });
+  assert.equal(client.policy().killed, false);
+  await f.request("/v1/fleet/freeze", { reason: "incident" }, owner.cookie);
+  assert.equal(client.policy().killed, false); // not instant: cached until the next poll
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.policy().killed, true);
+  await f.request("/v1/fleet/resume", { reason: "resolved" }, owner.cookie);
+  await client.sync();
+  assert.equal(client.policy().killed, false);
+});
+
+test("#113 fleet freeze state round-trips through the Postgres record mapping", async () => {
+  const { toRecords, fromRecords } = await import("../src/hosted/store-records.js");
+  const { EMPTY_STATE } = await import("../src/hosted/store.js");
+  const state = { ...structuredClone(EMPTY_STATE), fleetFreezes: { org1: { orgId: "org1", active: true, reason: "r", agentIds: ["x"] } } };
+  const recs = toRecords(state);
+  assert.equal(recs.get("fleetFreezes\u0000org1").orgId, "org1");
+  assert.deepEqual(fromRecords([...recs.values()], EMPTY_STATE), state);
+});
