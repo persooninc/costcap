@@ -344,11 +344,10 @@ test("#145 embeddings usage is input-only on the exact embeddings path only", ()
   assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":"8"}}', "x", e), null);
   assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":8,"completion_tokens":2}}', "x", e), null);
   assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":8,"total_tokens":8}}'), null);
-  assert.equal(extractUsage("openrouter", '{"usage":{"prompt_tokens":8}}', "x", e), null);
   assert.equal(isEmbeddingsPath("/openai/v1/embeddings"), true);
   assert.equal(isEmbeddingsPath("/openai/v1/embeddings?x=1"), true);
   for (const bad of ["/openai/v1/chat/completions", "/openai/v1/responses", "/openai/v1/x/../embeddings", "/openai/v1/%65mbeddings",
-    "/openai//v1/embeddings", "/openai/v1/embeddings/", "/openrouter/v1/embeddings", "/gemini/v1/embeddings", null]) assert.equal(isEmbeddingsPath(bad), false, bad);
+    "/openai//v1/embeddings", "/openai/v1/embeddings/", "/gemini/v1/embeddings", null]) assert.equal(isEmbeddingsPath(bad), false, bad);
 });
 
 async function embedProxy(t, responder, options = {}) {
@@ -394,6 +393,57 @@ test("#145 embeddings spend counts toward the cap", async (t) => {
   const r = await call();
   assert.equal(r.status, 429);
   assert.equal(receipts.filter((x) => x.cost_usd === 0.13).length, 2);
+});
+
+async function orEmbedProxy(t, body, options = {}) {
+  const up = http.createServer((req, res) => { req.resume(); res.writeHead(200, { "content-type": "application/json" }).end(body); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openrouter: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r), ...options });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = (path = "/openrouter/v1/embeddings", model = "openai/text-embedding-3-small") => fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: JSON.stringify({ model, input: "hello" }) });
+  return { call, receipts };
+}
+
+test("#202 AC1 OpenRouter embeddings with usage.cost record the provider cost; next call not paused", async (t) => {
+  const { call, receipts } = await orEmbedProxy(t, '{"model":"openai/text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8,"cost":0.0001}}');
+  assert.equal((await call()).status, 200);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].cost_source, receipts[0].output_tokens, receipts[0].reason], [0.0001, "provider", 0, undefined]);
+  assert.equal((await call()).status, 200);
+  assert.equal(receipts.length, 2);
+});
+
+test("#202 AC2 OpenRouter embeddings without cost use the table, or the fallback input rate", async (t) => {
+  const a = await orEmbedProxy(t, '{"model":"openai/text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8}}');
+  assert.equal((await a.call()).status, 200);
+  assert.deepEqual([a.receipts[0].cost_usd, a.receipts[0].fallback, a.receipts[0].output_tokens], [Number((8 * 0.02 / 1e6).toFixed(6)), false, 0]);
+  assert.equal((await a.call()).status, 200);
+  const b = await orEmbedProxy(t, '{"model":"qwen/qwen3-embedding-8b","usage":{"prompt_tokens":1000000,"total_tokens":1000000}}');
+  assert.equal((await b.call("/openrouter/v1/embeddings", "qwen/qwen3-embedding-8b")).status, 200);
+  assert.equal(b.receipts[0].fallback, true);
+  assert.ok(b.receipts[0].cost_usd > 0);
+  assert.equal((await b.call("/openrouter/v1/embeddings", "qwen/qwen3-embedding-8b")).status, 200);
+});
+
+test("#202 AC3/AC4 unusable OpenRouter embeddings usage and prompt-only chat still pause", async (t) => {
+  for (const [path, body] of [["/openrouter/v1/embeddings", '{"model":"openai/text-embedding-3-small","usage":{"total_tokens":8,"cost":0.0001}}'],
+    ["/openrouter/v1/embeddings", '{"usage":{"prompt_tokens":8,"completion_tokens":1,"cost":0.0001}}'],
+    ["/openrouter/v1/chat/completions", '{"usage":{"prompt_tokens":8,"total_tokens":8}}']]) {
+    const { call, receipts } = await orEmbedProxy(t, body);
+    assert.equal((await call(path)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"], body);
+    assert.equal((await (await call(path)).json()).error, "accounting_unavailable", body);
+  }
+});
+
+test("#202 AC7 OpenRouter embeddings spend counts toward the cap", async (t) => {
+  const { call } = await orEmbedProxy(t, '{"model":"openai/text-embedding-3-large","usage":{"prompt_tokens":8,"total_tokens":8,"cost":0.1}}',
+    { cap: createCapEngine({ caps: { run: 0.2 } }) });
+  assert.equal((await call()).status, 200);
+  assert.equal((await call()).status, 200);
+  const r = await call();
+  assert.equal(r.status, 429);
+  assert.equal((await r.json()).error.type, "budget_exceeded");
 });
 
 test("#148 AC4: a usage.cost on /openai is ignored; table pricing applies", async (t) => {

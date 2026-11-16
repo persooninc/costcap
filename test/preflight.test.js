@@ -288,3 +288,11 @@ test("#200 AC6 Gemini embed paths preflight input-only; unpriced embedding model
   assert.notEqual(estimateWorstCase("gemini", body, "/v1beta/models/gemini-2.5-flash:generateContent").output_tokens, 0);
   assert.equal(estimateWorstCase("gemini", body, "/v1beta/models/gemini-embedding-999:embedContent").reason, "preflight_unpriced");
 });
+
+test("#202 AC6 OpenRouter embeddings preflight estimates input only", () => {
+  const b = Buffer.from(JSON.stringify({ model: "openai/text-embedding-3-small", input: "hello world" }));
+  const e = estimateWorstCase("openrouter", b, "/v1/embeddings");
+  assert.equal(e.ok, true);
+  assert.equal(e.output_tokens, 0);
+  assert.ok(estimateWorstCase("openrouter", Buffer.from(JSON.stringify({ model: "openai/gpt-4o", messages: [] })), "/v1/chat/completions").output_tokens > 0);
+});

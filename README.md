@@ -318,7 +318,11 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `:batchEmbedContents` are metered input-only from
   `usageMetadata.promptTokenCount` (`gemini-embedding-001` $0.15/M;
   `gemini-embedding-2` text $0.20, image $0.45, audio $6.50, video $12.00 per
-  M via `promptTokenDetails`). OpenRouter embeddings are not metered.
+  M via `promptTokenDetails`). OpenRouter embeddings
+  (`POST /openrouter/v1/embeddings`, exact path) are metered input-only from
+  `usage.prompt_tokens`: a valid `usage.cost` wins (`cost_source: "provider"`),
+  otherwise `openai/` ids use the table rate and other ids the fallback input
+  rate (`fallback: true`).
 - The pricing table is offline-verifiable. `src/pricing-table.sha256.json`
   holds the committed SHA-256 of the canonical table (keys sorted, no
   whitespace). Every receipt records `table_version` and `table_sha256`.

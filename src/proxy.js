@@ -89,12 +89,12 @@ export function isNonBillableFilesRequest(method, rawUrl) {
   return false;
 }
 
-// OpenAI embeddings (#145): billed on input only. Exact path, same hardening as count_tokens.
+// OpenAI (#145) and OpenRouter (#202) embeddings: billed on input only. Exact path, same hardening as count_tokens.
 export function isEmbeddingsPath(rawUrl) {
   if (typeof rawUrl !== "string") return false;
   const pathname = rawUrl.split(/[?#]/, 1)[0];
   if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
-  return /^\/openai\/v1\/embeddings$/.test(pathname) || GEMINI_EMBED_PATH.test(pathname);
+  return /^\/(?:openai|openrouter)\/v1\/embeddings$/.test(pathname) || GEMINI_EMBED_PATH.test(pathname);
 }
 // Gemini embeddings (#200): :embedContent / :batchEmbedContents, billed on input only.
 const GEMINI_EMBED_PATH = /^\/gemini\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*:(?:embedContent|batchEmbedContents)$/;
@@ -229,7 +229,7 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       if (provider === "openrouter" && u && typeof u === "object") {
         providerCost = typeof u.cost === "number" && Number.isFinite(u.cost) && u.cost >= 0 ? u.cost : undefined;
       }
-      if (embeddings && provider === "openai") {
+      if (embeddings && (provider === "openai" || provider === "openrouter")) {
         // Embeddings carry only prompt_tokens (input-only billing); anything else is unknown.
         usage = u && isCount(u.prompt_tokens) && u.completion_tokens == null ? { input_tokens: u.prompt_tokens, output_tokens: 0, cached_input_tokens: 0 } : { unpriceable: NaN };
         return;

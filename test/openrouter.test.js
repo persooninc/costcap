@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractUsage, startMeteringProxy, baseUrlOverrides } from "../src/proxy.js";
+import { extractUsage, isEmbeddingsPath, startMeteringProxy, baseUrlOverrides } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 
 // OpenRouter is OpenAI-compatible, so its usage lands in the default branch.
@@ -156,4 +156,22 @@ test("#148 run summary reports each model's cost_source", async () => {
   ] });
   assert.equal(s.by_model["a/x"].cost_source, "provider");
   assert.equal(s.by_model["b/y"].cost_source, "mixed");
+});
+
+test("#202 AC1-AC5 OpenRouter embeddings extractUsage and isEmbeddingsPath", () => {
+  const e = { embeddings: true };
+  assert.deepEqual(extractUsage("openrouter", '{"model":"openai/text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8,"cost":0.0001}}', "x", e),
+    { model: "openai/text-embedding-3-small", usage: { input_tokens: 8, output_tokens: 0, cached_input_tokens: 0 }, providerCost: 0.0001 });
+  assert.deepEqual(extractUsage("openrouter", '{"model":"qwen/qwen3-embedding-8b","usage":{"prompt_tokens":8,"total_tokens":8}}', "x", e),
+    { model: "qwen/qwen3-embedding-8b", usage: { input_tokens: 8, output_tokens: 0, cached_input_tokens: 0 } });
+  for (const bad of ['{"usage":{"total_tokens":8,"cost":0.1}}', '{"usage":{"prompt_tokens":"8"}}', '{"usage":{"prompt_tokens":8,"completion_tokens":1}}', '{"model":"m"}'])
+    assert.equal(extractUsage("openrouter", bad, "x", e), null, bad);
+  // #138 unchanged: prompt-only usage off the embeddings path is unknown.
+  assert.equal(extractUsage("openrouter", '{"usage":{"prompt_tokens":8,"total_tokens":8,"cost":0.1}}', "x"), null);
+  // usage.cost on OpenAI embeddings is ignored.
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":8,"cost":0.1}}', "x", e).providerCost, undefined);
+  assert.equal(isEmbeddingsPath("/openrouter/v1/embeddings"), true);
+  assert.equal(isEmbeddingsPath("/openrouter/v1/embeddings?a=1"), true);
+  for (const bad of ["/openrouter/v1/embeddings/x", "/openrouter/v1/embeddings/", "/openrouter/v1/%65mbeddings", "/openrouter%2Fv1/embeddings",
+    "/openrouter/v1/x/../embeddings", "/openrouter//v1/embeddings", "/openrouter/v1/chat/completions"]) assert.equal(isEmbeddingsPath(bad), false, bad);
 });

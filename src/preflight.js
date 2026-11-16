@@ -81,9 +81,9 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
     return { ok: false, reason: "preflight_unpriced", model: model ?? "unknown" };
   }
   const input_tokens = Math.ceil(Buffer.byteLength(text, "utf8") / 4);
-  // OpenAI (#145) and Gemini (#200) embeddings bill input only: no output allowance.
+  // OpenAI (#145), OpenRouter (#202) and Gemini (#200) embeddings bill input only: no output allowance.
   const pathname = String(path ?? "").split(/[?#]/, 1)[0];
-  const embeddings = (provider === "openai" && pathname === "/v1/embeddings")
+  const embeddings = ((provider === "openai" || provider === "openrouter") && pathname === "/v1/embeddings")
     || (provider === "gemini" && /^\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_.-]+:(?:embedContent|batchEmbedContents)$/.test(pathname));
   const out = embeddings ? { tokens: 0, defaulted: false } : requestedOutputTokens(provider, req);
   const mult = outputMultiplier(provider, req);
