@@ -22,7 +22,7 @@ function assertReceipt(r) {
   if (!Number.isFinite(Date.parse(r.ts)) || badCost) throw new Error("Invalid receipt history; reconcile before running");
 }
 
-const POLICY_KEYS = new Set(["default", "agents", "teams"]);
+const POLICY_KEYS = new Set(["default", "agents", "teams", "preflight"]);
 const TEAM_KEYS = new Set([...SCOPES, "agents"]);
 const LIMIT_KEYS = new Set([...SCOPES, "maxSteps"]);
 
@@ -34,6 +34,7 @@ export function assertAgentPolicy(policy) {
     for (const key of Object.keys(limits ?? {})) if (!LIMIT_KEYS.has(key)) throw new Error(`Unknown limit ${key} for ${label}`);
     assertLimits(limits, label);
   };
+  if (policy.preflight !== undefined && typeof policy.preflight !== "boolean") throw new Error("Agent policy preflight must be a boolean");
   if (policy.default) check(policy.default, "default");
   for (const [agent, limits] of Object.entries(policy.agents ?? {})) check(limits, agent);
   const members = new Set();

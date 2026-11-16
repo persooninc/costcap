@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
   "       costcap check [--cap USD] [--receipts FILE]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
@@ -35,7 +35,7 @@ export function parseWrapArgs(argv) {
   if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] -- <command...>");
   const flags = argv.slice(0, sep);
   const command = argv.slice(sep + 1);
-  const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", killFile: DEFAULT_KILL_FILE, command };
+  const opts = { caps: {}, preflight: ["1", "true"].includes(process.env.COSTCAP_PREFLIGHT ?? ""), maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", killFile: DEFAULT_KILL_FILE, command };
   const money = (name, v) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number of USD, got "${v}"`);
@@ -44,6 +44,7 @@ export function parseWrapArgs(argv) {
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
     if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
+    if (f === "--preflight") { opts.preflight = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -81,9 +82,10 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared } = parseWrapArgs(argv);
+  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
+  const preflight = preflightFlag || policy?.preflight === true;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
   const who = agentId ? { agent_id: agentId, run_id: runId ?? randomUUID() } : {};
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
@@ -112,7 +114,7 @@ export async function wrap(argv) {
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger });
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

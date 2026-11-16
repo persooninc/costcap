@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { costForUsage } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { createSpiralDetector } from "./spiral.js";
+import { preflightCheck, preflightBody } from "./preflight.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -117,7 +118,7 @@ export function createSseUsageParser(provider, requestedModel) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -165,6 +166,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
+          if (preflight) {
+            const pre = preflightCheck({ provider, body, path, cap });
+            if (pre) return block(pre.reason, pre.detail, preflightBody(pre.reason, pre.detail));
+          }
           const vhit = velocity?.check();
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
           const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
