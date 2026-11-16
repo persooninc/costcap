@@ -43,6 +43,11 @@ test("#175 clearing the Hour field removes caps.hour; untouched keeps it", () =>
   assert.deepEqual(card.save(), { day: 50 });
 });
 
+test("#175 caps() skips keys a form does not render (enrollment form has no hour)", () => {
+  const { caps } = cardFns();
+  assert.deepEqual(caps({ elements: { run: { value: "" }, day: { value: "1" }, month: { value: "" } } }), { day: 1 });
+});
+
 async function fixture(t) {
   const codes = {};
   const storePath = join(mkdtempSync(join(tmpdir(), "cc-175-")), "store.json");
