@@ -11,6 +11,7 @@ import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
+import { parseSpendQuery, spendBreakdown } from "./spend.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
@@ -401,6 +402,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
             audit: labelAudit(s, u.orgId, s.audit),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)) });
+        }));
+      }
+      if (path === "/v1/spend" && req.method === "GET") {
+        return json(200, store.read((s) => {
+          const u = sessionUser(s, req);
+          const query = parseSpendQuery(new URL(req.url, origin).searchParams);
+          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
+          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names });
         }));
       }
       if (path === "/v1/fleet" && req.method === "GET") {

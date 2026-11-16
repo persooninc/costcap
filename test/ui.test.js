@@ -95,3 +95,17 @@ test('#159: agent cards render Recent runs via textContent with run click-throug
   assert.match(js, /run_id='\+encodeURIComponent\(runId\)/);
   for (const sink of ['inner', 'outer']) assert.ok(!js.includes(sink + 'HTML'));
 });
+test('#156 Spend card markup, period label and textContent-only rendering', () => {
+  const html = uiResponse('/').body;
+  assert.match(html, /<section class="card" id="spendCard">/);
+  assert.match(html, /id="spendPeriodSelect"><option value="7d">Last 7 days<\/option><option value="30d">Last 30 days<\/option><option value="month">This month \(UTC\)<\/option>/);
+  for (const id of ['spendDays', 'spendModels', 'spendAgents', 'spendTotal', 'costPeriod']) assert.match(html, new RegExp(`id="${id}"`));
+  assert.match(html, /Period: every synced receipt/);
+  const js = uiResponse('/assets/app.js').body;
+  const fn = js.slice(js.indexOf('function spendRows'), js.indexOf('async function spendLoad'));
+  assert.ok(fn.length > 50);
+  assert.ok(!new RegExp(['inner', 'insertAdjacent', 'outer'].map((p) => p + 'HTML').join('|')).test(fn));
+  assert.match(fn, /incomplete/);
+  assert.match(js, /\/v1\/spend\?group_by=/);
+  assert.match(js, /addEventListener\('change',spendLoad\)/);
+});
