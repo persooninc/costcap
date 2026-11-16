@@ -73,7 +73,7 @@ test("routes: classification, host derivation and unsupported paths", () => {
   assert.equal(classifyCloudRoute("bedrock", "POST", "/model/global.anthropic.claude-haiku-4-5-v1:0/invoke-with-response-stream").scope, "global");
   assert.equal(classifyCloudRoute("bedrock", "POST", "/model/x/count-tokens").countTokens, true);
   assert.equal(classifyCloudRoute("bedrock", "GET", "/inference-profiles"), null);
-  assert.equal(classifyCloudRoute("bedrock", "POST", "/model/x/converse"), null);
+  assert.equal(classifyCloudRoute("bedrock", "POST", "/model/x/converse-x"), null);
   assert.equal(classifyCloudRoute("bedrock", "POST", "/model/%E0%A4%A/invoke"), null);
   assert.equal(classifyCloudRoute("bedrock", "POST", "/model/../invoke"), null);
   const v = "/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-opus-4-5@20251101:rawPredict";

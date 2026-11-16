@@ -186,15 +186,21 @@ providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `
 
 ## Claude on Bedrock / Vertex
 
-`costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL` and `ANTHROPIC_VERTEX_BASE_URL`, so
-Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
+`costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and
+`ANTHROPIC_VERTEX_BASE_URL`, so boto3 / AWS SDK v3 Bedrock callers, Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
 Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
 
 - **Routes.** Bedrock `POST /model/{id}/invoke`, `invoke-with-response-stream` and
-  `count-tokens` go to `bedrock-runtime.<region>.amazonaws.com`. Vertex
+  `count-tokens`, plus Converse `POST /model/{id}/converse` and `converse-stream`
+  (boto3 `converse`/`converse_stream`, LangChain `ChatBedrockConverse`, Strands), go to `bedrock-runtime.<region>.amazonaws.com`. Vertex
   `…/locations/<loc>/publishers/anthropic/models/{id}:rawPredict` and `:streamRawPredict`
   go to `<loc>-aiplatform.googleapis.com` (`global` goes to `aiplatform.googleapis.com`).
-  Any other path (Converse, `GET /inference-profiles`, multi-region Vertex hosts such as
+  Converse is metered from `usage` (`inputTokens`, `outputTokens`, `cacheReadInputTokens`,
+  `cacheWriteInputTokens`) and ConverseStream from the final `metadata` event; a stream cut
+  before `metadata` is `stream_incomplete` (unknown cost, never $0). Preflight reads
+  `inferenceConfig.maxTokens`. If `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` is already set, wrap leaves
+  it alone and warns once. Non-Anthropic Converse models (Nova, Llama, …) are unpriced.
+  Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
   `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
 - **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes
   through unchanged; the region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`. A SigV4

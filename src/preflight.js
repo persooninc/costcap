@@ -24,7 +24,7 @@ export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropi
 export function requestedOutputTokens(provider, req) {
   const n = provider === "gemini"
     ? req?.generationConfig?.maxOutputTokens ?? req?.generation_config?.max_output_tokens
-    : req?.max_completion_tokens ?? req?.max_output_tokens ?? req?.max_tokens;
+    : req?.max_completion_tokens ?? req?.max_output_tokens ?? req?.max_tokens ?? req?.inferenceConfig?.maxTokens; // #216: Bedrock Converse
   return Number.isInteger(n) && n > 0 ? { tokens: n, defaulted: false } : { tokens: DEFAULT_MAX_OUTPUT[provider] ?? 65_536, defaulted: true };
 }
 

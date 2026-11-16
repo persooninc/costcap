@@ -1,7 +1,7 @@
 // Claude on Amazon Bedrock and Google Vertex AI (#188): route classification, upstream
 // host derivation, path-model mapping and a real-time AWS eventstream decoder.
-// Only the Anthropic Messages wire format is metered (invoke / rawPredict and their
-// streaming forms). Anything else is answered locally with 404 cloud_route_unsupported.
+// The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
+// Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
 import { resolveModelId } from "./pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
@@ -11,7 +11,7 @@ export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
 export const BEDROCK_UPSTREAM = "aws:bedrock-runtime";
 export const VERTEX_UPSTREAM = "gcp:aiplatform";
 
-const BEDROCK_ROUTE = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens)$/;
+const BEDROCK_ROUTE = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens|converse|converse-stream)$/;
 const VERTEX_ROUTE = /^\/v1(?:beta1)?\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):(rawPredict|streamRawPredict)$/;
 const REGION = /^[a-z]+-[a-z]+\d+$/; // GCP regions: us-east5, europe-west1
 
@@ -30,8 +30,8 @@ export function classifyCloudRoute(provider, method, pathname) {
     if (!m) return null;
     const modelId = safeDecode(m[1]);
     if (!modelId) return null;
-    return { modelId, stream: m[2] === "invoke-with-response-stream", countTokens: m[2] === "count-tokens",
-      scope: /^global\./.test(modelId) ? "global" : "regional" };
+    return { modelId, stream: m[2] === "invoke-with-response-stream" || m[2] === "converse-stream", countTokens: m[2] === "count-tokens",
+      ...(m[2].startsWith("converse") && { converse: true }), scope: /^global\./.test(modelId) ? "global" : "regional" };
   }
   if (provider === "vertex") {
     const m = VERTEX_ROUTE.exec(pathname);
@@ -44,6 +44,19 @@ export function classifyCloudRoute(provider, method, pathname) {
       countTokens, scope: location === "global" ? "global" : "regional", location };
   }
   return null;
+}
+
+/**
+ * #216: Bedrock Converse usage ({inputTokens, outputTokens, cacheReadInputTokens,
+ * cacheWriteInputTokens}) in Anthropic Messages shape, or null when the counters are missing.
+ */
+export function converseUsage(u) {
+  if (!u || typeof u !== "object") return null;
+  const ok = (v) => Number.isInteger(v) && v >= 0;
+  if (!ok(u.inputTokens) || !ok(u.outputTokens)) return null;
+  return { input_tokens: u.inputTokens, output_tokens: u.outputTokens,
+    ...(u.cacheReadInputTokens != null && { cache_read_input_tokens: u.cacheReadInputTokens }),
+    ...(u.cacheWriteInputTokens != null && { cache_creation_input_tokens: u.cacheWriteInputTokens }) };
 }
 
 /** Real upstream origin for a Vertex location. */
@@ -137,6 +150,11 @@ export function encodeEventFrame(headers, payload) {
   return frame;
 }
 
+/** A ConverseStream event frame (messageStart, contentBlockDelta, messageStop, metadata, ...). */
+export function converseEventFrame(type, payload) {
+  return encodeEventFrame({ ":event-type": type, ":content-type": "application/json", ":message-type": "event" }, JSON.stringify(payload));
+}
+
 /** A Bedrock chunk frame wrapping one Anthropic stream event. */
 export function bedrockChunkFrame(event) {
   return encodeEventFrame({ ":event-type": "chunk", ":content-type": "application/json", ":message-type": "event" },
@@ -148,7 +166,7 @@ export function bedrockChunkFrame(event) {
  * chunk frame's decoded Anthropic event is passed to onEvent. A bad CRC, a malformed
  * frame or an exception frame marks the stream corrupt (never priced).
  */
-export function createEventStreamDecoder(onEvent) {
+export function createEventStreamDecoder(onEvent, { converse = false } = {}) {
   let pending = Buffer.alloc(0);
   let corrupt = false;
   const frame = (f) => {
@@ -157,6 +175,11 @@ export function createEventStreamDecoder(onEvent) {
     let headers;
     try { headers = parseEventHeaders(f.subarray(12, 12 + hlen)); } catch { corrupt = true; return; }
     if (headers[":message-type"] !== "event") { corrupt = true; return; }
+    if (converse) {
+      // #216: ConverseStream frames carry their event JSON directly, typed by :event-type.
+      try { onEvent(JSON.parse(f.subarray(12 + hlen, total - 4).toString("utf8")), headers[":event-type"]); } catch { corrupt = true; }
+      return;
+    }
     if (headers[":event-type"] !== "chunk") return;
     try {
       const outer = JSON.parse(f.subarray(12 + hlen, total - 4).toString("utf8"));

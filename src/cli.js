@@ -280,6 +280,9 @@ export async function wrap(argv) {
     const [k, ...v] = line.split("=");
     env[k] = v.join("=");
   }
+  // #216: boto3 / AWS SDK v3 Converse callers read the service-specific endpoint variable.
+  if (process.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME) console.error("costcap: warning: AWS_ENDPOINT_URL_BEDROCK_RUNTIME is already set; AWS SDK Bedrock calls go there and are not metered by this wrap.");
+  else env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME = `http://127.0.0.1:${port}/bedrock`;
   // #188: the proxy re-signs SigV4 Bedrock calls only with static credentials from this env.
   if (process.env.CLAUDE_CODE_USE_BEDROCK === "1" && !awsCredentials(process.env) && !process.env.AWS_BEARER_TOKEN_BEDROCK) {
     console.error("costcap: note: CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials or AWS_BEARER_TOKEN_BEDROCK are set; signed Bedrock calls will be refused. Run: eval \"$(aws configure export-credentials --format env)\"");

@@ -24,7 +24,7 @@ import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isRe
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
-import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
+import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
@@ -350,6 +350,36 @@ export function createEventStreamUsageParser(requestedModel) {
     end() { return acc.result(); },
     get incomplete() { return decoder.corrupt || decoder.partial || acc.incomplete || !acc.result(); },
   };
+}
+
+// #216: ConverseStream -> usage. Only the final `metadata` event carries usage; a stream
+// cut before it (or with a bad frame / exception) is incomplete, never $0.
+export function createConverseStreamUsageParser(requestedModel) {
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  let seen = false, bad = false;
+  const decoder = createEventStreamDecoder((event, type) => {
+    if (type !== "metadata") return;
+    const u = converseUsage(event?.usage);
+    if (!u) { bad = true; return; }
+    seen = true;
+    acc.add({ usage: u });
+  }, { converse: true });
+  return {
+    push(bytes) { decoder.push(bytes); },
+    end() { return seen && !bad ? acc.result() : null; },
+    get incomplete() { return decoder.corrupt || decoder.partial || !seen || bad || !acc.result(); },
+  };
+}
+
+/** #216: a non-stream Converse response's usage, in the accumulator's result shape. */
+export function extractConverseUsage(text, requestedModel) {
+  let body;
+  try { body = JSON.parse(text); } catch { return null; }
+  const u = converseUsage(body?.usage);
+  if (!u) return null;
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  acc.add({ usage: u });
+  return acc.result();
 }
 
 // Bedrock/Vertex errors are {message} or {error:{...}} objects with no usage.
@@ -854,7 +884,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if ((/^text\/event-stream/i.test(contentType) || eventStream) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             // #188: Bedrock eventstream frames are forwarded byte-for-byte and decoded on the side.
-            const parser = eventStream ? createEventStreamUsageParser(requestedModel) : createSseUsageParser(meterAs, requestedModel);
+            const parser = eventStream ? (cloudRoute?.converse ? createConverseStreamUsageParser(requestedModel) : createEventStreamUsageParser(requestedModel)) : createSseUsageParser(meterAs, requestedModel);
             const decoder = new TextDecoder();
             arm(streamIdleMs);
             const filter = injected ? createUsageChunkFilter() : null;
@@ -901,7 +931,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(meterAs, raw.toString("utf8"), requestedModel,
+            metered = cloudRoute?.converse ? extractConverseUsage(raw.toString("utf8"), requestedModel) : extractUsage(meterAs, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           clearTimeout(timer);
