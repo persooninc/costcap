@@ -648,6 +648,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
                   succeeded: folded.succeeded, not_billed: folded.free });
                 recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts });
+                // #179: --policy agent/team budgets count the batch at its original ts, no restart needed.
+                agentBudgets?.settle({ receipt_id: pending.id, cost_usd: folded.cost_usd });
                 flushWarnings();
               } else {
                 // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.
