@@ -586,7 +586,9 @@ without the token counters is still `usage_unavailable`.
 
 Provider-side tools are priced per call, never silently free (#214). The
 pricing table's `tools` section carries the published rates: Anthropic
-`server_tool_use.web_search_requests` at $10 per 1,000 searches, OpenAI
+`server_tool_use.web_search_requests` at $10 per 1,000 searches (also Claude on
+Vertex AI, regional and global, without the 1.1× regional token multiplier;
+Claude on Bedrock stays unpriced until a rate is published, #222), OpenAI
 Responses `web_search_call` at $10 per 1,000 (`web_search` tool, and
 `web_search_preview` on gpt-5 / o-series) or $25 per 1,000
 (`web_search_preview` on gpt-4o / gpt-4.1), and `file_search_call` at $2.50 per
@@ -597,7 +599,7 @@ calls bill at the full rate. The OpenAI web search type comes from the
 request's `tools`; background receipts (settled on the terminal GET) use the type
 recorded at create time or the Response object's echoed `tools`, and batch
 receipts use each result line's Response `tools`. Only when none names a type
-does the higher rate apply (#219). With `--preflight`, an Anthropic web search tool
+does the higher rate apply (#219). With `--preflight`, an Anthropic or Vertex Claude web search tool
 that sets `max_uses` adds `max_uses × rate` to the worst case. Override a rate
 with a top-level `tools` map in the `--prices` / `--upstream-prices` file, for
 example `{"tools": {"web_search": 0.008}}` (keys `web_search`,

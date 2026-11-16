@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.11",
+  "version": "2026-11-16.12",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -21,12 +21,14 @@
     "https://developers.openai.com/api/docs/models/gpt-realtime and https://developers.openai.com/api/docs/pricing (Realtime: gpt-realtime, gpt-realtime-2.1, gpt-realtime-2.1-mini text/audio/image; gpt-realtime-mini text only per #194, audio stays unpriced; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/pricing (Audio #198: whisper-1 $0.006/min, gpt-transcribe $0.0045/min; gpt-4o-transcribe(-diarize) $2.50/$10, gpt-4o-mini-transcribe $1.25/$5 per 1M tokens; tts-1 $15, tts-1-hd $30 per 1M characters; gpt-4o-mini-tts $0.60 text in / $12 audio out; retrieved 2026-11-16)",
     "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool (web search $10 per 1,000 searches plus tokens; errored searches not billed; retrieved 2026-11-16)",
+    "https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/web-search (#222: Claude web search on Vertex AI is GA for Claude 4+ and billed per search as an add-on, same $10 per 1,000 as the Claude API; no regional multiplier on the tool rate; Gemini grounding stays unpriced; retrieved 2026-11-16)",
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (Gemini 2.5 Pro / Flash / Flash-Lite on Vertex AI: same per-token, cached-input and >200K long-context rates as the Gemini API; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/pricing (Built-in tools: web search $10.00/1k calls; web search preview $10/1k reasoning models, $25/1k other models; file search $2.50/1k tool calls; retrieved 2026-11-16)"
   ],
   "tools": {
     "unit": "usd_per_call",
     "anthropic": { "web_search": { "usd_per_call": 0.01 } },
+    "vertex": { "web_search": { "families": { "claude": 0.01 } } },
     "openai": {
       "web_search": { "families": { "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.01, "gpt-4.1": 0.01 } },
       "web_search_preview": { "families": { "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.025, "gpt-4.1": 0.025 } },

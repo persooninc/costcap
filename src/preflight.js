@@ -10,11 +10,12 @@ import { lookupPrice, selectRates, batchMultiplier, toolRate, TABLE_VERSION, TAB
 // #214: Anthropic web search with max_uses caps billed searches per request; the worst case adds
 // max_uses x the per-search rate. Without max_uses the search count is unbounded and not added.
 export function toolWorstCase(provider, req, model) {
-  if (provider !== "anthropic" || !Array.isArray(req?.tools)) return { ok: true, usd: 0, calls: 0 };
+  // #222: Claude on Vertex AI bills web search at the same per-search rate (tools.vertex, Claude only).
+  if ((provider !== "anthropic" && provider !== "vertex") || !Array.isArray(req?.tools)) return { ok: true, usd: 0, calls: 0 };
   let calls = 0;
   for (const t of req.tools) if (typeof t?.type === "string" && t.type.startsWith("web_search_") && Number.isInteger(t.max_uses) && t.max_uses > 0) calls += t.max_uses;
   if (!calls) return { ok: true, usd: 0, calls: 0 };
-  const rate = toolRate("anthropic", "web_search", model);
+  const rate = toolRate(provider, "web_search", model);
   return rate === null ? { ok: false } : { ok: true, usd: calls * rate, calls };
 }
 
