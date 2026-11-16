@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { digestPathFor, verifyTableDigest } from "./pricing-digest.js";
+import { dayOf, datedRow } from "./pricing-schedule.js";
 
 export const DEFAULT_TABLE_PATH = fileURLToPath(new URL("./pricing-table.json", import.meta.url));
 
@@ -55,17 +56,17 @@ export function resolveModelId(model) {
   return null;
 }
 
-function resolveEntry(model) {
-  const id = resolveModelId(model);
-  return id === null ? undefined : table.models[id];
-}
+export { dayOf, datedRow, validateSchedules } from "./pricing-schedule.js";
 
-export function lookupPrice(model) {
+// opts.undated: price from the base row only (Vertex keeps its 2.5 rows undated).
+export function lookupPrice(model, at, { undated = false } = {}) {
   assertTableIntegrity();
-  const entry = resolveEntry(model);
+  const id = resolveModelId(model);
   const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
-  if (entry) return { model, ...entry, ...pin, fallback: false };
-  return { model, ...table.fallback, ...pin, fallback: true };
+  if (id === null) return { model, ...table.fallback, ...pin, fallback: true };
+  if (undated) { const { effective, ...base } = table.models[id]; return { model, ...base, ...pin, fallback: false }; }
+  const d = datedRow(table, id, dayOf(at));
+  return { model, ...d.row, ...(d.rates_effective_from && { rates_effective_from: d.rates_effective_from }), ...(d.billed_as && { billed_as: d.billed_as }), ...pin, fallback: false };
 }
 
 // True when a model (or its dated snapshot base) has a published rate (#153: --unknown-models refuse).
@@ -181,8 +182,8 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale } = {}) {
-  const price = lookupPrice(model);
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false } = {}) {
+  const price = lookupPrice(model, at, { undated });
   // #198: a per-minute / per-character model (whisper-1, tts-1) has no token rate: unknown, never NaN or $0.
   if (!price.fallback && !(Number.isFinite(price.input) && Number.isFinite(price.output))) {
     return { model, cost_usd: null, reason: "unit_unpriced", input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
@@ -229,6 +230,8 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     ...(regionalM !== null && { regional_multiplier: regionalM }),
     ...(signal.speed !== undefined && { speed: signal.speed }),
     ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
+    ...(price.rates_effective_from && { rates_effective_from: price.rates_effective_from }),
+    ...(price.billed_as && { billed_as: price.billed_as }),
     table_version: price.table_version,
     table_sha256: price.table_sha256,
     fallback: price.fallback,

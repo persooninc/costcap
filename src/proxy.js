@@ -507,7 +507,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, now = Date.now } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -523,7 +523,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return sharedLedger.withLock(() => { held = true; try { return fn(); } finally { held = false; } });
   };
   const emitBase = (receipt) => guarded(() => {
-    const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
+    const complete = { id: randomUUID(), ts: new Date(now()).toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     tagCaps?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
@@ -565,7 +565,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return entry;
   };
   const emitEvent = (event) => guarded(() => {
-    const complete = { ts: new Date().toISOString(), ...event };
+    const complete = { ts: new Date(now()).toISOString(), ...event };
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
@@ -592,6 +592,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   // #190: one stderr hint when a custom upstream's first response is a 404 (usually a missing /v1).
   const customFirstSeen = new Set();
   const server = http.createServer((req, res) => {
+    // #236: an interactive call is priced at the instant the proxy received the request.
+    const reqAt = now();
     const url = new URL(req.url, "http://localhost");
     let [, provider, ...rest] = url.pathname.split("/");
     let upstream = upstreams[provider];
@@ -606,7 +608,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // #189: built-in routes use per-model overrides/discounts from the same file when present.
     const priced = (m) => (custom ? userPrice(userPrices, provider, m) !== null : userPrices ? isPricedWithOverrides(userPrices, provider, m) : isPricedModel(m));
     const priceFor = custom ? (m) => { const r = userPrice(userPrices, provider, m); return r && { model: m, ...r, fallback: false }; }
-      : userPrices ? (m) => effectivePrice(userPrices, provider, m) : undefined;
+      : userPrices ? (m) => effectivePrice(userPrices, provider, m, reqAt) : undefined;
     const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
     // #188: Bedrock/Vertex serve only the Anthropic Messages routes. Anything else is answered
@@ -796,11 +798,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             const cloudPrice = cloud ? () => {
               if (!cloudModel) return null;
               const rm = cloudRoute.scope === "regional" ? regionalMultiplier(cloudModel) : null;
-              return rm ? scalePrice(lookupPrice(cloudModel), rm) : lookupPrice(cloudModel);
+              return rm ? scalePrice(lookupPrice(cloudModel, undefined, { undated: true }), rm) : lookupPrice(cloudModel, undefined, { undated: true });
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
-            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor, requestedModel), onFit)
-              : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
+            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor, requestedModel, reqAt), onFit)
+              : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined, cloud ? undefined : reqAt);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -990,7 +992,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             resolvedBackground.add(bgRead.id);
             let c = null;
             if (metered && !metered.toolUseUnpriced) {
-              c = withToolCost(costWithOverrides(userPrices, provider, metered.model, metered.usage), userPrices, provider, metered,
+              // #236: a background response is priced at create and settle time; the higher cost is kept.
+              const atCreate = costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: bgPending.ts ?? reqAt });
+              const atSettle = costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: reqAt });
+              const tokens = atCreate.cost_usd === null || atSettle.cost_usd === null ? (atCreate.cost_usd === null ? atCreate : atSettle)
+                : atSettle.cost_usd > atCreate.cost_usd ? atSettle : atCreate;
+              c = withToolCost(tokens, userPrices, provider, metered,
                 // #219: the GET has no tools; use the type recorded at create time, else the response's echoed tools.
                 bgPending.web_search_type ? { tools: [{ type: bgPending.web_search_type }] } : parsedBody, raw ? safeJson(raw) : null);
               if (c.cost_usd === null || c.reason) c = null;
@@ -1050,8 +1057,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (metered) {
             if (cloud) metered.model = cloudModel;
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
-              : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional" })
-                : costWithOverrides(userPrices, provider, metered.model, metered.usage));
+              : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional", undated: true })
+                : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: reqAt }));
             rateLimit?.record(usageTokens(metered.usage));
             // #235: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier).
             if (metered.providerCost !== undefined && (receipt.cost_usd !== null || PROVIDER_COST_SETTLES.has(receipt.reason))) {
@@ -1104,7 +1111,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             const pending = batchId ? findPending(batchId) : null;
             if (pending && !resolvedBatches.has(batchId) && pending.provider === provider) {
               resolvedBatches.add(batchId);
-              const folded = foldBatchResults(provider, inlineResults ?? raw.toString("utf8"), userPrices, { model: pending.model && pending.model !== "unknown" ? pending.model : undefined });
+              const folded = foldBatchResults(provider, inlineResults ?? raw.toString("utf8"), userPrices, { model: pending.model && pending.model !== "unknown" ? pending.model : undefined, createdAt: pending.ts, settledAt: reqAt });
               receipt.batch_id = batchId;
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
@@ -1318,7 +1325,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             latch({ ...receiptBase, model, cost_usd: null, reason: "usage_unavailable" }, "A Realtime response reported no usable token usage. Restart only after reconciling this request.");
             return true;
           }
-          const priced = costWithOverrides(userPrices, "openai", model, usage);
+          const priced = costWithOverrides(userPrices, "openai", model, usage, { at: now() });
           const receipt = { ...receiptBase, ...priced };
           rateLimit?.record(usageTokens(usage));
           if (receipt.cost_usd === null) {

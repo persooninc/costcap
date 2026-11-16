@@ -97,7 +97,7 @@ export function anthropicBatchModels(body) {
 
 const r6 = (n) => Number(n.toFixed(6));
 
-function priceLine(provider, body, userPrices, model) {
+function priceLine(provider, body, userPrices, model, instants = [undefined]) {
   const acc = createUsageAccumulator(provider, model);
   acc.add(body);
   const metered = acc.result();
@@ -105,8 +105,13 @@ function priceLine(provider, body, userPrices, model) {
   // A premium speed/service tier has no published batch rate: unknown, never standard.
   if (premiumTier(metered.usage)) return null;
   // #189: a discount stacks on the batch multiplier; an absolute override has no batch rate (unknown).
-  const tokens = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider });
-  if (tokens.fallback || tokens.cost_usd === null) return null;
+  // #236: priced at the create and the settle instant; the higher cost is kept, never the cheaper guess.
+  let tokens = null;
+  for (const at of instants) {
+    const t = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider, at });
+    if (t.fallback || t.cost_usd === null) return null;
+    if (!tokens || t.cost_usd > tokens.cost_usd) tokens = t;
+  }
   // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
   const c = withToolCost(tokens, userPrices, provider, metered, null, body);
   if (c.cost_usd === null) return null;
@@ -118,7 +123,8 @@ function priceLine(provider, body, userPrices, model) {
  * or { ok: false, reason: "batch_unpriced", line }. Any malformed, unpriced or
  * premium-speed billed line makes the whole batch unknown: never a $0 guess.
  */
-export function foldBatchResults(provider, text, userPrices = null, { model } = {}) {
+export function foldBatchResults(provider, text, userPrices = null, { model, createdAt, settledAt } = {}) {
+  const instants = createdAt === undefined && settledAt === undefined ? [undefined] : [createdAt ?? settledAt, settledAt ?? createdAt];
   let cost = 0, succeeded = 0, free = 0, n = 0;
   const byModel = {};
   const lines = String(text).split("\n");
@@ -147,7 +153,7 @@ export function foldBatchResults(provider, text, userPrices = null, { model } = 
       if (status < 200 || status >= 300) { free++; continue; }
       billed = line.response.body;
     }
-    const c = priceLine(provider, billed, userPrices, model);
+    const c = priceLine(provider, billed, userPrices, model, instants);
     if (!c) return { ok: false, reason: "batch_unpriced", line: i + 1 };
     cost += c.cost_usd;
     // #226: keep each succeeded line's model so bill-check can attribute the batch per model.

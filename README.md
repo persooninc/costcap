@@ -307,7 +307,14 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `preflight_unpriced` naming it.
 - Local `wrap`/`check` daily and monthly periods use UTC; hosted caps follow the org budget period (below). Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
-  OpenRouter model ids. Unknown models use the declared fallback. On the
+  OpenRouter model ids. Announced price changes ship as effective-dated rows (#236):
+  from 00:00 UTC on the date the new rate applies with no upgrade (Gemini 4 Carbon/Argon
+  double on 2026-12-01, 3.8/3.6 Flash on 2027-01-01; `gemini-2.5-pro` / `gemini-2.5-flash`
+  bill as 3.8 Flash / 3.5 Flash-Lite from 2026-12-01; Vertex keeps the 2.5 rates).
+  Calls price at the instant the proxy received them; batch and background lines at the
+  higher of create and settle time. Receipts priced from a dated row carry
+  `rates_effective_from` (and `billed_as`). `costcap pricing show MODEL [--at YYYY-MM-DD]`
+  lists scheduled changes. Unknown models use the declared fallback. On the
   `/openrouter` route only, a finite, non-negative `usage.cost` in the response
   (or the last SSE usage chunk) is OpenRouter's exact USD charge and replaces
   the table/fallback price for any routed model. Every priced receipt carries

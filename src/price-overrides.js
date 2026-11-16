@@ -60,9 +60,9 @@ export function costWithOverrides(prices, provider, model, usage = {}, opts = {}
   return costForAbsolute(prices, o.absolute, model, usage, opts);
 }
 
-function costForAbsolute(prices, rate, model, usage, { batch } = {}) {
+function costForAbsolute(prices, rate, model, usage, { batch, at, undated } = {}) {
   const { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = usage;
-  const table = lookupPrice(model);
+  const table = lookupPrice(model, at, { undated });
   const lc = table.fallback ? null : table.long_context;
   const hasModality = modality_tokens && typeof modality_tokens === "object" &&
     Object.values(modality_tokens).some((s) => s && Object.values(s).some((n) => n > 0));
@@ -98,13 +98,13 @@ export function isPricedWithOverrides(prices, provider, model) {
 }
 
 /** Effective price row for preflight / pricing show: absolute rows are standard-only. */
-export function effectivePrice(prices, provider, model) {
+export function effectivePrice(prices, provider, model, at) {
   const o = builtinOverride(prices, provider, model);
-  if (!o) return lookupPrice(model);
+  if (!o) return lookupPrice(model, at);
   if (o.absolute) return { model, ...o.absolute, fallback: false, user_prices: true };
   const m = 1 - o.discount;
   const scale = (r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v && typeof v === "object" && !Array.isArray(v) ? scale(v) : v]));
-  return { ...scale(lookupPrice(model)), user_prices: true, discount: o.discount };
+  return { ...scale(lookupPrice(model, at)), user_prices: true, discount: o.discount };
 }
 
 /**

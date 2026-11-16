@@ -3,6 +3,7 @@
 // reformatting the file does not change the digest but editing any value does.
 
 import { createHash } from "node:crypto";
+import { validateSchedules } from "./pricing-schedule.js";
 
 export function canonicalize(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
@@ -26,6 +27,9 @@ export function verifyTableDigest(table, recorded) {
   if (!recorded || typeof recorded.sha256 !== "string") return { ok: false, actual, expected: null, reason: "digest_missing" };
   if (recorded.sha256 !== actual) return { ok: false, actual, expected: recorded.sha256, reason: "digest_mismatch" };
   if (recorded.version !== table.version) return { ok: false, actual, expected: recorded.sha256, reason: "version_mismatch" };
+  // #236: a malformed effective-dated schedule is refused like a digest mismatch.
+  const invalid = validateSchedules(table);
+  if (invalid) return { ok: false, actual, expected: recorded.sha256, reason: `schedule_invalid: ${invalid}` };
   return { ok: true, actual, expected: recorded.sha256, version: table.version };
 }
 

@@ -57,7 +57,9 @@ export function outputMultiplier(provider, req) {
 // #167: an OpenRouter `models` fallback list may route to any entry, so the
 // worst case is the max over every candidate (any unpriced candidate refuses).
 // #188: pathModel (cloud routes) is the model from the request path, used over the body.
-export function estimateWorstCase(provider, body, path = "", priceFor, pathModel) {
+export function estimateWorstCase(provider, body, path = "", priceFor, pathModel, at) {
+  // #236: the shipped table prices at the moment of the check.
+  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
@@ -116,8 +118,8 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel) {
-  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel), onFit);
+export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel, at) {
+  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel, at), onFit);
 }
 
 // #205: an Anthropic Message Batches create is estimated as the SUM of every
@@ -126,7 +128,8 @@ export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathM
 // entry model refuses as preflight_unpriced naming that model.
 // #230: a Gemini inline batch (batch.input_config.requests.requests[].request) is estimated the
 // same way, each entry priced at the create's path model.
-export function estimateBatch(provider, body, priceFor, pathModel) {
+export function estimateBatch(provider, body, priceFor, pathModel, at) {
+  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let reqs;
   if (provider === "gemini") {

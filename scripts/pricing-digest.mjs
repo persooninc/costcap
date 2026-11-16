@@ -6,12 +6,16 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { digestPathFor, tableDigest, verifyTableDigest } from "../src/pricing-digest.js";
+import { validateSchedules } from "../src/pricing-schedule.js";
 
 export function run(args, tablePath = fileURLToPath(new URL("../src/pricing-table.json", import.meta.url))) {
   const table = JSON.parse(readFileSync(tablePath, "utf8"));
   const sidecar = digestPathFor(tablePath);
   let recorded = null;
   try { recorded = JSON.parse(readFileSync(sidecar, "utf8")); } catch { recorded = null; }
+  // #236: an invalid effective-dated schedule is never written or accepted.
+  const invalid = validateSchedules(table);
+  if (invalid) return { code: 1, message: `pricing table schedule invalid: ${invalid}` };
   const v = verifyTableDigest(table, recorded);
   if (args.includes("--check")) {
     if (v.ok) return { code: 0, message: `pricing table ${table.version} sha256 ${v.actual} OK` };

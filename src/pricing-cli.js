@@ -2,7 +2,7 @@
 // Returns { code, out, err } so it is testable without spawning; table path injectable.
 
 import { readFileSync } from "node:fs";
-import { loadPricingTable } from "./pricing.js";
+import { loadPricingTable, datedRow, dayOf } from "./pricing.js";
 import { auditReceipts } from "./pricing-digest.js";
 import { loadUpstreamPrices } from "./upstreams.js";
 import { builtinOverride, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
@@ -15,7 +15,7 @@ function readJsonl(path) {
 
 const fmt = (n) => (n == null ? "n/a" : `$${Number(n.toFixed(6))}`);
 
-export const PRICING_USAGE = "usage: costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--prices FILE]";
+export const PRICING_USAGE = "usage: costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--at YYYY-MM-DD] [--prices FILE]";
 
 export function pricingCommand(args, { tablePath } = {}) {
   const [sub, ...rest] = args;
@@ -44,7 +44,12 @@ export function pricingCommand(args, { tablePath } = {}) {
     if (rest.includes("--json")) return { code, out: JSON.stringify({ ok: code === 0, table: { path, version: table.version, ...v }, ...(audit ? { receipts: audit } : {}) }), err: "" };
     return { code, out: code === 0 ? lines.join("\n") : "", err: code === 0 ? "" : lines.join("\n") };
   }
-  const model = rest.find((a, i) => !a.startsWith("--") && rest[i - 1] !== "--prices");
+  const model = rest.find((a, i) => !a.startsWith("--") && rest[i - 1] !== "--prices" && rest[i - 1] !== "--at");
+  // #236: --at YYYY-MM-DD prints the row in effect on that UTC day (default: today).
+  const atArg = option(rest, "--at");
+  if (atArg !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(atArg)) return { code: 2, out: "", err: `--at must be YYYY-MM-DD, got ${atArg}` };
+  let day;
+  try { day = dayOf(atArg === undefined ? undefined : `${atArg}T00:00:00Z`); } catch { return { code: 2, out: "", err: `--at must be a valid date, got ${atArg}` }; }
   const head = `pricing table ${table.version} (${table.currency}) sha256 ${v.actual}${v.ok ? "" : " UNVERIFIED"}`;
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
   // A long-context tier (#151) prints as a second row for the same model.
@@ -69,10 +74,22 @@ export function pricingCommand(args, { tablePath } = {}) {
   if (provider) {
     const o = builtinOverride(prices, provider, model);
     const tag = o.absolute ? ` (user_prices ${prices.sha256.slice(0, 8)})` : ` (discount ${o.discount})`;
-    const eff = effectivePrice(prices, provider, model);
+    const eff = effectivePrice(prices, provider, model, `${day}T00:00:00Z`);
     return { code: 0, out: [head, ...(o.absolute ? [row(`${provider}/${model}`, eff, tag)] : rowsFor(`${provider}/${model}`, eff).map((l, i) => (i === 0 ? l.replace(":", `${tag}:`) : l)))].join("\n"), err: "" };
   }
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
-  const entry = table.models[model] ?? table.models[base];
-  return { code: 0, out: [head, entry ? rowsFor(model, entry).join("\n") : row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };
+  const id = Object.hasOwn(table.models, model) ? model : Object.hasOwn(table.models, base) ? base : null;
+  if (id === null) return { code: 0, out: [head, row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };
+  const d = datedRow(table, id, day);
+  const lines = rowsFor(model, d.row);
+  if (d.billed_as) lines[0] = lines[0].replace(":", ` (billed as ${d.billed_as}):`);
+  lines.unshift(`${model} on ${day}${d.rates_effective_from ? ` (rates effective from ${d.rates_effective_from})` : ""}`);
+  // Scheduled changes (#236) list after the row: "from 2026-12-01: ...".
+  for (const e of table.models[id].effective ?? []) {
+    if (e.from <= day) continue;
+    if (e.billed_as) { lines.push(`from ${e.from}: billed as ${e.billed_as}`); continue; }
+    const after = datedRow(table, id, e.from).row;
+    lines.push(`from ${e.from}: input ${fmt(after.input)}, cached_input ${fmt(after.cached_input)}, cache_write ${fmt(after.cache_write)}, cache_write_1h ${fmt(after.cache_write_1h)}, output ${fmt(after.output)}`);
+  }
+  return { code: 0, out: [head, ...lines].join("\n"), err: "" };
 }
