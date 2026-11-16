@@ -207,17 +207,24 @@ test("wrap sends SIGKILL after 5 seconds when the child ignores SIGTERM", async 
   const dir = mkdtempSync(join(tmpdir(), "cc-sig-"));
   const killFile = join(dir, "KILL");
   const termed = join(dir, "termed");
-  const script = `process.on("SIGTERM",()=>require("node:fs").writeFileSync(${JSON.stringify(termed)},"1"));setInterval(()=>{},1000)`;
+  const ready = join(dir, "ready");
+  // Regression: a fixed 200ms sleep raced the child's SIGTERM handler install on slow
+  // runners (child died from default SIGTERM, no "termed" file). Wait for readiness instead.
+  const script = `process.on("SIGTERM",()=>require("node:fs").writeFileSync(${JSON.stringify(termed)},"1"));require("node:fs").writeFileSync(${JSON.stringify(ready)},"1");setInterval(()=>{},1000)`;
   const started = Date.now();
   const child = spawn(process.execPath, ["src/cli.js", "wrap", "--receipts", join(dir, "r.jsonl"), "--kill-file", killFile, "--", process.execPath, "-e", script], { stdio: "ignore" });
-  await new Promise((r) => setTimeout(r, 200));
+  const readyBy = Date.now() + 10000;
+  while (!existsSync(ready)) {
+    assert.ok(Date.now() < readyBy, "child never installed SIGTERM handler");
+    await new Promise((r) => setTimeout(r, 25));
+  }
   kill(killFile, "stop");
   const code = await new Promise((resolve) => child.on("exit", resolve));
   const elapsed = Date.now() - started;
   assert.equal(code, 143);
   assert.equal(readFileSync(termed, "utf8"), "1");
   assert.ok(elapsed >= 5000, `elapsed ${elapsed}`);
-  assert.ok(elapsed < 12000, `elapsed ${elapsed}`);
+  assert.ok(elapsed < 20000, `elapsed ${elapsed}`);
 });
 
 test("wrap enforces day-cap and month-cap from the CLI", async () => {
