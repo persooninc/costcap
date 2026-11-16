@@ -29,35 +29,63 @@ export function verifyToken(token, storedHash) {
 
 export const CAP_KEYS = ["run", "hour", "day", "month"];
 
-// Issue #208: time-boxed cap raise overlay. policy.raise = { <scope>: { cap, expires_at, request_id } }.
-// `cap` is the absolute effective cap while now < expires_at; base `caps` are never edited.
+// Issue #208/#212: time-boxed cap raise overlay. policy.raise = { <scope>: [{ amount_usd, expires_at, request_id }, ...] }.
+// Raises stack: the effective cap is computed at evaluation time as current base + sum of
+// active raise amounts, so lowering the base during a raise lowers the effective cap at once.
+// Legacy (#208) entries { cap, expires_at, request_id } are still read: they are migrated by
+// expireRaises() using the approved amount, and until then read as amount = cap - current base
+// (never negative), so no in-flight raise grows.
+const isLegacyRaise = (r) => r && typeof r === "object" && !Array.isArray(r) && "cap" in r;
+const raiseEntryError = (r) => !r || typeof r !== "object" || typeof r.expires_at !== "string" || !Number.isFinite(Date.parse(r.expires_at)) || typeof r.request_id !== "string";
+
+/** Entries for one scope as an array (legacy single objects wrapped). */
+export function raiseEntries(v) {
+  if (v == null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
 export function raiseError(raise) {
   if (raise === undefined || raise === null) return null;
   if (typeof raise !== "object" || Array.isArray(raise)) return "raise must be an object";
-  for (const [k, r] of Object.entries(raise)) {
+  for (const [k, v] of Object.entries(raise)) {
     if (!CAP_KEYS.includes(k)) return `raise.${k} is not a cap scope`;
-    if (!r || typeof r !== "object" || !(typeof r.cap === "number" && Number.isFinite(r.cap) && r.cap > 0) || typeof r.expires_at !== "string" || !Number.isFinite(Date.parse(r.expires_at)) || typeof r.request_id !== "string") return `raise.${k} must be { cap, expires_at, request_id }`;
+    if (Array.isArray(v)) {
+      if (!v.length) return `raise.${k} must be a non-empty array`;
+      for (const r of v) if (raiseEntryError(r) || !(typeof r.amount_usd === "number" && Number.isFinite(r.amount_usd) && r.amount_usd > 0)) return `raise.${k} entries must be { amount_usd, expires_at, request_id }`;
+    } else if (raiseEntryError(v) || !isLegacyRaise(v) || !(typeof v.cap === "number" && Number.isFinite(v.cap) && v.cap > 0)) return `raise.${k} must be an array of { amount_usd, expires_at, request_id }`;
   }
   return null;
 }
 
-/** Active raises at nowMs (expired ones dropped). */
+/** Active raises at nowMs per scope (expired entries dropped). */
 export function activeRaises(policy, nowMs = Date.now()) {
   const out = {};
-  for (const [k, r] of Object.entries(policy?.raise ?? {})) if (nowMs < Date.parse(r.expires_at)) out[k] = r;
+  for (const [k, v] of Object.entries(policy?.raise ?? {})) {
+    const live = raiseEntries(v).filter((r) => nowMs < Date.parse(r.expires_at));
+    if (live.length) out[k] = live;
+  }
   return out;
 }
 
-/** Base caps with any active raise applied; a raise only ever raises a scope that already has a base cap. */
+/** Amount one raise entry adds on top of `base`. */
+export function raiseAmount(r, base) {
+  return isLegacyRaise(r) ? Math.max(0, r.cap - base) : r.amount_usd;
+}
+
+/** Current base caps plus the sum of active raise amounts; a raise only ever raises a scope that already has a base cap. */
 export function effectiveCaps(policy, nowMs = Date.now()) {
   const caps = { ...(policy?.caps ?? {}) };
-  for (const [k, r] of Object.entries(activeRaises(policy, nowMs))) if (caps[k] != null) caps[k] = Math.max(caps[k], r.cap);
+  for (const [k, list] of Object.entries(activeRaises(policy, nowMs))) {
+    if (caps[k] == null) continue;
+    const base = caps[k];
+    caps[k] = Number((base + list.reduce((sum, r) => sum + raiseAmount(r, base), 0)).toFixed(6));
+  }
   return caps;
 }
 
 /** Earliest future raise expiry (ms) or null, so a long-running wrapper can re-resolve offline. */
 export function nextRaiseExpiry(policy, nowMs = Date.now()) {
-  const t = Object.values(activeRaises(policy, nowMs)).map((r) => Date.parse(r.expires_at));
+  const t = Object.values(activeRaises(policy, nowMs)).flat().map((r) => Date.parse(r.expires_at));
   return t.length ? Math.min(...t) : null;
 }
 

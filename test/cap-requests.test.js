@@ -150,15 +150,15 @@ test("hosted: request limits, roles, approval overlay, verdict across expiry and
   const policy = (await request("/v1/policy", undefined, null, agent.token)).body;
   assert.equal(policy.version, policyBefore.version + 1);
   assert.deepEqual(policy.caps, { day: 5, month: 50 });
-  assert.equal(policy.raise.day.cap, 20);
-  assert.equal(policy.raise.day.expires_at, new Date(f.now() + 2 * HOUR).toISOString());
+  assert.deepEqual(policy.raise.day.map((r) => r.amount_usd), [15]);
+  assert.equal(policy.raise.day[0].expires_at, new Date(f.now() + 2 * HOUR).toISOString());
   // AC5: verdict uses the raised cap.
   const during = await request(`/v1/agents/${agent.agentId}/budget`, undefined, null, agent.token);
   assert.equal(during.body.verdict, "ok");
   assert.equal(during.body.budget_remaining.day_usd, 14);
   // AC2: a later "Save caps" edit keeps the active raise.
   assert.equal((await request(`/v1/agents/${agent.agentId}/policy`, { caps: { day: 6, month: 50 } }, owner)).status, 200);
-  assert.equal((await request("/v1/policy", undefined, null, agent.token)).body.raise.day.cap, 20);
+  assert.equal((await request("/v1/policy", undefined, null, agent.token)).body.raise.day[0].amount_usd, 15);
   // AC4: killed is never lifted by a raise.
   assert.equal((await request(`/v1/agents/${agent.agentId}/policy`, { killed: true }, owner)).status, 200);
   assert.equal((await request(`/v1/agents/${agent.agentId}/budget`, undefined, null, agent.token)).body.verdict, "killed");
@@ -188,7 +188,7 @@ test("hosted: request limits, roles, approval overlay, verdict across expiry and
   const ap = byAction("cap_request.approve")[0];
   assert.equal(ap.detail.reason, ask.reason);
   assert.deepEqual(ap.detail.before.caps, { day: 5, month: 50 });
-  assert.equal(ap.detail.after.raise.day.cap, 20);
+  assert.equal(ap.detail.after.raise.day[0].amount_usd, 15);
   assert.equal(byAction("cap_request.create")[0].actor, agent.agentId);
   assert.equal(byAction("cap_request.expire")[0].actor, "cap-raise-expiry");
   const csv = (await request("/v1/audit.csv", undefined, owner)).body;
@@ -204,6 +204,78 @@ test("unit: hosted verdict and evidence use the effective cap; unknown cost is n
   const spendFor = () => ({ day: { usd: 6, unknown: 0 }, month: { usd: 6, unknown: 0 } });
   const ev = buildEvidence({ orgId: "o", nowMs: T0, spendFor, agents: [agent] });
   assert.deepEqual(ev.agents[0].effective_caps, { day: 25 });
-  assert.equal(ev.agents[0].raises.day.request_id, "r");
+  assert.equal(ev.agents[0].raises.day[0].request_id, "r");
   assert.equal(buildEvidence({ orgId: "o", nowMs: T0 + HOUR, spendFor, agents: [agent] }).agents[0].effective_caps, undefined);
+});
+
+// Issue #212: raises stack on top of the current base cap.
+const iso = (ms) => new Date(ms).toISOString();
+function stackStore() {
+  return { agents: { a: { id: "a", orgId: "o", revoked: false, policy: { version: 1, caps: { day: 10 }, killed: false } } }, capRequests: {} };
+}
+function file(s, id, amount, hours, nowMs) {
+  const req = createCapRequest(s, { agent: s.agents.a, actor: "a", input: { scope: "day", amount_usd: amount, duration_hours: hours, reason: id }, id, nowMs });
+  return approveCapRequest(s, { request: findRequest(s, "o", req.id), approval: { amount_usd: amount, duration_hours: hours, note: null }, actor: "owner", nowMs });
+}
+
+test("#212 unit: r1 then r2 on the same scope stack and expire independently, each audited once", () => {
+  const s = stackStore();
+  file(s, "r1", 20, 4, T0);
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0), { day: 30 });
+  file(s, "r2", 5, 1, T0 + 60_000);
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0 + 60_000), { day: 35 });
+  assert.deepEqual(validatePolicy(s.agents.a.policy), []);
+  assert.deepEqual(s.agents.a.policy.raise.day.map((r) => r.request_id), ["r1", "r2"]);
+  // r2 lapses first; r1 keeps its $20.
+  const rows1 = expireRaises(s, T0 + 60_000 + HOUR);
+  assert.deepEqual(rows1.map((r) => r.request_id), ["r2"]);
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0 + 2 * HOUR), { day: 30 });
+  assert.equal(s.capRequests.r1.status, "approved");
+  const rows2 = expireRaises(s, T0 + 10 * HOUR);
+  assert.deepEqual(rows2.map((r) => r.request_id), ["r1"]);
+  assert.deepEqual(expireRaises(s, T0 + 20 * HOUR), []);
+  assert.deepEqual([s.capRequests.r1.status, s.capRequests.r2.status], ["expired", "expired"]);
+  assert.equal(s.agents.a.policy.raise, undefined);
+});
+
+test("#212 unit: lowering the base during a raise lowers the effective cap at once", () => {
+  const s = stackStore();
+  file(s, "r1", 20, 4, T0);
+  s.agents.a.policy = { ...s.agents.a.policy, caps: { day: 2 }, version: s.agents.a.policy.version + 1 };
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0), { day: 22 });
+  assert.equal(resolvePolicy({ lastKnown: s.agents.a.policy, nowMs: T0 }).caps.day, 22);
+  assert.equal(hostedAgentVerdict({ agent: s.agents.a, receipts: [{ id: "x", ts: iso(T0), cost_usd: 25 }], nowMs: T0 }).verdict, "budget_exceeded");
+});
+
+test("#212 unit: offline wrapper reverts at each expiry via nextRaiseExpiry", () => {
+  const policy = { version: 3, caps: { day: 10 }, killed: false, raise: { day: [
+    { amount_usd: 20, expires_at: iso(T0 + 4 * HOUR), request_id: "r1" },
+    { amount_usd: 5, expires_at: iso(T0 + HOUR), request_id: "r2" }] } };
+  let r = resolvePolicy({ lastKnown: policy, nowMs: T0 });
+  assert.deepEqual([r.caps.day, r.raiseExpiresAt], [35, T0 + HOUR]);
+  r = resolvePolicy({ lastKnown: policy, nowMs: r.raiseExpiresAt });
+  assert.deepEqual([r.caps.day, r.raiseExpiresAt], [30, T0 + 4 * HOUR]);
+  r = resolvePolicy({ lastKnown: policy, nowMs: r.raiseExpiresAt });
+  assert.deepEqual([r.caps.day, r.raiseExpiresAt], [10, null]);
+});
+
+test("#212 unit: legacy {cap} overlays migrate without growing; orphaned approved requests expire once", () => {
+  const s = { agents: { a: { id: "a", orgId: "o", policy: { version: 2, caps: { day: 10, month: 50 }, killed: false, raise: {
+    day: { cap: 30, expires_at: iso(T0 + 4 * HOUR), request_id: "r1" }, month: { cap: 40, expires_at: iso(T0 + HOUR), request_id: "rx" } } } } },
+  capRequests: {
+    r1: { id: "r1", orgId: "o", agentId: "a", scope: "day", status: "approved", approved_amount_usd: 20, expires_at: iso(T0 + 4 * HOUR), reason: "a" },
+    r0: { id: "r0", orgId: "o", agentId: "a", scope: "day", status: "approved", approved_amount_usd: 7, expires_at: iso(T0 + 30 * 60_000), reason: "overwritten" } } };
+  // Legacy read before migration: amount = cap - current base, never negative.
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0), { day: 30, month: 50 });
+  assert.deepEqual(validatePolicy(s.agents.a.policy), []);
+  assert.deepEqual(expireRaises(s, T0), []);
+  assert.deepEqual(s.agents.a.policy.raise, { day: [{ amount_usd: 20, expires_at: iso(T0 + 4 * HOUR), request_id: "r1" }] });
+  s.agents.a.policy.caps.day = 2;
+  assert.deepEqual(effectiveCaps(s.agents.a.policy, T0), { day: 22, month: 50 });
+  // r0 lost its overlay before #212: it still expires and is audited exactly once.
+  const rows = expireRaises(s, T0 + HOUR);
+  assert.deepEqual(rows.map((r) => r.request_id), ["r0"]);
+  assert.equal(s.capRequests.r0.status, "expired");
+  assert.deepEqual(expireRaises(s, T0 + 2 * HOUR), []);
+  for (const bad of [{ day: [] }, { day: [{ amount_usd: 0, expires_at: iso(T0), request_id: "r" }] }, { day: [{ amount_usd: 1, expires_at: "nope", request_id: "r" }] }, { day: { expires_at: iso(T0), request_id: "r" } }]) assert.ok(raiseError(bad), JSON.stringify(bad));
 });

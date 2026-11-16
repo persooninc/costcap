@@ -1,8 +1,9 @@
 // Issue #208: time-boxed cap raise requests. Pure logic over the store object `s`;
 // the server wraps each call in a store transaction. A raise is an overlay on the
-// agent policy (policy.raise[scope] = { cap, expires_at, request_id }); base caps are
-// never edited, and the raise lapses on its own at expires_at (see effectiveCaps).
-import { CAP_KEYS } from "./policy.js";
+// agent policy (policy.raise[scope] = [{ amount_usd, expires_at, request_id }, ...]); base caps
+// are never edited, raises on one scope stack (#212), and each lapses on its own at expires_at
+// (see effectiveCaps).
+import { CAP_KEYS, raiseEntries } from "./policy.js";
 
 export const CAP_REQUEST_STATUSES = ["pending", "approved", "denied", "expired", "all"];
 const MAX_AMOUNT_USD = 100_000;
@@ -55,7 +56,9 @@ export function approveCapRequest(s, { request, approval, actor, nowMs }) {
   if (base == null) conflict(`Agent no longer has a ${request.scope} cap`);
   const before = { caps: { ...a.policy.caps }, raise: { ...(a.policy.raise ?? {}) } };
   const expires_at = new Date(nowMs + approval.duration_hours * 3600_000).toISOString();
-  const raise = { ...(a.policy.raise ?? {}), [request.scope]: { cap: base + approval.amount_usd, expires_at, request_id: request.id } };
+  migrateRaises(s, a);
+  const prior = raiseEntries(a.policy.raise?.[request.scope]);
+  const raise = { ...(a.policy.raise ?? {}), [request.scope]: [...prior, { amount_usd: approval.amount_usd, expires_at, request_id: request.id }] };
   a.policy = { ...a.policy, version: a.policy.version + 1, raise };
   Object.assign(request, { status: "approved", approved_amount_usd: approval.amount_usd, approved_duration_hours: approval.duration_hours, expires_at, decided_by: actor, decided_at: new Date(nowMs).toISOString(), ...(approval.note ? { decision_note: approval.note } : {}) });
   return { request, before, after: { caps: { ...a.policy.caps }, raise } };
@@ -66,23 +69,61 @@ export function denyCapRequest(request, { actor, note, nowMs }) {
   return request;
 }
 
-/** Drops expired raises from policies (bumping version) and marks their requests expired. Returns audit rows. */
+/** #212: rewrites legacy #208 { cap } overlays as stacked { amount_usd } entries using the approved amount. */
+export function migrateRaises(s, a) {
+  const raise = a.policy?.raise;
+  if (!raise || Object.values(raise).every(Array.isArray)) return false;
+  const next = {};
+  for (const [scope, v] of Object.entries(raise)) {
+    next[scope] = raiseEntries(v).map((r) => {
+      if (!("cap" in r)) return r;
+      const req = s.capRequests?.[r.request_id];
+      const amount = req?.approved_amount_usd ?? Math.max(0, r.cap - (a.policy.caps?.[scope] ?? r.cap));
+      return { amount_usd: amount, expires_at: r.expires_at, request_id: r.request_id };
+    }).filter((r) => r.amount_usd > 0);
+    if (!next[scope].length) delete next[scope];
+  }
+  const { raise: _drop, ...rest } = a.policy;
+  a.policy = { ...rest, ...(Object.keys(next).length ? { raise: next } : {}) };
+  return true;
+}
+
+/**
+ * Drops expired raise entries from policies (bumping version), marks their requests expired, and
+ * also expires any approved request whose expires_at has passed but has no overlay entry
+ * (e.g. one overwritten before #212). Each request is audited exactly once. Returns audit rows.
+ */
 export function expireRaises(s, nowMs) {
   const rows = [];
   for (const a of Object.values(s.agents ?? {})) {
-    const raise = a.policy?.raise;
+    if (!a.policy?.raise) continue;
+    migrateRaises(s, a);
+    const raise = a.policy.raise;
     if (!raise) continue;
-    const expired = Object.entries(raise).filter(([, r]) => Date.parse(r.expires_at) <= nowMs);
+    const expired = [];
+    const next = {};
+    for (const [scope, list] of Object.entries(raise)) {
+      const live = list.filter((r) => Date.parse(r.expires_at) > nowMs);
+      for (const r of list) if (!live.includes(r)) expired.push([scope, r]);
+      if (live.length) next[scope] = live;
+    }
     if (!expired.length) continue;
     const before = { caps: { ...a.policy.caps }, raise: { ...raise } };
-    const next = Object.fromEntries(Object.entries(raise).filter(([, r]) => Date.parse(r.expires_at) > nowMs));
     const { raise: _drop, ...rest } = a.policy;
     a.policy = { ...rest, version: a.policy.version + 1, ...(Object.keys(next).length ? { raise: next } : {}) };
     for (const [scope, r] of expired) {
       const req = s.capRequests?.[r.request_id];
-      if (req && req.status === "approved") req.status = "expired";
+      if (req && req.status !== "approved") continue;
+      if (req) req.status = "expired";
       rows.push({ orgId: a.orgId, agentId: a.id, request_id: r.request_id, scope, reason: req?.reason ?? null, before, after: { caps: { ...a.policy.caps }, raise: next } });
     }
+  }
+  for (const req of Object.values(s.capRequests ?? {})) {
+    if (req.status !== "approved" || !(Date.parse(req.expires_at) <= nowMs)) continue;
+    req.status = "expired";
+    const a = s.agents?.[req.agentId];
+    const snap = { caps: { ...(a?.policy?.caps ?? {}) }, raise: { ...(a?.policy?.raise ?? {}) } };
+    rows.push({ orgId: req.orgId, agentId: req.agentId, request_id: req.id, scope: req.scope, reason: req.reason ?? null, before: snap, after: snap });
   }
   return rows;
 }

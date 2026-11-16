@@ -59,6 +59,21 @@ test("agent requests a raise, admin approves in the dashboard, raise expires", a
     expect(during.verdict).toBe("ok");
     expect(during.budget_remaining.day_usd).toBe(19);
 
+    // 3b. #212: a second approved raise stacks (base 5 + 20 + 5), each card entry stays active.
+    const r2 = await post(`/v1/agents/${agent.agentId}/cap-requests`, { scope: "day", amount_usd: 5, duration_hours: 1, reason: "rerun failed shard" }, asAgent).then((r) => r.json());
+    expect((await post(`/v1/cap-requests/${r2.id}/approve`, {}, { cookie: owner })).status).toBe(200);
+    expect((await verdict()).budget_remaining.day_usd).toBe(24);
+    // Lowering the base during the raises lowers the effective cap at once (2 + 25 = 27).
+    expect((await post(`/v1/agents/${agent.agentId}/policy`, { caps: { day: 2 } }, { cookie: owner })).status).toBe(200);
+    expect((await verdict()).budget_remaining.day_usd).toBe(21);
+    // r2 expires on its own; r1 keeps applying and the card no longer shows r2 as active.
+    skew = 3600_000 + 1000;
+    expect((await verdict()).budget_remaining.day_usd).toBe(16);
+    await page.reload();
+    await expect(page.locator(`#capRequests [data-request="${r2.id}"]`)).toHaveCount(0);
+    await expect(page.locator("#capRequests .cap-request")).toHaveCount(1);
+    expect((await post(`/v1/agents/${agent.agentId}/policy`, { caps: { day: 5 } }, { cookie: owner })).status).toBe(200);
+
     // 4. The clock passes expiry and the verdict shows the base cap.
     skew = 4 * 3600_000 + 1000;
     const after = await verdict();
