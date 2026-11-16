@@ -17,6 +17,7 @@ jobs:
       - run: npm ci
       - run: npm audit --audit-level=high
       - run: node scripts/security-scan.mjs
+      - run: node scripts/pricing-digest.mjs --check
       - run: npm test
       - if: matrix.node == 22
         run: npm run test:coverage

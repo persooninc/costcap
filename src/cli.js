@@ -22,6 +22,8 @@ import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
+import { assertTableIntegrity } from "./pricing.js";
+import { pricingCommand } from "./pricing-cli.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--receipts FILE] [--github-output]\n" +
@@ -30,6 +32,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
+  "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
   "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
 
@@ -87,6 +90,8 @@ const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "ut
 
 export async function wrap(argv) {
   const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
+  // Never price from a tampered table (#122): refuse before spawning anything.
+  assertTableIntegrity();
   // --preflight or COSTCAP_PREFLIGHT=1 (CC-9): refuse calls whose estimated worst case cannot fit.
   const preflight = Boolean(preflightFlag) || /^(1|true|on)$/i.test(process.env.COSTCAP_PREFLIGHT ?? "");
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
@@ -202,6 +207,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const result = reconcileFiles({ receiptsPath, providerPath });
       console.log(JSON.stringify(result));
       process.exitCode = result.ok ? 0 : 1;
+    } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
+  } else if (cmd === "pricing") {
+    try {
+      const { code, out, err } = pricingCommand(rest);
+      if (out) console.log(out);
+      if (err) console.error(err);
+      process.exitCode = code;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
   } else if (cmd === "runs") {
     runsCommand(rest);

@@ -5,7 +5,7 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
-import { lookupPrice, TABLE_VERSION } from "./pricing.js";
+import { lookupPrice, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // Conservative default output ceilings when the request sets no limit.
 export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, gemini: 65_536 };
@@ -31,7 +31,7 @@ export function estimateWorstCase(provider, body, path = "") {
   const input_tokens = Math.ceil(Buffer.byteLength(text, "utf8") / 4);
   const out = requestedOutputTokens(provider, req);
   const estimate_usd = Number(((input_tokens * price.input + out.tokens * price.output) / 1_000_000).toFixed(6));
-  return { ok: true, model, input_tokens, output_tokens: out.tokens, output_defaulted: out.defaulted, estimate_usd, table_version: TABLE_VERSION };
+  return { ok: true, model, input_tokens, output_tokens: out.tokens, output_defaulted: out.defaulted, estimate_usd, table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
 }
 
 // Compares the estimate with the remaining run/day/month budget.

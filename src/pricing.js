@@ -1,22 +1,50 @@
 // Versioned model pricing with a declared fallback rate.
 // Unknown models bill at the fallback, flagged and never free.
 // The fallback is a floor for unknown models, not the highest published rate.
-// The table version is returned with every lookup so receipts can pin it.
+// The table version and SHA-256 digest are returned with every lookup so receipts can pin them.
+// The table is checked against its committed digest sidecar (#122); a tampered
+// table is never priced from: lookups throw and `costcap wrap` refuses to start.
+// COSTCAP_PRICING_TABLE overrides the table path (its sidecar sits next to it).
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { digestPathFor, verifyTableDigest } from "./pricing-digest.js";
 
-const tablePath = fileURLToPath(new URL("./pricing-table.json", import.meta.url));
-const table = JSON.parse(readFileSync(tablePath, "utf8"));
+export const DEFAULT_TABLE_PATH = fileURLToPath(new URL("./pricing-table.json", import.meta.url));
+
+export function loadPricingTable(tablePath = process.env.COSTCAP_PRICING_TABLE || DEFAULT_TABLE_PATH) {
+  const table = JSON.parse(readFileSync(tablePath, "utf8"));
+  let recorded = null;
+  try { recorded = JSON.parse(readFileSync(digestPathFor(tablePath), "utf8")); } catch { recorded = null; }
+  const verification = verifyTableDigest(table, recorded);
+  return { table, tablePath, digestPath: digestPathFor(tablePath), verification };
+}
+
+const loaded = loadPricingTable();
+const table = loaded.table;
 
 export const TABLE_VERSION = table.version;
+export const TABLE_SHA256 = loaded.verification.actual;
+export const TABLE_PATH = loaded.tablePath;
+
+export function tableIntegrity() { return loaded.verification; }
+
+export function integrityError(v = loaded.verification, path = loaded.tablePath) {
+  return `pricing table ${path} failed verification (${v.reason}): sha256 ${v.actual}, expected ${v.expected ?? "none"}. Refusing to price from an unverified table; run \`costcap pricing verify\`.`;
+}
+
+export function assertTableIntegrity() {
+  if (!loaded.verification.ok) throw new Error(integrityError());
+}
 
 export function lookupPrice(model) {
+  assertTableIntegrity();
   // OpenAI returns dated snapshot ids (gpt-4o-mini-2024-07-18); price them as their base model.
   const base = typeof model === "string" ? model.replace(/-\d{4}-\d{2}-\d{2}$/, "") : model;
   const entry = table.models[model] ?? table.models[base];
-  if (entry) return { model, ...entry, table_version: table.version, fallback: false };
-  return { model, ...table.fallback, table_version: table.version, fallback: true };
+  const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
+  if (entry) return { model, ...entry, ...pin, fallback: false };
+  return { model, ...table.fallback, ...pin, fallback: true };
 }
 
 export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0 } = {}) {
@@ -39,6 +67,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     cache_write_input_tokens,
     cache_write_1h_input_tokens,
     table_version: price.table_version,
+    table_sha256: price.table_sha256,
     fallback: price.fallback,
   };
 }

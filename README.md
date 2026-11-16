@@ -106,6 +106,16 @@ CostCap. The local proxy binds to 127.0.0.1.
   standard text price in force on the table version date (the lower tier when a
   model publishes a prompt-length split). Check `src/pricing-table.json` before
   relying on rates.
+- The pricing table is offline-verifiable. `src/pricing-table.sha256.json`
+  holds the committed SHA-256 of the canonical table (keys sorted, no
+  whitespace). Every receipt records `table_version` and `table_sha256`.
+  `costcap pricing verify` exits 0 when the installed table matches its digest
+  and 1 otherwise; `--receipts FILE` also lists receipts priced under a
+  different digest, and older receipts with no digest as "unknown" (never as
+  matching). `costcap pricing show [model]` prints a model's rates, or the
+  fallback rate for an unknown model. `costcap wrap` refuses to start on a table
+  that fails verification. To change rates: edit the table, bump `version`,
+  run `node scripts/pricing-digest.mjs`; CI runs it with `--check`.
 - Missing/invalid usage or an uncertain network outcome pauses further calls.
   Such receipts have `cost_usd: null`. Reconcile them before starting again;
   existing unknown-cost receipts block restart. Never replace unknown cost with
