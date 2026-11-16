@@ -14,6 +14,7 @@ import { budgetRemaining } from "./agent-budget.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
+import { rateLimitedBody, usageTokens } from "./rate-limit.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
@@ -393,7 +394,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -639,6 +640,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));
             }
           }
+          // #192: RPM/TPM refuse with Retry-After; never latches, never a step.
+          const rateHit = generates ? rateLimit?.check() : null;
+          if (rateHit) return block("rate_limited", rateHit, rateLimitedBody(rateHit));
           const vhit = velocity?.check();
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
           const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
@@ -664,6 +668,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
           }
         }
+        // #192: reserve the RPM slot only for a request actually forwarded upstream.
+        if (!["GET", "HEAD"].includes(req.method)) rateLimit?.admit();
         const cacheHeaders = cacheMode ? { [CACHE_HEADER]: cacheMode } : {};
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         let headers = { ...req.headers };
@@ -775,6 +781,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
               : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional" })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage));
+            rateLimit?.record(usageTokens(metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);

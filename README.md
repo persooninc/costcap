@@ -524,6 +524,20 @@ Each enrolled wrapper gets its team's caps and the team's synced spend with ever
 
 **Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
 
+## Rate limits
+
+Cap how fast a wrapped agent may call the model, independent of dollars:
+
+```sh
+node src/cli.js wrap --rpm 60 --tpm 200000 -- node your-agent.js
+```
+
+- **Where:** `--rpm N` / `--tpm N` (positive integers), `rpm`/`tpm` on `default` or an agent in a `--policy` file, or "Requests/min" / "Tokens/min" on the dashboard agent card (`rpm`/`tpm` on `POST /v1/agents/:id/policy`, audited as `policy.change`). The minimum of all three applies, so a local value can tighten a fleet value but never loosen it. The cached fleet value is enforced offline.
+- **Window:** rolling 60 s, per wrapper process (not shared across `--shared-ledger` wrappers or the fleet).
+- **RPM** counts requests admitted to the upstream; the slot is reserved before forwarding, so a concurrent burst cannot overshoot. GET/HEAD, cache hits and calls CostCap refuses do not count. A call the provider rejects (including its own 429) does count.
+- **TPM** adds the metered tokens (input + cached input + cache writes + output) when a call completes. It is checked before each call, so one in-flight call can overshoot it. Unknown usage adds 0 tokens.
+- **Refusal:** CostCap never queues. It returns `429` with `Retry-After` (seconds, at least 1) and `{error:{type:"rate_limited", source:"costcap", limit:"rpm"|"tpm", limit_value, observed, window_s:60, retry_after_s, message}}`, which the OpenAI and Anthropic SDKs retry. Each refusal writes a $0 `blocked:true, reason:"rate_limited"` receipt. It never latches and never counts toward `maxSteps`, velocity, spiral, caps or alerts.
+
 ## Soft warnings
 
 `wrap` and `check` warn before the hard stop. By default, a warning fires when run, day or month spend reaches 80% of its cap:

@@ -47,6 +47,8 @@ export function validatePolicy(p) {
     const err = warnFractionsError(p.warnFractions);
     if (err) errors.push(err);
   }
+  // Rate limits (issue #192): optional positive integers per 60 s.
+  for (const k of ["rpm", "tpm"]) if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] > 0)) errors.push(`${k} must be a positive integer`);
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   return errors;
 }
@@ -60,6 +62,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null }) 
   for (const k of CAP_KEYS) if (local[k] != null && (!Number.isFinite(local[k]) || local[k] <= 0)) throw new Error(`Invalid local cap ${k}`);
   if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");
   if (local.models != null && !isModelList(local.models)) throw new Error("Invalid local models");
+  for (const k of ["rpm", "tpm"]) if (local[k] != null && !(Number.isInteger(local[k]) && local[k] > 0)) throw new Error(`Invalid local ${k}`);
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
   if (fetched && validatePolicy(fetched).length === 0 && (!lastKnown || fetched.version > lastKnown.version)) {
@@ -76,5 +79,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null }) 
   const maxSteps = steps.length ? Math.min(...steps) : null;
   // Model allowlists combine as an intersection (most restrictive wins, #153).
   const models = intersectModels(server?.models ?? null, local?.models ?? null);
-  return { caps, maxSteps, models, killed: Boolean(server?.killed), version: server?.version ?? null, source };
+  // #192: rate limits: the minimum wins, so local can tighten but never loosen.
+  const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
+  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source };
 }

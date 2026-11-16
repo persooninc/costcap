@@ -95,6 +95,22 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await expect(page.locator("#agents small")).toContainText("Policy v6 · max 5 steps per run · models: gpt-4o-mini, claude-haiku-4-5");
     const modelsView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
     expect(modelsView.agents[0].policy.models).toEqual(["gpt-4o-mini", "claude-haiku-4-5"]);
+    // #192: Requests/min saves as rpm (audited); a later save of another field keeps rpm and an API-set tpm.
+    await page.locator("#agents input[name=rpm]").fill("30");
+    await page.locator("#agents button[type=submit]").click();
+    await expect(page.locator("#agents small")).toContainText("Policy v7");
+    const rpmView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
+    expect(rpmView.agents[0].policy.rpm).toBe(30);
+    expect(rpmView.audit.filter((x) => x.action === "policy.change").at(-1).detail.policy.rpm).toBe(30);
+    const apiTpm = await page.evaluate(async (id) => (await fetch(`/v1/agents/${encodeURIComponent(id)}/policy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tpm: 5000 }) })).status, rpmView.agents[0].id);
+    expect(apiTpm).toBe(200);
+    await page.locator("#refresh").click();
+    await expect(page.locator("#agents small")).toContainText("Policy v8");
+    await page.locator("#agents input[name=day]").fill("4");
+    await page.locator("#agents button[type=submit]").click();
+    await expect(page.locator("#agents small")).toContainText("Policy v9");
+    const keptView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
+    expect(keptView.agents[0].policy).toMatchObject({ rpm: 30, tpm: 5000, caps: { day: 4 } });
     await page.locator("#agents .danger").nth(1).click();
     await expect(page.locator("#agents strong")).toHaveText("REVOKED");
     await page.locator("#invite input[name=email]").fill("teammate@example.invalid");

@@ -17,6 +17,7 @@ import { createCapEngine, loadSettledReceipts, loadEvents } from "./cap.js";
 import { createSettler } from "./settle.js";
 import { DEFAULT_WARN_AT, createCapWarner, parseWarnAt } from "./cap-warn.js";
 import { createVelocityBreaker } from "./velocity.js";
+import { createRateLimiter, minLimit } from "./rate-limit.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
@@ -33,7 +34,7 @@ import { dirname, join } from "node:path";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
 import { awsCredentials } from "./sigv4.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
@@ -74,6 +75,11 @@ export function parseWrapArgs(argv) {
       const n = Number(v);
       if (!Number.isInteger(n) || n <= 0) throw new Error(`--max-steps must be a positive integer, got "${v}"`);
       opts.maxSteps = n;
+    } else if (f === "--rpm" || f === "--tpm") {
+      // #192: requests / tokens per rolling 60 s.
+      const n = Number(v);
+      if (!/^\d+$/.test(v) || !Number.isInteger(n) || n <= 0) throw new Error(`${f} must be a positive integer, got "${v}"`);
+      opts[f.slice(2)] = n;
     } else if (f === "--velocity-multiple") {
       const n = Number(v);
       if (!Number.isFinite(n) || n <= 1) throw new Error(`--velocity-multiple must be a number greater than 1, got "${v}"`);
@@ -145,7 +151,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm } = parseWrapArgs(argv);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
@@ -185,6 +191,13 @@ export async function wrap(argv) {
   let fleet;
   let fleetPolicy;
   let fleetModels = models ?? null;
+  // #192: effective rate limit = min(flag, --policy agent/default, fleet); re-applied on each fleet sync.
+  const rateLimit = createRateLimiter();
+  let fleetRate = {};
+  const applyRate = () => {
+    const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
+    rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
+  };
   const setPolicy = (p) => {
     fleetPolicy = p;
     const resolved = resolvePolicy({ local: { ...caps, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
@@ -192,6 +205,8 @@ export async function wrap(argv) {
     checkWarnings();
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
+    fleetRate = { rpm: p.rpm, tpm: p.tpm };
+    applyRate();
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => settleReceipt(r) });
@@ -204,6 +219,7 @@ export async function wrap(argv) {
   const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
+  applyRate();
   const runReceipts = [];
   const summaryRunId = who.run_id;
   const startedAt = new Date().toISOString();
@@ -212,7 +228,7 @@ export async function wrap(argv) {
   capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, tagCaps, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, tagCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });

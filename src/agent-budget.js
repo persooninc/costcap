@@ -17,6 +17,8 @@ function assertLimits(limits, label) {
   }
   const steps = limits?.maxSteps;
   if (steps != null && (!Number.isInteger(steps) || steps <= 0)) throw new Error(`Invalid ${label} maxSteps`);
+  // #192: requests/tokens per minute, positive integers.
+  for (const k of ["rpm", "tpm"]) if (limits?.[k] != null && !(Number.isInteger(limits[k]) && limits[k] > 0)) throw new Error(`Invalid ${label} ${k}`);
   if (limits?.models !== undefined && !isModelList(limits.models)) throw new Error(`Invalid ${label} models`);
 }
 
@@ -42,7 +44,7 @@ function assertReceipt(r) {
 
 const POLICY_KEYS = new Set(["default", "agents", "teams"]);
 const TEAM_KEYS = new Set([...SCOPES, "agents", "models"]);
-const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models"]);
+const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models", "rpm", "tpm"]);
 
 // Unknown keys are refused: a misspelled limit must not silently mean "no limit".
 export function assertAgentPolicy(policy) {

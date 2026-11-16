@@ -627,10 +627,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           // warnFractions (issue #165): omitted keeps, null resets to the [0.8] default, [] turns cap_approaching off.
           const rawWarn = body.warnFractions === undefined ? a.policy.warnFractions : body.warnFractions;
           const warnFractions = Array.isArray(rawWarn) && rawWarn.every((f) => typeof f === "number") ? sortWarnFractions(rawWarn) : rawWarn;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}) };
+          // rpm/tpm (issue #192): omitted keeps the current value, null clears it.
+          const rpm = body.rpm === undefined ? a.policy.rpm : body.rpm;
+          const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
-          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null };
+          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }) };
           a.policy = policy;
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;
