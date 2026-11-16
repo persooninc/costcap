@@ -444,7 +444,7 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
-receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC. `--hour-cap USD` is a rolling 60-minute window (spend with `now - 60min < ts <= now`): it never latches, a refusal is a 429 `budget_exceeded` with `scope: "hour"`, `retry_after_s` and a `Retry-After` header, and policy files (`hour` on `default`, agents, teams) and fleet `caps.hour` accept it too; the tighter of local and fleet wins.
+receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC. `--hour-cap USD` is a rolling 60-minute window (spend with `now - 60min < ts <= now`): it never latches, a refusal is a 429 `budget_exceeded` with `scope: "hour"`, `retry_after_s` and a `Retry-After` header, and policy files (`hour` on `default`, agents, teams) and fleet `caps.hour` accept it too (a policy `hour` refusal also carries `retry_after_s` and `Retry-After`, from the agent's or the team's pooled spend; #177); the tighter of local and fleet wins.
 ### Cost attribution tags
 
 Label spend for chargeback with `costcap wrap --tag feature=search --tag env=prod -- <command>`

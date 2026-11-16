@@ -114,7 +114,7 @@ test("parseWrapArgs reads --hour-cap", () => {
   assert.throws(() => parseWrapArgs(["--hour-cap", "0", "--", "x"]), /positive number/);
 });
 
-async function wrapAgainstMock(t, seededMinutesAgo) {
+async function wrapAgainstMock(t, seededMinutesAgo, flags = ["--hour-cap", "1"], seedExtra = {}) {
   let hits = 0;
   const up = await new Promise((r) => {
     const s = http.createServer((q, res) => { hits += 1; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 10 } })); });
@@ -123,13 +123,13 @@ async function wrapAgainstMock(t, seededMinutesAgo) {
   t.after(() => up.s.close());
   const dir = mkdtempSync(path.join(tmpdir(), "cc-hour-"));
   const receipts = path.join(dir, "r.jsonl");
-  writeFileSync(receipts, JSON.stringify({ id: "seed", ts: new Date(Date.now() - seededMinutesAgo * 60_000).toISOString(), provider: "openai", path: "/chat/completions", cost_usd: 1 }) + "\n");
+  writeFileSync(receipts, JSON.stringify({ id: "seed", ts: new Date(Date.now() - seededMinutesAgo * 60_000).toISOString(), provider: "openai", path: "/chat/completions", cost_usd: 1, ...seedExtra }) + "\n");
   const script = `
     const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions",{method:"POST",body:JSON.stringify({model:"gpt-4o-mini"})});
     const b = await r.json();
     console.log(JSON.stringify({ status: r.status, retry: r.headers.get("retry-after"), body: b }));`;
   const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--hour-cap", "1", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...(typeof flags === "function" ? flags(dir) : flags), "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
       { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
     let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
     c.on("exit", (code) => resolve({ code, out }));
@@ -162,4 +162,55 @@ test("e2e: wrap --hour-cap 1 forwards when the $1 is 61 min old; check passes", 
   assert.equal(r.hits, 1);
   const chk = spawnSync(process.execPath, ["src/cli.js", "check", "--hour-cap", "1", "--receipts", r.receipts], { encoding: "utf8" });
   assert.equal(chk.status, 0, chk.stdout + chk.stderr);
+});
+
+test("#177 agent policy hour refusal carries retry_after_s (agent and pooled team)", () => {
+  const b = createAgentBudgets({ policy: { default: { hour: 1 } }, history: [{ ts: ago(30), cost_usd: 1, agent_id: "a" }], now: () => new Date(T0) });
+  const hit = b.check({ agent_id: "a" });
+  assert.equal(hit.scope, "hour");
+  assert.ok(Math.abs(hit.retry_after_s - 1800) <= 1);
+  // Several receipts must age out: 0.6 (50 min ago) + 0.6 (20 min ago) vs cap 0.5 -> both, so ~40 min.
+  const multi = createAgentBudgets({ policy: { default: { hour: 0.5 } }, history: [{ ts: ago(20), cost_usd: 0.6, agent_id: "a" }, { ts: ago(50), cost_usd: 0.6, agent_id: "a" }], now: () => new Date(T0) });
+  assert.ok(Math.abs(multi.check({ agent_id: "a" }).retry_after_s - 2400) <= 1);
+  const team = createAgentBudgets({ policy: { teams: { t: { hour: 1, agents: ["a", "b"] } } },
+    history: [{ ts: ago(40), cost_usd: 0.5, agent_id: "a" }, { ts: ago(10), cost_usd: 0.5, agent_id: "b" }, { ts: ago(5), cost_usd: 5, agent_id: "z" }], now: () => new Date(T0) });
+  const th = team.check({ agent_id: "a" });
+  assert.equal(th.team, "t");
+  assert.ok(Math.abs(th.retry_after_s - 1200) <= 1); // a's 40-min-old receipt ages out first
+});
+
+test("#177 run/day/month and step_budget agent refusals have no retry_after_s", () => {
+  for (const scope of ["run", "day", "month"]) {
+    const b = createAgentBudgets({ policy: { default: { [scope]: 1 } }, history: [{ ts: ago(1), cost_usd: 1, agent_id: "a", run_id: "r" }], now: () => new Date(T0) });
+    const hit = b.check({ agent_id: "a", run_id: "r" });
+    assert.equal(hit.scope, scope);
+    assert.equal("retry_after_s" in hit, false);
+  }
+  const steps = createAgentBudgets({ policy: { default: { maxSteps: 1 } }, history: [{ ts: ago(1), cost_usd: 0, agent_id: "a", run_id: "r" }], now: () => new Date(T0) });
+  const sh = steps.check({ agent_id: "a", run_id: "r" });
+  assert.equal(sh.reason, "step_budget");
+  assert.equal("retry_after_s" in sh, false);
+});
+
+const policyFlags = (policy) => (dir) => {
+  const p = path.join(dir, "p.json");
+  writeFileSync(p, JSON.stringify(policy));
+  return ["--agent", "a", "--policy", p];
+};
+
+test("e2e #177: wrap --agent --policy hour refusal returns 429 + Retry-After", async (t) => {
+  const r = await wrapAgainstMock(t, 30, policyFlags({ default: { hour: 1 } }), { agent_id: "a" });
+  assert.equal(r.status, 429);
+  assert.equal(r.hits, 0);
+  assert.equal(r.body.scope, "hour");
+  assert.ok(Math.abs(r.body.retry_after_s - 1800) <= 5);
+  assert.equal(r.retry, String(r.body.retry_after_s));
+});
+
+test("e2e #177: wrap --agent --policy day refusal has no Retry-After", async (t) => {
+  const r = await wrapAgainstMock(t, 1, policyFlags({ default: { day: 1 } }), { agent_id: "a" });
+  assert.equal(r.status, 429);
+  assert.equal(r.body.scope, "day");
+  assert.equal(r.retry, null);
+  assert.equal("retry_after_s" in r.body, false);
 });
