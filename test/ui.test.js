@@ -84,3 +84,14 @@ test('GA4 tag G-P6NP48RRGC installed CSP-clean (issue #53)', () => {
   assert.match(html.headers['content-security-policy'], /connect-src [^;]*google-analytics\.com/);
   assert.ok(!html.headers['content-security-policy'].includes('unsafe-inline'));
 });
+
+test('#159: agent cards render Recent runs via textContent with run click-through and incomplete badge', () => {
+  const js = uiResponse('/assets/app.js').body;
+  new Script(js);
+  assert.match(js, /Recent runs/);
+  assert.match(js, /\/runs\?limit=10/);
+  assert.match(js, /'\/runs\/'\+encodeURIComponent\(runId\)/);
+  assert.match(js, /incomplete/);
+  assert.match(js, /run_id='\+encodeURIComponent\(runId\)/);
+  for (const sink of ['inner', 'outer']) assert.ok(!js.includes(sink + 'HTML'));
+});

@@ -439,7 +439,7 @@ test("receipt csv is the signed-in org only and ignores an agent bearer", async 
   assert.match(mine.body, /plain,0\.5/);
   assert.match(mine.body, /'=1\+1,,,,,budget_exceeded,day/);
   const theirs = await pull(other.cookie);
-  assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome");
+  assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,run_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome");
 });
 
 test("#149: receipts.csv since/until/agent_id filters, 400s, tenant isolation and total header", async (t) => {

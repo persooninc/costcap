@@ -10,6 +10,7 @@ import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor, alert
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
+import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
@@ -356,6 +357,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             ts: item.receipt?.ts ?? "",
             agent_id: item.agentId,
             receipt_id: item.receipt?.id ?? "",
+            run_id: item.receipt?.run_id ?? "",
             model: item.receipt?.model ?? "",
             cost_usd: item.receipt?.cost_usd == null ? "" : item.receipt.cost_usd,
             cost_source: item.receipt?.cost_source ?? "",
@@ -533,6 +535,27 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return verdictOf(s, s.teams[key]);
         });
         return json(200, result);
+      }
+      // Issue #159: per-run drill-down. An agent token reads only its own runs; any member (viewer included) any agent in the org.
+      const runsRoute = /^\/v1\/agents\/([^/]+)\/runs(?:\/([^/]+))?$/.exec(path);
+      if (runsRoute && req.method === "GET") {
+        return json(200, store.read((s) => {
+          const caller = req.headers.authorization ? { agent: agentUser(s, req) } : { user: sessionUser(s, req) };
+          const a = s.agents[decodeURIComponent(runsRoute[1])];
+          const orgId = caller.agent?.orgId ?? caller.user.orgId;
+          if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
+          const cutoff = retentionCutoff(entitlements(s, orgId), now());
+          const items = Object.values(s.receipts).filter((r) => r.orgId === orgId && r.agentId === a.id);
+          if (runsRoute[2]) {
+            const runId = decodeURIComponent(runsRoute[2]);
+            const receipts = runReceipts(items, runId, { cutoff });
+            if (!receipts.length) fail(404, "Run not found");
+            const [run] = summarizeRuns(items.filter((item) => receipts.some((r) => r.receipt_id === item.receipt?.id)));
+            return { agent_id: a.id, run, receipts, estimate_only: true };
+          }
+          const query = parseRunsQuery(new URL(req.url, origin).searchParams);
+          return { agent_id: a.id, ...pageRuns(items, { ...query, cutoff }), estimate_only: true };
+        }));
       }
       const budgetRoute = /^\/v1\/agents\/([^/]+)\/budget$/.exec(path);
       if (budgetRoute && req.method === "GET") {

@@ -1,7 +1,7 @@
 // Session export of synced receipts. This is the operator's copy of what
 // the proxy reported. It is not a provider bill.
 
-const COLUMNS = ["ts", "agent_id", "receipt_id", "model", "cost_usd", "cost_source", "settled_cost_usd", "settle_source", "reason", "scope", "outcome"];
+const COLUMNS = ["ts", "agent_id", "receipt_id", "run_id", "model", "cost_usd", "cost_source", "settled_cost_usd", "settle_source", "reason", "scope", "outcome"];
 export const RECEIPT_CSV_LIMIT = 5000;
 
 export function cell(value) {
@@ -15,9 +15,10 @@ export function cell(value) {
 // scoped export that fits under the limit is complete. When the limit still
 // truncates, the first line says so in-band: a browser download never shows
 // response headers.
-export function receiptsCsv(rows, { limit = RECEIPT_CSV_LIMIT, since, until, agentId } = {}) {
+export function receiptsCsv(rows, { limit = RECEIPT_CSV_LIMIT, since, until, agentId, runId } = {}) {
   const matched = rows.filter((row) => {
     if (agentId !== undefined && row.agent_id !== agentId) return false;
+    if (runId !== undefined && row.run_id !== runId) return false;
     if (since === undefined && until === undefined) return true;
     const ms = Date.parse(row.ts);
     if (Number.isNaN(ms)) return false;
@@ -43,5 +44,7 @@ export function parseReceiptsQuery(params, agentIds, parseRange) {
   if (range.since !== undefined && range.until !== undefined && range.since > range.until) bad("since must not be after until");
   const agentId = params.get("agent_id");
   if (agentId !== null && !agentIds.has(agentId)) bad("agent_id is not an agent in this workspace");
-  return { ...range, ...(agentId !== null ? { agentId } : {}) };
+  const runId = params.get("run_id");
+  if (runId !== null && (!runId || runId.length > 200)) bad("run_id must be 1-200 characters");
+  return { ...range, ...(agentId !== null ? { agentId } : {}), ...(runId !== null ? { runId } : {}) };
 }
