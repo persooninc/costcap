@@ -31,6 +31,7 @@ import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 import { createResponseCache, parseTtl } from "./response-cache.js";
 import { dirname, join } from "node:path";
+import { unpricedDiscountWarnings } from "./price-overrides.js";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
 import { awsCredentials } from "./sigv4.js";
 
@@ -152,6 +153,7 @@ const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "ut
 
 export async function wrap(argv) {
   const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm } = parseWrapArgs(argv);
+  for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.

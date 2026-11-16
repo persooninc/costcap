@@ -133,6 +133,15 @@ test("AC3 unknown model refused when --unknown-models refuse", async (t) => {
   assert.equal(up.upgrades, 0);
 });
 
+test("#197 a {discount} on an unpriced model doesn't open --unknown-models refuse on the handshake", async (t) => {
+  const userPrices = { version: "t", sha256: "0".repeat(64), upstreams: { openai: { "gpt-made-up": { discount: 0.2 } } } };
+  const { up, port } = await setup(t, { proxy: { unknownModels: "refuse", userPrices } });
+  const a = await connectRealtime(port, "/openai/v1/realtime?model=gpt-made-up");
+  assert.equal(a.status, 403);
+  assert.equal(a.body.error, "model_unpriced");
+  assert.equal(up.upgrades, 0);
+});
+
 test("AC3 kill closes an idle open session within 1s and writes a blocked receipt", async (t) => {
   const killFile = join(mkdtempSync(join(tmpdir(), "cc-k-")), "KILL");
   let conn;

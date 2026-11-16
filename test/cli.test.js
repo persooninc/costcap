@@ -677,3 +677,17 @@ test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered an
   assert.equal(runs.status, 0);
   assert.match(runs.stdout, /0\.1076/);
 });
+
+test("#197 wrap warns once per ignored {discount} on an unpriced model and still starts", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
+  const f = path.join(dir, "p.json");
+  writeFileSync(f, JSON.stringify({ upstreams: { openai: { "gpt-6-preview": { discount: 0.2 }, "gpt-4o": { discount: 0.1 } } } }));
+  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--receipts", path.join(dir, "r.jsonl"), "--upstream-prices", f, "--", process.execPath, "-e", "process.stdout.write('ran')"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "ran");
+  const warns = r.stderr.split("\n").filter((l) => l.includes("discount ignored"));
+  assert.deepEqual(warns, ["costcap: warning: discount ignored: openai/gpt-6-preview is not in the pricing table; add absolute rates"]);
+  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-6-preview", "--prices", f], { encoding: "utf8" });
+  assert.equal(show.status, 0);
+  assert.doesNotMatch(show.stdout, /discount/);
+});

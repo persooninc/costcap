@@ -9,7 +9,7 @@ import { startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 import { costForUsage } from "../src/pricing.js";
 import { loadUpstreamPrices } from "../src/upstreams.js";
-import { builtinOverride, costWithOverrides, effectivePrice, isPricedWithOverrides } from "../src/price-overrides.js";
+import { builtinOverride, costWithOverrides, effectivePrice, isPricedWithOverrides, unpricedDiscountWarnings } from "../src/price-overrides.js";
 import { foldBatchResults } from "../src/batch.js";
 import { auditReceipts } from "../src/pricing-digest.js";
 import { pricingCommand } from "../src/pricing-cli.js";
@@ -173,4 +173,61 @@ test("proxy: new model forwarded under refuse/preflight only with the file; unpr
   const next = await pp.call("/openai/v1/chat/completions", body);
   assert.equal(next.status, 429);
   assert.match(next.body, /unreconciled_receipt|accounting_unavailable/);
+});
+
+// #197: a {discount} on a model the table doesn't price is ignored everywhere (never priced, never lower).
+const DISC_UNPRICED = { version: "typo-1", upstreams: { openai: { "gpt-6-preview": { discount: 0.2 }, "gpt-4o": { discount: 0.2 } }, anthropic: { "claude-new-x": { input: 4, output: 9 } } } };
+const PU = () => loadUpstreamPrices(file(DISC_UNPRICED), []);
+
+test("#197 discount on an unpriced model: not priced, fallback row undiscounted, billed at full fallback (AC1, AC2)", () => {
+  const p = PU();
+  assert.equal(builtinOverride(p, "openai", "gpt-6-preview"), null);
+  assert.equal(builtinOverride(p, "openai", "gpt-6-preview-2026-12-01"), null);
+  assert.equal(isPricedWithOverrides(p, "openai", "gpt-6-preview"), false);
+  assert.equal(isPricedWithOverrides(p, "anthropic", "claude-new-x"), true); // absolute still prices an unknown model
+  const eff = effectivePrice(p, "openai", "gpt-6-preview");
+  const fb = costForUsage("gpt-6-preview", { input_tokens: 1e6 });
+  assert.equal(eff.fallback, true);
+  assert.equal("discount" in eff, false);
+  assert.equal("user_prices" in eff, false);
+  assert.equal(eff.input, fb.cost_usd);
+  const c = costWithOverrides(p, "openai", "gpt-6-preview", { input_tokens: 1e6 });
+  assert.equal(c.cost_usd, fb.cost_usd);
+  assert.equal(c.fallback, true);
+  const est = estimateWorstCase("openai", Buffer.from(JSON.stringify({ model: "gpt-6-preview", max_tokens: 10 })), "/v1/chat/completions", (m) => effectivePrice(p, "openai", m));
+  const estFb = estimateWorstCase("openai", Buffer.from(JSON.stringify({ model: "gpt-6-preview", max_tokens: 10 })), "/v1/chat/completions");
+  assert.deepEqual(est, estFb); // preflight budgets at the full fallback rate
+});
+
+test("#197 unchanged: a discount on a table-priced model and its snapshot still applies (AC4)", () => {
+  const p = PU();
+  assert.deepEqual(builtinOverride(p, "openai", "gpt-4o"), { discount: 0.2 });
+  assert.deepEqual(builtinOverride(p, "openai", "gpt-4o-2024-08-06"), { discount: 0.2 });
+  const c = costWithOverrides(p, "openai", "gpt-4o-2024-08-06", { input_tokens: 1000, output_tokens: 100 });
+  assert.equal(c.cost_source, "user_prices");
+  assert.equal(c.cost_usd, r6(costForUsage("gpt-4o-2024-08-06", { input_tokens: 1000, output_tokens: 100 }).cost_usd * 0.8));
+});
+
+test("#197 unpricedDiscountWarnings names each ignored entry, nothing else", () => {
+  assert.deepEqual(unpricedDiscountWarnings(PU()), ["costcap: warning: discount ignored: openai/gpt-6-preview is not in the pricing table; add absolute rates"]);
+  assert.deepEqual(unpricedDiscountWarnings(P()), []);
+  assert.deepEqual(unpricedDiscountWarnings(undefined), []);
+});
+
+test("#197 pricing show: fallback row with no discount label", () => {
+  const f = file(DISC_UNPRICED);
+  const out = pricingCommand(["show", "gpt-6-preview", "--prices", f]).out;
+  assert.match(out, /fallback/);
+  assert.doesNotMatch(out, /discount/);
+  assert.match(pricingCommand(["show", "gpt-4o", "--prices", f]).out, /\(discount 0\.2\)/);
+});
+
+test("#197 proxy: --unknown-models refuse still 403s a discount-only unpriced model", async (t) => {
+  const up = await fakeUpstream(t, { model: "gpt-6-preview", usage: { prompt_tokens: 100, completion_tokens: 10 } });
+  const p = await proxy(t, up.base, { userPrices: PU(), unknownModels: "refuse" });
+  const r = await p.call("/openai/v1/chat/completions", { model: "gpt-6-preview", max_tokens: 10, messages: [] });
+  assert.equal(r.status, 403);
+  assert.match(r.body, /model_unpriced/);
+  assert.equal(up.seen.length, 0);
+  assert.equal((await p.call("/openai/v1/chat/completions", { model: "gpt-4o", max_tokens: 10, messages: [] })).status, 200);
 });

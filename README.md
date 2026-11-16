@@ -171,7 +171,9 @@ providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `
   standard text components they list.
 - **Never $0, never silently lower.** Rates must be > 0. `wrap` exits 2 before spawning on
   a discount outside (0,1), rates mixed with a discount, an unknown key, or `"*"` with rates.
-  A discount never applies to a fallback-priced model. If a call needs a component that an
+  A discount never applies to a fallback-priced model: a `{discount}` entry for a model not in the
+  pricing table is ignored (`wrap` warns "discount ignored: …"), so `--unknown-models refuse` still refuses it and
+  `pricing show`/`--preflight` quote the full fallback rate. If a call needs a component that an
   absolute entry doesn't list (a cache write with no rate, long context over the table
   threshold, fast/priority, non-text tokens or a batch line), the receipt is
   `cost_usd: null, reason: "user_price_unpriced"` and the run pauses. The table rate is never used instead.

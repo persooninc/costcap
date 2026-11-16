@@ -36,7 +36,10 @@ export function builtinOverride(prices, provider, model) {
   const table = prices.upstreams?.[provider];
   if (!table) return null;
   for (const id of [model, model.replace(SNAPSHOT_SUFFIX, "")]) {
-    if (Object.hasOwn(table, id) && id !== "*") return "discount" in table[id] ? { discount: table[id].discount } : { absolute: table[id] };
+    if (!Object.hasOwn(table, id) || id === "*") continue;
+    if (!("discount" in table[id])) return { absolute: table[id] };
+    // #197: a discount needs a table rate to scale; on an unpriced model it is ignored (never priced, never lower).
+    return isPricedModel(model) ? { discount: table[id].discount } : null;
   }
   // A provider-wide discount applies only to models with a table rate (never the fallback).
   if (Object.hasOwn(table, "*") && isPricedModel(model)) return { discount: table["*"].discount };
@@ -76,6 +79,17 @@ function costForAbsolute(prices, rate, model, usage, { batch } = {}) {
     ...(modality_tokens && { modality_tokens }), ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }),
     table_version: table.table_version, table_sha256: table.table_sha256, fallback: false, ...pin(prices),
   };
+}
+
+/** #197: one warning per {discount} entry whose model the pricing table doesn't price (ignored). */
+export function unpricedDiscountWarnings(prices) {
+  const out = [];
+  for (const p of OVERRIDE_PROVIDERS) {
+    for (const [m, r] of Object.entries(prices?.upstreams?.[p] ?? {})) {
+      if (m !== "*" && r && "discount" in r && !isPricedModel(m)) out.push(`costcap: warning: discount ignored: ${p}/${m} is not in the pricing table; add absolute rates`);
+    }
+  }
+  return out;
 }
 
 /** Pre-call: true when a model is priced by the table or by an absolute/discount override. */

@@ -62,7 +62,7 @@ export function pricingCommand(args, { tablePath } = {}) {
   // #189: with --prices, the effective row for the first built-in provider that overrides the model.
   // A model-specific entry wins over another provider's "*" discount.
   const listed = (p) => [model, model.replace(/-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/, "")].some((id) => Object.hasOwn(prices.upstreams[p] ?? {}, id));
-  const provider = prices && (OVERRIDE_PROVIDERS.find(listed) ?? OVERRIDE_PROVIDERS.find((p) => builtinOverride(prices, p, model)));
+  const provider = prices && (OVERRIDE_PROVIDERS.find((p) => listed(p) && builtinOverride(prices, p, model)) ?? OVERRIDE_PROVIDERS.find((p) => builtinOverride(prices, p, model)));
   if (provider) {
     const o = builtinOverride(prices, provider, model);
     const tag = o.absolute ? ` (user_prices ${prices.sha256.slice(0, 8)})` : ` (discount ${o.discount})`;
