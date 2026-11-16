@@ -460,3 +460,89 @@ test("regression #109: month burn-rate projection pages once through the fleet w
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.length, 1);
 });
+
+test("#112 GET /v1/agents/:id/budget: cited verdicts, unknown-cost honesty, tenant isolation", async (t) => {
+  const { agentBudgetStatus } = await import("../src/check.js");
+  const f = await fixture(t);
+  const owner = await f.login("verdict-owner@example.invalid");
+  const outsider = await f.login("verdict-outsider@example.invalid");
+  const enroll = async (caps, name) => {
+    const tok = (await f.request("/v1/enrollment-tokens", { caps }, owner.cookie)).body.token;
+    return (await f.request("/v1/enroll", { name }, null, tok)).body;
+  };
+  const ts = new Date().toISOString();
+  const sync = (agent, receipts) => f.request("/v1/receipts", { receipts }, null, agent.token);
+  const budget = (id, cookie, auth) => f.request(`/v1/agents/${id}/budget`, undefined, cookie, auth);
+
+  // AC1: under caps
+  const a = await enroll({ day: 5, month: 20 }, "under");
+  await sync(a, [{ id: "r1", ts, cost_usd: 1.5 }]);
+  let r = await budget(a.agentId, owner.cookie);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.verdict, "ok");
+  assert.equal(r.body.reason, null);
+  assert.equal(r.body.agent_id, a.agentId);
+  assert.deepEqual(r.body.budget_remaining, { day_usd: 3.5, month_usd: 18.5 });
+  // AC7: key parity with local agent-status
+  const local = agentBudgetStatus({ receiptsPath: join(mkdtempSync(join(tmpdir(), "cc-par-")), "none.jsonl"), policy: { agents: { x: { day: 5 } } }, agent_id: "x" });
+  assert.deepEqual(Object.keys(r.body).sort(), Object.keys(local).sort());
+  assert.deepEqual(Object.keys(r.body.budget_remaining).every((k) => k in local.budget_remaining), true);
+  // agent token may read itself
+  assert.equal((await budget(a.agentId, null, a.token)).body.verdict, "ok");
+
+  // Regression: one null-cost receipt flips the passing verdict (AC3)
+  await sync(a, [{ id: "r2", ts, cost_usd: null }]);
+  r = await budget(a.agentId, owner.cookie);
+  assert.equal(r.body.verdict, "accounting_unavailable");
+  assert.equal(r.body.reason, "unreconciled_receipt");
+  assert.equal(r.body.unknown_receipts, 1);
+  assert.equal(r.body.ok, false);
+
+  // AC2: over a cap
+  const b = await enroll({ day: 1 }, "over");
+  await sync(b, [{ id: "r1", ts, cost_usd: 1 }]);
+  r = await budget(b.agentId, owner.cookie);
+  assert.equal(r.body.verdict, "budget_exceeded");
+  assert.equal(r.body.scope, "day");
+  assert.equal(r.body.cap_usd, 1);
+  assert.equal(r.body.spent_usd, 1);
+  assert.deepEqual(r.body.budget_remaining, { day_usd: 0, month_usd: null });
+
+  // AC6: no caps
+  const c = await enroll({}, "nocap");
+  r = await budget(c.agentId, owner.cookie);
+  assert.equal(r.body.verdict, "no_budget_policy");
+  assert.equal(r.body.budget_remaining, null);
+
+  // AC5: isolation and auth
+  const cross = await budget(a.agentId, outsider.cookie);
+  const unknown = await budget("does-not-exist", outsider.cookie);
+  assert.equal(cross.status, 404);
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(cross.body, unknown.body);
+  assert.equal((await budget(b.agentId, null, a.token)).status, 404);
+  assert.equal((await budget(a.agentId)).status, 401);
+
+  // AC4: killed, then revoked
+  await f.request(`/v1/agents/${b.agentId}/policy`, { killed: true }, owner.cookie);
+  assert.equal((await budget(b.agentId, owner.cookie)).body.verdict, "killed");
+  await f.request(`/v1/agents/${c.agentId}/revoke`, {}, owner.cookie);
+  r = await budget(c.agentId, owner.cookie);
+  assert.equal(r.body.verdict, "revoked");
+  assert.equal(r.body.ok, false);
+  assert.equal((await budget(c.agentId, null, c.token)).status, 401);
+});
+
+test("#112 a viewer may read an agent budget verdict", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("vb-owner@example.invalid");
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: { month: 2 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "v" }, null, tok)).body;
+  await f.request("/v1/invitations", { email: "vb-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("vb-viewer@example.invalid");
+  assert.equal(viewer.body.role, "viewer");
+  const r = await f.request(`/v1/agents/${agent.agentId}/budget`, undefined, viewer.cookie);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.verdict, "ok");
+  assert.deepEqual(r.body.budget_remaining, { day_usd: null, month_usd: 2 });
+});

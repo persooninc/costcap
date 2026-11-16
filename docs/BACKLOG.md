@@ -136,6 +136,7 @@ Closed: #2, #3, #4, #7, #8, #9, #17, #18, #19, #20, #37, #38, #39, #40, #41, #46
 Compared the README's promises, category expectations, and the agent-to-agent needs (per-agent dollar and step budgets, a budget-exceeded verdict, kill one or all). Highest value first. Each story is one PR. PR #87 ships the local per-agent budgets these build on.
 
 ### CC-1 Hosted per-agent budget verdict
+- Status: shipped (#112), `src/hosted/agent-verdict.js` behind `GET /v1/agents/:id/budget`.
 - Acceptance: `GET /v1/agents/:id/budget`, scoped to the caller's org, returns `verdict`, `reason` and `budget_remaining` with the same names as `costcap agent-status`. Another org's agent returns 404. Unknown cost returns `accounting_unavailable`, never a pass.
 
 ### CC-2 Per-agent step budgets in fleet policy

@@ -98,3 +98,40 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+test("#112 a signed-in org reads its agent budget verdict; cross-org read is 404", async ({ request }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-budget-")), "data.json"),
+    origin, secureCookies: false, stripeEnv: {},
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    const login = async (email) => {
+      const ch = await (await fetch(`${origin}/auth/request`, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify({ email, turnstileToken: fixtureToken }) })).json();
+      const r = await fetch(`${origin}/auth/verify`, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify({ challengeId: ch.challengeId, code: codes.at(-1).code }) });
+      expect(r.status).toBe(200);
+      return r.headers.get("set-cookie").split(";")[0];
+    };
+    const owner = await login("budget-owner@example.invalid");
+    const outsider = await login("budget-outsider@example.invalid");
+    const post = (path, body, headers) => fetch(`${origin}${path}`, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) }).then((r) => r.json());
+    const { token } = await post("/v1/enrollment-tokens", { caps: { day: 4 } }, { cookie: owner });
+    const agent = await post("/v1/enroll", { name: "e2e" }, { authorization: `Bearer ${token}` });
+    await post("/v1/receipts", { receipts: [{ id: "e1", ts: new Date().toISOString(), cost_usd: 1 }] }, { authorization: `Bearer ${agent.token}` });
+    const mine = await request.get(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: { cookie: owner } });
+    expect(mine.status()).toBe(200);
+    const body = await mine.json();
+    expect(body.verdict).toBe("ok");
+    expect(body.budget_remaining.day_usd).toBe(3);
+    const cross = await request.get(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: { cookie: outsider } });
+    expect(cross.status()).toBe(404);
+  } finally {
+    service.server.closeAllConnections();
+    service.server.close();
+  }
+});

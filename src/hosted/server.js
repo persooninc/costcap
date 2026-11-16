@@ -12,6 +12,7 @@ import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
+import { hostedAgentVerdict } from "./agent-verdict.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
 
@@ -335,6 +336,18 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           audit(s, user.orgId, user.id, "invitation.revoke", invite.id);
         });
         return json(200, { revoked: true });
+      }
+      const budgetRoute = /^\/v1\/agents\/([^/]+)\/budget$/.exec(path);
+      if (budgetRoute && req.method === "GET") {
+        return json(200, store.read((s) => {
+          // An enrolled agent token may read only its own verdict; a member (viewers included) any agent in the org.
+          const caller = req.headers.authorization ? { agent: agentUser(s, req) } : { user: sessionUser(s, req) };
+          const a = s.agents[budgetRoute[1]];
+          const orgId = caller.agent?.orgId ?? caller.user.orgId;
+          if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
+          const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now() });
+        }));
       }
       const update = /^\/v1\/agents\/([^/]+)\/(policy|revoke)$/.exec(path);
       if (update && req.method === "POST") {
