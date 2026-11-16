@@ -9,8 +9,14 @@
   ],
   "alerts": [ { "kind": "cap_hit", "key": "cap_hit:agent-sample:day", "agent_id": "agent-sample", "scope": "day" } ],
   "receipts": [
-    { "agent_id": "agent-sample", "receipt_id": "r-1", "ts": "2026-11-15T01:00:00.000Z", "model": "gpt-4o-mini", "cost_usd": 0.6 },
-    { "agent_id": "agent-sample", "receipt_id": "r-2", "ts": "2026-11-15T02:00:00.000Z", "model": "gpt-4o-mini", "cost_usd": null }
+    { "agent_id": "agent-sample", "receipt_id": "r-1", "ts": "2026-11-15T01:00:00.000Z", "model": "gpt-4o-mini", "cost_usd": 0.6, "blocked": false, "reason": null, "scope": null },
+    { "agent_id": "agent-sample", "receipt_id": "r-2", "ts": "2026-11-15T02:00:00.000Z", "model": "gpt-4o-mini", "cost_usd": null, "blocked": false, "reason": null, "scope": null },
+    { "agent_id": "agent-sample", "receipt_id": "r-3", "ts": "2026-11-15T03:00:00.000Z", "model": "gpt-4o-mini", "cost_usd": 0, "blocked": true, "reason": "cap_exceeded", "scope": "day" }
   ],
-  "totals": { "agents": 1, "receipts": 2, "unknown_cost_receipts": 1, "cost_complete": false }
+  "audit": [
+    { "ts": "2026-11-15T00:30:00.000Z", "actor": "user-owner", "action": "policy.change", "target": "agent-sample",
+      "detail": { "previous": { "caps": { "day": 0.25 }, "killed": false, "maxSteps": null }, "policy": { "version": 2, "caps": { "day": 0.5 }, "killed": false }, "reason": "raise for batch run" } },
+    { "ts": "2026-11-15T04:00:00.000Z", "actor": "user-owner", "action": "fleet.freeze", "target": null, "detail": { "reason": "incident review", "agent_ids": ["agent-sample"] } }
+  ],
+  "totals": { "agents": 1, "receipts": 3, "unknown_cost_receipts": 1, "cost_complete": false }
 }

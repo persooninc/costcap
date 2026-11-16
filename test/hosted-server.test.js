@@ -732,3 +732,39 @@ test("#114 maxSteps round-trips through the Postgres record mapping", async () =
   const state = { ...structuredClone(EMPTY_STATE), agents: { a1: { id: "a1", orgId: "o", name: "n", hash: "h", policy: { version: 2, caps: {}, killed: false, maxSteps: 5 }, lastSeen: 1, revoked: false } } };
   assert.deepEqual(fromRecords([...toRecords(state).values()], EMPTY_STATE), state);
 });
+
+test("regression #118: evidence export carries the audit trail with before/after caps, freeze reason, org isolation", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("ev-owner@example.invalid");
+  const outsider = await f.login("ev-outsider@example.invalid");
+  const enroll = async (who, name) => {
+    const e = await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, who.cookie);
+    return (await f.request("/v1/enroll", { name }, null, e.body.token)).body;
+  };
+  const a = await enroll(owner, "a");
+  const other = await enroll(outsider, "other");
+  assert.equal((await f.request(`/v1/agents/${a.agentId}/policy`, { caps: { day: 5 }, maxSteps: 9, reason: "batch" }, owner.cookie)).status, 200);
+  assert.equal((await f.request(`/v1/agents/${other.agentId}/policy`, { caps: { day: 2 } }, outsider.cookie)).status, 200);
+  assert.equal((await f.request("/v1/fleet/freeze", { reason: "incident 7" }, owner.cookie)).status, 200);
+  await f.request("/v1/invitations", { email: "ev-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("ev-viewer@example.invalid");
+  await f.restart();
+  assert.equal((await f.request("/v1/evidence.json")).status, 401);
+  const doc = (await f.request("/v1/evidence.json", undefined, viewer.cookie)).body;
+  const change = doc.audit.find((e) => e.action === "policy.change" && e.target === a.agentId);
+  assert.deepEqual(change.detail.previous, { caps: { day: 1 }, killed: false, maxSteps: null });
+  assert.deepEqual(change.detail.policy.caps, { day: 5 });
+  assert.equal(change.detail.policy.maxSteps, 9);
+  assert.equal(change.detail.reason, "batch");
+  assert.equal(change.actor, owner.body.userId ?? change.actor);
+  const freeze = doc.audit.find((e) => e.action === "fleet.freeze");
+  assert.equal(freeze.detail.reason, "incident 7");
+  assert.deepEqual(freeze.detail.agent_ids, [a.agentId]);
+  for (const e of doc.audit) for (const k of ["ts", "actor", "action", "target", "detail"]) assert.ok(k in e, k);
+  const ts = doc.audit.map((e) => e.ts);
+  assert.deepEqual(ts, [...ts].sort());
+  assert.equal(JSON.stringify(doc).includes(other.agentId), false);
+  const theirs = (await f.request("/v1/evidence.json", undefined, outsider.cookie)).body;
+  assert.ok(theirs.audit.some((e) => e.action === "policy.change" && e.detail.previous.caps.day === 1 && e.detail.policy.caps.day === 2));
+  assert.equal(theirs.audit.some((e) => e.action === "fleet.freeze"), false);
+});

@@ -5,7 +5,7 @@ export const EVIDENCE_SCHEMA = "costcap.evidence/v1";
 
 const known = (unknown) => unknown === 0;
 
-export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], nowMs, spendFor }) {
+export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], audit = [], nowMs, spendFor }) {
   if (typeof orgId !== "string" || !orgId) throw new Error("orgId required");
   if (!Number.isFinite(nowMs)) throw new Error("nowMs required");
   if (typeof spendFor !== "function") throw new Error("spendFor required");
@@ -30,7 +30,19 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     ts: item.receipt?.ts ?? null,
     model: item.receipt?.model ?? null,
     cost_usd: typeof item.receipt?.cost_usd === "number" ? item.receipt.cost_usd : null,
+    blocked: Boolean(item.receipt?.blocked),
+    reason: item.receipt?.reason ?? null,
+    scope: item.receipt?.scope ?? null,
   }));
+  // Audit trail (#118): org-scoped, oldest first. Fleet freeze/resume detail is
+  // normalized to snake_case agent_ids; policy.change carries previous + policy.
+  const trail = audit.filter((e) => e && e.org_id === orgId)
+    .map((e, i) => ({ e, i })).sort((x, y) => String(x.e.ts).localeCompare(String(y.e.ts)) || x.i - y.i)
+    .map(({ e }) => {
+      const { agentIds, ...rest } = e.detail ?? {};
+      const detail = agentIds !== undefined ? { ...rest, agent_ids: agentIds } : rest;
+      return { ts: e.ts ?? null, actor: e.actor ?? null, action: e.action, target: e.target ?? null, detail };
+    });
   const unknownTotal = rows.filter((r) => r.cost_usd === null).length;
   return {
     schema: EVIDENCE_SCHEMA,
@@ -39,6 +51,7 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     agents: out,
     alerts: alerts.map((a) => ({ kind: a.kind ?? null, key: a.key ?? null, agent_id: a.agentId ?? null, scope: a.scope ?? null })),
     receipts: rows,
+    audit: trail,
     totals: { agents: out.length, receipts: rows.length, unknown_cost_receipts: unknownTotal, cost_complete: known(unknownTotal) },
   };
 }

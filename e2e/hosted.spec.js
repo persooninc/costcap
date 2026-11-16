@@ -137,6 +137,13 @@ test("#112 a signed-in org reads its agent budget verdict; cross-org read is 404
     expect(body.budget_remaining.day_usd).toBe(3);
     const cross = await request.get(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: { cookie: outsider } });
     expect(cross.status()).toBe(404);
+    // #118: the signed-in evidence export carries policy.change with previous caps.
+    await post(`/v1/agents/${agent.agentId}/policy`, { caps: { day: 6 }, reason: "e2e raise" }, { cookie: owner });
+    const ev = await request.get(`${origin}/v1/evidence.json`, { headers: { cookie: owner } });
+    expect(ev.status()).toBe(200);
+    const change = (await ev.json()).audit.find((e) => e.action === "policy.change");
+    expect(change.detail.previous.caps).toEqual({ day: 4 });
+    expect(change.detail.policy.caps).toEqual({ day: 6 });
   } finally {
     service.server.closeAllConnections();
     service.server.close();

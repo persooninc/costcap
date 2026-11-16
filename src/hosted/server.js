@@ -319,7 +319,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
-            alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active) });
+            alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active),
+            audit: s.audit.filter((e) => e.org_id === u.orgId) });
         }));
       }
       if (path === "/v1/fleet" && req.method === "GET") {
@@ -408,8 +409,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
           const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
+          const prev = a.policy ?? {};
+          const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null };
           a.policy = policy;
-          audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { policy, reason } : { policy });
+          audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;
         });
         return json(200, result);
