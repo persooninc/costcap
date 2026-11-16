@@ -913,6 +913,30 @@ curl -X POST https://app.costcap.dev/v1/fleet/freeze -H "Authorization: Bearer $
   -H 'content-type: application/json' -d '{"reason":"cap_hit webhook"}'
 ```
 
+### Prometheus metrics (hosted, #220)
+
+`GET /v1/metrics` serves Prometheus text exposition (`text/plain; version=0.0.4`) for your org, so Grafana, Datadog or Prometheus can scrape agent spend next to your other service metrics. Authenticate with a viewer or admin `cck_` key (or a member session); no key, or a revoked or expired one, gets `401`, and a key only ever sees its own org.
+
+Series (all gauges for the current budget period, #209): `costcap_spend_usd{agent,team,window}` (`window` is `day` or `month`), `costcap_spend_complete{agent,window}` (`0` when the window holds unsettled unknown-cost receipts, so spend is a lower bound, never a silent $0), `costcap_unknown_cost_receipts{agent}`, `costcap_cap_usd` / `costcap_cap_remaining_usd{scope="agent|team",name,window}` (omitted when there is no cap), `costcap_alerts_open{kind,scope,scope_name}` for every alert kind, `costcap_agent_frozen{agent}`, `costcap_agent_last_sync_timestamp_seconds{agent}` and `costcap_metrics_truncated`. Spend matches `/v1/spend` for the same period and excludes receipts past the retention cutoff (#211).
+
+`?by=model` replaces each agent's `costcap_spend_usd` total with per-model series (they sum to the total). The response is capped at 5,000 series: past the cap it drops the per-model and optional series first, keeps every agent total and sets `costcap_metrics_truncated 1`.
+
+The values are gauges for the current period, not monotonic counters: retention deletes old receipts and periods roll over, so use `max_over_time`/`last_over_time`, not `rate()`. Prometheus keeps the history.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: costcap
+    scheme: https
+    metrics_path: /v1/metrics
+    scrape_interval: 60s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/costcap_api_key   # a viewer cck_ key
+    static_configs:
+      - targets: ["app.costcap.dev"]
+```
+
 ### Fleet freeze (kill switch)
 
 `POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin [API key](#org-api-keys), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.

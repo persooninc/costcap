@@ -32,7 +32,7 @@ async function fixture(t) {
     assert.equal(v.status, 200);
     return v;
   };
-  return { raw, login, storePath, tick: (ms) => { clock += ms; } };
+  return { raw, login, storePath, tick: (ms) => { clock += ms; }, evaluate: () => service.evaluateFleetAlerts() };
 }
 
 test("unit: bearer parsing, input validation, hashing, masking, expiry and principal", () => {
@@ -157,4 +157,104 @@ test("AC1-AC6: create once, role matrix, freeze without Origin, revoke/expiry/is
   // AC6: sessions keep working unchanged.
   assert.equal((await f.raw("/v1/spend", { cookie: viewer.cookie })).status, 200);
   assert.equal((await f.raw("/v1/fleet/freeze", { body: { reason: "s" }, cookie: owner.cookie })).status, 200);
+});
+
+// Issue #220: GET /v1/metrics (Prometheus) auth, isolation, parity with /v1/spend, alerts and freeze.
+test("#220 /v1/metrics: viewer key scrape, 401s, org isolation, /v1/spend parity, alerts, freeze", async (t) => {
+  const { parseProm, value, find } = await import("./support/prom.js");
+  const f = await fixture(t);
+  const owner = await f.login("m-owner@example.invalid");
+  const other = await f.login("m-other@example.invalid");
+  const enroll = async (cookie, name, caps) => {
+    const tok = (await f.raw("/v1/enrollment-tokens", { body: { caps }, cookie })).body.token;
+    return (await f.raw("/v1/enroll", { body: { name }, bearer: tok })).body;
+  };
+  const a = await enroll(owner.cookie, "a", { day: 5 });
+  const b = await enroll(owner.cookie, "b", {});
+  const ts = new Date(T0 - 3600_000).toISOString();
+  assert.equal((await f.raw("/v1/receipts", { body: { receipts: [{ id: "a1", ts, cost_usd: 1, model: "m1" }, { id: "a2", ts, cost_usd: 0.25, model: "m2" }] }, bearer: a.token })).status, 200);
+  assert.equal((await f.raw("/v1/receipts", { body: { receipts: [{ id: "b1", ts, cost_usd: 0.5, model: "m1" }, { id: "b2", ts, cost_usd: null, model: "m1" }] }, bearer: b.token })).status, 200);
+  assert.equal((await f.raw("/v1/teams", { body: { name: "t", agents: [a.agentId, b.agentId], day: 100 }, cookie: owner.cookie })).status, 200);
+  const viewerKey = (await f.raw("/v1/api-keys", { body: { name: "prom", role: "viewer" }, cookie: owner.cookie })).body.key;
+
+  // AC1
+  const scrape = async (bearer, q = "") => f.raw(`/v1/metrics${q}`, { bearer });
+  const r = await scrape(viewerKey);
+  assert.equal(r.status, 200);
+  const rows = parseProm(r.text);
+  assert.equal(value(rows, "costcap_spend_usd", { agent: "a", team: "t", window: "day" }), 1.25);
+  assert.equal(value(rows, "costcap_cap_remaining_usd", { scope: "agent", name: "a", window: "day" }), 3.75);
+  assert.equal(value(rows, "costcap_spend_complete", { agent: "b", window: "day" }), 0);
+  assert.equal(value(rows, "costcap_unknown_cost_receipts", { agent: "b" }), 1);
+  assert.equal((await f.raw("/v1/metrics", { cookie: owner.cookie })).status, 200, "member session works");
+  assert.equal((await scrape(viewerKey, "?by=team")).status, 400);
+
+  // AC3: parity with /v1/spend (month, by agent) to the cent.
+  const spend = (await f.raw("/v1/spend?group_by=agent&range=current_month", { bearer: viewerKey })).body;
+  for (const bucket of spend.buckets) {
+    assert.equal(value(rows, "costcap_spend_usd", { agent: bucket.label, window: "month" }).toFixed(2), bucket.usd_known.toFixed(2));
+  }
+  // by=model sums to the agent total.
+  const byModel = parseProm((await scrape(viewerKey, "?by=model")).text);
+  assert.equal(find(byModel, "costcap_spend_usd", { agent: "a", window: "day" }).reduce((s, x) => s + x.value, 0), 1.25);
+
+  // AC2: isolation. The other org's key sees none of org A's series.
+  const otherKey = (await f.raw("/v1/api-keys", { body: { name: "o" }, cookie: other.cookie })).body.key;
+  const otherRows = parseProm((await scrape(otherKey)).text);
+  assert.equal(find(otherRows, "costcap_spend_usd").length, 0);
+  assert.ok(!(await scrape(otherKey)).text.includes('agent="a"'));
+
+  // AC4: an open cap_hit alert shows 1, then 0 after ack; freeze -> frozen 1 for every agent.
+  assert.equal((await f.raw("/v1/receipts", { body: { receipts: [{ id: "a3", ts, cost_usd: 4, model: "m1" }] }, bearer: a.token })).status, 200);
+  await f.evaluate();
+  let open = parseProm((await scrape(viewerKey)).text);
+  assert.equal(value(open, "costcap_alerts_open", { kind: "cap_hit", scope: "agent", scope_name: "a" }), 1);
+  const alert = (await f.raw("/v1/alerts?status=active", { cookie: owner.cookie })).body.alerts.find((x) => x.kind === "cap_hit");
+  assert.equal((await f.raw(`/v1/alerts/${alert.id}/ack`, { body: {}, cookie: owner.cookie })).status, 200);
+  open = parseProm((await scrape(viewerKey)).text);
+  assert.equal(value(open, "costcap_alerts_open", { kind: "cap_hit", scope: "agent", scope_name: "a" }), 0);
+  assert.equal((await f.raw("/v1/fleet/freeze", { body: { reason: "drill" }, cookie: owner.cookie })).status, 200);
+  assert.deepEqual(find(parseProm((await scrape(viewerKey)).text), "costcap_agent_frozen").map((x) => x.value), [1, 1]);
+
+  // AC2: no auth, unknown, revoked and expired keys get 401.
+  assert.equal((await f.raw("/v1/metrics", { withOrigin: false })).status, 401);
+  assert.equal((await scrape("cck_unknown")).status, 401);
+  assert.equal((await scrape(a.token)).status, 401, "agent token is not a scrape credential");
+  const id = (await f.raw("/v1/api-keys", { cookie: owner.cookie })).body.keys.find((k) => k.name === "prom").id;
+  assert.equal((await f.raw(`/v1/api-keys/${id}/revoke`, { body: {}, cookie: owner.cookie })).status, 200);
+  assert.equal((await scrape(viewerKey)).status, 401);
+  const short = (await f.raw("/v1/api-keys", { body: { name: "short", expires_at: new Date(T0 + 60_000).toISOString() }, cookie: owner.cookie })).body.key;
+  assert.equal((await scrape(short)).status, 200);
+  f.tick(61_000);
+  assert.equal((await scrape(short)).status, 401);
+});
+
+test("#220 /v1/metrics on the Postgres store: org-scoped series", async (t) => {
+  const { openPostgresStore } = await import("../src/hosted/store-postgres.js");
+  const { parseProm, find } = await import("./support/prom.js");
+  const pool = { async connect() { return { async query(sql) { return { rows: [] }; }, release() {} }; } };
+  const store = await openPostgresStore({ pool, log: () => {} });
+  const A = "00000000-0000-4000-8000-0000000000a1", B = "00000000-0000-4000-8000-0000000000b1";
+  const keys = {};
+  store.transaction((s) => {
+    for (const org of [A, B]) {
+      s.orgs[org] = { id: org, name: org };
+      s.agents[`ag-${org}`] = { id: `ag-${org}`, orgId: org, name: `agent-${org.slice(-2)}`, policy: { caps: {}, version: 1, killed: false }, lastSeen: T0, revoked: false };
+      s.receipts[`ag-${org}:r`] = { orgId: org, agentId: `ag-${org}`, receipt: { id: "r", ts: new Date(T0 - 60_000).toISOString(), cost_usd: org === A ? 2 : 3, model: "m" } };
+      keys[org] = createApiKey(s, { orgId: org, createdBy: "u", name: "prom", role: "viewer", expiresAt: null }, T0).raw;
+    }
+  });
+  await store.flush();
+  const service = createHostedServer({ store, origin: "http://localhost", secureCookies: false, now: () => T0, stripeEnv: {}, verifyChallenge: async () => true, sendCode: async () => {} });
+  await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
+  t.after(() => { service.server.closeAllConnections(); service.server.close(); });
+  const get = (key) => fetch(`http://127.0.0.1:${service.server.address().port}/v1/metrics`, { headers: key ? { authorization: `Bearer ${key}` } : {} });
+  const ra = await get(keys[A]);
+  assert.equal(ra.status, 200);
+  assert.match(ra.headers.get("content-type"), /^text\/plain; version=0\.0\.4/);
+  const rows = find(parseProm(await ra.text()), "costcap_spend_usd");
+  assert.deepEqual(rows.map((r) => [r.labels.agent, r.value]), [["agent-a1", 2], ["agent-a1", 2]]);
+  const rb = find(parseProm(await (await get(keys[B])).text()), "costcap_spend_usd");
+  assert.deepEqual([...new Set(rb.map((r) => r.labels.agent))], ["agent-b1"]);
+  assert.equal((await get(null)).status, 401);
 });
