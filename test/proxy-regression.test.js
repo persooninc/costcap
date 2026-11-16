@@ -530,3 +530,20 @@ test("#163 AC2: gpt-image-1 images/generations priced from the table", async (t)
   assert.equal(rec.cost_usd, Number(((50 * 5 + 4160 * 40) / 1e6).toFixed(6)));
   assert.equal(rec.cost_source, "table");
 });
+
+test("#184 without a cache every receipt keeps its exact pre-cache shape and no cache header is sent", async (t) => {
+  const up = await new Promise((r) => { const s = http.createServer((q, res) => { q.resume(); q.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } }))); }); s.listen(0, "127.0.0.1", () => r(s)); });
+  t.after(() => up.close());
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r), spiral: null });
+  t.after(() => server.close());
+  for (let i = 0; i < 2; i++) {
+    const res = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0 }) });
+    await res.text();
+    assert.equal(res.headers.get("x-costcap-cache"), null);
+  }
+  await new Promise((r) => setImmediate(r));
+  assert.equal(receipts.length, 2);
+  assert.deepEqual(Object.keys(receipts[1]).sort(), Object.keys(receipts[0]).sort());
+  for (const r of receipts) for (const k of ["cache", "saved_usd", "cache_source_receipt"]) assert.equal(k in r, false);
+});

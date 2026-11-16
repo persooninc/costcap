@@ -427,6 +427,20 @@ costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
 - When a scope has an unknown-cost receipt, its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
 - `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
 
+## Response cache
+
+`costcap wrap --cache TTL` (off by default; `30s`, `10m`, `24h`, `7d`, at most `7d`) answers repeated identical deterministic requests from a local disk cache. A hit makes no upstream call, costs $0, and still writes a receipt: `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`.
+
+- **Cached:** `POST` non-streaming generation requests whose JSON body sets `temperature` (Gemini: `generationConfig.temperature`) to exactly `0`, and embeddings requests. Only a `2xx` response with a known, numeric `cost_usd` is stored.
+- **Never cached** (`x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), batches, Files, count-tokens, GET/HEAD and `n > 1`. Provider errors, unknown or unpriced cost and `batch_pending` responses are never stored.
+- **Key:** SHA-256 of provider, upstream, method, path and query, the exact body bytes, `anthropic-version`, `anthropic-beta`, `openai-organization`, `openai-project`, and a hash of the API key headers and any `key=` query value. Different keys never share entries.
+- **Order:** the lookup runs after every check (kill file, caps, allowlist, preflight, breaker, spiral). A hit never bypasses a refusal. Hits count toward `--max-steps` and policy `maxSteps`, never toward velocity spend, caps, alerts or billing.
+- **Storage:** `--cache-dir DIR` (default `<ledger-dir>/cache`, mode `0700`, entries `0600`). `--cache-max-mb N` (default 256) evicts least recently used entries; a response over 1/10 of the cap is not stored. Entries hold status, content-type, response body, model, original cost, source receipt id and a timestamp. They never hold request bodies, headers or keys. Delete the directory to purge.
+- **Per call:** send `x-costcap-cache: bypass` to skip lookup and store. CostCap always strips the header before forwarding. Responses carry `x-costcap-cache: hit|miss|bypass`.
+- **Reporting:** the run summary gains `cache: {hits, misses, saved_usd}`, the roll-up line adds ` · cache: N hits, saved $X`, and hosted `/v1/spend` reports `cache_hits` and `saved_usd` per bucket and in the total.
+
+Cached answers can be stale for up to the TTL. Use a short TTL, or the bypass header, where freshness matters.
+
 ## Run summaries
 
 Every `costcap wrap` run writes `<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`) when it ends, including after a cap stop, breaker stop or `costcap kill`. It holds `calls`, `blocked_calls`, `by_model` (calls, input/output/cache-read/cache-write tokens, `cost_usd`), `total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope) and `stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`, plus `stopped_scope`). If any call has unknown cost, `total_cost_usd` is `null`, never a silent $0. A one-line roll-up is printed to stderr.

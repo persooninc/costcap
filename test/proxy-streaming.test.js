@@ -299,3 +299,27 @@ test("#166 Gemini stream: cumulative usageMetadata without finishReason is incom
   bare.push(`data: {${usage}}\n\n`);
   assert.equal(bare.incomplete, false);
 });
+
+test("#184 with a cache, a temperature-0 stream bypasses the cache and passes through unchanged", async (t) => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createResponseCache } = await import("../src/response-cache.js");
+  const sse = 'data: {"model":"gpt-4o-mini","choices":[{"delta":{"content":"hi"}}]}\n\ndata: {"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n\ndata: [DONE]\n\n';
+  let calls = 0;
+  const up = await new Promise((r) => { const s = http.createServer((q, res) => { calls++; q.resume(); q.on("end", () => res.writeHead(200, { "content-type": "text/event-stream" }).end(sse)); }); s.listen(0, "127.0.0.1", () => r(s)); });
+  t.after(() => up.close());
+  const receipts = [];
+  const cache = createResponseCache({ dir: join(mkdtempSync(join(tmpdir(), "cc-sc-")), "cache"), ttlMs: 60_000 });
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r), spiral: null, cache });
+  t.after(() => server.close());
+  for (let i = 0; i < 2; i++) {
+    const res = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0, stream: true, stream_options: { include_usage: true } }) });
+    assert.equal(res.headers.get("x-costcap-cache"), "bypass");
+    assert.equal(await res.text(), sse);
+  }
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 2);
+  assert.ok(receipts.every((r) => r.cache === "bypass" && r.cost_usd > 0));
+  assert.equal(cache.stats.hits + cache.stats.misses, 0);
+});

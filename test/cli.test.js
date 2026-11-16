@@ -397,3 +397,22 @@ test("#163: wrap meters Gemini audio at the audio rate, check --cap trips on it,
   const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gemini-2.5-flash"], { encoding: "utf8" });
   assert.match(show.stdout, /gemini-2\.5-flash \(audio\): input \$1, cached_input \$0\.1/);
 });
+
+// #184: --cache flags.
+test("#184 parseWrapArgs reads --cache, --cache-dir and --cache-max-mb", () => {
+  const o = parseWrapArgs(["--cache", "24h", "--cache-dir", "/tmp/x", "--cache-max-mb", "16", "--", "node"]);
+  assert.equal(o.cacheTtlMs, 86_400_000);
+  assert.equal(o.cacheDir, "/tmp/x");
+  assert.equal(o.cacheMaxMb, 16);
+  assert.equal(parseWrapArgs(["--", "node"]).cacheTtlMs, undefined);
+  assert.throws(() => parseWrapArgs(["--cache", "8d", "--", "x"]), /at most 7d/);
+  assert.throws(() => parseWrapArgs(["--cache", "soon", "--", "x"]), /duration/);
+  assert.throws(() => parseWrapArgs(["--cache", "1h", "--cache-max-mb", "0", "--", "x"]), /positive/);
+  assert.throws(() => parseWrapArgs(["--cache-dir", "/tmp/x", "--", "x"]), /need --cache/);
+});
+
+test("#184 wrap with a bad --cache TTL exits 2", () => {
+  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--cache", "forever", "--", process.execPath, "-e", "1"], { encoding: "utf8" });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--cache must be/);
+});

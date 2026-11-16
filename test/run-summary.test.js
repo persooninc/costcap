@@ -194,3 +194,36 @@ test("#160 a pending batch keeps the run total unknown until its batch_results s
   const settled = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending, { event: "reconciliation", receipt_id: "p1", cost_usd: 0.25, source: "batch_results" }] });
   assert.deepEqual([settled.total_cost_usd, settled.unknown_cost_calls], [0.35, 0]);
 });
+
+// #184: response cache reporting.
+test("#184 cache block counts hits/misses and saved_usd; roll-up shows the saving; absent without cache", () => {
+  const s = buildRunSummary({ run_id: "c1", started_at: "a", ended_at: "b", receipts: [
+    priced("m1", 0.2, { cache: "miss" }), priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.2 }), priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.2 }), priced("m1", 0.1, { cache: "bypass" })] });
+  assert.deepEqual(s.cache, { hits: 2, misses: 1, saved_usd: 0.4 });
+  assert.equal(s.total_cost_usd, 0.3);
+  assert.match(rollupLine(s), / · cache: 2 hits, saved \$0\.4000$/);
+  const plain = buildRunSummary({ run_id: "c2", started_at: "a", ended_at: "b", receipts: [priced("m1", 0.1)] });
+  assert.equal("cache" in plain, false);
+  assert.doesNotMatch(rollupLine(plain), /cache:/);
+  const none = buildRunSummary({ run_id: "c3", started_at: "a", ended_at: "b", receipts: [], cacheEnabled: true });
+  assert.deepEqual(none.cache, { hits: 0, misses: 0, saved_usd: 0 });
+  assert.doesNotMatch(rollupLine(none), /cache:/);
+});
+
+test("#184 wrap --cache: repeated temperature-0 calls hit the cache, summary and roll-up report the saving", async (t) => {
+  let upstreamCalls = 0;
+  const up = await fakeUpstream(t, (b) => { upstreamCalls++; return { model: b.model, usage: { prompt_tokens: 1000, completion_tokens: 200 } }; });
+  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
+  const rp = path.join(dir, "r.jsonl");
+  const script = `const u = process.env.OPENAI_BASE_URL + "/chat/completions";
+    for (let i = 0; i < 3; i++) await fetch(u, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0 }) });`;
+  const r = await runWrap(up, ["--receipts", rp, "--cache", "1h"], script);
+  assert.equal(r.code, 0);
+  assert.equal(upstreamCalls, 1);
+  const [s] = readSummaries(dir);
+  assert.equal(s.cache.hits, 2);
+  assert.equal(s.cache.misses, 1);
+  assert.ok(s.cache.saved_usd > 0);
+  assert.match(r.err, / · cache: 2 hits, saved \$/);
+  assert.ok(readdirSync(path.join(dir, "cache")).length === 1, "default cache dir is <ledger-dir>/cache");
+});

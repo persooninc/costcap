@@ -14,6 +14,7 @@ import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
+import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -348,7 +349,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -424,6 +425,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     let reqTags = null, tagError = null;
     try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
     delete req.headers[TAG_HEADER];
+    // #184: x-costcap-cache is CostCap's; never forwarded.
+    const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
+    delete req.headers[CACHE_HEADER];
     const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
@@ -524,6 +528,25 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           return null;
         });
         if (verdict === "blocked") return;
+        // #184: lookup only after the full verdict, so a hit never skips a refusal.
+        let cacheMode = null, cacheKeyHex = null;
+        if (cache) {
+          cacheMode = cacheBypass || isStreamRequest({ path, body }) || !isCacheable({ method: req.method, path, body }) ? "bypass" : "miss";
+          if (cacheMode === "miss") {
+            cacheKeyHex = cacheKey({ provider, upstream, method: req.method, path, body, headers: req.headers });
+            const entry = cache.get(cacheKeyHex);
+            if (entry) {
+              cache.hit(entry.cost_usd);
+              velocity?.step?.();
+              emit({ provider, path: storedPath, status: entry.status, blocked: false, model: entry.model ?? requestedModel ?? "unknown",
+                cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id });
+              flushWarnings();
+              if (!res.destroyed) res.writeHead(entry.status, { "content-type": entry.content_type, [CACHE_HEADER]: "hit" }).end(entry.body);
+              return;
+            }
+          }
+        }
+        const cacheHeaders = cacheMode ? { [CACHE_HEADER]: cacheMode } : {};
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
@@ -549,7 +572,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             return;
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
-          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
+          if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false, sseIncomplete = false;
           if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
@@ -566,7 +590,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
             };
             if (!res.destroyed) {
-              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache" });
+              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache", ...(cacheMode && { [CACHE_HEADER]: "bypass" }) });
               res.flushHeaders();
             }
             const reader = upstreamRes.body.getReader();
@@ -626,7 +650,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ...(batchModels && { request_count: batchModels.length }) });
             const done = emit(receipt);
             pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id, run_id: done.run_id ?? null });
-            if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw);
+            if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw);
             return;
           } else if (raw && req.method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchReadPath(req.method, req.url)) {
             Object.assign(receipt, { model: "unknown", cost_usd: 0, reason: "non_billable_request" });
@@ -671,9 +695,16 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           }
           const emitted = emit(receipt);
           // #171: the unknown counts on the running cap engine so a settle lands exactly once.
+          // #184: only a 2xx, metered, known-cost response is stored.
+          if (cacheMode === "miss") {
+            cache.miss();
+            if (raw && metered && !failMsg && upstreamRes.status >= 200 && upstreamRes.status < 300 && typeof emitted.cost_usd === "number" && Number.isFinite(emitted.cost_usd) && !emitted.reason) {
+              try { cache.set(cacheKeyHex, { status: upstreamRes.status, contentType, body: raw, model: emitted.model ?? null, cost_usd: emitted.cost_usd, receipt_id: emitted.id }); } catch { /* cache is best effort */ }
+            }
+          }
           if (failMsg) { failures.set(emitted.id, failMsg); if (!metered) recordSpend(emitted); failMsg = null; }
           flushWarnings();
-          if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw); }
+          if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw); }
           else if (streamCut) res.destroy();
           else if (!res.destroyed) res.end();
         } catch {

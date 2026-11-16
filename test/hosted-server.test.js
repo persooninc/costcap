@@ -1208,3 +1208,24 @@ test("#161 without enforced entitlements an invite still accepts past the free s
   for (let i = 1; i <= 4; i++) assert.equal((await f.request("/v1/invitations", { email: `b${i}@beta.invalid`, role: "viewer" }, owner.cookie)).status, 201);
   for (let i = 1; i <= 4; i++) { const r = await f.login(`b${i}@beta.invalid`); assert.equal(r.status, 200); assert.equal(r.body.orgId, owner.body.orgId); }
 });
+
+test("#184 receipt ingest accepts saved_usd only on a $0 cache_hit receipt; /v1/spend reports it", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("cache-owner@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", {}, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "cached" }, null, enrollment.body.token)).body;
+  const ts = new Date().toISOString();
+  const hit = { id: "h-1", ts, cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: 0.3, model: "gpt-4.1" };
+  for (const bad of [{ ...hit, id: "b1", saved_usd: -1 }, { ...hit, id: "b2", saved_usd: "x" }, { id: "b3", ts, cost_usd: 0.3, saved_usd: 0.3, model: "gpt-4.1" }, { ...hit, id: "b4", cost_usd: 0.1 }, { ...hit, id: "b5", saved_usd: null }]) {
+    assert.equal((await f.request("/v1/receipts", { receipts: [bad] }, null, agent.token)).status, 400, JSON.stringify(bad));
+  }
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "m-1", ts, cost_usd: 0.3, cache: "miss", model: "gpt-4.1" }, hit] }, null, agent.token)).status, 200);
+  for (const g of ["day", "model", "agent"]) {
+    const s = await f.request(`/v1/spend?group_by=${g}`, undefined, owner.cookie);
+    assert.equal(s.status, 200);
+    assert.equal(s.body.total.cache_hits, 1);
+    assert.equal(s.body.total.saved_usd, 0.3);
+    assert.equal(s.body.total.usd_known, 0.3);
+    assert.equal(s.body.buckets[0].cache_hits, 1);
+  }
+});

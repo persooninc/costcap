@@ -24,6 +24,8 @@ export function createVelocityBreaker({
       buckets.set(i, (buckets.get(i) ?? 0) + costUsd);
       for (const k of buckets.keys()) if (k < i - baselineBuckets - 1) buckets.delete(k);
     },
+    // #184: a cache hit is a step (counts toward maxSteps) but never velocity spend.
+    step() { steps += 1; },
     // Returns null if calls may proceed, else a descriptor. Latches once tripped.
     check() {
       if (tripped) return tripped;
