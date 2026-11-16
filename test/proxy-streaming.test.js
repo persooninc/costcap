@@ -52,8 +52,9 @@ async function setup(t, events, opts = {}, proxyOpts = {}) {
   return { up, proxy, receipts };
 }
 
-async function streamCall(proxy, path) {
-  const res = await fetch(`http://127.0.0.1:${proxy}${path}`, { method: "POST", body: '{"stream":true}' });
+// Caller opted in to include_usage, so the usage chunk is forwarded unchanged (#152).
+async function streamCall(proxy, path, body = '{"stream":true,"stream_options":{"include_usage":true}}') {
+  const res = await fetch(`http://127.0.0.1:${proxy}${path}`, { method: "POST", body });
   const chunks = [];
   let firstAt = 0;
   for await (const c of res.body) { if (!firstAt) firstAt = Date.now(); chunks.push(Buffer.from(c)); }
@@ -143,7 +144,7 @@ test("#154 idle timeout mid-stream (gap longer than streamIdleMs) is treated as 
   assert.equal(receipts[0].reason, "stream_incomplete");
 });
 
-test("a stream that ends cleanly without usage is usage_unavailable", async (t) => {
+test("a stream that ends cleanly without usage (even after injection) is usage_unavailable", async (t) => {
   const { proxy, receipts } = await setup(t, [OPENAI_EVENTS[0], OPENAI_EVENTS[3]], { gapMs: 5 });
   const { body } = await streamCall(proxy, "/openai/v1/chat/completions");
   assert.equal(body, OPENAI_EVENTS[0] + OPENAI_EVENTS[3]);

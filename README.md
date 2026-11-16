@@ -189,6 +189,13 @@ traffic bypasses CostCap.
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
+  OpenAI and OpenRouter chat completions only send usage in a stream when
+  `stream_options.include_usage` is set, so for `"stream": true` chat calls
+  costcap sets it in the forwarded request (other `stream_options` keys are kept).
+  When costcap injected it, the extra usage-only chunk (`choices: []`) is metered
+  and not forwarded, so your client sees the same events as without costcap. If you
+  set `include_usage: true` yourself, the chunk is forwarded unchanged. Other
+  requests are forwarded byte-identical.
   The receipt is written when the stream ends, so a cap hit by a streamed call
   blocks the **next** call; a call already in flight can overshoot the cap. A
   stream cut (upstream error, client abort or timeout) before usage arrives

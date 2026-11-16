@@ -25,6 +25,6 @@ CostCap sets `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` for the child.
 4. Compare receipt totals with the OpenAI dashboard for the same night. Differences mean unmetered paths (streaming without usage, other keys).
 
 ## Known risks
-- Streaming responses only meter if the caller sets `stream_options.include_usage`. NightlyQA's call is non-streaming, so fine.
+- Streaming OpenAI/OpenRouter chat calls meter by default: costcap injects `stream_options.include_usage` (see README).
 - Bypass: any code path that calls OpenAI without the env var is unmetered. Only `src/llm.js` references the API today (code search on the repo).
 - The nightly runner is currently started from the QA agent's 4am wake until Coolify takes over; the wrap command applies to whichever starts it.

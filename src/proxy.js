@@ -212,6 +212,50 @@ export const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
 export const DEFAULT_STREAM_IDLE_MS = 300_000;
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
+const CHAT_STREAM_PROVIDERS = new Set(["openai", "openrouter"]);
+
+// #152: OpenAI-compatible chat streams carry no usage unless stream_options.include_usage is set.
+// Returns the rewritten body when costcap had to inject it, else null (forward byte-identical).
+export function injectStreamUsage(provider, method, pathname, body) {
+  if (!CHAT_STREAM_PROVIDERS.has(provider) || method !== "POST" || !/\/chat\/completions\/?$/.test(pathname)) return null;
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.stream !== true) return null;
+  const opts = parsed.stream_options;
+  if (opts && typeof opts === "object" && !Array.isArray(opts) && opts.include_usage === true) return null;
+  if (opts !== undefined && opts !== null && (typeof opts !== "object" || Array.isArray(opts))) return null;
+  parsed.stream_options = { ...(opts ?? {}), include_usage: true };
+  return Buffer.from(JSON.stringify(parsed));
+}
+
+// Drops the usage-only chunk (choices: [] plus usage) that only exists because costcap asked for it.
+export function createUsageChunkFilter() {
+  let buf = "";
+  const keep = (event) => {
+    const data = event.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+    if (!data || data === "[DONE]") return true;
+    try {
+      const j = JSON.parse(data);
+      return !(j && Array.isArray(j.choices) && j.choices.length === 0 && j.usage);
+    } catch { return true; }
+  };
+  return {
+    push(text) {
+      buf += text;
+      let out = "";
+      for (;;) {
+        const m = /\r?\n\r?\n/.exec(buf);
+        if (!m) break;
+        const event = buf.slice(0, m.index + m[0].length);
+        buf = buf.slice(m.index + m[0].length);
+        if (keep(event)) out += event;
+      }
+      return out;
+    },
+    end() { const rest = buf; buf = ""; return rest && keep(rest) ? rest : ""; },
+  };
+}
+
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
   spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
@@ -308,6 +352,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           return null;
         });
         if (verdict === "blocked") return;
+        const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
         try {
@@ -318,7 +363,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const onClientClose = () => { if (!res.writableFinished) abort.abort(); };
           res.once("close", onClientClose);
           const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
-            body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
+            body: ["GET", "HEAD"].includes(req.method) ? undefined : (injected ?? body),
             // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
             redirect: "manual",
             signal: abort.signal });
@@ -340,6 +385,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             const parser = createSseUsageParser(provider, requestedModel);
             const decoder = new TextDecoder();
             arm(streamIdleMs);
+            const filter = injected ? createUsageChunkFilter() : null;
+            const forward = async (value) => {
+              if (res.destroyed) throw new Error("client_closed");
+              if (!value.length) return;
+              if (!res.write(value)) {
+                await new Promise((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
+              }
+            };
             if (!res.destroyed) {
               res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache" });
               res.flushHeaders();
@@ -350,13 +403,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 const { done, value } = await reader.read();
                 if (done) break;
                 arm(streamIdleMs);
-                parser.push(decoder.decode(value, { stream: true }));
-                if (res.destroyed) throw new Error("client_closed");
-                if (!res.write(value)) {
-                  await new Promise((resolve) => { res.once("drain", resolve); res.once("close", resolve); });
+                if (filter) {
+                  const text = decoder.decode(value, { stream: true });
+                  parser.push(text);
+                  await forward(Buffer.from(filter.push(text)));
+                } else {
+                  parser.push(decoder.decode(value, { stream: true }));
+                  await forward(value);
                 }
               }
-              parser.push(decoder.decode());
+              const tail = decoder.decode();
+              parser.push(tail);
+              if (filter) await forward(Buffer.from(filter.push(tail) + filter.end()));
             } catch {
               streamCut = true;
               abort.abort();
