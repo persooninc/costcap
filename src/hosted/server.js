@@ -6,7 +6,7 @@ import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { evaluateAlerts, auditEntry, silentAfterMsFor } from "./alerts.js";
+import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
@@ -644,6 +644,23 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           } else if (prior.delivery === "failed") out.push(prior);
         }
       }
+      // Issue #139: team day/month caps alert too, keyed per org and team.
+      const teamKeys = new Set();
+      for (const t of Object.values(s.teams ?? {})) {
+        const prefix = `team:${t.name}:`;
+        const blockedScopes = t.agents.flatMap((id) => agentReceipts(s, id))
+          .filter((r) => Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith(prefix))
+          .map((r) => r.scope.slice(prefix.length));
+        for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict: verdictOf(s, t), blockedScopes })) {
+          teamKeys.add(alert.key);
+          const prior = s.alerts[alert.key];
+          if (!prior?.active) {
+            s.alerts[alert.key] = { ...alert, orgId: t.orgId, agentId: null, active: true, delivery: "pending" };
+            out.push(s.alerts[alert.key]);
+          } else if (prior.delivery === "failed") out.push(prior);
+        }
+      }
+      for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) prior.active = false;
       return out;
     });
     for (const a of queued) {
@@ -659,7 +676,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
         s.alerts[a.key].delivery = alertDeliveryState(result);
-        audit(s, a.orgId, "alert-worker", "alert.delivery", a.agentId, { kind: a.kind, result });
+        audit(s, a.orgId, "alert-worker", "alert.delivery", a.agentId ?? `team:${a.team}`, { kind: a.kind, ...(a.team ? { team: a.team, scope: a.scope } : {}), result });
       });
     }
     return queued.length;

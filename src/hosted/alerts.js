@@ -85,3 +85,24 @@ export function auditEntry({ orgId, actor, action, target, detail = {}, now = ne
   if (!orgId || !actor || !action) throw new Error("audit entry needs orgId, actor and action");
   return { ts: now.toISOString(), org_id: orgId, actor, action, target: target ?? null, detail };
 }
+
+// Issue #139: hosted team budgets alert like per-agent caps. Pure.
+// verdict: teamVerdict() output; blockedScopes: ["day"|"month"] from member
+// receipts blocked with scope team:<name>:<scope> in the last hour.
+// Unknown cost (accounting_unavailable) or non-finite spend raises no cap
+// alert: unknown cost never counts as $0.
+export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { approachFraction = 0.8 } = {}) {
+  if (!verdict || verdict.spend?.unknown_count !== 0 || verdict.verdict === "accounting_unavailable") return [];
+  const out = [];
+  const id = `team:${orgId}:${verdict.name}`;
+  for (const scope of ["day", "month"]) {
+    const cap = verdict.caps?.[scope];
+    if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
+    const spent = verdict.spend[`${scope}_usd`];
+    if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
+    const base = { team: verdict.name, scope, cap, spent };
+    if (spent >= cap || blockedScopes.includes(scope)) out.push({ kind: "cap_hit", key: `cap_hit:${id}:${scope}`, ...base });
+    else if (spent >= cap * approachFraction) out.push({ kind: "cap_approaching", key: `cap_approaching:${id}:${scope}`, ...base });
+  }
+  return out;
+}

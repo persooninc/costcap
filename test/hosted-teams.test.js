@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
 import { enroll, createFleetClient } from "../src/hosted/client.js";
+import { evaluateTeamAlerts } from "../src/hosted/alerts.js";
+import { createAlertDelivery } from "../src/hosted/delivery.js";
 import { teamVerdict, cachedTeamVerdict, parseTeamInput, teamPolicy, validTeamPolicy, teamScope } from "../src/hosted/teams.js";
 import { hostedAgentVerdict } from "../src/hosted/agent-verdict.js";
 import { buildEvidence } from "../src/hosted/evidence.js";
@@ -83,12 +85,12 @@ test("unit: evidence lists teams and each agent's team", () => {
   assert.deepEqual(doc.agents.map((a) => a.team), ["ops", null]);
 });
 
-async function fixture(t) {
+async function fixture(t, { deliverAlert } = {}) {
   let code;
   const storePath = join(mkdtempSync(join(tmpdir(), "cc-teams-")), "store.json");
   let service, port = 0;
   const start = async () => {
-    service = createHostedServer({ storePath, origin: "http://localhost", secureCookies: false, stripeEnv: {}, verifyChallenge: async (v) => v === "ok", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {} });
+    service = createHostedServer({ storePath, origin: "http://localhost", secureCookies: false, stripeEnv: {}, verifyChallenge: async (v) => v === "ok", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {}, deliverAlert });
     service.server.keepAliveTimeout = 60_000;
     await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
     port = service.server.address().port; // restarts keep the URL the wrapper cached
@@ -108,7 +110,7 @@ async function fixture(t) {
     const e = await request("/v1/enrollment-tokens", { caps: {} }, cookie);
     return (await request("/v1/enroll", { name }, null, e.body.token)).body;
   };
-  return { request, login, agent, url, restart: async () => { service.server.closeAllConnections(); await new Promise((r) => service.server.close(r)); await start(); } };
+  return { request, login, agent, url, sweep: () => service.evaluateFleetAlerts(), restart: async () => { service.server.closeAllConnections(); await new Promise((r) => service.server.close(r)); await start(); } };
 }
 
 test("regression: /v1/teams roles, isolation, enforcement, evidence, removal, audit and restart", async (t) => {
@@ -201,4 +203,84 @@ test("regression: a wrapper client refuses from its cached team policy after the
   await f.request("/v1/teams", { name: "ops", remove: true }, owner.cookie);
   assert.equal((await cached.sync()).online, true);
   assert.equal(cached.teamCheck(), null);
+});
+
+// Issue #139: team caps raise cap_approaching / cap_hit alerts.
+test("unit: evaluateTeamAlerts thresholds, blocked receipts, unknown cost", () => {
+  const v = (day, extra = {}) => teamVerdict({ team, nowMs: NOW, receiptsByAgent: { a: [{ id: "1", ts: "2026-11-15T01:00:00Z", cost_usd: day, ...extra }] } });
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: v(10) }), []);
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: v(24) }), [{ kind: "cap_approaching", key: "cap_approaching:team:o:ops:day", team: "ops", scope: "day", cap: 30, spent: 24 }]);
+  assert.equal(evaluateTeamAlerts({ orgId: "o", verdict: v(30) })[0].key, "cap_hit:team:o:ops:day");
+  assert.equal(evaluateTeamAlerts({ orgId: "o", verdict: v(1), blockedScopes: ["day"] })[0].kind, "cap_hit");
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: v(null), blockedScopes: ["day"] }), []);
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: null }), []);
+  const nan = v(24); nan.spend.day_usd = NaN;
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: nan }), []);
+  const m = teamVerdict({ team: { name: "m", agents: ["a"], month: 10 }, nowMs: NOW, receiptsByAgent: { a: [{ id: "1", ts: "2026-11-02T00:00:00Z", cost_usd: 9 }] } });
+  assert.deepEqual(evaluateTeamAlerts({ orgId: "o", verdict: m }).map((x) => x.key), ["cap_approaching:team:o:m:month"]);
+});
+
+test("unit: alert text names the team, scope, spend and cap", async () => {
+  let sent;
+  const deliver = createAlertDelivery({ slackWebhook: "https://hooks.slack.com/services/x", fetchImpl: async (_u, o) => { sent = JSON.parse(o.body).text; return { ok: true, status: 200 }; } });
+  await deliver({ kind: "cap_hit", team: "ops", scope: "day", cap: 30, spent: 31 });
+  assert.match(sent, /team ops, day \(spent \$31 of \$30 cap\)/);
+});
+
+test("regression: a two-agent team alerts once at 80% and once at 100%, re-arms, ignores unknown cost, clears on delete", async (t) => {
+  const delivered = [];
+  const f = await fixture(t, { deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; } });
+  const owner = await f.login("team-alerts@example.invalid");
+  const rb = await f.agent(owner.cookie, "release-bot"), tb = await f.agent(owner.cookie, "triage-bot");
+  assert.equal((await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], day: 30 }, owner.cookie)).status, 200);
+  const ts = new Date().toISOString();
+  const teamAlerts = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => a.team);
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 12 }] }, null, rb.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 13 }] }, null, tb.token);
+  await f.sweep(); await f.sweep();
+  assert.deepEqual(delivered.map((a) => a.kind), ["cap_approaching"]);
+  assert.equal(delivered[0].team, "ops");
+  assert.equal(delivered[0].spent, 25);
+  await f.request("/v1/receipts", { receipts: [{ id: "r2", ts, cost_usd: 5 }] }, null, tb.token);
+  await f.sweep(); await f.sweep();
+  assert.deepEqual(delivered.map((a) => a.kind), ["cap_approaching", "cap_hit"]);
+  assert.deepEqual((await teamAlerts()).filter((a) => a.active).map((a) => a.key), [`cap_hit:team:${delivered[1].orgId}:ops:day`]);
+  // Per-agent alerts unchanged: agents with no own caps raise no cap alerts.
+  assert.equal((await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => !a.team && a.kind.startsWith("cap")).length, 0);
+  // Condition clears (cap raised), then re-arms when crossed again.
+  await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], day: 100 }, owner.cookie);
+  await f.sweep();
+  assert.equal((await teamAlerts()).filter((a) => a.active).length, 0);
+  await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], day: 30 }, owner.cookie);
+  await f.sweep();
+  assert.deepEqual(delivered.map((a) => a.kind), ["cap_approaching", "cap_hit", "cap_hit"]);
+  // Unknown cost: no cap alert, even with a fresh team-scope block.
+  await f.request("/v1/receipts", { receipts: [{ id: "r3", ts, cost_usd: null }, { id: "b1", ts, cost_usd: 0, blocked: true, reason: "budget_exceeded", scope: "team:ops:day" }] }, null, rb.token);
+  await f.sweep();
+  assert.equal((await teamAlerts()).filter((a) => a.active).length, 0);
+  assert.equal(delivered.length, 3);
+  // Deleting the team deactivates its alerts.
+  await f.request("/v1/teams", { name: "ops", agents: [rb.agentId], day: 1 }, owner.cookie);
+  await f.sweep();
+  assert.equal((await teamAlerts()).filter((a) => a.active).length, 0);
+});
+
+test("regression: a team-scope block in the last hour raises cap_hit even when synced totals lag; delete clears it", async (t) => {
+  const delivered = [];
+  const f = await fixture(t, { deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; } });
+  const owner = await f.login("team-block@example.invalid");
+  const rb = await f.agent(owner.cookie, "release-bot");
+  await f.request("/v1/teams", { name: "ops", agents: [rb.agentId], day: 30 }, owner.cookie);
+  const now = Date.now();
+  await f.request("/v1/receipts", { receipts: [
+    { id: "old", ts: new Date(now - 2 * 3600_000).toISOString(), cost_usd: 0, blocked: true, reason: "budget_exceeded", scope: "team:ops:month" },
+    { id: "b1", ts: new Date(now).toISOString(), cost_usd: 0, blocked: true, reason: "budget_exceeded", scope: "team:ops:day" },
+  ] }, null, rb.token);
+  await f.sweep();
+  assert.deepEqual(delivered.map((a) => [a.kind, a.scope, a.team]), [["cap_hit", "day", "ops"]]);
+  await f.request("/v1/teams", { name: "ops", remove: true }, owner.cookie);
+  await f.sweep();
+  const alerts = (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => a.team);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].active, false);
 });

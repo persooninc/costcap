@@ -11,7 +11,7 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
     if (!response.ok) throw new Error(`delivery HTTP ${response.status}`);
   };
   return async (alert) => {
-    const text = `CostCap ${alert.kind}: agent ${alert.agentId ?? "unknown"}${alert.scope ? `, ${alert.scope}` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = `CostCap ${alert.kind}: ${alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.team ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (emailKey && emailFrom && emailTo?.length) {
       try {
