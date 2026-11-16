@@ -45,7 +45,8 @@ test("blocked calls set stopped_by and scope; kill wins; zero-call run", () => {
   assert.equal(v.stopped_by, "breaker_open");
   assert.match(rollupLine(v), /stopped_by=breaker_open$/);
   assert.equal(buildRunSummary({ run_id: "r", killed: true, receipts: [{ blocked: true, reason: "step_budget" }] }).stopped_by, "killed");
-  assert.equal(buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "spiral_detected" }] }).stopped_by, null);
+  assert.equal(buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "spiral_detected" }] }).stopped_by, "breaker_open");
+  assert.equal(buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "tag_budget_exceeded" }] }).stopped_by, "budget_exceeded");
   assert.equal(stopReason("killed"), "killed");
   const z = buildRunSummary({ run_id: "z" });
   assert.deepEqual([z.calls, z.blocked_calls, z.total_cost_usd, z.unknown_cost_calls, z.exit_code], [0, 0, 0, 0, null]);

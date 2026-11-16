@@ -33,6 +33,8 @@ test("unit: wrap stop reasons map to the issue's vocabulary", () => {
   assert.equal(stopReasonFor({ reason: "killed" }), "kill_switch");
   assert.equal(stopReasonFor({ reason: "budget_exceeded" }), "cap_hit");
   assert.equal(stopReasonFor({ reason: "breaker_open" }), "spiral");
+  assert.equal(stopReasonFor({ reason: "spiral_detected" }), "spiral");
+  assert.equal(stopReasonFor({ reason: "tag_budget_exceeded" }), "cap_hit");
   assert.equal(stopReasonFor({ reason: "cost_velocity" }), "velocity");
   assert.equal(stopReasonFor({ reason: "step_budget" }), "step_budget");
   assert.equal(stopReasonFor({ signal: "SIGINT" }), "signal:SIGINT");
@@ -93,8 +95,11 @@ test("unit: group_by=outcome splits spend, totals match ungrouped, unknown is a 
   // empty input still lists all four buckets at $0
   assert.deepEqual(spendBreakdown([], { groupBy: "outcome" }).buckets.map((b) => [b.key, b.calls]), OUTCOME_BUCKETS.map((k) => [k, 0]));
   const csv = spendCsv(items(), { groupBy: "outcome", outcomeOf, period: "month" }).body.trim().split("\n");
-  assert.ok(csv.includes("2026-11,outcome,killed,killed,0.5,2,1,false,0"));
-  assert.ok(csv.includes("2026-11,outcome,success,success,1.5,2,0,true,0"));
+  assert.ok(csv.includes("period,group_by,key,label,usd_known,calls,unknown_count,cost_complete,blocked_count,runs,lower_bound"));
+  assert.ok(csv.includes("2026-11,outcome,killed,killed,0.5,2,1,false,0,1,true"));
+  assert.ok(csv.includes("2026-11,outcome,success,success,1.5,2,0,true,0,1,false"));
+  // other group_by values keep the original columns (regression)
+  assert.ok(spendCsv(items(), { groupBy: "agent", period: "month" }).body.includes("period,group_by,key,label,usd_known,calls,unknown_count,cost_complete,blocked_count\n"));
 });
 
 test("unit: agent-card outcome summary", () => {
@@ -192,8 +197,8 @@ async function serverFlow(t, extra = {}) {
   assert.deepEqual([by.killed.lower_bound, by.killed.unknown_count, by.success.runs], [true, 1, 1]);
   assert.deepEqual(g.total, spendBefore.total);
   const csv = (await f.request("/v1/spend.csv?group_by=outcome", undefined, owner)).body;
-  assert.match(csv, /,outcome,killed,killed,0\.5,2,1,false,0/);
-  assert.match(csv, /,outcome,failure,failure,2,1,0,true,0/);
+  assert.match(csv, /,outcome,killed,killed,0\.5,2,1,false,0,1,true/);
+  assert.match(csv, /,outcome,failure,failure,2,1,0,true,0,1,false/);
 
   // AC4: override with the agent's own token; other agent 403; other org 404; audited
   const ov = await f.request(`/v1/agents/${agent.agentId}/runs/run-ok/outcome`, { outcome: "failure", note: "bad output" }, null, agent.token);
@@ -304,4 +309,22 @@ test("AC1: enrolled wrap syncs run-ends (exit 0 → success, exit 3 → failure,
   assert.equal((await get("run-three")).outcome, "failure");
   const capped = await get("run-capped");
   assert.deepEqual([capped.stop_reason, capped.outcome], ["cap_hit", "killed"]);
+});
+
+test("unit: spiral- and tag-cap-blocked runs are killed even when the child exits 0", () => {
+  for (const [reason, stop] of [["spiral_detected", "spiral"], ["tag_budget_exceeded", "cap_hit"]]) {
+    const sum = buildRunSummary({ run_id: "r", started_at: "2026-11-16T00:00:00Z", ended_at: "2026-11-16T00:01:00Z", exit_code: 0,
+      receipts: [{ ts: "2026-11-16T00:00:30Z", run_id: "r", blocked: true, reason, cost_usd: 0 }] });
+    assert.equal(sum.stop_reason, stop);
+    assert.equal(sum.outcome, "killed");
+  }
+});
+
+test("unit: an override set before the run ends keeps the later run-end", () => {
+  const map = { "a1:r1": { orgId: "o", agentId: "a1", run_end: null, received_at: null, override: { outcome: "failure", note: null } } };
+  const re = parseRunEnd({ run_id: "r1", started_at: "2026-11-16T00:00:00Z", ended_at: "2026-11-16T00:01:00Z", exit_code: 0, stop_reason: "exited", calls: 1, usd_known: 0.1, unknown_count: 0 });
+  assert.deepEqual(upsertRunEnd(map, { orgId: "o", agentId: "a1" }, re, "2026-11-16T00:02:00Z"), { key: "a1:r1", duplicate: false });
+  const f = runOutcomeFields(map["a1:r1"]);
+  assert.deepEqual([f.exit_code, f.stop_reason, f.ended_at, f.outcome], [0, "exited", "2026-11-16T00:01:00Z", "failure"]);
+  assert.equal(upsertRunEnd(map, { orgId: "o", agentId: "a1" }, re, "x").duplicate, true);
 });

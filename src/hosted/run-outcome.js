@@ -27,8 +27,8 @@ export function deriveOutcome(runEnd, override = null) {
 // the costcap kill watcher, or the signal that ended the child.
 export function stopReasonFor({ killed = false, reason = null, signal = null } = {}) {
   if (killed || reason === "killed") return "kill_switch";
-  if (reason === "budget_exceeded") return "cap_hit";
-  if (reason === "breaker_open") return "spiral";
+  if (reason === "budget_exceeded" || reason === "tag_budget_exceeded") return "cap_hit";
+  if (reason === "breaker_open" || reason === "spiral_detected") return "spiral";
   if (reason === "cost_velocity") return "velocity";
   if (reason === "step_budget") return "step_budget";
   if (typeof signal === "string" && SIGNAL.test(`signal:${signal}`)) return `signal:${signal}`;
@@ -64,6 +64,12 @@ export function parseOutcomeOverride(body) {
 export function upsertRunEnd(map, { orgId, agentId }, runEnd, nowIso) {
   const key = `${agentId}:${runEnd.run_id}`;
   const existing = map[key];
+  // An override set before the run ended leaves a placeholder with no run_end:
+  // fill it in and keep the override.
+  if (existing && existing.run_end == null) {
+    existing.run_end = runEnd; existing.received_at = nowIso;
+    return { key, duplicate: false };
+  }
   if (existing) {
     const same = JSON.stringify(existing.run_end) === JSON.stringify(runEnd);
     if (same) return { key, duplicate: true };

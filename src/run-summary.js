@@ -6,12 +6,12 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const SCHEMA = "costcap.run-summary/v1";
-const BREAKER = new Set(["breaker_open", "step_budget", "cost_velocity"]);
+const BREAKER = new Set(["breaker_open", "spiral_detected", "step_budget", "cost_velocity"]);
 const r6 = (n) => Number(n.toFixed(6));
 
 export function stopReason(reason) {
   if (reason === "killed") return "killed";
-  if (reason === "budget_exceeded") return "budget_exceeded";
+  if (reason === "budget_exceeded" || reason === "tag_budget_exceeded") return "budget_exceeded";
   if (BREAKER.has(reason)) return "breaker_open";
   return null;
 }

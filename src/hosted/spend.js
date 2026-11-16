@@ -147,6 +147,7 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
 // computed with spendBreakdown so the CSV and /v1/spend can't drift. In-band
 // "#" lines say when retention clamped the range or cost is incomplete.
 export const SPEND_CSV_COLUMNS = ["period", "group_by", "key", "label", "usd_known", "calls", "unknown_count", "cost_complete", "blocked_count"];
+export const OUTCOME_CSV_COLUMNS = ["runs", "lower_bound"];
 export function spendCsv(items, { period = "month", budgetPeriod = null, ...opts } = {}) {
   if (!CSV_PERIODS.includes(period)) throw bad(`period must be one of ${CSV_PERIODS.join("|")}`);
   const whole = spendBreakdown(items, { ...opts, budgetPeriod });
@@ -163,14 +164,17 @@ export function spendCsv(items, { period = "month", budgetPeriod = null, ...opts
     const b = spendBreakdown(parts.get(k), { ...opts, budgetPeriod });
     if (!b.total.calls) continue;
     for (const r of b.buckets) {
-      rows.push([k, b.group_by, r.key, r.label ?? r.key, r.usd_known, r.calls, r.unknown_count, r.cost_complete, r.blocked_count]);
+      const row = [k, b.group_by, r.key, r.label ?? r.key, r.usd_known, r.calls, r.unknown_count, r.cost_complete, r.blocked_count];
+      // #225: outcome rows also carry runs and lower_bound, like /v1/spend.
+      if (b.group_by === "outcome") row.push(r.runs, r.lower_bound);
+      rows.push(row);
     }
   }
   const lines = [];
   if (whole.retention_clamped) lines.push(`# retention_clamped: since moved to ${whole.since} by your plan's receipt retention`);
   if (!whole.total.cost_complete) lines.push(`# cost_incomplete: ${whole.total.unknown_count} receipts have unknown cost; usd_known excludes them`);
   if (whole.group_by === "team") lines.push("# team_membership: current (spend is allocated by today's team membership)");
-  lines.push(SPEND_CSV_COLUMNS.join(","));
+  lines.push((whole.group_by === "outcome" ? [...SPEND_CSV_COLUMNS, ...OUTCOME_CSV_COLUMNS] : SPEND_CSV_COLUMNS).join(","));
   for (const r of rows) lines.push(r.map(cell).join(","));
   return { body: `${lines.join("\n")}\n`, rows: rows.length, total: whole.total, retention_clamped: whole.retention_clamped };
 }
