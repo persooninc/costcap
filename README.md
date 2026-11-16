@@ -212,6 +212,11 @@ traffic bypasses CostCap.
   settles. Reading the results through the proxy settles it: Anthropic
   `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
   links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
+  Enrolled fleet day/month caps and hosted-team caps (`wrap --enrollment`) follow
+  the same rule: a pending batch is not an unreconciled unknown, so the next call
+  and the results read are allowed, and once settled its cost counts toward the
+  fleet/team cap. The fleet view shows it as `pending_batches` /
+  `pending_batch_count`, not as unknown.
   Succeeded lines are priced at the published 50% batch rate (pricing table
   `batch`, applied to every component including cache reads/writes and on top of
   long_context); errored, canceled, expired and non-2xx lines cost $0. One

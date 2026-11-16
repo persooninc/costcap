@@ -5,6 +5,7 @@
 // (cost_usd: null) from any member makes the team verdict accounting_unavailable;
 // it is never treated as $0.
 import { createAgentBudgets } from "../agent-budget.js";
+import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 export const TEAM_SCOPES = Object.freeze(["day", "month"]);
@@ -63,9 +64,10 @@ export function teamVerdict({ team, receiptsByAgent, nowMs }) {
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
       if (!Number.isFinite(Date.parse(r?.ts)) || new Date(r.ts).toISOString().slice(0, 7) !== month) continue;
-      history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null });
+      history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
+  const pendingBatches = history.filter(isPendingBatch).length;
   const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate });
   const spend = budgets.spend({ agent_id: team.agents[0] }, team.agents);
   // Any member's view of the team is the same once its own receipts are folded in.
@@ -75,7 +77,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs }) {
     name: team.name,
     agents: [...team.agents],
     caps,
-    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, cost_complete: spend.unknown === 0 },
+    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
     verdict: hit ? hit.verdict : "ok",
     ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
@@ -114,6 +116,9 @@ function cachedTotals(entry, pending, nowMs) {
   for (const s of TEAM_SCOPES) total[s] = now.slice(0, window[s]) === asOf.slice(0, window[s]) ? entry.spent[s] : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
+    // #183: a pending batch is not unknown (same rule as cap.js/agent-budget.js);
+    // its settled cost (settled-aware load) counts like any other receipt.
+    if (isPendingBatch(r)) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     const ts = new Date(r.ts).toISOString();
     for (const s of TEAM_SCOPES) if (ts.slice(0, window[s]) === now.slice(0, window[s])) total[s] += r.cost_usd;
@@ -140,15 +145,18 @@ export function agentSpendPolicy(receipts, nowMs) {
   const now = new Date(nowMs).toISOString();
   const spent = { day: 0, month: 0 };
   let unknown = 0;
+  let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     const ts = new Date(r.ts).toISOString();
     if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+    // #183: a synced pending batch shows as pending, not as an unreconciled unknown.
+    if (isPendingBatch(r)) { pendingBatches += 1; continue; }
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     spent.month += r.cost_usd;
     if (ts.slice(0, 10) === now.slice(0, 10)) spent.day += r.cost_usd;
   }
-  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, as_of: now };
+  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
 }
 
 export function validAgentSpend(a) {
