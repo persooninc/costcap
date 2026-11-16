@@ -523,7 +523,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     if (!sharedLedger || held) return fn();
     return sharedLedger.withLock(() => { held = true; try { return fn(); } finally { held = false; } });
   };
-  const emitBase = (receipt) => guarded(() => {
+  const emitBase = (receipt, meta) => guarded(() => {
     const complete = { id: randomUUID(), ts: new Date(now()).toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     tagCaps?.record(complete);
@@ -531,7 +531,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     sharedLedger?.track?.(complete);
-    try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
+    // #239: meta (request start time) is in-memory only; the ledger receipt shape is unchanged.
+    try { Promise.resolve(onReceipt?.(complete, meta)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
   // Batch state (#160): pending batch_id -> receipt, OpenAI output_file_id -> batch_id.
@@ -631,7 +632,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // #184: x-costcap-cache is CostCap's; never forwarded.
     const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
     delete req.headers[CACHE_HEADER];
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, { startedAt: reqAt });
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
       req.resume();
@@ -1222,7 +1223,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       writeHttpJson(socket, 400, { error: "invalid_tags", message: `CostCap: ${e.message}. The upstream call was not made.` });
       return;
     }
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    const wsAt = now();
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, { startedAt: wsAt });
     const storedPath = receiptPath("/v1/realtime", url.search);
     const queryModel = url.searchParams.get("model") || undefined;
     let model = queryModel ?? "unknown";

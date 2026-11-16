@@ -994,9 +994,35 @@ bash scripts/setup.sh
 
 Requires: Node 20+, and access to `gitdhillonai/dotenv` for `.env.local`.
 
+## OpenTelemetry export
+
+`costcap wrap --otlp URL` (or `COSTCAP_OTLP_ENDPOINT=URL`) pushes traces to any OTLP/HTTP endpoint (an OpenTelemetry Collector, Grafana Tempo, Honeycomb, Datadog, Langfuse). It is off by default. CostCap does not read `OTEL_EXPORTER_OTLP_*`; those belong to your agent's own SDK.
+
+- Transport: OTLP/HTTP JSON, `POST <URL>/v1/traces`. No protobuf, no gRPC, no `@opentelemetry/*` dependency.
+- Headers: only from `COSTCAP_OTLP_HEADERS` (`k=v,k2=v2`, the `OTEL_EXPORTER_OTLP_HEADERS` format). Values are never logged, stored or exported.
+- A URL that is not http(s), or that contains `user:pass@`, exits 2 before the agent starts. Plain http to a non-loopback host prints a warning.
+- One `CLIENT` span per metered, unknown-cost or refused call, named `"<gen_ai.operation.name> <model>"`, from request arrival to receipt time. Attributes: `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.usage.cost` (USD, only when known), `costcap.cost_usd`, `costcap.cost_complete`, `costcap.receipt_id`, `costcap.run_id`, `costcap.agent_id`, `costcap.blocked`, `costcap.reason`, `costcap.path` (credentials redacted), `costcap.tag.<k>`, `http.response.status_code`. Refusals and upstream errors have status `ERROR`.
+- One `costcap.run` root span per run with `costcap.total_cost_usd` (absent, never `0`, when any call has unknown cost), `costcap.unknown_cost_calls`, `costcap.calls`, `costcap.blocked_calls`, `costcap.stopped_by`, `costcap.exit_code`. All spans of a run share one trace id derived from `run_id`.
+- Delivery never slows a call or a cap decision: batches of up to 100 spans or every 5 s, a 10,000-span queue, 10 s per POST, no retries, at most 5 s (4.5 s) of final flush at exit. The first failure prints one `costcap: warning: otlp ...` line; the run summary and roll-up report `otlp: {spans_exported, spans_dropped}`.
+- No prompt, completion or request body is ever exported.
+
+Collector example:
+
+```bash
+COSTCAP_OTLP_HEADERS="authorization=Bearer $COLLECTOR_TOKEN" \
+  costcap wrap --cap 5 --otlp http://127.0.0.1:4318 -- python agent.py
+```
+
+Langfuse (OTLP ingest maps `gen_ai.usage.cost` to cost):
+
+```bash
+COSTCAP_OTLP_HEADERS="authorization=Basic $(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 -w0)" \
+  costcap wrap --otlp https://cloud.langfuse.com/api/public/otel -- node agent.js
+```
+
 ## Environment
 
-See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
+See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`. `costcap wrap` also reads `COSTCAP_OTLP_ENDPOINT` and `COSTCAP_OTLP_HEADERS` (see [OpenTelemetry export](#opentelemetry-export)).
 
 ## Docs
 
