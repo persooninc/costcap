@@ -33,3 +33,25 @@ test("receipt csv keeps only the newest rows past the limit", () => {
   assert.doesNotMatch(body, /,a,m,/);
   assert.equal(RECEIPT_CSV_LIMIT, 5000);
 });
+
+test("#149: filters apply before the limit and truncation is stated in-band", async () => {
+  const { parseReceiptsQuery } = await import("../src/hosted/receipts-csv.js");
+  const { parseAuditRange } = await import("../src/hosted/audit-log.js");
+  const rows = ["a", "b", "c", "d"].map((id, i) => ({ ts: `2026-01-0${i + 1}T00:00:00.000Z`, agent_id: i % 2 ? "x" : "y", receipt_id: id, model: "m", cost_usd: 0 }));
+  const scoped = receiptsCsv(rows, { limit: 2, since: Date.parse("2026-01-02T00:00:00Z"), until: Date.parse("2026-01-03T23:59:59Z") });
+  assert.equal(scoped.truncated, false);
+  assert.equal(scoped.total, 2);
+  assert.match(scoped.body, /^ts,agent_id/);
+  assert.match(scoped.body, /,b,m,/);
+  assert.match(scoped.body, /,c,m,/);
+  const byAgent = receiptsCsv(rows, { agentId: "x" });
+  assert.deepEqual([byAgent.count, byAgent.total], [2, 2]);
+  assert.doesNotMatch(byAgent.body, /,y,/);
+  const cut = receiptsCsv(rows, { limit: 3 });
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.total, 4);
+  assert.equal(cut.body.split("\n")[0], "# truncated: showing newest 3 of 4 receipts; narrow with since/until");
+  const p = (q, ids = new Set(["x"])) => parseReceiptsQuery(new URLSearchParams(q), ids, parseAuditRange);
+  assert.deepEqual(p("agent_id=x&since=2026-01-01"), { agentId: "x", since: Date.parse("2026-01-01") });
+  for (const q of ["since=nope", "until=", "since=2026-02-01&until=2026-01-01", "agent_id=other"]) assert.throws(() => p(q), (e) => e.status === 400, q);
+});

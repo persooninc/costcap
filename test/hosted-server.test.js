@@ -442,6 +442,38 @@ test("receipt csv is the signed-in org only and ignores an agent bearer", async 
   assert.equal(theirs.body.trim(), "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope");
 });
 
+test("#149: receipts.csv since/until/agent_id filters, 400s, tenant isolation and total header", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("csv149@example.invalid");
+  const other = await f.login("csv149-other@example.invalid");
+  const enrol = async (cookie, name) => (await f.request("/v1/enroll", { name }, null, (await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, cookie)).body.token)).body;
+  const a = await enrol(owner.cookie, "a"), b = await enrol(owner.cookie, "b"), foreign = await enrol(other.cookie, "z");
+  await f.request("/v1/receipts", { receipts: [{ id: "a-old", ts: "2026-10-01T01:00:00.000Z", cost_usd: 1 }, { id: "a-new", ts: "2026-10-20T01:00:00.000Z", cost_usd: 1 }] }, null, a.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "b-new", ts: "2026-10-20T02:00:00.000Z", cost_usd: 1 }] }, null, b.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "z-secret", ts: "2026-10-20T03:00:00.000Z", cost_usd: 1 }] }, null, foreign.token);
+  const port = f.service().server.address().port;
+  const pull = async (q, cookie = owner.cookie) => { const r = await fetch(`http://127.0.0.1:${port}/v1/receipts.csv${q}`, { headers: { cookie } }); return { status: r.status, type: r.headers.get("content-type"), total: r.headers.get("x-costcap-total"), truncated: r.headers.get("x-costcap-truncated"), body: await r.text() }; };
+  const all = await pull("");
+  assert.equal(all.total, "3");
+  assert.equal(all.truncated, null);
+  const recent = await pull("?since=2026-10-15T00:00:00Z");
+  assert.equal(recent.total, "2");
+  assert.doesNotMatch(recent.body, /a-old/);
+  const early = await pull("?until=2026-10-02T00:00:00Z");
+  assert.match(early.body, /a-old/);
+  assert.doesNotMatch(early.body, /a-new|b-new/);
+  const onlyB = await pull(`?agent_id=${encodeURIComponent(b.agentId)}`);
+  assert.equal(onlyB.total, "1");
+  assert.match(onlyB.body, /b-new/);
+  assert.doesNotMatch(onlyB.body, /a-new/);
+  for (const q of ["?since=garbage", "?since=2026-10-20&until=2026-10-01", `?agent_id=${encodeURIComponent(foreign.agentId)}`, "?agent_id=unknown"]) {
+    const r = await pull(q);
+    assert.equal(r.status, 400, q);
+    assert.match(r.type, /json/, q);
+    assert.doesNotMatch(r.body, /z-secret|ts,agent_id/, q);
+  }
+});
+
 test("regression #109: month burn-rate projection pages once through the fleet worker", async (t) => {
   let clock = Date.parse("2026-11-16T00:00:00.000Z");
   const f = await fixture(t, { now: () => clock });

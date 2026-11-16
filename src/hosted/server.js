@@ -9,7 +9,7 @@ import { buildEvidence } from "./evidence.js";
 import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
-import { receiptsCsv } from "./receipts-csv.js";
+import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
@@ -350,6 +350,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
           const u = sessionUser(s, req);
+          const orgAgents = new Set(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => a.id));
+          const query = parseReceiptsQuery(new URL(req.url, origin).searchParams, orgAgents, parseAuditRange);
           const rows = visibleReceipts(s, u.orgId).map((item) => ({
             ts: item.receipt?.ts ?? "",
             agent_id: item.agentId,
@@ -362,7 +364,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             reason: item.receipt?.reason ?? "",
             scope: item.receipt?.scope ?? "",
           }));
-          return receiptsCsv(rows);
+          return receiptsCsv(rows, query);
         });
         const headers = {
           "content-type": "text/csv; charset=utf-8",
@@ -370,6 +372,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           "x-content-type-options": "nosniff",
           "content-disposition": 'attachment; filename="costcap-receipts.csv"',
         };
+        headers["x-costcap-total"] = String(csv.total);
         if (csv.truncated) headers["x-costcap-truncated"] = "true";
         return res.writeHead(200, headers).end(csv.body);
       }
