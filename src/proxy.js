@@ -688,6 +688,13 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   // accounting failure clears that failure; the block lifts once all are settled.
   // #176: a settled pending batch is resolved, so a later results read in this run
   // neither emits a second reconciliation nor records its spend again.
+  // #181: warn for fractions reached via settlements, sibling receipts or cap changes.
+  server.checkWarnings = () => {
+    if (!cap || !capWarner) return;
+    const spend = cap.spend();
+    pendingWarnings.push(...capWarner.reached({ caps: cap.limits(), spend, lowerBound: spend.unknown > 0 }));
+    flushWarnings();
+  };
   server.settle = (r) => {
     const id = r?.receipt_id ?? r?.id;
     if (typeof r?.batch_id === "string") resolvedBatches.add(r.batch_id);

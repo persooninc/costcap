@@ -73,23 +73,35 @@ export function createCapWarner({ fractions = DEFAULT_WARN_AT, events = [], runI
   const seen = new Set();
   for (const e of events) if (e?.event === "cap_warning") seen.add(dedupeKey(e.scope, e.fraction, e.period));
   const emitted = [];
+  const emit = (pairs, caps, spend, lowerBound) => {
+    if (!fractions.length) return [];
+    const at = now();
+    const out = [];
+    for (const { scope, fraction } of pairs) {
+      const period = periodKey(scope, { runId, now: at });
+      const k = dedupeKey(scope, fraction, period);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const ev = { event: "cap_warning", scope, fraction, cap: caps[scope], spent_usd: Number(spend[scope].toFixed(6)), period, run_id: runId, agent_id: agentId, lower_bound: !!lowerBound };
+      out.push(ev);
+      emitted.push(ev);
+    }
+    return out;
+  };
   return {
     emitted,
     // Returns the new cap_warning events (not yet persisted) for a spend change.
     observe({ caps, before, after, lowerBound = false }) {
-      if (!fractions.length) return [];
-      const at = now();
-      const out = [];
-      for (const { scope, fraction } of crossedThresholds({ caps, before, after, fractions })) {
-        const period = periodKey(scope, { runId, now: at });
-        const k = dedupeKey(scope, fraction, period);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        const ev = { event: "cap_warning", scope, fraction, cap: caps[scope], spent_usd: Number(after[scope].toFixed(6)), period, run_id: runId, agent_id: agentId, lower_bound: !!lowerBound };
-        out.push(ev);
-        emitted.push(ev);
-      }
-      return out;
+      return emit(crossedThresholds({ caps, before, after, fractions }), caps, after, lowerBound);
     },
+    // #181: spend or caps changed outside an own receipt (settlement, sibling
+    // receipt, fleet policy): every fraction current spend has reached and that
+    // was not yet warned for this period.
+    reached({ caps, spend, lowerBound = false }) {
+      if (!fractions.length) return [];
+      return emit(currentWarnings({ caps, spend, fractions }), caps, spend, lowerBound);
+    },
+    // #181: a cap_warning another wrapper on the shared ledger already wrote.
+    note(e) { if (e?.event === "cap_warning") seen.add(dedupeKey(e.scope, e.fraction, e.period)); },
   };
 }

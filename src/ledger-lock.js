@@ -93,7 +93,9 @@ function breakStale(lock, host) {
 // settles an unknown-cost receipt (incl. batch_pending) this wrapper folded in
 // from the ledger or wrote itself and passed to track() (#178); settlements of
 // already-costed or untracked receipts are ignored.
-export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, timeoutMs } = {}) {
+// onExternalWarning(event) (#181) sees every cap_warning line read from the ledger,
+// before the settlements and receipts of the same chunk.
+export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, onExternalWarning = () => {}, timeoutMs } = {}) {
   mkdirSync(dirname(path), { recursive: true });
   const dir = `${path}.shared`;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -107,6 +109,7 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
     throw new Error(`Receipt ledger is locked${owner ? ` by PID ${owner.pid} on ${owner.host}` : ""} by a non-shared wrapper. Confirm the owner stopped before removing ${path}.lock.`);
   }
   let offset = 0;
+  let depth = 0;
   let pending = "";
   const unknown = new Map(); // receipt id -> folded-in receipt still at null cost
   // Settle tracked unknowns first (first valid settlement wins), then track new ones.
@@ -118,6 +121,7 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
       unknown.delete(e.receipt_id);
       settled.push([e, r]);
     }
+    for (const e of lines) if (e?.event === "cap_warning") onExternalWarning(e);
     const receipts = applySettlements(lines);
     for (const r of receipts) if (r.cost_usd === null && typeof r.id === "string") unknown.set(r.id, r);
     return { receipts, settled };
@@ -145,8 +149,12 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
       try { return fold(readNew()).receipts; } finally { release(); }
     },
     // Folds other wrappers' receipts in, then runs fn, all inside the critical section.
+    // Reentrant (#181): a warning flushed from onExternal reuses the held section.
     withLock(fn) {
-      const release = acquireCriticalSection(path, { timeoutMs });
+      if (depth > 0) return fn();
+      depth += 1;
+      let release;
+      try { release = acquireCriticalSection(path, { timeoutMs }); } catch (e) { depth -= 1; throw e; }
       try {
         const { receipts, settled } = fold(readNew());
         for (const [e, r] of settled) onExternalSettle(e, r);
@@ -155,7 +163,7 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
         // Our own append (if any) is already accounted for by the caller.
         if (existsSync(path)) { const size = statSync(path).size; if (size > offset) { offset = size; pending = ""; } }
         return out;
-      } finally { release(); }
+      } finally { depth -= 1; release(); }
     },
     // #178: track this wrapper's own unknown-cost receipt so a later
     // reconcile --apply from another process settles it via onExternalSettle.
