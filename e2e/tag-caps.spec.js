@@ -55,8 +55,10 @@ test("Tag caps card: owner adds and removes a rule, viewer is disabled", async (
     await form.locator("input[name=key]").fill("project");
     await form.locator("select[name=scope]").selectOption("month");
     await form.locator("input[name=usd]").fill("50");
+    await form.locator("input[name=warn]").fill("80, 50");
     await page.locator("#tagCapAdd").click();
-    await expect(page.locator('#tagCaps li[data-rule="project:month"]')).toBeVisible();
+    await expect(page.locator('#tagCaps li[data-rule="project:month"]')).toContainText("warn at 50%, 80%");
+    await expect(page.locator('#tagCaps li[data-rule="customer:day"]')).toContainText("warn at 80%");
     await page.reload();
     await expect(page.locator("#tagCaps li[data-rule]")).toHaveCount(2);
     await page.locator('#tagCaps li[data-rule="project:month"]').getByRole("button", { name: "Remove" }).click();
@@ -71,6 +73,7 @@ test("Tag caps card: owner adds and removes a rule, viewer is disabled", async (
     await expect(page.locator('#tagCaps li[data-rule="customer:day"]')).toBeVisible();
     await expect(page.locator('#tagCaps li[data-rule="customer:day"] button')).toBeDisabled();
     await expect(page.locator("#tagCapAdd")).toBeDisabled();
+    await expect(page.locator("#tagCapWarn")).toBeDisabled();
     expect(await page.evaluate(async () => (await fetch("/v1/tag-caps", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ tagCaps: [] }) })).status)).toBe(403);
   } finally {
     service.server.closeAllConnections();

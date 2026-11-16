@@ -237,6 +237,35 @@ export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, b
   return out;
 }
 
+// Issue #243: fleet tag cap alerts, one per rule and tag value (UNTAGGED
+// included). spend: fleetTagCapsPolicy(...).spend (every value, no truncation);
+// blockedHits: [{tag_key, tag_value, scope}] from tag_budget_exceeded blocks
+// synced in the last hour. Key `<kind>:tag:<orgId>:<key>=<value>:<scope>`.
+// A value with unknown-cost receipts this period raises no alert (never $0).
+export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits = [] }) {
+  const out = [];
+  for (const rule of rules) {
+    const values = spend?.[rule.key] ?? {};
+    const fractions = Array.isArray(rule.warnFractions) ? rule.warnFractions : DEFAULT_WARN_FRACTIONS;
+    const blocked = new Set(blockedHits.filter((h) => h?.tag_key === rule.key && h?.scope === rule.scope).map((h) => h.tag_value));
+    const names = new Set([...Object.keys(values), ...blocked]);
+    for (const value of [...names].sort()) {
+      const e = values[value] ?? { day: 0, month: 0, unknown: 0 };
+      if (e.unknown > 0) continue;
+      const spent = e[rule.scope];
+      if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
+      const id = `tag:${orgId}:${rule.key}=${value}`;
+      const base = { tag: { key: rule.key, value }, scope: rule.scope, cap: rule.usd, spent };
+      if (spent >= rule.usd || blocked.has(value)) out.push({ kind: "cap_hit", key: `cap_hit:${id}:${rule.scope}`, ...base });
+      else {
+        const warn = approaching(id, rule.scope, rule.usd, spent, fractions, true, {});
+        if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, fraction: warn.fraction });
+      }
+    }
+  }
+  return out;
+}
+
 // Issue #143: alert lifecycle. s.alerts holds one record per firing (occurrence),
 // keyed by occurrence id. Records never get deleted: clearing sets resolved_at.
 // Legacy records (keyed by alert key, no id/fired_at) keep fired_at null.

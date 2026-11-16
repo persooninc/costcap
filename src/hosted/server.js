@@ -9,7 +9,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -1238,6 +1238,32 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       // A new period is a new firing: an alert from an earlier period resolves even if the key matches again.
       for (const prior of Object.values(s.alerts).filter((x) => x.org && x.active && (!orgKeys.has(x.key) || (x.period && x.period !== capPeriod(x.scope, now(), orgPeriod(s, x.orgId)))))) resolveAlert(prior, now());
+      // Issue #243: fleet tag cap alerts per rule and tag value (every value, no 1000 cap).
+      const tagKeys = new Set();
+      for (const [orgId, org] of Object.entries(s.orgs ?? {})) {
+        const rules = org?.tagCaps ?? [];
+        if (!rules.length) continue;
+        const bp = orgPeriod(s, orgId);
+        const receipts = orgReceipts(s, orgId);
+        const spend = fleetTagCapsPolicy(rules, receipts, now(), Infinity, bp)?.spend ?? {};
+        const blockedHits = receipts.filter((r) => r && r.reason === "tag_budget_exceeded" && Date.parse(r.ts) > now() - 3600_000 && typeof r.tag_key === "string" && typeof r.tag_value === "string");
+        const ruleOf = Object.fromEntries(rules.map((r) => [`${r.key}:${r.scope}`, r]));
+        for (const alert of evaluateTagAlerts({ orgId, rules, spend, blockedHits })) {
+          tagKeys.add(alert.key);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) {
+            const rule = ruleOf[`${alert.tag.key}:${alert.scope}`];
+            const e = spend[alert.tag.key]?.[alert.tag.value] ?? { day: 0, month: 0 };
+            const warnOk = gateWarnings(s, `tag:${orgId}:${alert.tag.key}=${alert.tag.value}`, { [alert.scope]: rule.usd }, { day: e.day, month: e.month }, rule.warnFractions ?? [0.8], bp);
+            if (!warnOk(alert)) continue;
+            out.push({ ...claim(fireAlert(s.alerts, alert, { orgId, agentId: null, period: capPeriod(alert.scope, now(), bp) }, { nowMs: now(), id: randomUUID() })) });
+          } else queueRetry(prior, out);
+        }
+        // Arm state for earlier periods is dropped so per-value state stays bounded.
+        for (const [k, st] of Object.entries(s.warnArm ?? {})) if (k.startsWith(`tag:${orgId}:`) && st.period !== capPeriod(k.endsWith(":month") ? "month" : "day", now(), bp)) delete s.warnArm[k];
+      }
+      // Resolves when the condition clears, the rule is removed, or the period rolls over.
+      for (const prior of Object.values(s.alerts).filter((x) => x.tag && x.active && (!tagKeys.has(x.key) || (x.period && x.period !== capPeriod(x.scope, now(), orgPeriod(s, x.orgId)))))) resolveAlert(prior, now());
       return out;
     });
     for (const queuedAlert of queued) {
@@ -1255,8 +1281,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         result = deliverAlert ? await deliverAlert({ ...a, agentName }, settings, requested ? { channels: requested } : undefined) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
-        const target = a.agentId ?? (a.org ? `org:${a.orgId}` : `team:${a.team}`);
-        const extra = a.team ? { team: a.team, scope: a.scope } : a.org ? { org: true, scope: a.scope } : {};
+        const target = a.agentId ?? (a.org ? `org:${a.orgId}` : a.tag ? `tag:${a.tag.key}=${a.tag.value}` : `team:${a.team}`);
+        const extra = a.team ? { team: a.team, scope: a.scope } : a.org ? { org: true, scope: a.scope } : a.tag ? { tag: a.tag, scope: a.scope } : {};
         const rec = s.alerts[a.id];
         if (rec) delete rec.delivery_claimed_at;
         const gaveUp = rec ? applyDeliveryResult(rec, result, requested, now()) : [];

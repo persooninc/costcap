@@ -6,6 +6,7 @@ import { periodKey, samePeriod } from "../period.js";
 import { TAG_KEY } from "../tags.js";
 import { UNTAGGED } from "../tag-cap.js";
 import { isPendingBatch } from "../cap.js";
+import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 export const FLEET_TAG_SCOPES = Object.freeze(["day", "month"]);
 export const MAX_FLEET_TAG_RULES = 10;
@@ -27,7 +28,12 @@ export function parseFleetTagCaps(input) {
     const id = `${r.key}:${r.scope}`;
     if (seen.has(id)) return { error: `Duplicate rule ${id}` };
     seen.add(id);
-    rules.push({ key: r.key, scope: r.scope, usd: r.usd });
+    // Issue #243: optional per-rule cap_approaching fractions (default [0.8] when absent).
+    if (r.warnFractions !== undefined) {
+      const err = warnFractionsError(r.warnFractions);
+      if (err) return { error: `Rule ${id}: ${err}` };
+    }
+    rules.push({ key: r.key, scope: r.scope, usd: r.usd, ...(r.warnFractions !== undefined ? { warnFractions: sortWarnFractions(r.warnFractions) } : {}) });
   }
   return { rules };
 }
