@@ -400,11 +400,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   let pendingWarnings = [];
   const recordSpend = (receipt) => {
     if (!cap) return;
-    const before = cap.spend();
     cap.record(receipt);
-    if (!capWarner) return;
-    const after = cap.spend();
-    pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: after.unknown > 0 }));
+    queueWarnings();
+  };
+  // #181: level-based, so spend that moved past a fraction by another path
+  // (settlement, sibling receipt, cap change) still warns once.
+  const queueWarnings = () => {
+    if (!cap || !capWarner) return;
+    const spend = cap.spend();
+    pendingWarnings.push(...capWarner.sync({ caps: cap.limits(), spend, lowerBound: spend.unknown > 0 }));
   };
   const flushWarnings = () => {
     const evs = pendingWarnings;
@@ -695,6 +699,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return failures.delete(id);
   };
   server.accountingFailure = accountingFailureNow;
+  // #181: re-check soft cap warnings after a spend/cap change outside recordSpend.
+  server.checkWarnings = () => { queueWarnings(); flushWarnings(); };
   return server;
 }
 
