@@ -67,3 +67,47 @@ test("wrapper cannot loosen a cached fleet policy", async () => {
   up.close();
   fleet.close();
 });
+
+test("#114 enrolled wrapper enforces the cached hosted maxSteps per run, offline, tighter wins", async () => {
+  let hits = 0;
+  const up = http.createServer((req, res) => {
+    hits++;
+    res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 0 } }));
+  });
+  const upPort = await listen(up);
+  // The hosted API is stopped: grab a port, then close it so every sync fails.
+  const dead = http.createServer();
+  const deadPort = await listen(dead);
+  await new Promise((r) => dead.close(r));
+  const dir = mkdtempSync(join(tmpdir(), "cc-steps-"));
+  const enrollment = join(dir, "enrollment.json");
+  const receipts = join(dir, "r.jsonl");
+  writeFileSync(enrollment, JSON.stringify({
+    url: `http://127.0.0.1:${deadPort}`, token: "agent-token", agentId: "agent-1",
+    policy: { version: 2, caps: {}, killed: false, maxSteps: 5 }, syncedIds: [],
+  }), { mode: 0o600 });
+  const script = `for (let i = 0; i < 8; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: "{}" }); console.log(r.status); if (r.status === 429) { const b = await r.json(); console.log(b.error + "/" + b.reason); break; } }`;
+  const run = (args = []) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--enrollment", enrollment, "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${upPort}` } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n"), err }));
+  });
+  const first = await run();
+  assert.equal(first.code, 0, first.err);
+  assert.match(first.err, /fleet offline; cached policy enforced/);
+  assert.deepEqual(first.out, ["200", "200", "200", "200", "200", "429", "breaker_open/step_budget"]);
+  assert.equal(hits, 5);
+  const blocked = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.blocked);
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].reason, "step_budget");
+  assert.equal(blocked[0].max_steps, 5);
+  // A new run starts at 0 again.
+  hits = 0;
+  assert.equal((await run()).out.filter((s) => s === "200").length, 5);
+  // Local 3 tightens; local 10 cannot loosen.
+  assert.equal((await run(["--max-steps", "3"])).out.filter((s) => s === "200").length, 3);
+  assert.equal((await run(["--max-steps", "10"])).out.filter((s) => s === "200").length, 5);
+  up.close();
+});

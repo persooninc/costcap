@@ -82,6 +82,13 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await page.locator("#agents input[name=day]").fill("3");
     await page.locator("#agents button[type=submit]").click();
     await expect(page.locator("#agents small")).toContainText("Policy v4");
+    // #114: the dashboard edits the per-run step budget; policy and audit both show it.
+    await page.locator("#agents input[name=maxSteps]").fill("5");
+    await page.locator("#agents button[type=submit]").click();
+    await expect(page.locator("#agents small")).toContainText("Policy v5 · max 5 steps per run");
+    const fleetView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
+    expect(fleetView.agents[0].policy.maxSteps).toBe(5);
+    expect(fleetView.audit.filter((x) => x.action === "policy.change").at(-1).detail.policy.maxSteps).toBe(5);
     await page.locator("#agents .danger").nth(1).click();
     await expect(page.locator("#agents strong")).toHaveText("REVOKED");
     await page.locator("#invite input[name=email]").fill("teammate@example.invalid");

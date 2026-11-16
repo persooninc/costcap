@@ -637,3 +637,39 @@ test("#113 fleet freeze state round-trips through the Postgres record mapping", 
   assert.equal(recs.get("fleetFreezes\u0000org1").orgId, "org1");
   assert.deepEqual(fromRecords([...recs.values()], EMPTY_STATE), state);
 });
+
+test("#114 hosted maxSteps: validation, versioning, clearing, budget run steps", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("steps-owner@example.invalid");
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: {}, maxSteps: 4 }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "stepper" }, null, tok)).body;
+  assert.equal(agent.policy.maxSteps, 4);
+  assert.equal((await f.request("/v1/enrollment-tokens", { maxSteps: 0 }, owner.cookie)).status, 400);
+  const set = (body) => f.request(`/v1/agents/${agent.agentId}/policy`, body, owner.cookie);
+  let r = await set({ maxSteps: 5 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.version, 2);
+  assert.equal(r.body.maxSteps, 5);
+  for (const bad of [0, -1, 2.5, "5"]) assert.equal((await set({ maxSteps: bad })).status, 400, String(bad));
+  const policy = (await f.request("/v1/policy", undefined, null, agent.token)).body;
+  assert.equal(policy.version, 2);
+  assert.equal(policy.maxSteps, 5);
+  // Omitting maxSteps keeps it; null clears it.
+  assert.equal((await set({ caps: { day: 9 } })).body.maxSteps, 5);
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal(fleet.audit.filter((x) => x.action === "policy.change").at(-1).detail.policy.maxSteps, 5);
+  // Budget reports run steps.
+  const ts = new Date().toISOString();
+  await f.request("/v1/receipts", { receipts: [1, 2, 3, 4, 5].map((i) => ({ id: `s${i}`, ts, cost_usd: 0.01, run_id: "run-a" })) }, null, agent.token);
+  r = await f.request(`/v1/agents/${agent.agentId}/budget?run_id=run-a`, undefined, owner.cookie);
+  assert.equal(r.body.max_steps, 5);
+  assert.equal(r.body.steps, 5);
+  assert.equal(r.body.verdict, "breaker_open");
+  assert.equal(r.body.reason, "step_budget");
+  r = await f.request(`/v1/agents/${agent.agentId}/budget?run_id=run-b`, undefined, owner.cookie);
+  assert.equal(r.body.steps, 0);
+  assert.equal(r.body.verdict, "ok");
+  r = await set({ maxSteps: null });
+  assert.equal(r.status, 200);
+  assert.equal("maxSteps" in r.body, false);
+});

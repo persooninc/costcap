@@ -34,6 +34,8 @@ export function validatePolicy(p) {
     const v = p.caps?.[k];
     if (v !== undefined && !(typeof v === "number" && Number.isFinite(v) && v > 0)) errors.push(`caps.${k} must be a positive number`);
   }
+  // Step budget (issue #114): upstream calls one run may make. Optional positive integer.
+  if (p.maxSteps !== undefined && p.maxSteps !== null && !(Number.isInteger(p.maxSteps) && p.maxSteps > 0)) errors.push("maxSteps must be a positive integer");
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   return errors;
 }
@@ -45,6 +47,7 @@ export function validatePolicy(p) {
 export function resolvePolicy({ local = {}, lastKnown = null, fetched = null }) {
   if (lastKnown && validatePolicy(lastKnown).length) throw new Error("Invalid cached fleet policy; refusing to loosen enforcement");
   for (const k of CAP_KEYS) if (local[k] != null && (!Number.isFinite(local[k]) || local[k] <= 0)) throw new Error(`Invalid local cap ${k}`);
+  if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
   if (fetched && validatePolicy(fetched).length === 0 && (!lastKnown || fetched.version > lastKnown.version)) {
@@ -56,5 +59,8 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null }) 
     const vals = [server?.caps?.[k], local?.[k]].filter((v) => v != null);
     if (vals.length) caps[k] = Math.min(...vals);
   }
-  return { caps, killed: Boolean(server?.killed), version: server?.version ?? null, source };
+  // A local step budget can tighten the fleet one, never loosen it.
+  const steps = [server?.maxSteps, local?.maxSteps].filter((v) => v != null);
+  const maxSteps = steps.length ? Math.min(...steps) : null;
+  return { caps, maxSteps, killed: Boolean(server?.killed), version: server?.version ?? null, source };
 }

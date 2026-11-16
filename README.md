@@ -139,6 +139,8 @@ node src/cli.js wrap --agent release-bot --policy .costcap/policy.json -- node y
 node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 ```
 
+Enrolled agents can also get a fleet step budget: an admin sets "Max steps per run" in the dashboard (`maxSteps` on `POST /v1/agents/:id/policy`). The wrapper enforces it per run from its cached policy, even offline. A local `--max-steps` can tighten it, never loosen it.
+
 An agent entry replaces the default. An agent with no entry and no default is
 refused (`no_budget_policy`).
 

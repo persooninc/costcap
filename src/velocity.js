@@ -50,6 +50,8 @@ export function createVelocityBreaker({
       }
       return null;
     },
+    // Fleet policy can change the step budget mid-run (issue #114). null clears it.
+    setMaxSteps(n) { maxSteps = n ?? undefined; },
     resume() { tripped = null; steps = 0; buckets.clear(); },
   };
 }

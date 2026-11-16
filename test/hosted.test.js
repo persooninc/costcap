@@ -104,3 +104,18 @@ test("corrupt cached policies and invalid local caps fail closed", () => {
   assert.throws(() => resolvePolicy({ lastKnown: { version: 1, caps: { day: -1 } } }), /Invalid cached/);
   assert.throws(() => resolvePolicy({ local: { run: -1 } }), /Invalid local/);
 });
+
+test("#114 hosted maxSteps validation and tighter-wins merge", () => {
+  assert.deepEqual(validatePolicy({ version: 2, caps: {}, maxSteps: 5 }), []);
+  for (const bad of [0, -1, 1.5, "5"]) assert.ok(validatePolicy({ version: 2, caps: {}, maxSteps: bad }).length, String(bad));
+  const lastKnown = { version: 2, caps: {}, maxSteps: 5, killed: false };
+  assert.equal(resolvePolicy({ lastKnown }).maxSteps, 5);
+  assert.equal(resolvePolicy({ lastKnown, local: { maxSteps: 3 } }).maxSteps, 3);
+  assert.equal(resolvePolicy({ lastKnown, local: { maxSteps: 10 } }).maxSteps, 5);
+  assert.equal(resolvePolicy({ lastKnown: null, local: { maxSteps: 7 } }).maxSteps, 7);
+  assert.throws(() => resolvePolicy({ lastKnown, local: { maxSteps: 0 } }), /maxSteps/);
+  // Regression: no maxSteps anywhere means no step budget, caps unchanged.
+  const plain = resolvePolicy({ lastKnown: { version: 1, caps: { day: 5 }, killed: false } });
+  assert.equal(plain.maxSteps, null);
+  assert.deepEqual(plain.caps, { day: 5 });
+});
