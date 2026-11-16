@@ -39,14 +39,27 @@ function pagesOf(doc) {
 }
 
 // OpenAI GET /v1/organization/costs (group_by=line_item). amount.value is USD.
-export function parseOpenAICosts(doc, { project } = {}) {
+// #227: a project/workspace filter needs the export grouped by that id; the providers
+// return the id as null otherwise, so filtering an ungrouped export would drop every row.
+function assertGrouped(results, field, id, grouped) {
+  if (!id || grouped || !results.length) return;
+  if (results.every((r) => r?.[field] === null || r?.[field] === undefined)) {
+    const flag = field === "project_id" ? "--project" : "--workspace";
+    const by = field === "project_id" ? "group_by=project_id" : "group_by[]=workspace_id";
+    throw new Error(`${flag} needs an export grouped by ${field.replace("_id", "")} (${by}); no row has ${field}. Re-export grouped by ${field.replace("_id", "")} or use --fetch`);
+  }
+}
+
+export function parseOpenAICosts(doc, { project, grouped = false } = {}) {
   const rows = [];
+  const all = [];
   for (const page of pagesOf(doc)) {
     if (!Array.isArray(page?.data)) throw new Error("OpenAI costs export needs a data list");
     for (const bucket of page.data) {
       const day = dayOf(bucket?.start_time);
       if (!day) throw new Error("OpenAI costs bucket needs a start_time");
       for (const r of bucket.results ?? []) {
+        all.push(r);
         if (project && r.project_id !== project) continue;
         const currency = String(r.amount?.currency ?? "usd").toLowerCase();
         if (currency !== "usd") throw new Error(`Unsupported currency ${currency}`);
@@ -57,18 +70,21 @@ export function parseOpenAICosts(doc, { project } = {}) {
       }
     }
   }
+  assertGrouped(all, "project_id", project, grouped);
   return rows;
 }
 
 // Anthropic GET /v1/organizations/cost_report. amount is a decimal string in cents.
-export function parseAnthropicCostReport(doc, { workspace } = {}) {
+export function parseAnthropicCostReport(doc, { workspace, grouped = false } = {}) {
   const rows = [];
+  const all = [];
   for (const page of pagesOf(doc)) {
     if (!Array.isArray(page?.data)) throw new Error("Anthropic cost report needs a data list");
     for (const bucket of page.data) {
       const day = dayOf(bucket?.starting_at);
       if (!day) throw new Error("Anthropic cost report bucket needs starting_at");
       for (const r of bucket.results ?? []) {
+        all.push(r);
         if (workspace && r.workspace_id !== workspace) continue;
         const currency = String(r.currency ?? "USD").toUpperCase();
         if (currency !== "USD") throw new Error(`Unsupported currency ${currency}`);
@@ -77,12 +93,13 @@ export function parseAnthropicCostReport(doc, { workspace } = {}) {
       }
     }
   }
+  assertGrouped(all, "workspace_id", workspace, grouped);
   return rows;
 }
 
 export function parseExport(provider, doc, filters = {}) {
-  if (provider === "openai") return parseOpenAICosts(doc, { project: filters.project });
-  if (provider === "anthropic") return parseAnthropicCostReport(doc, { workspace: filters.workspace });
+  if (provider === "openai") return parseOpenAICosts(doc, { project: filters.project, grouped: filters.grouped });
+  if (provider === "anthropic") return parseAnthropicCostReport(doc, { workspace: filters.workspace, grouped: filters.grouped });
   throw new Error("--provider must be openai or anthropic");
 }
 
@@ -164,9 +181,21 @@ export function billCheck({ receipts, billed, provider, since, until, toleranceP
       delta_pct: billedTotal ? round((delta / billedTotal) * 100) : null, unknown_count: unknownCount }, estimate_only: false };
 }
 
-export function billCheckFiles({ receiptsPath, exportDoc, provider, since, until, tolerancePct, project, workspace }) {
+export function billCheckFiles({ receiptsPath, exportDoc, provider, since, until, tolerancePct, project, workspace, grouped = false }) {
   const receipts = applySettlements(loadLedgerLines(receiptsPath));
-  return billCheck({ receipts, billed: parseExport(provider, exportDoc, { project, workspace }), provider, since, until, tolerancePct });
+  const billed = parseExport(provider, exportDoc, { project, workspace, grouped });
+  const result = billCheck({ receipts, billed, provider, since, until, tolerancePct });
+  const filter = provider === "openai" ? project : workspace;
+  if (filter && !billed.some((b) => inWindow(b.day, since, until))) {
+    const unfiltered = parseExport(provider, exportDoc, {}).filter((b) => inWindow(b.day, since, until));
+    if (unfiltered.length) {
+      // #227: a mistyped id (or Anthropic's default workspace, reported as null) is not pricing drift.
+      result.filter_note = `filter matched no billed rows (${provider === "openai" ? "--project" : "--workspace"} ${filter}; export has ${unfiltered.length} rows in the period)`;
+      result.verdict = "incomplete";
+      result.ok = false;
+    }
+  }
+  return result;
 }
 
 export function readExportFile(path) {
@@ -191,7 +220,7 @@ function getJson(url, headers) {
 }
 
 // Fetch every page of the provider's cost export. Returns the list of pages.
-export async function fetchExport({ provider, env = process.env, since, until, maxPages = 100 }) {
+export async function fetchExport({ provider, env = process.env, since, until, project, workspace, maxPages = 100 }) {
   if (!PROVIDERS.includes(provider)) throw new Error("--provider must be openai or anthropic");
   const apiKey = env[KEY_ENV[provider]];
   if (!apiKey) throw new Error(`--fetch needs ${KEY_ENV[provider]} in the environment`);
@@ -210,6 +239,7 @@ export async function fetchExport({ provider, env = process.env, since, until, m
       if (end) url.searchParams.set("end_time", String(Math.floor(end.getTime() / 1000)));
       url.searchParams.set("bucket_width", "1d");
       url.searchParams.append("group_by", "line_item");
+      if (project) url.searchParams.append("group_by", "project_id");
       url.searchParams.set("limit", "180");
       headers = { authorization: `Bearer ${apiKey}` };
     } else {
@@ -217,6 +247,7 @@ export async function fetchExport({ provider, env = process.env, since, until, m
       url.searchParams.set("starting_at", start.toISOString());
       if (end) url.searchParams.set("ending_at", end.toISOString());
       url.searchParams.append("group_by[]", "description");
+      if (workspace) url.searchParams.append("group_by[]", "workspace_id");
       url.searchParams.set("limit", "31");
       headers = { "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
     }
@@ -255,6 +286,7 @@ export function parseBillCheckArgs(argv) {
 export function formatBillCheck(r) {
   const usd = (n) => `$${n.toFixed(2)}`;
   const lines = [`costcap bill-check ${r.provider}: ${r.verdict} (tolerance ${r.tolerance_pct}%)`];
+  if (r.filter_note) lines.push(`  ${r.filter_note}`);
   for (const row of r.rows) lines.push(`  ${row.day} ${row.model}: metered ${usd(row.metered_usd)} billed ${usd(row.billed_usd)} delta ${usd(row.delta_usd)}${row.delta_pct === null ? "" : ` (${row.delta_pct.toFixed(1)}%)`} ${row.status}${row.unknown_count ? ` unknown=${row.unknown_count}` : ""}`);
   for (const u of r.unmapped) lines.push(`  ${u.day} unmapped "${u.line_item ?? ""}": ${usd(u.usd)}`);
   const t = r.totals;
@@ -266,8 +298,8 @@ export function formatBillCheck(r) {
 export async function billCheckCommand(argv, { env = process.env, out = console.log, err = console.error } = {}) {
   try {
     const o = parseBillCheckArgs(argv);
-    const exportDoc = o.fetch ? await fetchExport({ provider: o.provider, env, since: o.since, until: o.until }) : readExportFile(o.exportPath);
-    const result = billCheckFiles({ receiptsPath: o.receiptsPath, exportDoc, provider: o.provider, since: o.since, until: o.until, tolerancePct: o.tolerancePct, project: o.project, workspace: o.workspace });
+    const exportDoc = o.fetch ? await fetchExport({ provider: o.provider, env, since: o.since, until: o.until, project: o.project, workspace: o.workspace }) : readExportFile(o.exportPath);
+    const result = billCheckFiles({ receiptsPath: o.receiptsPath, exportDoc, provider: o.provider, since: o.since, until: o.until, tolerancePct: o.tolerancePct, project: o.project, workspace: o.workspace, grouped: o.fetch });
     out(o.json ? JSON.stringify(result) : formatBillCheck(result));
     return result.ok ? 0 : 1;
   } catch (e) {

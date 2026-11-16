@@ -111,3 +111,11 @@ test("command returns 2 on bad input and fetch validates env", async () => {
   await assert.rejects(fetchExport({ provider: "anthropic", env: { COSTCAP_ANTHROPIC_ADMIN_KEY: "k" } }), /--since/);
   await assert.rejects(fetchExport({ provider: "x", env: {} }), /--provider/);
 });
+
+test("#227 parsers: grouped flag skips the ungrouped guard; filter note is set only when the period has rows", () => {
+  const doc = { data: [{ starting_at: "2026-10-31T00:00:00Z", results: [{ amount: "100", workspace_id: null, model: "claude-sonnet-4-5" }] }] };
+  assert.throws(() => parseAnthropicCostReport(doc, { workspace: "w" }), /grouped by workspace/);
+  assert.deepEqual(parseAnthropicCostReport(doc, { workspace: "w", grouped: true }), []);
+  assert.equal(parseAnthropicCostReport(doc).length, 1);
+  assert.deepEqual(parseOpenAICosts({ data: [] }, { project: "p" }), []);
+});

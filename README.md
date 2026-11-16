@@ -516,7 +516,14 @@ attributed per model from its results (#226): the `batch_results` settlement (an
 succeeded line's model, so a mixed-model batch splits across model rows; the day is
 the batch create day, as with budgets. Older settlements without `by_model` stay
 under model `unknown`. `--project` /
-`--workspace` filter the export. Samples: `docs/fixtures/openai-costs.sample.json`,
+`--workspace` filter the export; filtering needs the export grouped by project
+(`group_by=project_id`) or workspace (`group_by[]=workspace_id`), because the
+providers report the id as `null` otherwise. `--fetch` adds that grouping
+automatically; a `--provider-export` file with no project/workspace ids exits 2
+and asks you to re-export grouped. If the filter matches no billed rows while the
+export has rows in the period (a mistyped id, or Anthropic's default workspace,
+reported as `null`), the output says `filter matched no billed rows` and the
+verdict is `incomplete` (exit 1), not `over_metered`. Samples: `docs/fixtures/openai-costs.sample.json`,
 `docs/fixtures/anthropic-cost-report.sample.json`.
 
 Settlements also flow the other way (#162): `GET /v1/policy` returns `settlements` (`receipt_id`, `settled_cost_usd`, `settle_source`, `audit_id` of the `receipt.settle` audit entry) for this agent's settled unknown-cost receipts. On the next poll the wrapper appends one `{"event":"reconciliation","source":"hosted_settle",...}` line per settlement to its local ledger (never editing the original line; repeat polls add nothing), so a dashboard settle unblocks a running or freshly started `costcap wrap` and `costcap agent-status` agrees with `/v1/agents/:id/budget`. Settlements for other agents' receipts, known-cost receipts or receipts already settled locally are ignored.

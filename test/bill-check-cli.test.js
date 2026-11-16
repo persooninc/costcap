@@ -114,3 +114,64 @@ test("AC6 regression: reconcile output is unchanged", async () => {
   assert.equal(r.code, 0);
   assert.equal(r.out.trim(), JSON.stringify({ ok: true, matched: 1, unknown: [], receipt_only: [], provider_only: [], mismatched: [], estimate_only: false }));
 });
+
+// #227: providers null workspace_id/project_id unless the export is grouped by it.
+function contractStub(fixture, field, groupParam) {
+  const doc = JSON.parse(readFileSync(FIX(fixture), "utf8"));
+  return stub((req, res) => {
+    const grouped = new URL(req.url, "http://x").searchParams.getAll(groupParam).includes(field);
+    const copy = JSON.parse(JSON.stringify(doc));
+    for (const b of copy.data) for (const r of b.results) if (!grouped) r[field] = null;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ...copy, has_more: false, next_page: null }));
+  });
+}
+const ANT = [{ id: "x", ts: "2026-10-31T05:00:00Z", provider: "anthropic", model: "claude-sonnet-4-5-20250929", cost_usd: 8 }];
+
+test("#227 --fetch --workspace groups by workspace_id and matches the full bill", async () => {
+  const { s, seen, base } = await contractStub("anthropic-cost-report.sample.json", "workspace_id", "group_by[]");
+  const { p } = ledger(ANT);
+  const env = { COSTCAP_ANTHROPIC_ADMIN_KEY: KEY, COSTCAP_ANTHROPIC_ADMIN_BASE_URL: base };
+  const r = await run(["bill-check", "--receipts", p, "--provider", "anthropic", "--fetch", "--since", "2026-10-31", "--until", "2026-10-31", "--workspace", "wrkspc_sample", "--json"], env);
+  const plain = await run(["bill-check", "--receipts", p, "--provider", "anthropic", "--fetch", "--since", "2026-10-31", "--until", "2026-10-31", "--json"], env);
+  const typo = await run(["bill-check", "--receipts", p, "--provider", "anthropic", "--fetch", "--since", "2026-10-31", "--until", "2026-10-31", "--workspace", "wrkspc_typo"], env);
+  s.close();
+  assert.equal(r.code, 0, r.err);
+  const j = JSON.parse(r.out);
+  assert.equal(j.verdict, "match");
+  assert.equal(j.totals.billed_usd, 8);
+  const q = new URL(seen[0].url, "http://x").searchParams.getAll("group_by[]");
+  assert.deepEqual(q, ["description", "workspace_id"]);
+  assert.deepEqual(new URL(seen[1].url, "http://x").searchParams.getAll("group_by[]"), ["description"]);
+  assert.equal(plain.code, 0, plain.err);
+  assert.equal(typo.code, 1);
+  assert.match(typo.out, /: incomplete/);
+  assert.match(typo.out, /filter matched no billed rows/);
+});
+
+test("#227 --fetch --project groups by project_id and matches", async () => {
+  const { s, seen, base } = await contractStub("openai-costs.sample.json", "project_id", "group_by");
+  const { p } = ledger(AC1);
+  const r = await run(["bill-check", "--receipts", p, "--provider", "openai", "--fetch", "--since", "2026-10-30", "--until", "2026-10-30", "--project", "proj_sample", "--json"], { COSTCAP_OPENAI_ADMIN_KEY: KEY, COSTCAP_OPENAI_ADMIN_BASE_URL: base });
+  s.close();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(JSON.parse(r.out).verdict, "match");
+  assert.deepEqual(new URL(seen[0].url, "http://x").searchParams.getAll("group_by"), ["line_item", "project_id"]);
+});
+
+test("#227 --provider-export --workspace on an ungrouped export exits 2 with guidance", async () => {
+  const doc = JSON.parse(readFileSync(FIX("anthropic-cost-report.sample.json"), "utf8"));
+  for (const b of doc.data) for (const r of b.results) delete r.workspace_id;
+  const { dir, p } = ledger(ANT);
+  const f = join(dir, "ungrouped.json");
+  writeFileSync(f, JSON.stringify(doc));
+  const r = await run(["bill-check", "--receipts", p, "--provider", "anthropic", "--provider-export", f, "--workspace", "wrkspc_sample"]);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /grouped by workspace/);
+  const oa = JSON.parse(readFileSync(FIX("openai-costs.sample.json"), "utf8"));
+  for (const b of oa.data) for (const x of b.results) x.project_id = null;
+  writeFileSync(f, JSON.stringify(oa));
+  const r2 = await run(["bill-check", "--receipts", p, "--provider", "openai", "--provider-export", f, "--project", "proj_sample"]);
+  assert.equal(r2.code, 2);
+  assert.match(r2.err, /grouped by project/);
+});
