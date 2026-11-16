@@ -320,6 +320,15 @@ export function openaiTextUsage(u) {
   return { input_tokens: total - cached - writes, ...out, cache_write_input_tokens: w30, cache_write_1h_input_tokens: w12 };
 }
 
+// #148/#235: OpenRouter's exact usage.cost replaces the table cost, and also rescues a call the
+// table cannot price (cache write or service tier without a rate), never other unknowns.
+const PROVIDER_COST_RESCUES = new Set(["cache_write_unpriced", "long_context_cache_write_unpriced", "service_tier_unpriced"]);
+export function applyProviderCost(receipt, providerCost) {
+  if (providerCost === undefined || !(receipt.cost_usd !== null || PROVIDER_COST_RESCUES.has(receipt.reason))) return receipt;
+  delete receipt.reason;
+  return Object.assign(receipt, { cost_usd: Number(providerCost.toFixed(6)), cost_source: "provider", fallback: false });
+}
+
 export function extractUsage(provider, text, requestedModel, opts = {}) {
   let chunks;
   try { const parsed = JSON.parse(text); chunks = Array.isArray(parsed) ? parsed : [parsed]; }
@@ -1051,7 +1060,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional" })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage));
             rateLimit?.record(usageTokens(metered.usage));
-            if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
+            applyProviderCost(receipt, metered.providerCost);
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
             else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
             recordSpend(receipt);

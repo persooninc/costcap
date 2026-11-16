@@ -92,8 +92,9 @@ export function selectTier(price, prompt_tokens) {
 // OpenAI Fast (renamed from Priority on 2026-07-30) reports service_tier "fast" (GPT-6) or
 // "priority" (GPT-5.6 and earlier); both price at the model's `priority` set. "ultrafast"
 // uses the model's `ultrafast` set. Known standard values are only recorded; any other
-// value is "unrecognised" and unpriced, never standard.
-export const STANDARD_SERVICE_TIERS = Object.freeze(["default", "auto", "flex", "scale", "standard", "batch"]);
+// value is "unrecognised" and unpriced, never standard. #235: Groq (and OpenRouter) report
+// "on_demand" as their default standard tier, so it prices at standard too.
+export const STANDARD_SERVICE_TIERS = Object.freeze(["default", "auto", "flex", "scale", "standard", "batch", "on_demand"]);
 export const PREMIUM_TIERS = Object.freeze(["fast", "priority", "ultrafast", "unrecognised"]);
 export function premiumTier({ speed, service_tier } = {}) {
   if (speed === "fast") return "fast";
