@@ -39,7 +39,7 @@ const { server, evaluateFleetAlerts, billingReady } = createHostedServer({
     const webhookSecret = required("COSTCAP_STRIPE_WEBHOOK_SECRET");
     const secretKey = required("COSTCAP_STRIPE_SECRET_KEY");
     if (stripeMode === "test") {
-      const billing = createTestModeStripeBilling({ store, origin, secretKey, webhookSecret, priceId, teamPriceId: process.env.COSTCAP_STRIPE_TEAM_PRICE_ID || undefined });
+      const billing = createTestModeStripeBilling({ store, origin, secretKey, webhookSecret, priceId, teamPriceId: process.env.COSTCAP_STRIPE_TEAM_PRICE_ID || undefined, teamLookupKey: process.env.COSTCAP_STRIPE_TEAM_LOOKUP_KEY || TEAM_BUNDLE_LOOKUP_KEY });
       if (!billing) throw new Error("Test-mode Stripe key required");
       return billing;
     }

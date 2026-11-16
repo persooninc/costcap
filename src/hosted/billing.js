@@ -80,8 +80,10 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
   const planForPrice = (id) => Object.keys(prices).find((p) => prices[p] === id) ?? null;
   const publicStatus = (s, orgId) => {
     const b = s.orgs[orgId]?.billing;
-    return { enabled: true, amount: 1900, currency: 'usd', interval: 'month', status: b?.status ?? 'free_beta',
-      plan: b?.status && !['free_beta', 'canceled', 'unpaid', 'incomplete_expired'].includes(b.status) ? (b.plan ?? 'workspace') : null, plans: Object.keys(prices),
+    const plan = b?.status && !['free_beta', 'canceled', 'unpaid', 'incomplete_expired'].includes(b.status) ? (b.plan ?? 'workspace') : null;
+    // The amount is the subscribed plan's price: $79 for a Team (bundle) subscriber, else $19.
+    return { enabled: true, amount: plan === 'team' ? 7900 : 1900, currency: 'usd', interval: 'month', status: b?.status ?? 'free_beta',
+      plan, plans: Object.keys(prices),
       cancelAtPeriodEnd: b?.cancelAtPeriodEnd ?? false, paidInvoiceCount: b?.paidInvoiceCount ?? 0 };
   };
   const applySubscription = (orgId, sub) => {
@@ -123,6 +125,11 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
       if (existing?.status === 'open' && (state.checkout?.plan ?? 'workspace') === plan) {
         if (!/^https:\/\/checkout\.stripe\.com\//.test(existing.url ?? '')) throw problem(503, 'Invalid Checkout response');
         return { url: existing.url };
+      }
+      // Switching plans: expire the other plan's open session first so one workspace cannot pay for both.
+      if (existing?.status === 'open' && existing.id) {
+        const closed = await request(`/checkout/sessions/${encodeURIComponent(existing.id)}/expire`, {});
+        if (closed.status !== 'expired') throw problem(503, 'Could not close the open checkout');
       }
       let key;
       store.transaction(s => {
@@ -189,7 +196,9 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
 // other secret return null. This does not create or edit a price.
 // `priceId` sells Solo (plan id "workspace"); optional `teamPriceId` sells Team.
 // Both are owner-supplied test prices; code never creates a price.
-export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId, teamPriceId, origin, store,
+// Without `teamPriceId`, Team resolves on first use by `teamLookupKey` (the Agent
+// Guardrails Team bundle) from the test-mode price list, as live mode does at startup.
+export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId, teamPriceId, teamLookupKey, origin, store,
   fetchImpl = fetch, now = () => Date.now(), log = console.error } = {}) {
   if (!String(secretKey ?? "").startsWith("sk_test_")) {
     log("costcap: test-mode Stripe key refused");
@@ -223,6 +232,22 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
     });
     if (!res.ok) throw problem(503, "Billing provider unavailable");
     return res.json();
+  };
+  // Lazy bundle lookup: a verified test price is kept; a miss or provider error retries after 5 minutes.
+  // A bundle-keyed price that fails readback is never sold.
+  let teamLookup = null;
+  let teamMissAt = -Infinity;
+  const resolveTeam = async () => {
+    if (prices.team || !teamLookupKey || now() - teamMissAt < 300_000) return;
+    teamLookup ??= read(`/prices?active=true&lookup_keys[]=${encodeURIComponent(teamLookupKey)}&expand[]=data.product`)
+      .then((list) => {
+        const found = (list?.data ?? []).filter((p) => p?.lookup_key === teamLookupKey);
+        const team = found.length === 1 ? found[0] : null;
+        if (team && checkMonthlyPrice(team, 7900, false) && team.id !== priceId) prices.team = team.id;
+        else { teamMissAt = now(); if (found.length) log("costcap: test-mode Team bundle price readback failed"); }
+      }, () => { teamMissAt = now(); })
+      .finally(() => { teamLookup = null; });
+    await teamLookup;
   };
   const publicStatus = (s, orgId) => {
     const b = s.orgs[orgId]?.billing;
@@ -288,6 +313,7 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
   };
   return {
     async status(orgId) {
+      await resolveTeam();
       const subId = store.read(s => s.orgs[orgId]?.billing?.subscriptionId);
       if (subId) {
         const sub = await read(`/subscriptions/${encodeURIComponent(subId)}`);
@@ -296,6 +322,7 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
       return store.read(s => publicStatus(s, orgId));
     },
     async checkout(user, { plan = "workspace" } = {}) {
+      if (plan === "team") await resolveTeam();
       if (!Object.hasOwn(prices, plan)) throw problem(plan === "team" ? 409 : 400, plan === "team" ? "Team plan is not configured" : "Unknown plan");
       await syncCheckout(user.orgId);
       const state = store.read(s => s.orgs[user.orgId]?.billing ?? {});

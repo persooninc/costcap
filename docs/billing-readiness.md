@@ -74,7 +74,7 @@ Plan catalog and entitlement checks live in the portable `src/billing/` module
 (see HANDOFF.md, Portable modules). The hosted server counts usage and calls it.
 
 - Free workspace: 3 agents, 3 people (owner included), receipts shown for 30 days. Solo (`workspace`, $19 list):
-  15 agents, 3 people, 90 days. Team (`team`, $79 list, test mode only, FA-CC-03): 50 agents, 15 people, 1 year.
+  15 agents, 3 people, 90 days. Team (`team`, $79: the Agent Guardrails Team bundle, lookup key `guardrails_team_month`, #131): 50 agents, 15 people, 1 year.
   Older receipts are hidden, never deleted, and only when entitlements are enforced.
   Pending enrollment tokens and invitations hold a slot. Redemption re-checks the agent limit.
 - Paid statuses: `active`, `trialing`, `past_due`. Everything else is the free workspace.
@@ -85,7 +85,7 @@ Plan catalog and entitlement checks live in the portable `src/billing/` module
   `COSTCAP_STRIPE_MODE=test` and to report-only in live mode. Live enforcement is an owner switch.
 - `/pricing` is served and listed in the sitemap by default (FA-CC-03); `COSTCAP_PUBLIC_PRICING=disabled`
   turns it off. It shows the catalog list prices and, in test mode, a banner that no real charge is made.
-- Team checkout needs the owner's test price in `COSTCAP_STRIPE_TEAM_PRICE_ID`. Without it, only Solo is sold.
+- Team checkout uses the Agent Guardrails Team bundle price, resolved by lookup key `guardrails_team_month` (`COSTCAP_STRIPE_TEAM_LOOKUP_KEY` overrides) in test and live mode. `COSTCAP_STRIPE_TEAM_PRICE_ID` pins a test price instead. Without a verified bundle price, only Solo is sold.
   The live adapter sells Solo only.
 - Onboarding: `/v1/fleet` returns `onboarding` (token, enroll, first receipt). The workspace
   shows the checklist with the exact enroll and wrap commands until the first receipt syncs.
