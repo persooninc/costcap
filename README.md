@@ -341,6 +341,22 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
   content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
+- Retrieves never create spend: any GET/HEAD (for example `GET /v1/responses/{id}` or a
+  stored `GET /v1/chat/completions/{id}`) is `cost_usd: 0, reason: "non_billable_request"`
+  even when the body carries usage, unless it settles a pending background response.
+- OpenAI Responses background mode (`POST /openai/v1/responses` with
+  `background: true`): a 2xx `queued`/`in_progress` reply writes a
+  `reason: "background_pending"` receipt with `response_id` at `cost_usd: null`. Like a
+  pending batch it does not pause the run, spend is a lower bound and `costcap check`
+  fails until it settles. A cut `background: true, stream: true` stream that already
+  sent `response.created` is also `background_pending`. Polling `queued`/`in_progress`
+  costs $0. The first terminal (`completed`, `incomplete`, `failed`, `cancelled`) read
+  through the proxy (`GET /v1/responses/{id}`, a resumed `?stream=true` stream, or
+  `POST /v1/responses/{id}/cancel`) appends one
+  `{"event":"reconciliation","source":"background_result","response_id"}` at the
+  create's `ts` (once, including across restarts). A terminal reply with null or
+  unpriceable usage appends `{"event":"background_unpriced"}`: the receipt becomes an
+  unknown `background_unpriced` and the run pauses.
 - Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
   OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
   (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
@@ -583,7 +599,7 @@ costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
 `costcap wrap --cache TTL` (off by default; `30s`, `10m`, `24h`, `7d`, at most `7d`) answers repeated identical deterministic requests from a local disk cache. A hit makes no upstream call, costs $0, and still writes a receipt: `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`.
 
 - **Cached:** `POST` non-streaming generation requests whose JSON body sets `temperature` (Gemini: `generationConfig.temperature`) to exactly `0`, and embeddings requests. Only a `2xx` response with a known, numeric `cost_usd` is stored.
-- **Never cached** (`x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), batches, Files, count-tokens, GET/HEAD and `n > 1`. Provider errors, unknown or unpriced cost and `batch_pending` responses are never stored.
+- **Never cached** (`x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), batches, Files, count-tokens, GET/HEAD and `n > 1`. Provider errors, unknown or unpriced cost `batch_pending` and `background_pending` responses are never stored.
 - **Key:** SHA-256 of provider, upstream, method, path and query, the exact body bytes, `anthropic-version`, `anthropic-beta`, `openai-organization`, `openai-project`, and a hash of the API key headers and any `key=` query value. Different keys never share entries.
 - **Order:** the lookup runs after every check (kill file, caps, allowlist, preflight, breaker, spiral). A hit never bypasses a refusal. Hits count toward `--max-steps` and policy `maxSteps`, never toward velocity spend, caps, alerts or billing.
 - **Storage:** `--cache-dir DIR` (default `<ledger-dir>/cache`, mode `0700`, entries `0600`). `--cache-max-mb N` (default 256) evicts least recently used entries; a response over 1/10 of the cap is not stored. Entries hold status, content-type, response body, model, original cost, source receipt id and a timestamp. They never hold request bodies, headers or keys. Delete the directory to purge.

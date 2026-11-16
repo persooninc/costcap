@@ -140,3 +140,14 @@ test("e2e: costcap wrap meters two streamed Responses calls and the run is not p
   for (const r of rows) assert.equal(typeof r.cost_usd, "number");
   assert.doesNotMatch(result.err, /unknown|paused|accounting/i);
 });
+
+test("#196 a cut non-background Responses stream is still stream_incomplete", async (t) => {
+  const { createResponsesStreamTracker } = await import("../src/background.js");
+  const tr = createResponsesStreamTracker();
+  for (const e of START) tr.push(e);
+  tr.end();
+  assert.deepEqual([tr.id, tr.terminal], ["resp_1", null]);
+  for (const type of ["response.completed", "response.incomplete", "response.failed"]) {
+    const x = createResponsesStreamTracker(); x.push(terminal(type)); assert.equal(x.terminal, type.slice(9));
+  }
+});

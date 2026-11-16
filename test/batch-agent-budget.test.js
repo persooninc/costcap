@@ -73,3 +73,9 @@ test("batch_unpriced leaves the agent accounting unavailable", async (t) => {
   assert.equal(s.agentBudgets.check(who).verdict, "accounting_unavailable");
   assert.equal(s.fresh().check(who).verdict, "accounting_unavailable");
 });
+
+test("#196: a pending background response is not an agent unknown", () => {
+  const b = createAgentBudgets({ policy: policyFor(1), history: [{ id: "g", ts: new Date().toISOString(), agent_id: "worker", run_id: "r1", reason: "background_pending", cost_usd: null }] });
+  assert.equal(b.spend({ agent_id: "worker", run_id: "r1" }).unknown, 0);
+  assert.equal(b.check({ agent_id: "worker", run_id: "r1" }), null);
+});

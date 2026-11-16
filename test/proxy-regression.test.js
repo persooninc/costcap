@@ -565,3 +565,10 @@ test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hit
   assert.equal(r.status, 200);
   assert.equal(server.accountingFailure(), null);
 });
+
+test("#196 a GET whose body carries usage is $0 non_billable_request and never pauses", async (t) => {
+  const f = await scripted(t, "openai", [200]);
+  const r = await f.call(0, "GET", "/openai/v1/chat/completions/chatcmpl_1");
+  assert.equal(r.status, 200);
+  assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [0, "non_billable_request"]);
+});

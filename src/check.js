@@ -25,7 +25,7 @@ function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }
   const total = history.reduce((sum, r) => sum + (typeof r.cost_usd === "number" ? r.cost_usd : 0), 0);
   let hit = cap.check();
   // #160: a pending batch does not stop the proxy, but a check never passes on unknown cost.
-  if (!hit && history.some(isPendingBatch)) hit = { scope: "accounting", cap: 0, spent: 0, reason: "batch_pending" };
+  if (!hit && history.some(isPendingBatch)) hit = { scope: "accounting", cap: 0, spent: 0, reason: history.find(isPendingBatch).reason };
   if (!hit && caps.run != null) {
     if (!Number.isFinite(caps.run) || caps.run <= 0) throw new Error("Invalid run cap");
     if (total >= caps.run) hit = { scope: "run", cap: caps.run, spent: total };
@@ -36,7 +36,7 @@ function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }
   return { ok: !hit, receipt_count: history.length, total_usd: Number(total.toFixed(6)), unknown_cost_count,
     hour: { spent_usd: Number(s.hour.toFixed(6)), cap: caps.hour ?? null, scope: "whole ledger, last 60 minutes" },
     blocked_model_count: history.filter((r) => r.outcome === "blocked_model").length,
-    unknown_cost_counted_as_zero: false, spend: s, hit, warnings,
+    unknown_cost_counted_as_zero: false, cost_complete: unknown_cost_count === 0, spend: s, hit, warnings,
     estimate_only: true, scope: "all receipts in selected ledger; run total is not a reconstructed process run" };
 }
 
@@ -59,7 +59,7 @@ function checkRunBudget({ history, caps = {}, now, runId, warnAt }) {
   if (!hit && ledgerCaps) hit = cap.check();
   // #185: a pending batch in any run makes ledger-wide spend unknown, so hour/day/month never pass on it.
   const ledgerPendingBatches = history.filter(isPendingBatch).length;
-  if (!hit && ledgerCaps && ledgerPendingBatches > 0) hit = { scope: "accounting", cap: 0, spent: 0, reason: "batch_pending" };
+  if (!hit && ledgerCaps && ledgerPendingBatches > 0) hit = { scope: "accounting", cap: 0, spent: 0, reason: history.find(isPendingBatch).reason };
   const ledgerUnknown = history.filter((r) => r.cost_usd === null).length;
   const warnings = currentWarnings({ caps, spend: { run: runTotal, day: s.day, month: s.month }, fractions: warnAt,
     lowerBound: { run: runUnknown > 0, day: ledgerUnknown > 0, month: ledgerUnknown > 0 } });

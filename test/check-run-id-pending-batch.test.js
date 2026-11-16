@@ -62,3 +62,8 @@ test("AC5: once settled, the settled cost decides the day cap", () => {
   const u = checkBudget({ receiptsPath: under, caps: { day: 10 }, runId: "B" });
   assert.equal(u.ok, true); assert.equal(u.hit, null);
 });
+
+test("#196: another run's pending background response fails --run-id like a batch", () => {
+  const res = checkBudget({ receiptsPath: ledger([{ id: "g1", run_id: "A", reason: "background_pending", response_id: "resp_1", cost_usd: null }, BASE[1]]), caps: { day: 10 }, runId: "B" });
+  assert.equal(res.ok, false); assert.equal(res.hit.reason, "background_pending");
+});

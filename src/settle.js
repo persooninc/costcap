@@ -1,3 +1,4 @@
+import { PENDING_REASONS } from "./cap.js";
 // #176: one settle path for the running wrapper, used by both the hosted fleet
 // poll (onSettle) and the shared ledger (onExternalSettle). A batch_pending
 // receipt was never counted as unknown, so its settled cost is recorded on the
@@ -14,8 +15,9 @@ export function createSettler({ cap, agentBudgets, proxySettle, tagCaps = () => 
     const r = cap();
     // Fleet passes the receipt with its settled cost already merged, so test reason only.
     // #178: a settled batch of this wrapper's own run also counts toward run.
-    if (receipt?.reason === "batch_pending") r?.resolvePending?.(id);
-    if (receipt?.reason === "batch_pending") r?.record({ ts: receipt.ts, cost_usd: cost }, { external: !(r.runId != null && receipt.run_id === r.runId) });
+    const pending = PENDING_REASONS.includes(receipt?.reason); // #196: background_pending too
+    if (pending) r?.resolvePending?.(id);
+    if (pending) r?.record({ ts: receipt.ts, cost_usd: cost }, { external: !(r.runId != null && receipt.run_id === r.runId) });
     else r?.settle({ ...receipt, cost_usd: cost });
     tagCaps()?.settle(id, cost); // #191
     agentBudgets()?.settle?.({ receipt_id: id, cost_usd: cost });

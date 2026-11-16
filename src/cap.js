@@ -28,15 +28,22 @@ export function isSettlement(e) {
     typeof e.cost_usd === "number" && Number.isFinite(e.cost_usd) && e.cost_usd >= 0;
 }
 
+// #196: a pending OpenAI Responses background job is treated exactly like a pending batch.
+export const PENDING_REASONS = Object.freeze(["batch_pending", "background_pending"]);
 export function isPendingBatch(r) {
-  return !!r && r.reason === "batch_pending" && r.cost_usd === null;
+  return !!r && PENDING_REASONS.includes(r.reason) && r.cost_usd === null;
 }
+export const isPending = isPendingBatch;
 
 export function applySettlements(lines) {
   const settle = new Map();
+  const unpriced = new Set();
   for (const e of lines) if (isSettlement(e) && !settle.has(e.receipt_id)) settle.set(e.receipt_id, e);
+  // #196: a background response that finished unpriced turns its pending receipt into an unknown.
+  for (const e of lines) if (e?.event === "background_unpriced" && typeof e.receipt_id === "string" && !settle.has(e.receipt_id)) unpriced.add(e.receipt_id);
   return lines.filter((r) => !r.event).map((r) => {
     const e = r.cost_usd === null && typeof r.id === "string" ? settle.get(r.id) : undefined;
+    if (!e && r.cost_usd === null && r.reason === "background_pending" && unpriced.has(r.id)) return { ...r, reason: "background_unpriced" };
     return e ? { ...r, cost_usd: e.cost_usd, settled: { source: e.source ?? null, provider_sha256: e.provider_sha256 ?? null, ts: e.ts ?? null } } : r;
   });
 }

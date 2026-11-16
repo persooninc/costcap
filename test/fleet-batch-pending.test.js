@@ -71,3 +71,9 @@ test("non-batch null-cost receipts still return accounting_unavailable; pending 
   const settled = agentSpendPolicy([{ ...batch, cost_usd: 0.4 }], now);
   assert.deepEqual([settled.unknown, settled.pending_batches, settled.spent.day], [0, 0, 0.4]);
 });
+
+test("#196: agentSpendPolicy counts a pending background response as pending, not unknown", () => {
+  const now = Date.now();
+  const s = agentSpendPolicy([{ id: "g", ts: new Date(now).toISOString(), reason: "background_pending", cost_usd: null }], now);
+  assert.deepEqual([s.unknown, s.pending_batches], [0, 1]);
+});

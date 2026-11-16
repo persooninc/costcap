@@ -19,6 +19,7 @@ import { preflightCheck, openRouterModels } from "./preflight.js";
 import { rateLimitedBody, usageTokens } from "./rate-limit.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
+import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
@@ -443,6 +444,21 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     if (lines.some((l) => isSettlement(l) && l.receipt_id === r.id)) resolvedBatches.add(batchId);
     return entry;
   };
+  // #196: pending background Responses, response_id -> receipt; restart reads the ledger.
+  const pendingBackground = new Map();
+  const resolvedBackground = new Set();
+  const findPendingBackground = (responseId) => {
+    if (pendingBackground.has(responseId)) return pendingBackground.get(responseId);
+    if (!receiptsPath) return null;
+    let lines;
+    try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
+    const r = lines.find((l) => !l.event && l.reason === "background_pending" && l.response_id === responseId && l.cost_usd === null);
+    if (!r) return null;
+    const entry = { id: r.id, ts: r.ts, response_id: responseId, run_id: r.run_id ?? null };
+    pendingBackground.set(responseId, entry);
+    if (lines.some((l) => (isSettlement(l) || l.event === "background_unpriced") && l.receipt_id === r.id)) resolvedBackground.add(responseId);
+    return entry;
+  };
   const emitEvent = (event) => guarded(() => {
     const complete = { ts: new Date().toISOString(), ...event };
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
@@ -738,6 +754,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false, sseIncomplete = false;
+          // #196: Responses background create / read / cancel on the first-party OpenAI route.
+          const firstPartyOpenAI = provider === "openai" && !custom && !cloud;
+          const bgCreate = firstPartyOpenAI && isResponsesCreate(req.method, req.url) && requestsBackground(body);
+          const bgRead = firstPartyOpenAI ? responsesReadPath(req.method, req.url) : null;
+          const tracker = bgCreate || bgRead ? createResponsesStreamTracker() : null;
           const eventStream = cloud && /^application\/vnd\.amazon\.eventstream/i.test(contentType);
           if ((/^text\/event-stream/i.test(contentType) || eventStream) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
@@ -766,20 +787,24 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 if (filter) {
                   const text = decoder.decode(value, { stream: true });
                   parser.push(text);
+                  if (tracker) tracker.push(text);
                   await forward(Buffer.from(filter.push(text)));
                 } else {
-                  parser.push(eventStream ? value : decoder.decode(value, { stream: true }));
+                  const chunk = eventStream ? value : decoder.decode(value, { stream: true });
+                  parser.push(chunk);
+                  if (tracker) tracker.push(chunk);
                   await forward(value);
                 }
               }
               const tail = eventStream ? "" : decoder.decode();
-              if (!eventStream) parser.push(tail);
+              if (!eventStream) { parser.push(tail); tracker?.push(tail); }
               if (filter) await forward(Buffer.from(filter.push(tail) + filter.end()));
             } catch {
               streamCut = true;
               abort.abort();
               reader.cancel().catch(() => {});
             }
+            tracker?.end();
             metered = parser.end();
             // Stream ended without its terminal event (Responses, Anthropic message_stop, Gemini finishReason): usage is partial or absent.
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
@@ -791,7 +816,57 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           clearTimeout(timer);
           res.off("close", onClientClose);
           if (cloud) Object.assign(receipt, { provider_model: providerModel, endpoint_scope: cloudRoute.scope });
-          if (metered && cloud && !cloudModel) {
+          const ok2xx = upstreamRes.status >= 200 && upstreamRes.status < 300;
+          const isRead = ["GET", "HEAD"].includes(req.method);
+          const bgState = raw ? responseState(raw) : { id: tracker?.id ?? null, status: streamCut ? null : tracker?.terminal ?? null };
+          const bgPending = bgRead && ok2xx ? findPendingBackground(bgRead.id) : null;
+          if (bgPending && !resolvedBackground.has(bgRead.id) && TERMINAL_STATUSES.has(bgState.status) && !(raw ? false : streamCut)) {
+            // #196: a terminal read settles the pending background response exactly once.
+            resolvedBackground.add(bgRead.id);
+            let c = null;
+            if (metered && !metered.toolUseUnpriced) {
+              c = costWithOverrides(userPrices, provider, metered.model, metered.usage);
+              if (c.cost_usd === null || c.reason) c = null;
+            }
+            receipt.response_id = bgRead.id;
+            cap?.resolvePending?.(bgPending.id);
+            if (c) {
+              Object.assign(receipt, { model: metered.model ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
+              emitEvent({ event: "reconciliation", receipt_id: bgPending.id, cost_usd: c.cost_usd, source: "background_result", response_id: bgRead.id });
+              const external = !(who.run_id != null && bgPending.run_id === who.run_id);
+              recordSpend({ cost_usd: c.cost_usd, ts: bgPending.ts }, { external });
+              agentBudgets?.settle({ receipt_id: bgPending.id, cost_usd: c.cost_usd });
+              tagCaps?.settle(bgPending.id, c.cost_usd);
+              rateLimit?.record(usageTokens(metered.usage));
+              velocity?.record(c.cost_usd);
+              flushWarnings();
+            } else {
+              // The pending receipt becomes unknown (applySettlements reads this event); the run pauses until it is reconciled.
+              Object.assign(receipt, { model: metered?.model ?? requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
+              emitEvent({ event: "background_unpriced", receipt_id: bgPending.id, response_id: bgRead.id, status: bgState.status });
+              recordSpend({ cost_usd: null, ts: bgPending.ts });
+              failures.set(bgPending.id, `Background response ${bgRead.id} finished (${bgState.status}) with usage CostCap cannot price. Restart only after reconciling this request.`);
+            }
+            metered = null;
+          } else if (bgRead && (isRead || ok2xx) && (bgPending || isRead || PENDING_STATUSES.has(bgState.status) || bgRead.kind === "cancel")) {
+            // Reads of a background response (queued, in progress, already settled or unknown to this ledger) never bill.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request", response_id: bgRead.id });
+            metered = null; streamCut = false; sseIncomplete = false;
+          } else if (bgCreate && ok2xx && bgState.id && (raw ? PENDING_STATUSES.has(bgState.status) : !bgState.status)) {
+            // #196: queued/in-progress (or a cut background stream): pending, unknown (never $0), the run continues.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "background_pending", response_id: bgState.id });
+            const done = emit(receipt);
+            pendingBackground.set(bgState.id, { id: done.id, ts: done.ts, response_id: bgState.id, run_id: done.run_id ?? null });
+            flushWarnings();
+            if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw); }
+            else if (streamCut) res.destroy();
+            else if (!res.destroyed) res.end();
+            return;
+          } else if (isRead && !(raw && ok2xx && batchReadPath(req.method, req.url))) {
+            // Retrieves never create spend (#135/#196), even when the body carries usage.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
+            metered = null; streamCut = false; sseIncomplete = false;
+          } else if (metered && cloud && !cloudModel) {
             // #188: an unmapped cloud model is unknown, never the fallback rate.
             Object.assign(receipt, { model: providerModel ?? "unknown", cost_usd: null, reason: "cloud_model_unpriced" });
             recordSpend(receipt);
