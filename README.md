@@ -146,6 +146,14 @@ A priced receipt carries `cost_source: "user_prices"`, `prices_version` and
 `prices_sha256`. A model missing from the file (or cached tokens with no
 `cached_input` rate) records `cost_usd: null, reason: "upstream_model_unpriced"`
 and pauses the run until `costcap reconcile --apply` settles it.
+An entry may also set `cache_write` and `cache_write_1h` (USD per 1M tokens) for
+OpenAI-style `prompt_tokens_details.cache_write_tokens`; cache writes on an entry
+without the matching rate record `cost_usd: null, reason: "user_price_unpriced"`,
+never $0. Groq's `service_tier` values `on_demand` (its default) and `default`
+price at the standard rates; `performance`, `priority`, `fast` and other premium or
+unknown tiers have no user rate and are unpriced. On OpenRouter, a numeric
+`usage.cost` settles the receipt (`cost_source: "provider"`) even when the table
+has no cache-write or service-tier rate.
 `--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
 request with no body `model` (Azure deployments) is model-less and refused when
 an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere v2)

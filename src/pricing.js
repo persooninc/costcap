@@ -93,7 +93,9 @@ export function selectTier(price, prompt_tokens) {
 // "priority" (GPT-5.6 and earlier); both price at the model's `priority` set. "ultrafast"
 // uses the model's `ultrafast` set. Known standard values are only recorded; any other
 // value is "unrecognised" and unpriced, never standard.
-export const STANDARD_SERVICE_TIERS = Object.freeze(["default", "auto", "flex", "scale", "standard", "batch"]);
+// #235: "on_demand" is Groq's default (standard) tier, also passed through by OpenRouter
+// and OpenAI-compatible gateways; it is never a premium tier.
+export const STANDARD_SERVICE_TIERS = Object.freeze(["default", "auto", "flex", "scale", "standard", "batch", "on_demand"]);
 export const PREMIUM_TIERS = Object.freeze(["fast", "priority", "ultrafast", "unrecognised"]);
 export function premiumTier({ speed, service_tier } = {}) {
   if (speed === "fast") return "fast";

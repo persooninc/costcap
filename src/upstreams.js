@@ -87,8 +87,8 @@ export function loadUpstreamPrices(path, names) {
     if (!names.includes(name)) throw new Error(`--upstream-prices ${path}: upstream "${name}" is not declared with --upstream`);
     if (!models || typeof models !== "object" || Array.isArray(models)) throw new Error(`--upstream-prices ${path}: upstreams.${name} must be an object of models`);
     for (const [model, r] of Object.entries(models)) {
-      if (!r || typeof r !== "object" || !rateOk(r.input) || !rateOk(r.output) || (r.cached_input !== undefined && !rateOk(r.cached_input))) {
-        throw new Error(`--upstream-prices ${path}: ${name}/${model} needs finite, non-negative input and output (and optional cached_input) USD per 1M tokens`);
+      if (!r || typeof r !== "object" || !rateOk(r.input) || !rateOk(r.output) || ["cached_input", "cache_write", "cache_write_1h"].some((k) => r[k] !== undefined && !rateOk(r[k]))) {
+        throw new Error(`--upstream-prices ${path}: ${name}/${model} needs finite, non-negative input and output (and optional cached_input, cache_write, cache_write_1h) USD per 1M tokens`);
       }
     }
   }
@@ -109,14 +109,18 @@ export function userPrice(prices, provider, model) {
 
 /** Receipt fields for a metered custom-upstream response. Unpriced stays unknown, never $0. */
 export function costForUserPrices(prices, provider, model, usage = {}) {
-  const { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, modality_tokens, speed, service_tier } = usage;
+  const { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, modality_tokens, speed, service_tier } = usage;
   const rate = userPrice(prices, provider, model);
-  const base = { model, input_tokens, output_tokens, cached_input_tokens, pricing_tier: "standard", fallback: false,
+  const writes = cache_write_input_tokens > 0 || cache_write_1h_input_tokens > 0;
+  const base = { model, input_tokens, output_tokens, cached_input_tokens, ...(writes && { cache_write_input_tokens, cache_write_1h_input_tokens }), pricing_tier: "standard", fallback: false,
     ...(modality_tokens && { modality_tokens }), ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const unpricedReason = !rate || (cached_input_tokens > 0 && rate.cached_input === undefined) ? "upstream_model_unpriced"
+    // #235: cache writes are never $0; an entry without the matching cache_write rate is unpriced.
+    : (cache_write_input_tokens > 0 && rate.cache_write === undefined) || (cache_write_1h_input_tokens > 0 && rate.cache_write_1h === undefined) ? "user_price_unpriced"
     : modality_tokens ? "modality_unpriced"
     : premiumTier({ speed, service_tier }) ? "service_tier_unpriced" : null;
   if (unpricedReason) return { ...base, cost_usd: null, reason: unpricedReason };
-  const cost = (input_tokens * rate.input + cached_input_tokens * (rate.cached_input ?? 0) + output_tokens * rate.output) / 1_000_000;
+  const cost = (input_tokens * rate.input + cached_input_tokens * (rate.cached_input ?? 0) +
+    cache_write_input_tokens * (rate.cache_write ?? 0) + cache_write_1h_input_tokens * (rate.cache_write_1h ?? 0) + output_tokens * rate.output) / 1_000_000;
   return { ...base, cost_usd: Number(cost.toFixed(6)), cost_source: "user_prices", prices_version: prices.version, prices_sha256: prices.sha256 };
 }

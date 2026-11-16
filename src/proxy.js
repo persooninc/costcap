@@ -303,6 +303,8 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
 // cache_write_tokens with an optional cache_write_tokens_details { ttl_30m_tokens, ttl_12h_tokens }.
 // 30m -> cache_write_input_tokens, 12h -> cache_write_1h_input_tokens; no breakdown -> all 30m.
 // A breakdown that does not sum, or cached + writes over the total, is unknown, never guessed.
+const PROVIDER_COST_SETTLES = new Set(["cache_write_unpriced", "long_context_cache_write_unpriced", "service_tier_unpriced"]);
+
 export function openaiTextUsage(u) {
   const total = u.prompt_tokens ?? u.input_tokens ?? 0;
   const d = u.prompt_tokens_details ?? u.input_tokens_details ?? u.input_token_details;
@@ -1051,7 +1053,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional" })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage));
             rateLimit?.record(usageTokens(metered.usage));
-            if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
+            // #235: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier).
+            if (metered.providerCost !== undefined && (receipt.cost_usd !== null || PROVIDER_COST_SETTLES.has(receipt.reason))) {
+              delete receipt.reason;
+              Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
+            }
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
             else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
             recordSpend(receipt);
