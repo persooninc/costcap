@@ -489,6 +489,31 @@ counts toward the original receipt's run/day/month. A missing, null or negative
 charge never settles (it is not $0): the command exits 1 and lists the ids still
 unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.json`.
 
+### Check metered spend against the provider bill
+
+`reconcile` needs per-receipt charges, which no provider export has. `bill-check`
+compares daily aggregates instead: CostCap's metered spend (receipts plus
+`reconcile --apply` settlements) against the OpenAI Costs API
+(`/v1/organization/costs?group_by=line_item`) or the Anthropic Cost Report
+(`/v1/organizations/cost_report`), per UTC day and model:
+
+```sh
+costcap bill-check --receipts .costcap/receipts.jsonl --provider openai \
+  --provider-export costs.json --since 2026-11-01 --until 2026-11-15 --tolerance-pct 5 [--json]
+# or fetch it (admin key from env only, never argv; redirects are never followed):
+COSTCAP_OPENAI_ADMIN_KEY=... costcap bill-check --receipts ... --provider openai --fetch --since 2026-11-01
+```
+
+Each day/model row has `metered_usd`, `billed_usd`, `delta_usd`, `delta_pct` and a
+status (`match`, `over_metered`, `unmetered_spend`, `metered_only`, `billed_only`,
+`incomplete`). Line items that don't map to a model are listed under `unmapped`
+with their USD, never dropped. Unknown-cost receipts are counted as
+`unknown_count` and make the verdict `incomplete`; they are never $0. Verdicts:
+`match` (exit 0), `over_metered` (pricing drift), `unmetered_spend` (possible
+bypass traffic) and `incomplete` (exit 1); usage errors exit 2. `--project` /
+`--workspace` filter the export. Samples: `docs/fixtures/openai-costs.sample.json`,
+`docs/fixtures/anthropic-cost-report.sample.json`.
+
 Settlements also flow the other way (#162): `GET /v1/policy` returns `settlements` (`receipt_id`, `settled_cost_usd`, `settle_source`, `audit_id` of the `receipt.settle` audit entry) for this agent's settled unknown-cost receipts. On the next poll the wrapper appends one `{"event":"reconciliation","source":"hosted_settle",...}` line per settlement to its local ledger (never editing the original line; repeat polls add nothing), so a dashboard settle unblocks a running or freshly started `costcap wrap` and `costcap agent-status` agrees with `/v1/agents/:id/budget`. Settlements for other agents' receipts, known-cost receipts or receipts already settled locally are ignored.
 
 On an enrolled wrapper, the fleet team and agent checks use the settled cost too.

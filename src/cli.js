@@ -5,6 +5,7 @@
 // Guardrails, not guarantees: only traffic through the proxy is metered.
 
 import { reconcileFiles, applyReconciliation } from "./reconcile.js";
+import { billCheckCommand } from "./bill-check.js";
 import { serveMcp } from "./mcp.js";
 import { parseTagList } from "./tags.js";
 import { createTagCaps, parseTagCaps, withFleetTagCaps } from "./tag-cap.js";
@@ -42,6 +43,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] 
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
+  "       costcap bill-check --receipts FILE --provider openai|anthropic (--provider-export FILE | --fetch) [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tolerance-pct 5] [--project ID] [--workspace ID] [--json]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap request-raise --scope run|hour|day|month --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
@@ -364,6 +366,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
     requestRaise({ path: option("--enrollment") ?? ".costcap/enrollment.json", scope: option("--scope"), amountUsd: Number(option("--amount")), durationHours: Number(option("--hours")), reason: option("--reason") })
       .then((r) => { console.log(JSON.stringify({ request_id: r.id, status: r.status, scope: r.scope, amount_usd: r.amount_usd, duration_hours: r.duration_hours })); console.error("costcap: cap raise requested; an admin can approve it in the dashboard."); }, (e) => { console.error(`costcap: ${e.message}`); process.exitCode = 2; });
+  } else if (cmd === "bill-check") {
+    billCheckCommand(rest).then((c) => { process.exitCode = c; });
   } else if (cmd === "reconcile") {
     try {
       const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
