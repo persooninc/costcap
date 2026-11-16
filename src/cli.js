@@ -159,7 +159,7 @@ export async function wrap(argv) {
   });
   clearInterval(watcher);
   if (syncTimer) clearInterval(syncTimer);
-  if (fleet) await fleet.sync();
+  if (fleet) await fleet.sync({ wait: true });
   server.closeAllConnections();
   server.close();
   const s = cap.spend();

@@ -55,10 +55,13 @@ export async function enroll({ url, token, name, path }) {
   return { agentId: data.agentId };
 }
 
-export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
+// Server accepts at most 100 receipts per POST (src/hosted/server.js).
+const SYNC_BATCH = 100;
+
+export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, maxBatches = 500, syncBudgetMs = 30_000 }) {
   let data = loadEnrollment(path);
   let revoked = Boolean(data.revoked);
-  let busy = false;
+  let busy = false, inflight = Promise.resolve();
   const policy = () => resolvePolicy({ lastKnown: data.policy });
   // Issue #129: each local reconcile settlement of a synced null-cost receipt goes up
   // once. An older server without the endpoint (404) skips it; receipt sync still succeeds.
@@ -102,14 +105,27 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
       return cachedAgentVerdict(data.agentSpend, policy().caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
     },
     revoked: () => revoked,
-    async sync() {
-      if (busy) return { skipped: true };
+    // wait: true (used at exit) waits for an in-flight sync, then runs a fresh one,
+    // so a final sync never gets skipped while the 60s poll is mid-upload (#146).
+    async sync({ wait = false } = {}) {
+      if (busy) {
+        if (!wait) return { skipped: true };
+        await inflight;
+        return this.sync({ wait });
+      }
       busy = true;
+      let done;
+      inflight = new Promise((r) => { done = r; });
       try {
         // Receipts go up first so the team spend fetched next already includes them (#123).
         const synced = new Set(data.syncedIds ?? []);
-        const pending = loadReceipts(receiptsPath).filter((r) => r.id && !synced.has(r.id)).slice(0, 100);
-        if (pending.length) {
+        // Drain the backlog in server-sized batches (#146). syncedIds is saved after
+        // every acknowledged batch, so a failure mid-drain resumes without duplicates.
+        // Bounded by a batch ceiling and a time budget so one sync cannot run forever.
+        const backlog = loadReceipts(receiptsPath).filter((r) => r.id && !synced.has(r.id));
+        const deadline = Date.now() + syncBudgetMs;
+        for (let i = 0, n = 0; i < backlog.length && n < maxBatches && Date.now() < deadline; i += SYNC_BATCH, n++) {
+          const pending = backlog.slice(i, i + SYNC_BATCH);
           const result = await request(data.url, data.token, "/v1/receipts", { receipts: pending });
           const ids = new Set(pending.map((r) => r.id));
           if (!Array.isArray(result.acceptedIds) || result.acceptedIds.some((id) => !ids.has(id))) throw new Error("Invalid receipt acknowledgment");
@@ -135,7 +151,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
         // Revoked credentials cannot keep an agent running as if merely offline.
         if (/HTTP (401|403)/.test(err.message)) { revoked = true; data.revoked = true; saveEnrollment(path, data); }
         return { online: false, revoked, version: data.policy.version, error: err.message };
-      } finally { busy = false; }
+      } finally { busy = false; done(); }
     },
   };
 }
