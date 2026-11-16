@@ -43,10 +43,18 @@ export function isCountTokensPath(rawUrl) {
   return COUNT_TOKENS_PATHS.some((re) => re.test(pathname));
 }
 
+// OpenAI embeddings (#145): billed on input only. Exact path, same hardening as count_tokens.
+export function isEmbeddingsPath(rawUrl) {
+  if (typeof rawUrl !== "string") return false;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
+  return /^\/openai\/v1\/embeddings$/.test(pathname);
+}
+
 const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
-export function createUsageAccumulator(provider, requestedModel) {
+export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
   let usage = {};
   // OpenAI Responses API streams nest model/usage under `response` and end with
@@ -96,6 +104,11 @@ export function createUsageAccumulator(provider, requestedModel) {
       }
     } else {
       const u = chunk.usage;
+      if (embeddings && provider === "openai") {
+        // Embeddings carry only prompt_tokens (input-only billing); anything else is unknown.
+        usage = u && isCount(u.prompt_tokens) && u.completion_tokens == null ? { input_tokens: u.prompt_tokens, output_tokens: 0, cached_input_tokens: 0 } : { unpriceable: NaN };
+        return;
+      }
       // Both prompt/input and completion/output counters are required; duration-billed or empty shapes are unknown.
       if (u && !(isCount(u.prompt_tokens ?? u.input_tokens) && isCount(u.completion_tokens ?? u.output_tokens))) usage = { unpriceable: NaN };
       else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
@@ -114,7 +127,7 @@ export function createUsageAccumulator(provider, requestedModel) {
   return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
 }
 
-export function extractUsage(provider, text, requestedModel) {
+export function extractUsage(provider, text, requestedModel, opts = {}) {
   let chunks;
   try { const parsed = JSON.parse(text); chunks = Array.isArray(parsed) ? parsed : [parsed]; }
   catch {
@@ -122,7 +135,7 @@ export function extractUsage(provider, text, requestedModel) {
     parser.push(text);
     return parser.end();
   }
-  const acc = createUsageAccumulator(provider, requestedModel);
+  const acc = createUsageAccumulator(provider, requestedModel, opts);
   for (const chunk of chunks) acc.add(chunk);
   return acc.result();
 }
@@ -301,7 +314,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(provider, raw.toString("utf8"), requestedModel);
+            metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
+              { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           res.off("close", onClientClose);
           if (metered) {

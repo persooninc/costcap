@@ -267,3 +267,48 @@ test("#142 wrap: count-tokens then a normal call both succeed; an Anthropic web-
   assert.equal(check.status, 1);
   assert.equal(JSON.parse(check.stdout).hit.scope, "accounting");
 });
+
+async function embedWrap(t, cap) {
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => {
+      q.resume();
+      const body = q.url.endsWith("/embeddings") ? { model: "text-embedding-3-large", usage: { prompt_tokens: 1_000_000, total_tokens: 1_000_000 } }
+        : { model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+    });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `
+    const b = process.env.OPENAI_BASE_URL;
+    const e = () => fetch(b + "/embeddings",{method:"POST",body:JSON.stringify({model:"text-embedding-3-large",input:"x"})}).then((r) => r.status);
+    const c = () => fetch(b + "/chat/completions",{method:"POST",body:JSON.stringify({model:"gpt-4o-mini"})}).then((r) => r.status);
+    console.log(await e(), await e(), await c());`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...(cap ? ["--cap", cap] : []), "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim() }));
+  });
+  return { res, receipts };
+}
+
+test("#145 wrap: two embeddings calls and a chat call are priced; check exits 0 with a non-null total", async (t) => {
+  const { res, receipts } = await embedWrap(t);
+  assert.equal(res.out, "200 200 200");
+  const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
+  assert.deepEqual(rows.filter((r) => r.model === "text-embedding-3-large").map((r) => [r.cost_usd, r.output_tokens]), [[0.13, 0], [0.13, 0]]);
+  const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "5", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(check.status, 0, check.stdout + check.stderr);
+  const v = JSON.parse(check.stdout);
+  assert.equal(v.ok, true);
+  assert.equal(v.unknown_cost_count ?? 0, 0);
+  assert.ok(JSON.stringify(v).includes("0.26"), check.stdout);
+});
+
+test("#145 wrap: embeddings spend crosses --cap and the next call is blocked", async (t) => {
+  const { res } = await embedWrap(t, "0.2");
+  assert.equal(res.out, "200 200 429");
+});

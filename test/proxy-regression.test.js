@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractUsage, isCountTokensPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
+import { extractUsage, isCountTokensPath, isEmbeddingsPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
 import { costForUsage } from "../src/pricing.js";
 import { createCapEngine } from "../src/cap.js";
 
@@ -318,4 +318,66 @@ test("#142 count-tokens 2xx is non_billable and the next call reaches upstream; 
   const { post, receipts } = await multi(t, (req, res) => { req.resume(); res.writeHead(500).end("oops"); });
   await post("/anthropic/v1/messages/count_tokens");
   assert.equal(receipts[0].reason, "usage_unavailable");
+});
+
+test("#145 embeddings usage is input-only on the exact embeddings path only", () => {
+  const e = { embeddings: true };
+  assert.deepEqual(extractUsage("openai", '{"model":"text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8}}', "x", e),
+    { model: "text-embedding-3-small", usage: { input_tokens: 8, output_tokens: 0, cached_input_tokens: 0 } });
+  assert.equal(extractUsage("openai", '{"model":"text-embedding-3-small"}', "x", e), null);
+  assert.equal(extractUsage("openai", '{"usage":{}}', "x", e), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":-1}}', "x", e), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":"8"}}', "x", e), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":8,"completion_tokens":2}}', "x", e), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":8,"total_tokens":8}}'), null);
+  assert.equal(extractUsage("openrouter", '{"usage":{"prompt_tokens":8}}', "x", e), null);
+  assert.equal(isEmbeddingsPath("/openai/v1/embeddings"), true);
+  assert.equal(isEmbeddingsPath("/openai/v1/embeddings?x=1"), true);
+  for (const bad of ["/openai/v1/chat/completions", "/openai/v1/responses", "/openai/v1/x/../embeddings", "/openai/v1/%65mbeddings",
+    "/openai//v1/embeddings", "/openai/v1/embeddings/", "/openrouter/v1/embeddings", "/gemini/v1/embeddings", null]) assert.equal(isEmbeddingsPath(bad), false, bad);
+});
+
+async function embedProxy(t, responder, options = {}) {
+  const up = http.createServer((req, res) => { req.resume(); const [status, body] = responder(req); res.writeHead(status, { "content-type": "application/json" }).end(body); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r), ...options });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = (path = "/openai/v1/embeddings", model = "text-embedding-3-small") => fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: JSON.stringify({ model, input: "hello" }) });
+  return { call, receipts };
+}
+
+test("#145 an embeddings 2xx is priced input-only and the next call is not paused", async (t) => {
+  const { call, receipts } = await embedProxy(t, () => [200, '{"model":"text-embedding-3-small","usage":{"prompt_tokens":1000,"total_tokens":1000}}']);
+  assert.equal((await call()).status, 200);
+  assert.equal(receipts[0].cost_usd, Number((1000 * 0.02 / 1e6).toFixed(6)));
+  assert.deepEqual([receipts[0].output_tokens, receipts[0].fallback, receipts[0].reason], [0, false, undefined]);
+  assert.match(receipts[0].table_sha256, /^[0-9a-f]{64}$/);
+  assert.equal((await call()).status, 200);
+});
+
+test("#145 unknown embeddings model is priced at the fallback input rate, never $0", async (t) => {
+  const { call, receipts } = await embedProxy(t, () => [200, '{"model":"text-embedding-foo","usage":{"prompt_tokens":1000000,"total_tokens":1000000}}']);
+  assert.equal((await call("/openai/v1/embeddings", "text-embedding-foo")).status, 200);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].fallback], [2.5, true]);
+});
+
+test("#145 prompt-only usage on chat/responses and usage-less embeddings still pause", async (t) => {
+  for (const [path, body] of [["/openai/v1/chat/completions", '{"usage":{"prompt_tokens":8,"total_tokens":8}}'], ["/openai/v1/responses", '{"usage":{"prompt_tokens":8,"total_tokens":8}}'],
+    ["/openai/v1/embeddings", '{"model":"text-embedding-3-small"}'], ["/openai/v1/embeddings", '{"usage":{"prompt_tokens":-3}}']]) {
+    const { call, receipts } = await embedProxy(t, () => [200, body]);
+    assert.equal((await call(path)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"], path);
+    assert.equal((await (await call(path)).json()).error, "accounting_unavailable", path);
+  }
+});
+
+test("#145 embeddings spend counts toward the cap", async (t) => {
+  const { call, receipts } = await embedProxy(t, () => [200, '{"model":"text-embedding-3-large","usage":{"prompt_tokens":1000000,"total_tokens":1000000}}'],
+    { cap: createCapEngine({ caps: { run: 0.2 } }) });
+  assert.equal((await call()).status, 200);
+  assert.equal((await call()).status, 200);
+  const r = await call();
+  assert.equal(r.status, 429);
+  assert.equal(receipts.filter((x) => x.cost_usd === 0.13).length, 2);
 });

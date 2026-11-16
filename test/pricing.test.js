@@ -55,6 +55,8 @@ test("every table rate is finite and positive and each provider has a source URL
   }
   for (const [model, rates] of Object.entries(table.models)) {
     for (const field of ["input", "cached_input", "output"]) {
+      // Documented exception (#145): input-only models (embeddings) bill no output, so output is exactly 0.
+      if (rates.input_only && field === "output") { assert.equal(rates.output, 0, model); continue; }
       assert.equal(Number.isFinite(rates[field]) && rates[field] > 0, true, `${model}.${field}`);
     }
   }
@@ -83,4 +85,13 @@ test("dated snapshot ids price as their base model, not the fallback", () => {
   assert.equal(p.fallback, false);
   assert.equal(p.input, 0.15);
   assert.equal(lookupPrice("gpt-99-ultra-2026-01-01").fallback, true);
+});
+
+test("#145 embeddings rates are input-only at published prices", () => {
+  for (const [m, rate] of [["text-embedding-3-small", 0.02], ["text-embedding-3-large", 0.13], ["text-embedding-ada-002", 0.1]]) {
+    const p = lookupPrice(m);
+    assert.deepEqual([p.input, p.output, p.input_only, p.fallback], [rate, 0, true, false], m);
+  }
+  assert.equal(costForUsage("text-embedding-3-small", { input_tokens: 1_000_000 }).cost_usd, 0.02);
+  assert.ok(table.sources.some((u) => u.includes("openai.com/api/pricing")));
 });

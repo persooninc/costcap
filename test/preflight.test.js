@@ -226,3 +226,14 @@ test("proxy e2e: fits at n=1, refused at n=8 before upstream; allowed receipt re
   assert.equal(c.output_multiplier, 2);
   h.close();
 });
+
+test("#145 preflight on OpenAI embeddings estimates input only; unpriced embeddings model is refused", () => {
+  const b = body({ model: "text-embedding-3-small", input: "hello world" });
+  const e = estimateWorstCase("openai", b, "/v1/embeddings");
+  assert.equal(e.ok, true);
+  assert.equal(e.output_tokens, 0);
+  assert.equal(e.estimate_usd, Number((Math.ceil(Buffer.byteLength(b) / 4) * 0.02 / 1e6).toFixed(6)));
+  assert.equal(preflightCheck({ remaining: () => ({ run: 0.001 }) }, "openai", b, "/v1/embeddings?x=1"), null);
+  assert.equal(estimateWorstCase("openai", body({ model: "gpt-4o-mini" }), "/v1/chat/completions").output_tokens, DEFAULT_MAX_OUTPUT.openai);
+  assert.equal(preflightCheck(null, "openai", body({ model: "text-embedding-foo" }), "/v1/embeddings").reason, "preflight_unpriced");
+});

@@ -124,6 +124,14 @@ CostCap. The local proxy binds to 127.0.0.1.
   standard text price in force on the table version date (the lower tier when a
   model publishes a prompt-length split). Check `src/pricing-table.json` before
   relying on rates.
+- OpenAI embeddings (`POST /openai/v1/embeddings`, exact path) are metered
+  input-only: `text-embedding-3-small` ($0.02/M), `text-embedding-3-large`
+  ($0.13/M) and `text-embedding-ada-002` ($0.10/M), with `output_tokens: 0`.
+  They count toward run, day and month caps. Unknown embedding models bill at
+  the fallback input rate (`fallback: true`). An embeddings response with no
+  usable `usage.prompt_tokens` is still `usage_unavailable`. `--preflight`
+  estimates embeddings as input only. Gemini `embedContent` and OpenRouter
+  embeddings are not metered (no usage in the response).
 - The pricing table is offline-verifiable. `src/pricing-table.sha256.json`
   holds the committed SHA-256 of the canonical table (keys sorted, no
   whitespace). Every receipt records `table_version` and `table_sha256`.

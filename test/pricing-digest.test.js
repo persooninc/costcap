@@ -186,3 +186,12 @@ test("preflight estimates pin the verified table digest too", async () => {
   assert.equal(e.ok, true);
   assert.equal(e.table_sha256, TABLE_SHA256);
 });
+
+test("#145 digest --check passes with embeddings rows and pricing show prints the embeddings rate", () => {
+  const c = spawnSync(process.execPath, ["scripts/pricing-digest.mjs", "--check"], { encoding: "utf8" });
+  assert.equal(c.status, 0, c.stderr);
+  const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
+  assert.equal(s.status, 0, s.stderr);
+  assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
+  assert.equal(TABLE_VERSION, "2026-11-16");
+});

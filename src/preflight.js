@@ -52,7 +52,10 @@ export function estimateWorstCase(provider, body, path = "") {
     return { ok: false, reason: "preflight_unpriced", model: model ?? "unknown" };
   }
   const input_tokens = Math.ceil(Buffer.byteLength(text, "utf8") / 4);
-  const out = requestedOutputTokens(provider, req);
+  // OpenAI embeddings bill input only (#145): no output allowance.
+  const pathname = String(path ?? "").split(/[?#]/, 1)[0];
+  const embeddings = provider === "openai" && pathname === "/v1/embeddings";
+  const out = embeddings ? { tokens: 0, defaulted: false } : requestedOutputTokens(provider, req);
   const mult = outputMultiplier(provider, req);
   const output_tokens = out.tokens * mult.multiplier;
   const estimate_usd = Number(((input_tokens * price.input + output_tokens * price.output) / 1_000_000).toFixed(6));
