@@ -510,7 +510,12 @@ status (`match`, `over_metered`, `unmetered_spend`, `metered_only`, `billed_only
 with their USD, never dropped. Unknown-cost receipts are counted as
 `unknown_count` and make the verdict `incomplete`; they are never $0. Verdicts:
 `match` (exit 0), `over_metered` (pricing drift), `unmetered_spend` (possible
-bypass traffic) and `incomplete` (exit 1); usage errors exit 2. `--project` /
+bypass traffic) and `incomplete` (exit 1); usage errors exit 2. A settled batch is
+attributed per model from its results (#226): the `batch_results` settlement (and a
+`reconcile --apply` charge with a `by_model` object) records `by_model` with each
+succeeded line's model, so a mixed-model batch splits across model rows; the day is
+the batch create day, as with budgets. Older settlements without `by_model` stay
+under model `unknown`. `--project` /
 `--workspace` filter the export. Samples: `docs/fixtures/openai-costs.sample.json`,
 `docs/fixtures/anthropic-cost-report.sample.json`.
 

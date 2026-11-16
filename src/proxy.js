@@ -1061,7 +1061,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               receipt.batch_id = batchId;
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
-                  succeeded: folded.succeeded, not_billed: folded.free });
+                  succeeded: folded.succeeded, not_billed: folded.free, by_model: folded.by_model });
                 // #182: another run's (or wrapper's) batch counts toward day/month only, like src/settle.js.
                 const external = !(who.run_id != null && pending.run_id === who.run_id);
                 cap?.resolvePending?.(pending.id);

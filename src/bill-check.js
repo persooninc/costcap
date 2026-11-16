@@ -106,6 +106,16 @@ export function billCheck({ receipts, billed, provider, since, until, toleranceP
     if (!r || r.provider !== provider) continue;
     const day = dayOf(r.ts);
     if (!inWindow(day, since, until)) continue;
+    // #226: a settled batch is attributed per model from its results (day = create day).
+    const split = r.settled?.by_model;
+    if (split && typeof r.cost_usd === "number" && typeof split === "object") {
+      for (const [m, usd] of Object.entries(split)) {
+        const sc = cell(day, (m === "unknown" ? null : normalizeModel(m)) ?? "unknown");
+        sc.metered = true;
+        sc.metered_usd += usd;
+      }
+      continue;
+    }
     const c = cell(day, normalizeModel(r.model) ?? "unknown");
     c.metered = true;
     if (r.cost_usd === null || r.cost_usd === undefined) { c.unknown_count += 1; unknownCount += 1; continue; }

@@ -2,7 +2,7 @@
 // Unknown receipt cost is never treated as zero, and a missing charge is not a match.
 import { appendFileSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { loadReceipts, loadLedgerLines, applySettlements, isSettlement } from "./cap.js";
+import { loadReceipts, loadLedgerLines, applySettlements, isSettlement, settledByModel } from "./cap.js";
 
 export function reconcile({ receipts, charges }) {
   if (!Array.isArray(receipts) || !receipts.length) throw new Error("No receipts found; reconciliation needs evidence");
@@ -56,7 +56,10 @@ export function planSettlements({ lines, charges }) {
     if (already.has(r.id)) { alreadySettled.push(r.id); continue; }
     const c = byId.get(r.id);
     const cost = c?.cost_usd;
-    if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) { settle.push({ receipt_id: r.id, cost_usd: cost }); already.add(r.id); }
+    if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+      const by_model = settledByModel({ by_model: c.by_model, cost_usd: cost });
+      settle.push(by_model ? { receipt_id: r.id, cost_usd: cost, by_model } : { receipt_id: r.id, cost_usd: cost }); already.add(r.id);
+    }
     else stillUnknown.push(r.id);
   }
   return { settle, still_unknown: stillUnknown, already_settled: alreadySettled };
@@ -71,7 +74,7 @@ export function applyReconciliation({ receiptsPath, providerPath, now = () => ne
   const provider_sha256 = createHash("sha256").update(providerBytes).digest("hex");
   const plan = planSettlements({ lines, charges: loadReceipts(providerPath) });
   const ts = now().toISOString();
-  const events = plan.settle.map((s) => ({ event: "reconciliation", receipt_id: s.receipt_id, cost_usd: s.cost_usd, source: "provider_file", provider_sha256, ts }));
+  const events = plan.settle.map((s) => ({ event: "reconciliation", receipt_id: s.receipt_id, cost_usd: s.cost_usd, ...(s.by_model ? { by_model: s.by_model } : {}), source: "provider_file", provider_sha256, ts }));
   if (events.length) appendFileSync(receiptsPath, events.map((e) => JSON.stringify(e) + "\n").join(""));
   return { ok: plan.still_unknown.length === 0, settled: events.map((e) => ({ receipt_id: e.receipt_id, cost_usd: e.cost_usd })),
     still_unknown: plan.still_unknown, already_settled: plan.already_settled, provider_sha256, estimate_only: false };

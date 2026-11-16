@@ -51,10 +51,12 @@ test("path matchers are exact and hardened like count_tokens", () => {
 
 test("fold: succeeded lines at 0.5x, errored/canceled/expired and non-2xx at $0", () => {
   const a = foldBatchResults("anthropic", ANTHROPIC_RESULTS);
-  assert.deepEqual(a, { ok: true, cost_usd: ANTHROPIC_EXPECTED, succeeded: 2, free: 1 });
+  assert.deepEqual(a, { ok: true, cost_usd: ANTHROPIC_EXPECTED, succeeded: 2, free: 1, by_model: { "claude-sonnet-4-6": ANTHROPIC_EXPECTED } });
   const free = ["canceled", "expired", "errored"].map((type) => JSON.stringify({ custom_id: type, result: { type } })).join("\n");
-  assert.deepEqual(foldBatchResults("anthropic", free), { ok: true, cost_usd: 0, succeeded: 0, free: 3 });
-  assert.deepEqual(foldBatchResults("openai", OPENAI_RESULTS), { ok: true, cost_usd: OPENAI_EXPECTED, succeeded: 2, free: 1 });
+  assert.deepEqual(foldBatchResults("anthropic", free), { ok: true, cost_usd: 0, succeeded: 0, free: 3, by_model: {} });
+  const o = foldBatchResults("openai", OPENAI_RESULTS);
+  assert.deepEqual({ ...o, by_model: undefined }, { ok: true, cost_usd: OPENAI_EXPECTED, succeeded: 2, free: 1, by_model: undefined });
+  assert.equal(Object.values(o.by_model).reduce((x, y) => x + y, 0).toFixed(6), OPENAI_EXPECTED.toFixed(6));
   assert.equal(foldBatchResults("openai", '{"id":"x","response":null,"error":{"code":"batch_expired"}}').free, 1);
 });
 

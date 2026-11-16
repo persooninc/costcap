@@ -35,6 +35,22 @@ export function isPendingBatch(r) {
 }
 export const isPending = isPendingBatch;
 
+// #226: a settlement's optional per-model split ({ model: usd }). Kept only when every
+// value is a finite non-negative number and the split sums to the settled cost.
+export function settledByModel(e) {
+  const b = e?.by_model;
+  if (!b || typeof b !== "object" || Array.isArray(b)) return null;
+  const entries = Object.entries(b);
+  if (!entries.length) return null;
+  let sum = 0;
+  for (const [m, v] of entries) {
+    if (!m || typeof v !== "number" || !Number.isFinite(v) || v < 0) return null;
+    sum += v;
+  }
+  if (Math.abs(sum - e.cost_usd) > 1e-6 * Math.max(1, entries.length)) return null;
+  return Object.fromEntries(entries);
+}
+
 export function applySettlements(lines) {
   const settle = new Map();
   const unpriced = new Set();
@@ -44,8 +60,15 @@ export function applySettlements(lines) {
   return lines.filter((r) => !r.event).map((r) => {
     const e = r.cost_usd === null && typeof r.id === "string" ? settle.get(r.id) : undefined;
     if (!e && r.cost_usd === null && r.reason === "background_pending" && unpriced.has(r.id)) return { ...r, reason: "background_unpriced" };
-    return e ? { ...r, cost_usd: e.cost_usd, settled: { source: e.source ?? null, provider_sha256: e.provider_sha256 ?? null, ts: e.ts ?? null } } : r;
+    return e ? { ...r, cost_usd: e.cost_usd, settled: settledInfo(e) } : r;
   });
+}
+
+function settledInfo(e) {
+  const s = { source: e.source ?? null, provider_sha256: e.provider_sha256 ?? null, ts: e.ts ?? null };
+  const b = settledByModel(e);
+  if (b) s.by_model = b;
+  return s;
 }
 
 // Receipts with provider settlements applied: what spend and verdicts read.

@@ -57,16 +57,17 @@ function priceLine(provider, body, userPrices) {
   // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
   const c = withToolCost(tokens, userPrices, provider, metered, null, body);
   if (c.cost_usd === null) return null;
-  return c;
+  return { ...c, model: metered.model ?? null };
 }
 
 /**
- * Folds a batch results JSONL body. Returns { ok: true, cost_usd, succeeded, free }
+ * Folds a batch results JSONL body. Returns { ok: true, cost_usd, succeeded, free, by_model }
  * or { ok: false, reason: "batch_unpriced", line }. Any malformed, unpriced or
  * premium-speed billed line makes the whole batch unknown: never a $0 guess.
  */
 export function foldBatchResults(provider, text, userPrices = null) {
   let cost = 0, succeeded = 0, free = 0, n = 0;
+  const byModel = {};
   const lines = String(text).split("\n");
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
@@ -91,8 +92,13 @@ export function foldBatchResults(provider, text, userPrices = null) {
     const c = priceLine(provider, billed, userPrices);
     if (!c) return { ok: false, reason: "batch_unpriced", line: i + 1 };
     cost += c.cost_usd;
+    // #226: keep each succeeded line's model so bill-check can attribute the batch per model.
+    const m = typeof c.model === "string" && c.model ? c.model : "unknown";
+    byModel[m] = (byModel[m] ?? 0) + c.cost_usd;
     succeeded++;
   }
   if (!n) return { ok: false, reason: "batch_unpriced", line: 0 };
-  return { ok: true, cost_usd: r6(cost), succeeded, free };
+  const by_model = {};
+  for (const [m, v] of Object.entries(byModel)) by_model[m] = r6(v);
+  return { ok: true, cost_usd: r6(cost), succeeded, free, by_model };
 }
