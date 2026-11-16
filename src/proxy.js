@@ -15,7 +15,7 @@ import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
-import { preflightCheck, openRouterModels } from "./preflight.js";
+import { preflightCheck, checkEstimate, estimateBatch, openRouterModels } from "./preflight.js";
 import { rateLimitedBody, usageTokens } from "./rate-limit.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
@@ -662,21 +662,37 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const tagHit = tagCaps?.check(reqTags);
           if (tagHit?.verdict === "accounting_unavailable") return block("accounting_unavailable", tagHit, { error: "accounting_unavailable", ...tagHit });
           if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
-          if (preflight) {
+          // #205: preflight estimates generating calls only. GET/HEAD (polls, retrieves,
+          // model lists), file uploads and OpenAI batch creates (models live in an
+          // uploaded file) pass through; audio checks only that the model is priced.
+          const pfMode = !preflight || !generates ? null
+            : batchCreate === "anthropic" && !cloud ? "batch"
+            : batchCreate === "openai" || /^\/v1\/(?:files|uploads)(?:\/|$|\?)/.test(path) ? "pass"
+            : audio ? "audio" : "estimate";
+          if (pfMode === "pass") preflightEst = { pass: true };
+          if (pfMode === "audio" && requestedModel && priced(requestedModel)) preflightEst = { pass: true };
+          if (pfMode === "audio" && !preflightEst) {
+            const pf = { reason: "preflight_unpriced", estimate: true, model: requestedModel ?? "unknown" };
+            return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
+              message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
+          }
+          if (pfMode === "batch" || pfMode === "estimate") {
             // #188: cloud preflight prices the mapped path model, with the regional premium.
             const cloudPrice = cloud ? () => {
               if (!cloudModel) return null;
               const rm = cloudRoute.scope === "regional" ? regionalMultiplier(cloudModel) : null;
               return rm ? scalePrice(lookupPrice(cloudModel), rm) : lookupPrice(cloudModel);
             } : undefined;
-            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
+            const onFit = (est) => { preflightEst = est; };
+            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor), onFit)
+              : preflightCheck(cap, provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
               message: `CostCap preflight estimate: worst case $${pf.estimate_usd} does not fit the remaining ${pf.scope} budget ($${pf.remaining_usd[pf.scope]}). This is an estimate. The upstream call was not made.`,
               scope: pf.scope, estimate_usd: pf.estimate_usd, remaining_usd: pf.remaining_usd } });
             // #193: the estimate must also fit the agent/team remainder and every matching tag cap.
-            if (preflightEst) {
+            if (preflightEst && !preflightEst.pass) {
               const est = preflightEst.estimate_usd;
               const left = agentBudgets?.limitsFor ? budgetRemaining(agentBudgets, who) : null;
               const agentScope = left && ["run", "hour", "day", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
@@ -778,7 +794,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
-            ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
+            ...(preflightEst?.pass ? { preflight_estimate: false } : preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, audioCost, streamCut = false, sseIncomplete = false;
           // #196: Responses background create / read / cancel on the first-party OpenAI route.
           const firstPartyOpenAI = provider === "openai" && !custom && !cloud;

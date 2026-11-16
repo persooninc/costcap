@@ -5,7 +5,7 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
-import { lookupPrice, selectRates, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+import { lookupPrice, selectRates, batchMultiplier, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // Conservative default output ceilings when the request sets no limit.
 export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, bedrock: 64_000, vertex: 64_000, gemini: 65_536 };
@@ -102,7 +102,32 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
 export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel) {
-  const est = estimateWorstCase(provider, body, path, priceFor, pathModel);
+  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel), onFit);
+}
+
+// #205: an Anthropic Message Batches create is estimated as the SUM of every
+// entry's worst case (requests[].params, same bytes/4 + max_tokens maths as a
+// single call) times the provider batch multiplier. Any unpriced or missing
+// entry model refuses as preflight_unpriced naming that model.
+export function estimateBatch(provider, body, priceFor) {
+  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
+  let reqs;
+  try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
+  if (!Array.isArray(reqs) || !reqs.length) return { ok: false, reason: "preflight_unpriced", model: "unknown" };
+  const mult = batchMultiplier(provider) ?? 1;
+  let usd = 0, input_tokens = 0, output_tokens = 0, model;
+  for (const r of reqs) {
+    const params = r?.params && typeof r.params === "object" ? r.params : {};
+    const e = estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
+    if (!e.ok) return e;
+    usd += e.estimate_usd; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
+  }
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: 1, batch_entries: reqs.length, batch_multiplier: mult,
+    estimate_usd: Number((usd * mult).toFixed(6)) };
+}
+
+// Compares a precomputed estimate (estimateWorstCase / estimateBatch) with the remaining budget.
+export function checkEstimate(cap, est, onFit) {
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "hour", "day", "month"]) {

@@ -267,6 +267,18 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   with no published rate are refused with `preflight_unpriced`, never priced at
   the fallback. The blocked receipt has `estimate: true`, `estimate_usd` and
   `scope`, and costs $0 toward spend.
+  Which endpoints are estimated (#205): chat, responses, messages, embeddings
+  and other generating POSTs use the maths above. An Anthropic Message Batches
+  create is estimated as the **sum** of every `requests[].params` worst case
+  times the batch rate (0.5x); any unpriced entry refuses with
+  `preflight_unpriced` naming it. These pass through preflight unestimated
+  (still subject to caps, allowlists and rpm; the receipt has
+  `preflight_estimate: false`): `GET`/`HEAD` (background polls, batch and file
+  retrieves, `/v1/models`), `/v1/files` and `/v1/uploads`, and OpenAI batch
+  creates (their models live in the uploaded file; results are metered at
+  settle). Audio (`/v1/audio/*`) is checked against the extracted `model`
+  only: a priced model (e.g. `whisper-1`) passes, an unpriced one refuses with
+  `preflight_unpriced` naming it.
 - Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Unknown models use the declared fallback. On the
