@@ -17,6 +17,29 @@ export function requestedOutputTokens(provider, req) {
   return Number.isInteger(n) && n > 0 ? { tokens: n, defaulted: false } : { tokens: DEFAULT_MAX_OUTPUT[provider] ?? 65_536, defaulted: true };
 }
 
+// Max completions per request the provider accepts; larger values are clamped
+// to it (the provider would reject them) and flagged output_multiplier_clamped.
+export const MAX_OUTPUT_MULTIPLIER = { openai: 128, openrouter: 128, gemini: 8, anthropic: 1 };
+
+// OpenAI-compatible n / best_of (best_of bills every candidate, so the larger
+// wins) and Gemini candidateCount multiply billed output tokens. A missing
+// value is 1; an invalid one (non-integer, <= 0, non-number) is treated as 1
+// and flagged output_multiplier_defaulted.
+export function outputMultiplier(provider, req) {
+  const raw = provider === "gemini"
+    ? [req?.generationConfig?.candidateCount ?? req?.generation_config?.candidate_count]
+    : provider === "anthropic" ? [] : [req?.n, req?.best_of];
+  let multiplier = 1, defaulted = false;
+  for (const v of raw) {
+    if (v === undefined || v === null) continue;
+    if (!Number.isInteger(v) || v <= 0) { defaulted = true; continue; }
+    multiplier = Math.max(multiplier, v);
+  }
+  const max = MAX_OUTPUT_MULTIPLIER[provider] ?? 128;
+  const clamped = multiplier > max;
+  return { multiplier: clamped ? max : multiplier, defaulted, clamped };
+}
+
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
 export function estimateWorstCase(provider, body, path = "") {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
@@ -30,21 +53,26 @@ export function estimateWorstCase(provider, body, path = "") {
   }
   const input_tokens = Math.ceil(Buffer.byteLength(text, "utf8") / 4);
   const out = requestedOutputTokens(provider, req);
-  const estimate_usd = Number(((input_tokens * price.input + out.tokens * price.output) / 1_000_000).toFixed(6));
-  return { ok: true, model, input_tokens, output_tokens: out.tokens, output_defaulted: out.defaulted, estimate_usd, table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
+  const mult = outputMultiplier(provider, req);
+  const output_tokens = out.tokens * mult.multiplier;
+  const estimate_usd = Number(((input_tokens * price.input + output_tokens * price.output) / 1_000_000).toFixed(6));
+  const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
 }
 
 // Compares the estimate with the remaining run/day/month budget.
-// Returns null when it fits, else the refusal detail.
-export function preflightCheck(cap, provider, body, path) {
+// Returns null when it fits, else the refusal detail. When `onFit` is given it
+// receives the estimate of a call that fits (for the allowed-call receipt).
+export function preflightCheck(cap, provider, body, path, onFit) {
   const est = estimateWorstCase(provider, body, path);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model };
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
       return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model,
-        input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens };
+        input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier };
     }
   }
+  onFit?.(est);
   return null;
 }

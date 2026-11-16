@@ -161,3 +161,68 @@ test("e2e: costcap wrap --preflight refuses an oversize call against a fake upst
     assert.equal(hits, expectedHits);
   }
 });
+
+// #128: completion-count output multiplier.
+test("multiplier: OpenAI n multiplies output tokens and price", () => {
+  const e = estimateWorstCase("openai", body({ model: "gpt-4o-mini", n: 4, max_tokens: 1000 }));
+  assert.equal(e.output_tokens, 4000);
+  assert.equal(e.output_multiplier, 4);
+  assert.equal(e.estimate_usd, Number(((e.input_tokens * 0.15 + 4000 * 0.6) / 1e6).toFixed(6)));
+});
+
+test("multiplier: Gemini candidateCount in both casings", () => {
+  for (const cfg of [{ generationConfig: { candidateCount: 3, maxOutputTokens: 500 } }, { generation_config: { candidate_count: 3, max_output_tokens: 500 } }]) {
+    const e = estimateWorstCase("gemini", body(cfg), "/v1beta/models/gemini-2.5-flash:generateContent");
+    assert.equal(e.ok, true);
+    assert.equal(e.output_tokens, 1500);
+    assert.equal(e.output_multiplier, 3);
+  }
+});
+
+test("multiplier: legacy best_of wins over n", () => {
+  const e = estimateWorstCase("openai", body({ model: "gpt-4o-mini", best_of: 5, n: 2, max_tokens: 10 }));
+  assert.equal(e.output_multiplier, 5);
+  assert.equal(e.output_tokens, 50);
+});
+
+test("multiplier: missing n is byte-identical to before; invalid n defaults to 1 and is flagged; absurd n is clamped", () => {
+  const e = estimateWorstCase("openai", body({ model: "gpt-4o-mini", max_tokens: 1000 }));
+  assert.equal(e.output_tokens, 1000);
+  assert.equal(e.output_multiplier, 1);
+  assert.equal("output_multiplier_defaulted" in e, false);
+  assert.equal(e.estimate_usd, Number(((e.input_tokens * 0.15 + 1000 * 0.6) / 1e6).toFixed(6)));
+  for (const n of [1.5, 0, -2, "4", null, true]) {
+    const d = estimateWorstCase("openai", body({ model: "gpt-4o-mini", n, max_tokens: 10 }));
+    assert.equal(d.output_multiplier, 1, `n=${n}`);
+    assert.equal(d.output_multiplier_defaulted, n === null ? undefined : true, `n=${n}`);
+  }
+  const c = estimateWorstCase("openai", body({ model: "gpt-4o-mini", n: 1000, max_tokens: 10 }));
+  assert.equal(c.output_multiplier, 128);
+  assert.equal(c.output_multiplier_clamped, true);
+  const g = estimateWorstCase("gemini", body({ generationConfig: { candidateCount: 50, maxOutputTokens: 10 } }), "/models/gemini-2.5-flash:x");
+  assert.equal(g.output_multiplier, 8);
+  assert.equal(estimateWorstCase("anthropic", body({ model: "claude-sonnet-4-5", n: 9, max_tokens: 10 })).output_multiplier ?? 1, 1);
+});
+
+test("proxy e2e: fits at n=1, refused at n=8 before upstream; allowed receipt records multiplied estimate", async () => {
+  // gpt-4o output $10/M: 1000 tokens ≈ $0.01 fits $0.05; ×8 = 8000 ≈ $0.08 does not.
+  const h = await harness({ preflight: true, caps: { day: 0.05 } });
+  const one = await h.call(body({ model: "gpt-4o", max_tokens: 1000 }));
+  assert.equal(one.status, 200);
+  assert.equal(h.hits(), 1);
+  const eight = await h.call(body({ model: "gpt-4o", max_tokens: 1000, n: 8 }));
+  assert.equal(eight.status, 429);
+  assert.equal((await eight.json()).error.reason, "preflight_estimate");
+  assert.equal(h.hits(), 1);
+  const two = await h.call(body({ model: "gpt-4o-mini", max_tokens: 100, n: 2 }));
+  assert.equal(two.status, 200);
+  const [a, b, c] = h.ledger();
+  assert.equal(a.output_tokens_est, 1000);
+  assert.equal(a.output_multiplier, 1);
+  assert.equal(b.blocked, true);
+  assert.equal(b.output_tokens_est, 8000);
+  assert.equal(b.output_multiplier, 8);
+  assert.equal(c.output_tokens_est, 200);
+  assert.equal(c.output_multiplier, 2);
+  h.close();
+});

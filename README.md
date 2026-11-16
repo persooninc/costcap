@@ -96,7 +96,14 @@ CostCap. The local proxy binds to 127.0.0.1.
   any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
   It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
   tokens = `max_tokens` (or `max_completion_tokens`, Gemini
-  `generationConfig.maxOutputTokens`), else a conservative provider default.
+  `generationConfig.maxOutputTokens`), else a conservative provider default,
+  times the completion count: OpenAI-compatible `n` / `best_of` (the larger,
+  since `best_of` bills every candidate) or Gemini `candidateCount`
+  (`candidate_count`). An invalid count is treated as 1 and flagged
+  `output_multiplier_defaulted`; a count above the provider maximum (128 for
+  OpenAI/OpenRouter, 8 for Gemini) is clamped to it and flagged
+  `output_multiplier_clamped`. Allowed calls record `output_tokens_est` and
+  `output_multiplier` on their receipt.
   Text that tokenizes denser than 4 bytes/token can still overshoot. Models
   with no published rate are refused with `preflight_unpriced`, never priced at
   the fallback. The blocked receipt has `estimate: true`, `estimate_usd` and

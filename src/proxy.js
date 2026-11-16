@@ -158,6 +158,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           send(429, response);
           return "blocked";
         };
+        let preflightEst;
         const verdict = guarded(() => {
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
@@ -169,7 +170,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
-            const pf = preflightCheck(cap, provider, body, path);
+            const pf = preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; });
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -196,7 +197,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
             signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), abort.signal]) });
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
-          const receipt = { provider, path: url.pathname.replace(`/${provider}`, ""), status: upstreamRes.status, blocked: false };
+          const receipt = { provider, path: url.pathname.replace(`/${provider}`, ""), status: upstreamRes.status, blocked: false,
+            ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false;
           if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
