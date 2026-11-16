@@ -94,8 +94,12 @@ function syncedEntry(policy, key, value) {
   const values = policy.spend?.[key] ?? {};
   if (values[value]) return values[value];
   if (!policy.truncated) return { day: 0, month: 0, unknown: 0 };
-  const floor = Math.min(...Object.values(values).map((e) => e.month));
-  return Number.isFinite(floor) ? { day: floor, month: floor, unknown: 0 } : { day: 0, month: 0, unknown: 0 };
+  // Values with unknown-cost receipts sort first and may show $0, so they never set
+  // the floor. If every listed value has unknown cost, the unlisted one can't be bounded.
+  const known = Object.values(values).filter((e) => e.unknown === 0);
+  if (!known.length) return { day: 0, month: 0, unknown: Object.keys(values).length ? 1 : 0 };
+  const floor = Math.min(...known.map((e) => e.month));
+  return { day: floor, month: floor, unknown: 0 };
 }
 
 /**

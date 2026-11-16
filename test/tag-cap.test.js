@@ -334,3 +334,15 @@ test("#204 cached fleet verdict: pending receipts, UTC rollover and unknown for 
   assert.deepEqual([unk.verdict, unk.unknown_receipts], ["accounting_unavailable", 1]);
   assert.equal(cachedFleetTagVerdict(policy, [], { customer: "globex" }, [r(null, { customer: "acme" }, now)], T0), null);
 });
+
+test("#204 truncation floor ignores listed unknown-cost values; all-unknown lists refuse the unlisted value", () => {
+  const now = new Date(T0).toISOString();
+  const rules = [{ key: "customer", scope: "month", usd: 30 }];
+  const p = fleetTagCapsPolicy(rules, [r(null, { customer: "c-unknown" }, now), r(100, { customer: "c-big" }, now), r(40, { customer: "c-drop" }, now)], T0, 2);
+  assert.equal(p.truncated, true);
+  assert.equal(p.spend.customer["c-drop"], undefined);
+  const hit = cachedFleetTagVerdict(p, [], { customer: "c-drop" }, [], T0);
+  assert.deepEqual([hit.verdict, hit.spend_usd], ["tag_budget_exceeded", 100]);
+  const allUnknown = fleetTagCapsPolicy(rules, [r(null, { customer: "u1" }, now), r(null, { customer: "u2" }, now), r(5, { customer: "c-drop" }, now)], T0, 2);
+  assert.equal(cachedFleetTagVerdict(allUnknown, [], { customer: "c-drop" }, [], T0).verdict, "accounting_unavailable");
+});
