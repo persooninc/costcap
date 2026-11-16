@@ -29,7 +29,7 @@ async function harness(caps = { day: 100 }) {
   const dir = mkdtempSync(join(tmpdir(), "cc-pfr-"));
   const receipts = join(dir, "r.jsonl");
   const cap = createCapEngine({ caps });
-  const { server } = await startMeteringProxy({ receiptsPath: receipts, cap, preflight: true, upstreams: { openai: u, anthropic: u } });
+  const { server } = await startMeteringProxy({ receiptsPath: receipts, cap, preflight: true, upstreams: { openai: u, anthropic: u, gemini: u } });
   const base = `http://127.0.0.1:${server.address().port}`;
   const call = (path, init = {}) => fetch(base + path, init);
   const ledger = () => readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
@@ -188,4 +188,36 @@ test("stress: 200 mixed preflight routes, none mis-refused", async () => {
   for (const r of res) { const t = await r.text(); assert.equal(r.status, 200, t); }
   assert.equal(h.seen.length, 200);
   h.close();
+});
+
+// #230: Gemini inline batch creates are estimated (sum x 0.5); file-input creates pass unestimated.
+const geminiBatch = (n, maxOutputTokens = 1000) => j({ batch: { input_config: { requests: { requests: Array.from({ length: n }, (_, i) => ({
+  request: { contents: [{ parts: [{ text: "hi" }] }], generationConfig: { maxOutputTokens } }, metadata: { key: `k${i}` } })) } } } });
+const GCREATE = "/gemini/v1beta/models/gemini-2.5-flash:batchGenerateContent";
+
+test("#230 estimateBatch gemini: sums inline requests at 0.5x the path model; unusable or unpriced refuse", () => {
+  const one = estimateBatch("gemini", geminiBatch(1), undefined, "gemini-2.5-flash");
+  const three = estimateBatch("gemini", geminiBatch(3), undefined, "gemini-2.5-flash");
+  assert.deepEqual([three.ok, three.batch_entries, three.batch_multiplier, three.model], [true, 3, 0.5, "gemini-2.5-flash"]);
+  assert.ok(Math.abs(three.estimate_usd - 3 * one.estimate_usd) < 1e-5);
+  assert.equal(estimateBatch("gemini", geminiBatch(1), undefined, "gemini-made-up-9").reason, "preflight_unpriced");
+  assert.equal(estimateBatch("gemini", "nope", undefined, "gemini-2.5-flash").reason, "preflight_unpriced");
+});
+
+test("#230 AC6: --preflight refuses an inline Gemini batch over the cap before sending; file input passes", async () => {
+  const h = await harness({ run: 0.001 });
+  let r = await h.call(GCREATE, { method: "POST", body: geminiBatch(3) });
+  assert.equal(r.status, 429);
+  assert.equal((await r.json()).error.reason, "preflight_estimate");
+  const refusal = h.ledger().at(-1);
+  assert.deepEqual([refusal.reason, refusal.batch_entries], ["preflight_estimate", 3]);
+  assert.equal(h.seen.length, 0);
+  r = await h.call(GCREATE, { method: "POST", body: j({ batch: { input_config: { file_name: "files/in-1" } } }) });
+  assert.equal(r.status, 200);
+  const pend = h.ledger().at(-1);
+  assert.deepEqual([pend.reason, pend.preflight_estimate], ["batch_pending", false]);
+  const roomy = await harness({ day: 100 });
+  r = await roomy.call(GCREATE, { method: "POST", body: geminiBatch(3) });
+  assert.equal(r.status, 200);
+  assert.equal(roomy.ledger().at(-1).reason, "batch_pending");
 });

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { startMeteringProxy } from "../src/proxy.js";
 import { loadSettledReceipts } from "../src/cap.js";
 import { agentSpendPolicy, cachedAgentVerdict, cachedTeamVerdict } from "../src/hosted/teams.js";
-import { ANTHROPIC_EXPECTED, mockUpstream } from "./support/batch.js";
+import { ANTHROPIC_EXPECTED, GEMINI_EXPECTED, mockUpstream } from "./support/batch.js";
 
 const SONNET = { model: "claude-sonnet-4-6", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
 const ABATCH = JSON.stringify({ requests: ["a", "b", "c"].map((custom_id) => ({ custom_id, params: SONNET })) });
@@ -19,7 +19,7 @@ async function wrapper(t, gate) {
   const base = `http://127.0.0.1:${up.address().port}`;
   const receiptsPath = join(mkdtempSync(join(tmpdir(), "cc-fleet-batch-")), "r.jsonl");
   const pending = () => loadSettledReceipts(receiptsPath);
-  const p = await startMeteringProxy({ upstreams: { anthropic: base, openai: base }, receiptsPath, teamCheck: () => gate(pending(), Date.now()), who: { agent_id: "worker", run_id: "r1" } });
+  const p = await startMeteringProxy({ upstreams: { anthropic: base, openai: base, gemini: base }, receiptsPath, teamCheck: () => gate(pending(), Date.now()), who: { agent_id: "worker", run_id: "r1" } });
   t.after(() => { up.closeAllConnections(); up.close(); p.server.closeAllConnections(); p.server.close(); });
   return { pending, call: (method, path, body) => fetch(`http://127.0.0.1:${p.port}${path}`, { method, body }) };
 }
@@ -76,4 +76,20 @@ test("#196: agentSpendPolicy counts a pending background response as pending, no
   const now = Date.now();
   const s = agentSpendPolicy([{ id: "g", ts: new Date(now).toISOString(), reason: "background_pending", cost_usd: null }], now);
   assert.deepEqual([s.unknown, s.pending_batches], [0, 1]);
+});
+
+test("#230: a Gemini pending batch is pending (not unknown) for fleet caps, and its settled cost counts", async (t) => {
+  const spend = { spent: { day: 0, month: 0 }, unknown: 0, as_of: today() };
+  const s = await wrapper(t, (pending, now) => cachedAgentVerdict(spend, { day: 1000 }, pending, now));
+  const body = JSON.stringify({ batch: { input_config: { requests: { requests: [{ request: { contents: [{ parts: [{ text: "hi" }] }] } }] } } } });
+  assert.equal((await s.call("POST", "/gemini/v1beta/models/gemini-2.5-flash:batchGenerateContent", body)).status, 200);
+  const p = agentSpendPolicy(s.pending(), Date.now());
+  assert.deepEqual([p.unknown, p.pending_batches], [0, 1]);
+  assert.equal((await s.call("POST", "/anthropic/v1/messages", JSON.stringify(SONNET))).status, 200, "sync call allowed while batch pending");
+  assert.equal((await s.call("GET", "/gemini/v1beta/batches/gb_01")).status, 200);
+  const rows = s.pending();
+  assert.ok(rows.every((r) => r.cost_usd !== null), "batch settled");
+  const v = cachedAgentVerdict(spend, { day: GEMINI_EXPECTED }, rows, Date.now());
+  assert.equal(v.verdict, "budget_exceeded");
+  assert.ok(v.spent_usd >= GEMINI_EXPECTED);
 });

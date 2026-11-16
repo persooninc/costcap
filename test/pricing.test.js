@@ -107,7 +107,8 @@ test("#160 batch multiplier is 0.5 per provider and stacks with caching and long
   const { batchMultiplier } = await import("../src/pricing.js");
   assert.equal(batchMultiplier("openai"), 0.5);
   assert.equal(batchMultiplier("anthropic"), 0.5);
-  assert.equal(batchMultiplier("gemini"), null);
+  assert.equal(batchMultiplier("gemini"), 0.5); // #230
+  assert.equal(batchMultiplier("openrouter"), null);
   const usage = { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 4000, cache_write_input_tokens: 300, cache_write_1h_input_tokens: 200 };
   const std = costForUsage("claude-sonnet-4-6", usage);
   const b = costForUsage("claude-sonnet-4-6", usage, { batch: "anthropic" });
@@ -118,7 +119,12 @@ test("#160 batch multiplier is 0.5 per provider and stacks with caching and long
   assert.equal(lc.pricing_tier, "long_context");
   assert.ok(Math.abs(lc.cost_usd - costForUsage("claude-sonnet-4-6", big).cost_usd * 0.5) < 1e-6);
   assert.equal(costForUsage("gpt-4o", { input_tokens: 10 }).batch_multiplier, undefined);
-  assert.throws(() => costForUsage("gemini-2.5-pro", { input_tokens: 1 }, { batch: "gemini" }), /no batch rate/);
+  assert.throws(() => costForUsage("gemini-2.5-pro", { input_tokens: 1 }, { batch: "openrouter" }), /no batch rate/);
+  // #230: Gemini batch stacks with long_context like the other providers.
+  const g = { input_tokens: 250000, output_tokens: 1000, cached_input_tokens: 1000 };
+  const gb = costForUsage("gemini-2.5-pro", g, { batch: "gemini" });
+  assert.deepEqual([gb.batch_multiplier, gb.pricing_tier], [0.5, "long_context"]);
+  assert.ok(Math.abs(gb.cost_usd - costForUsage("gemini-2.5-pro", g).cost_usd * 0.5) < 1e-6);
 });
 
 test("#163: text-only costs are unchanged by the modality breakdown", () => {

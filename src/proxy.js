@@ -18,7 +18,7 @@ import { DOWNGRADE_HEADER, downgradeLine, downgradeRoute, rewriteModel } from ".
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, checkEstimate, estimateBatch, openRouterModels } from "./preflight.js";
 import { rateLimitedBody, usageTokens } from "./rate-limit.js";
-import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
+import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults, geminiBatchId, geminiBatchOutput, geminiBatchRequests, isGeminiBatchFreeCall } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
 import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
@@ -471,7 +471,12 @@ export function createUsageChunkFilter() {
 }
 
 function batchIdOf(raw) {
-  try { const b = JSON.parse(raw.toString("utf8")); return typeof b?.id === "string" && /^[A-Za-z0-9_-]+$/.test(b.id) ? b.id : null; } catch { return null; }
+  try {
+    const b = JSON.parse(raw.toString("utf8"));
+    if (typeof b?.id === "string" && /^[A-Za-z0-9_-]+$/.test(b.id)) return b.id;
+    // #230: a Gemini batch create returns an Operation named "batches/<id>".
+    return geminiBatchId(b);
+  } catch { return null; }
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
@@ -512,7 +517,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
     const r = lines.find((l) => !l.event && l.reason === "batch_pending" && l.batch_id === batchId && l.cost_usd === null);
     if (!r) return null;
-    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId, run_id: r.run_id ?? null };
+    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId, run_id: r.run_id ?? null, model: r.model ?? null };
     pendingBatches.set(batchId, entry);
     if (lines.some((l) => isSettlement(l) && l.receipt_id === r.id)) resolvedBatches.add(batchId);
     return entry;
@@ -678,6 +683,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         // #160: an Anthropic batch names its models per request; every one is checked.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
         if (batchModels && !requestedModel) requestedModel = batchModels.find(Boolean);
+        // #230: a Gemini batch names one model in its path; inline requests are counted (file input: []).
+        const geminiReqs = batchCreate === "gemini" ? geminiBatchRequests(body) : null;
         // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
         const modelRefusal = (status, error, message) => {
           emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
@@ -744,6 +751,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           // uploaded file) pass through; audio checks only that the model is priced.
           const pfMode = !preflight || !generates ? null
             : batchCreate === "anthropic" && !cloud ? "batch"
+            : batchCreate === "gemini" ? (geminiReqs?.length ? "batch" : "pass")
             : batchCreate === "openai" || /^\/v1\/(?:files|uploads)(?:\/|$|\?)/.test(path) ? "pass"
             : audio ? "audio" : "estimate";
           if (pfMode === "pass") preflightEst = { pass: true };
@@ -761,7 +769,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               return rm ? scalePrice(lookupPrice(cloudModel), rm) : lookupPrice(cloudModel);
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
-            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor), onFit)
+            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor, requestedModel), onFit)
               : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
@@ -1038,26 +1046,31 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // #160: a batch is billed when it runs. Pending, unknown (never $0), and the run continues.
             const batch_id = batchIdOf(raw);
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "batch_pending", batch_id,
-              ...(batchModels && { request_count: batchModels.length }) });
+              ...(batchModels && { request_count: batchModels.length }), ...(geminiReqs?.length && { request_count: geminiReqs.length }) });
             const done = emit(receipt);
-            pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id, run_id: done.run_id ?? null });
+            pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id, run_id: done.run_id ?? null, model: done.model });
             if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw);
             return;
           } else if (raw && req.method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchReadPath(req.method, req.url)) {
             Object.assign(receipt, { model: "unknown", cost_usd: 0, reason: "non_billable_request" });
             const read = batchReadPath(req.method, req.url);
-            let batchId = null;
+            let batchId = null, inlineResults = null;
             if (read.kind === "openai_batch") {
               try {
                 const b = JSON.parse(raw.toString("utf8"));
                 if (typeof b?.output_file_id === "string" && /^[A-Za-z0-9_-]+$/.test(b.output_file_id) && findPending(read.id)?.provider === "openai") batchFiles.set(b.output_file_id, read.id);
               } catch { /* not a batch object: nothing to link */ }
             } else if (read.kind === "anthropic_results") batchId = read.id;
-            else batchId = batchFiles.get(read.id) ?? null;
+            else if (read.kind === "gemini_batch") {
+              // #230: done + inlined responses settle now; a responsesFile is linked for the download.
+              const out = geminiBatchOutput(raw.toString("utf8"));
+              if (out?.inline) { batchId = read.id; inlineResults = out.inline; }
+              else if (out?.file && findPending(read.id)?.provider === "gemini") batchFiles.set(out.file, read.id);
+            } else batchId = batchFiles.get(read.id) ?? null;
             const pending = batchId ? findPending(batchId) : null;
             if (pending && !resolvedBatches.has(batchId) && pending.provider === provider) {
               resolvedBatches.add(batchId);
-              const folded = foldBatchResults(provider, raw.toString("utf8"), userPrices);
+              const folded = foldBatchResults(provider, inlineResults ?? raw.toString("utf8"), userPrices, { model: pending.model && pending.model !== "unknown" ? pending.model : undefined });
               receipt.batch_id = batchId;
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
@@ -1078,7 +1091,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
           } else if (raw && (["GET", "HEAD"].includes(req.method) ||
             (upstreamRes.status >= 200 && upstreamRes.status < 300 &&
-              ((req.method === "POST" && (isCountTokensPath(req.url) || cloudRoute?.countTokens)) || isNonBillableFilesRequest(req.method, req.url))))) {
+              ((req.method === "POST" && (isCountTokensPath(req.url) || cloudRoute?.countTokens)) || isNonBillableFilesRequest(req.method, req.url) || isGeminiBatchFreeCall(req.method, req.url))))) {
             // Metadata reads, token-count endpoints and Files upload/delete never generate tokens.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else {

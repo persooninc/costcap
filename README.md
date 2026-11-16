@@ -418,9 +418,21 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   Anthropic `requests[].params.model` is checked against `--models` and
   `--unknown-models refuse`; an OpenAI batch names its models only inside the
   input file, so an OpenAI batch create is refused whenever an allowlist is set.
-  Not covered: pre-flight reservation for batches, Gemini batch mode and
-  OpenRouter batches, and polling the provider (costcap only sees results you
-  fetch through it).
+  Gemini Batch Mode (#230): a 2xx `POST /gemini/v1beta/models/{m}:batchGenerateContent`
+  writes the same `batch_pending` receipt (`batch_id` from `name: "batches/{id}"`,
+  `request_count` for inline requests, the path model checked against `--models`
+  and `--unknown-models refuse`). A `GET /gemini/v1beta/batches/{id}` that is
+  `done` with inlined responses settles it; one that names a `responsesFile`
+  links the file, and `GET /gemini/download/v1beta/files/{f}:download` settles it.
+  Lines are priced like interactive Gemini calls (cache, thoughts, modality and
+  long-context rules) at `batch.gemini` 0.5; error lines are $0. Cancel
+  (`POST …/batches/{id}:cancel`) and `DELETE …/batches/{id}` are $0 and never pause;
+  a failed, cancelled or expired batch with no output stays pending (unknown).
+  With `--preflight`, an inline Gemini create is estimated as the sum of each
+  request's worst case x 0.5; a file-input create passes unestimated.
+  Not covered: Gemini batch embeddings (`:asyncBatchEmbedContent`), Vertex batch
+  prediction, OpenRouter batches, and polling the provider (costcap only sees
+  results you fetch through it).
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when

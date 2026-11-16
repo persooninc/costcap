@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.12");
+  assert.equal(TABLE_VERSION, "2026-11-16.13");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -244,4 +244,12 @@ test("#198 AC6: the committed digest covers audio unit rates; a tampered per_min
   assert.equal(verifyTableDigest(t, recorded).ok, true);
   t.models["whisper-1"].per_minute = 0.0001;
   assert.deepEqual([verifyTableDigest(t, recorded).ok, verifyTableDigest(t, recorded).reason], [false, "digest_mismatch"]);
+});
+
+test("#230 the bumped table declares batch.gemini 0.5 with a source, and the digest covers it", () => {
+  assert.equal(table.batch.gemini, 0.5);
+  assert.ok(table.sources.some((s) => s.includes("ai.google.dev/gemini-api/docs/batch-mode")));
+  assert.equal(JSON.parse(readFileSync(digestPathFor(tablePath), "utf8")).sha256, tableDigest(table));
+  const { p } = tempTable((t) => { t.batch.gemini = 0.4; });
+  assert.equal(verifyTableDigest(JSON.parse(readFileSync(p, "utf8")), JSON.parse(readFileSync(digestPathFor(p), "utf8"))).ok, false);
 });

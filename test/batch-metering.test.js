@@ -169,3 +169,15 @@ test("hardened look-alike paths are not batch creates and still pause", async (t
     assert.equal(s.lines()[0].reason, "usage_unavailable", path);
   }
 });
+
+test("#230 Gemini look-alike batch paths are not batch creates and still pause", async (t) => {
+  for (const path of ["/gemini/v1beta/models/gemini-2.5-flash:batchGenerateContent%2F..", "/gemini/v1beta/batches/x/extra"]) {
+    const up = http.createServer((req, res) => { req.resume(); res.end('{"name":"batches/b"}'); });
+    await new Promise((r) => up.listen(0, "127.0.0.1", r));
+    const receiptsPath = join(mkdtempSync(join(tmpdir(), "cc-gla-")), "r.jsonl");
+    const p = await startMeteringProxy({ upstreams: { gemini: `http://127.0.0.1:${up.address().port}` }, receiptsPath });
+    t.after(() => { up.closeAllConnections(); up.close(); p.server.closeAllConnections(); p.server.close(); });
+    await fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: "{}" });
+    assert.equal(JSON.parse(readFileSync(receiptsPath, "utf8").trim().split("\n")[0]).reason, "usage_unavailable", path);
+  }
+});

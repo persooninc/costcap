@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { startMeteringProxy } from "../src/proxy.js";
 import { createAgentBudgets } from "../src/agent-budget.js";
 import { loadSettledReceipts } from "../src/cap.js";
-import { ANTHROPIC_EXPECTED, OPENAI_EXPECTED, mockUpstream } from "./support/batch.js";
+import { ANTHROPIC_EXPECTED, GEMINI_EXPECTED, OPENAI_EXPECTED, mockUpstream } from "./support/batch.js";
 
 const SONNET = { model: "claude-sonnet-4-6", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
 const ABATCH = JSON.stringify({ requests: ["a", "b", "c"].map((custom_id) => ({ custom_id, params: SONNET })) });
@@ -20,7 +20,7 @@ async function setup(t, policy, upstreamOpts = {}) {
   const base = `http://127.0.0.1:${up.address().port}`;
   const receiptsPath = join(mkdtempSync(join(tmpdir(), "cc-batch-agent-")), "r.jsonl");
   const agentBudgets = createAgentBudgets({ policy });
-  const p = await startMeteringProxy({ upstreams: { openai: base, anthropic: base }, receiptsPath, agentBudgets, who: { agent_id: "worker", run_id: "r1" } });
+  const p = await startMeteringProxy({ upstreams: { openai: base, anthropic: base, gemini: base }, receiptsPath, agentBudgets, who: { agent_id: "worker", run_id: "r1" } });
   t.after(() => { up.closeAllConnections(); up.close(); p.server.closeAllConnections(); p.server.close(); });
   return {
     receiptsPath, agentBudgets,
@@ -78,4 +78,15 @@ test("#196: a pending background response is not an agent unknown", () => {
   const b = createAgentBudgets({ policy: policyFor(1), history: [{ id: "g", ts: new Date().toISOString(), agent_id: "worker", run_id: "r1", reason: "background_pending", cost_usd: null }] });
   assert.equal(b.spend({ agent_id: "worker", run_id: "r1" }).unknown, 0);
   assert.equal(b.check({ agent_id: "worker", run_id: "r1" }), null);
+});
+
+test("#230 Gemini inline batch settle reaches --policy agent budgets and matches a fresh wrapper", async (t) => {
+  const s = await setup(t, policyFor(GEMINI_EXPECTED * 0.9));
+  const body = JSON.stringify({ batch: { input_config: { requests: { requests: [{ request: { contents: [{ parts: [{ text: "hi" }] }] } }] } } } });
+  assert.equal((await s.call("POST", "/gemini/v1beta/models/gemini-2.5-flash:batchGenerateContent", body)).status, 200);
+  await s.call("GET", "/gemini/v1beta/batches/gb_01");
+  const who = { agent_id: "worker", run_id: "r1" };
+  assert.equal(Number(s.agentBudgets.spend(who).day.toFixed(6)), GEMINI_EXPECTED);
+  assert.deepEqual(round(s.agentBudgets.spend(who)), round(s.fresh().spend(who)));
+  assert.equal(s.fresh().check(who).reason, "budget_exceeded");
 });

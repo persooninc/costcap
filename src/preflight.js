@@ -5,6 +5,7 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
+import { geminiBatchRequests } from "./batch.js";
 import { lookupPrice, selectRates, batchMultiplier, toolRate, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // #214: Anthropic web search with max_uses caps billed searches per request; the worst case adds
@@ -123,17 +124,24 @@ export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathM
 // entry's worst case (requests[].params, same bytes/4 + max_tokens maths as a
 // single call) times the provider batch multiplier. Any unpriced or missing
 // entry model refuses as preflight_unpriced naming that model.
-export function estimateBatch(provider, body, priceFor) {
+// #230: a Gemini inline batch (batch.input_config.requests.requests[].request) is estimated the
+// same way, each entry priced at the create's path model.
+export function estimateBatch(provider, body, priceFor, pathModel) {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let reqs;
-  try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
+  if (provider === "gemini") {
+    const g = geminiBatchRequests(text);
+    reqs = g?.map((request) => ({ params: request }));
+  } else try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
   if (!Array.isArray(reqs) || !reqs.length) return { ok: false, reason: "preflight_unpriced", model: "unknown" };
   const mult = batchMultiplier(provider) ?? 1;
   // #218: the batch discount covers tokens only; tool calls (web search) bill at 100%.
   let usd = 0, toolUsd = 0, toolCalls = 0, input_tokens = 0, output_tokens = 0, model;
   for (const r of reqs) {
     const params = r?.params && typeof r.params === "object" ? r.params : {};
-    const e = estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
+    const e = provider === "gemini"
+      ? estimateOne(provider, params, JSON.stringify(params), `/v1beta/models/${pathModel}:generateContent`, pathModel ?? "unknown", priceFor)
+      : estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
     if (!e.ok) return e;
     const t = e.tool_usd_max ?? 0;
     usd += e.estimate_usd - t; toolUsd += t; toolCalls += e.tool_calls_max ?? 0; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
@@ -150,7 +158,7 @@ export function checkEstimate(cap, est, onFit) {
   for (const scope of ["run", "hour", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
       return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,
-        input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier };
+        input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier, ...(est.batch_entries && { batch_entries: est.batch_entries }) };
     }
   }
   onFit?.(est);
