@@ -49,7 +49,10 @@ export function pricingCommand(args, { tablePath } = {}) {
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
   // A long-context tier (#151) prints as a second row for the same model.
   // Premium speed / service tiers (#155) print as (fast) / (priority) rows.
-  const rowsFor = (name, r) => [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
+  // #198: per-minute / per-character audio models print their unit rate instead of token rates.
+  const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of audio`
+    : `${name}: ${fmt(r.per_million_characters)} per 1M characters of input text`);
+  const rowsFor = (name, r) => (Number.isFinite(r.per_minute) || Number.isFinite(r.per_million_characters)) && !Number.isFinite(r.input) ? [unitRow(name, r)] : [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
     ...["fast", "priority"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
     // Modality rates (#163) print as (audio) / (image) rows; uniform / text-rate notes follow.
     ...Object.entries(r.modalities ?? {}).map(([m, mr]) => `${name} (${m}): input ${fmt(mr.input)}, cached_input ${fmt(mr.cached_input)}, output ${fmt(mr.output)}`),

@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.7",
+  "version": "2026-11-16.8",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -17,7 +17,8 @@
     "https://ai.google.dev/gemini-api/docs/pricing (Gemini 2.5 Flash / Flash-Lite audio input and audio cache rates; text/image/video share the text rate; retrieved 2026-11-16)",
     "https://platform.openai.com/docs/models/gpt-image-1 (text $5 / cached $1.25, image input $10 / cached $2.50, image output $40; retrieved 2026-11-16)",
     "https://platform.claude.com/docs/en/about-claude/pricing (Regional and multi-region endpoint pricing: Claude 4.5+ on Amazon Bedrock and Google Vertex AI regional endpoints cost 10% over global; retrieved 2026-11-16)",
-    "https://developers.openai.com/api/docs/models/gpt-realtime and https://developers.openai.com/api/docs/pricing (Realtime: gpt-realtime, gpt-realtime-2.1, gpt-realtime-2.1-mini text/audio/image; gpt-realtime-mini text only per #194, audio stays unpriced; retrieved 2026-11-16)"
+    "https://developers.openai.com/api/docs/models/gpt-realtime and https://developers.openai.com/api/docs/pricing (Realtime: gpt-realtime, gpt-realtime-2.1, gpt-realtime-2.1-mini text/audio/image; gpt-realtime-mini text only per #194, audio stays unpriced; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/pricing (Audio #198: whisper-1 $0.006/min, gpt-transcribe $0.0045/min; gpt-4o-transcribe(-diarize) $2.50/$10, gpt-4o-mini-transcribe $1.25/$5 per 1M tokens; tts-1 $15, tts-1-hd $30 per 1M characters; gpt-4o-mini-tts $0.60 text in / $12 audio out; retrieved 2026-11-16)"
   ],
   "batch": { "openai": 0.5, "anthropic": 0.5 },
   "regional_endpoint": { "multiplier": 1.1, "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"] },
@@ -60,6 +61,14 @@
     "gpt-realtime-2.1": { "input": 4.00, "cached_input": 0.40, "output": 24.00, "modalities": { "audio": { "input": 32.00, "cached_input": 0.40, "output": 64.00 }, "image": { "input": 5.00, "cached_input": 0.50 } } },
     "gpt-realtime-2.1-mini": { "input": 0.60, "cached_input": 0.06, "output": 2.40, "modalities": { "audio": { "input": 10.00, "cached_input": 0.30, "output": 20.00 }, "image": { "input": 0.80, "cached_input": 0.08 } } },
     "gpt-realtime-mini": { "input": 0.60, "cached_input": 0.06, "output": 2.40 },
+    "whisper-1": { "per_minute": 0.006 },
+    "gpt-transcribe": { "per_minute": 0.0045 },
+    "tts-1": { "per_million_characters": 15.00 },
+    "tts-1-hd": { "per_million_characters": 30.00 },
+    "gpt-4o-transcribe": { "input": 2.50, "cached_input": 2.50, "output": 10.00, "uniform_modalities": true },
+    "gpt-4o-transcribe-diarize": { "input": 2.50, "cached_input": 2.50, "output": 10.00, "uniform_modalities": true },
+    "gpt-4o-mini-transcribe": { "input": 1.25, "cached_input": 1.25, "output": 5.00, "uniform_modalities": true },
+    "gpt-4o-mini-tts": { "input": 0.60, "cached_input": 0.60, "output": 12.00, "uniform_modalities": true },
     "gpt-image-1": { "input": 5.00, "cached_input": 1.25, "output": 40.00, "modalities": { "image": { "input": 10.00, "cached_input": 2.50, "output": 40.00 } } },
     "anthropic/claude-sonnet-4.6": { "input": 3.00, "cached_input": 0.30, "output": 15.00 },
     "anthropic/claude-opus-4.6": { "input": 5.00, "cached_input": 0.50, "output": 25.00 },

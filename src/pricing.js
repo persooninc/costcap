@@ -159,6 +159,11 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
 
 export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale } = {}) {
   const price = lookupPrice(model);
+  // #198: a per-minute / per-character model (whisper-1, tts-1) has no token rate: unknown, never NaN or $0.
+  if (!price.fallback && !(Number.isFinite(price.input) && Number.isFinite(price.output))) {
+    return { model, cost_usd: null, reason: "unit_unpriced", input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
+      pricing_tier: "standard", table_version: price.table_version, table_sha256: price.table_sha256, fallback: false, cost_source: "table" };
+  }
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
   const batchM = batch ? batchMultiplier(batch) : null;

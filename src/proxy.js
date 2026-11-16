@@ -25,6 +25,7 @@ import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
+import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
 
 const PROVIDERS = {
@@ -223,11 +224,12 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       }
       // Both prompt/input and completion/output counters are required; duration-billed or empty shapes are unknown.
       if (u && !(isCount(u.prompt_tokens ?? u.input_tokens) && isCount(u.completion_tokens ?? u.output_tokens))) usage = { unpriceable: NaN };
-      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
+      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.input_token_details?.cached_tokens ?? 0),
         output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
-        cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0 };
+        cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.input_token_details?.cached_tokens ?? 0 };
       if (u && usage.input_tokens !== undefined) {
-        const inDetails = u.prompt_tokens_details ?? u.input_tokens_details;
+        // #198: transcription usage spells it input_token_details.
+        const inDetails = u.prompt_tokens_details ?? u.input_tokens_details ?? u.input_token_details;
         const cachedDetails = inDetails?.cached_tokens_details;
         const cached = openaiModalitySlice(cachedDetails, usage.cached_input_tokens);
         const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens);
@@ -564,6 +566,17 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        // #198: transcriptions/translations are multipart; read only the model field (bounded).
+        const audio = provider === "openai" ? audioRoute(req.method, req.url) : null;
+        if (audio && audio !== "speech" && !requestedModel) {
+          const mp = parseMultipartFields(body, getHeader(req.headers, "content-type"));
+          if (mp?.duplicateModel) {
+            emit({ provider, path: storedPath, blocked: true, reason: "invalid_model", outcome: "blocked_model", model: "unknown", cost_usd: 0 });
+            send(400, { error: "invalid_model", model: null, message: "CostCap: the multipart body has more than one `model` part. The upstream call was not made." });
+            return;
+          }
+          if (typeof mp?.fields.model === "string" && mp.fields.model) requestedModel = mp.fields.model;
+        }
         // #188: cloud routes carry the model in the path (Vertex count-tokens: in the body).
         let cloudModel = null, providerModel = null;
         if (cloud) {
@@ -753,7 +766,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }),
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
-          let metered, raw, streamCut = false, sseIncomplete = false;
+          let metered, raw, audioCost, streamCut = false, sseIncomplete = false;
           // #196: Responses background create / read / cancel on the first-party OpenAI route.
           const firstPartyOpenAI = provider === "openai" && !custom && !cloud;
           const bgCreate = firstPartyOpenAI && isResponsesCreate(req.method, req.url) && requestsBackground(body);
@@ -866,6 +879,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Retrieves never create spend (#135/#196), even when the body carries usage.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
             metered = null; streamCut = false; sseIncomplete = false;
+          } else if (audio && ok2xx && (audioCost = audioUnitCost(audio, requestedModel, { responseText: raw ? raw.toString("utf8") : null, requestBody: parsedBody }))) {
+            // #198: per-minute (whisper) and per-character (tts-1) audio, priced from the table.
+            Object.assign(receipt, audioCost);
+            recordSpend(receipt);
+            velocity?.record(receipt.cost_usd);
+            metered = null;
           } else if (metered && cloud && !cloudModel) {
             // #188: an unmapped cloud model is unknown, never the fallback rate.
             Object.assign(receipt, { model: providerModel ?? "unknown", cost_usd: null, reason: "cloud_model_unpriced" });
@@ -884,6 +903,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             else if (receipt.reason === "upstream_model_unpriced") failMsg = `Model ${receipt.model} on custom upstream ${provider} has no rate in --upstream-prices. Restart only after reconciling this request.`;
             else if (receipt.reason === "user_price_unpriced") failMsg = `Model ${receipt.model} was billed for a component (cache write, long context, premium tier or non-text tokens) your --upstream-prices entry does not price. Restart only after reconciling this request.`;
             else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
+            else if (receipt.reason === "unit_unpriced") failMsg = `Model ${receipt.model} is billed per minute or per character, and this response carried no usage CostCap can price. Restart only after reconciling this request.`;
             else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
             else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);

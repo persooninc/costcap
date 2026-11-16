@@ -194,10 +194,47 @@ test("#135 wrap: first call 429 (provider rejected), second 200 with usage; both
   assert.match(check.stdout + check.stderr, /unknown[^0-9]*0|"unknown_cost_count":\s*0/i);
 });
 
-test("#138 wrap: duration-style usage pauses the run, check exits 1 accounting_unavailable, reconcile --apply settles it", async (t) => {
+test("#198 wrap: whisper-1 multipart then tts-1 speech are metered; check --cap passes with the summed spend", async (t) => {
+  const seen = [];
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => {
+      const parts = []; q.on("data", (d) => parts.push(d));
+      q.on("end", () => {
+        seen.push(q.url);
+        if (q.url.endsWith("/audio/speech")) res.writeHead(200, { "content-type": "audio/mpeg" }).end(Buffer.from([0xff, 0xfb, 0x90, 0x00]));
+        else res.writeHead(200, { "content-type": "application/json" }).end('{"text":"hi","usage":{"type":"duration","seconds":42}}');
+      });
+    });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `
+    const fd = new FormData(); fd.append("model", "whisper-1"); fd.append("file", new Blob([new Uint8Array(64)]), "a.wav");
+    const a = await fetch(process.env.OPENAI_BASE_URL + "/audio/transcriptions", { method: "POST", body: fd });
+    const b = await fetch(process.env.OPENAI_BASE_URL + "/audio/speech", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "tts-1", input: "Hello world", voice: "alloy" }) });
+    await b.arrayBuffer();
+    console.log(a.status, b.status);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "200 200", res.err);
+  const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
+  assert.deepEqual(rows.map((r) => [r.model, r.cost_usd, r.cost_basis]), [["whisper-1", 0.0042, "duration"], ["tts-1", 0.000165, "characters"]]);
+  const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(check.status, 0, check.stdout + check.stderr);
+  assert.match(check.stdout, /0\.004365/);
+});
+
+test("#138 wrap: a text-format transcription (no usage) pauses the run, check exits 1 accounting_unavailable, reconcile --apply settles it", async (t) => {
   let n = 0;
   const up = await new Promise((r) => {
-    const s = http.createServer((q, res) => { n++; q.resume(); res.writeHead(200, { "content-type": "application/json" }).end('{"model":"whisper-1","usage":{"type":"duration","seconds":42}}'); });
+    const s = http.createServer((q, res) => { n++; q.resume(); res.writeHead(200, { "content-type": "text/plain" }).end("hello there"); });
     s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
   });
   t.after(() => up.s.close());

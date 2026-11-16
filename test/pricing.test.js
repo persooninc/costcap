@@ -54,6 +54,13 @@ test("every table rate is finite and positive and each provider has a source URL
     assert.ok(table.sources.some((url) => url.includes(host)), host);
   }
   for (const [model, rates] of Object.entries(table.models)) {
+    // #198: audio models billed per minute / per character carry one positive unit rate and no token rates.
+    if (rates.per_minute !== undefined || rates.per_million_characters !== undefined) {
+      const unit = rates.per_minute ?? rates.per_million_characters;
+      assert.equal(Number.isFinite(unit) && unit > 0, true, `${model} unit rate`);
+      assert.equal(rates.input, undefined, model);
+      continue;
+    }
     for (const field of ["input", "cached_input", "output"]) {
       // Documented exception (#145): input-only models (embeddings) bill no output, so output is exactly 0.
       if (rates.input_only && field === "output") { assert.equal(rates.output, 0, model); continue; }

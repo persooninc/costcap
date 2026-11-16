@@ -517,10 +517,28 @@ refused (`no_budget_policy`).
 
 Usage is known only when the provider's required token counters are present as
 finite numbers: prompt/input **and** completion/output for OpenAI and OpenRouter,
-`promptTokenCount` **and** `candidatesTokenCount` for Gemini. An empty or
-duration-shaped usage object (for example `{"seconds": 42}`) is recorded as
+`promptTokenCount` **and** `candidatesTokenCount` for Gemini. An empty usage
+object, or a duration-shaped one outside the OpenAI audio routes below, is recorded as
 `cost_usd: null`, `reason: "usage_unavailable"`, and pauses the run. It is never
-zero-filled to $0. Real explicit zeros still record a known $0. The proxy never
+zero-filled to $0.
+
+**OpenAI audio (#198).** `POST /v1/audio/transcriptions` and `/translations` send
+`multipart/form-data`; CostCap reads only the `model`, `response_format` and `stream`
+text parts (256 bytes each) and forwards the upload byte-for-byte, so `--models` and
+`--unknown-models refuse` work on them. Two `model` parts get `400 invalid_model`
+with no upstream call. Pricing, from the verified table:
+
+| Model | Billed | Receipt |
+|---|---|---|
+| `whisper-1` ($0.006/min), `gpt-transcribe` ($0.0045/min) | `usage.seconds`, else verbose_json `duration` rounded up to a whole second | `cost_basis: "duration"`, `billed_seconds` |
+| `tts-1` ($15/1M chars), `tts-1-hd` ($30/1M chars) | request `input`, counted in Unicode code points | `cost_basis: "characters"`, `billed_characters` |
+| `gpt-4o-transcribe`, `-diarize`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-tts` | token usage (JSON, or SSE `transcript.text.done` / `speech.audio.done`) | token receipt |
+
+Unknown stays unknown and pauses the run: a `text`/`srt`/`vtt` reply with no
+duration, a binary `gpt-4o-mini-tts` reply, an unpriced model (audio tokens on an
+unknown `*-transcribe` model are `modality_unpriced`), or a per-minute model that
+returns only token usage (`unit_unpriced`). Audio has no preflight estimate, and
+`--prices` / `--upstream-prices` cannot override the per-minute or per-character units. Real explicit zeros still record a known $0. The proxy never
 follows a provider redirect, so your API key is not sent to another host. A 3xx
 returns 502 `upstream_redirect` to the client, with a $0 receipt because nothing
 was generated. A missing, negative, non-finite or non-numeric OpenRouter

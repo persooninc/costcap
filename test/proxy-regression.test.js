@@ -194,9 +194,23 @@ test("#138 usage without both priceable counters is unknown, never a zero-filled
   assert.deepEqual(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0}}', "g"), { model: "g", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } });
 });
 
-test("#138 a 200 with duration-style usage records usage_unavailable and pauses", async (t) => {
+test("#138/#198 a 200 with duration-style usage now meters per minute; the run continues", async (t) => {
   let hits = 0;
   const up = http.createServer((req, res) => { hits++; req.resume(); res.writeHead(200, { "content-type": "application/json" }).end('{"model":"whisper-1","usage":{"seconds":3}}'); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = () => fetch(`http://127.0.0.1:${p.port}/openai/v1/audio/transcriptions`, { method: "POST", body: '{"model":"whisper-1"}' });
+  assert.equal((await call()).status, 200);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].cost_basis, receipts[0].billed_seconds, receipts[0].reason], [0.0003, "duration", 3, undefined]);
+  assert.equal((await call()).status, 200);
+  assert.equal(hits, 2);
+});
+
+test("#138 a 200 with no usable usage (text-format transcription) records usage_unavailable and pauses", async (t) => {
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; req.resume(); res.writeHead(200, { "content-type": "text/plain" }).end("hello world"); });
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
   const receipts = [];
   const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });

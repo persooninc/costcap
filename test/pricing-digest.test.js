@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.7");
+  assert.equal(TABLE_VERSION, "2026-11-16.8");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -236,4 +236,12 @@ test("#194 pricing show lists gpt-realtime audio rates and snapshots resolve", (
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /\(audio\): input \$32, cached_input \$0\.4, output \$64/);
   assert.match(s.stdout, /\(image\): input \$5, cached_input \$0\.5/);
+});
+
+test("#198 AC6: the committed digest covers audio unit rates; a tampered per_minute fails verification", () => {
+  const t = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
+  const recorded = JSON.parse(readFileSync(new URL("../src/pricing-table.sha256.json", import.meta.url), "utf8"));
+  assert.equal(verifyTableDigest(t, recorded).ok, true);
+  t.models["whisper-1"].per_minute = 0.0001;
+  assert.deepEqual([verifyTableDigest(t, recorded).ok, verifyTableDigest(t, recorded).reason], [false, "digest_mismatch"]);
 });
