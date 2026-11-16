@@ -33,6 +33,7 @@ import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js"
 import { awsCredentials } from "./sigv4.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
+  "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
@@ -48,7 +49,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] 
 
 export function parseWrapArgs(argv) {
   const sep = argv.indexOf("--");
-  if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] -- <command...>");
+  if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--upstream NAME=URL[,env=VAR]]... -- <command...>\n  (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url)");
   const flags = argv.slice(0, sep);
   const command = argv.slice(sep + 1);
   const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", warnAt: [...DEFAULT_WARN_AT], killFile: DEFAULT_KILL_FILE, command };

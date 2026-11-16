@@ -429,14 +429,14 @@ test("wrap --upstream routes the child through GROQ_BASE_URL, prices from --upst
   const prices = path.join(dir, "prices.json");
   writeFileSync(prices, JSON.stringify({ version: "p1", upstreams: { groq: { "llama-3.3-70b": { input: 0.5, output: 0.5 } } } }));
   const script = `
-    const u = process.env.GROQ_BASE_URL + "/v1/chat/completions";
+    const u = process.env.GROQ_BASE_URL + "/openai/v1/chat/completions"; // what the Groq SDK builds
     console.log(process.env.GROQ_BASE_URL === process.env.COSTCAP_UPSTREAM_GROQ_BASE_URL, /\\/u\\/groq$/.test(process.env.GROQ_BASE_URL));
     const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"llama-3.3-70b"})});
     const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"llama-3.3-70b"})});
     console.log(a.status, b.status);`;
   const receipts = path.join(dir, "r.jsonl");
   const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.05", "--receipts", receipts, "--upstream", `groq=http://127.0.0.1:${up.port}/openai,env=GROQ_BASE_URL`, "--upstream-prices", prices, "--", process.execPath, "--input-type=module", "-e", script]);
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.05", "--receipts", receipts, "--upstream", `groq=http://127.0.0.1:${up.port},env=GROQ_BASE_URL`, "--upstream-prices", prices, "--", process.execPath, "--input-type=module", "-e", script]);
     let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
     c.on("exit", (code) => resolve({ code, out }));
   });
@@ -446,6 +446,64 @@ test("wrap --upstream routes the child through GROQ_BASE_URL, prices from --upst
   const first = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.provider === "u/groq" && !r.blocked);
   assert.equal(first.cost_usd, 0.1);
   assert.equal(first.cost_source, "user_prices");
+});
+
+// #190 AC2/AC3: a vLLM-shaped upstream serves only /v1/chat/completions; the child calls exactly
+// $OPENAI_BASE_URL/chat/completions, as the OpenAI SDK does.
+async function wrapVllm(t, urlSuffix, calls = 2) {
+  const hits = [];
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => {
+      hits.push(q.url);
+      if (q.url !== "/v1/chat/completions") { res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ detail: "Not Found" })); return; }
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "qwen3", usage: { prompt_tokens: 100_000, completion_tokens: 100_000 } }));
+    });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const prices = path.join(dir, "prices.json");
+  writeFileSync(prices, JSON.stringify({ version: "p1", upstreams: { vllm: { qwen3: { input: 0.5, output: 0.5 } } } }));
+  const script = `
+    const out = [];
+    for (let i = 0; i < ${calls}; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions",{method:"POST",body:JSON.stringify({model:"qwen3"})}); out.push(r.status); }
+    console.log(out.join(" "));`;
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.05", "--receipts", receipts, "--upstream", `vllm=http://127.0.0.1:${up.port}${urlSuffix},env=OPENAI_BASE_URL`, "--upstream-prices", prices, "--", process.execPath, "--input-type=module", "-e", script]);
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  let lines = [];
+  try { lines = readFileSync(receipts, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { /* no receipts */ }
+  return { ...res, hits, lines };
+}
+
+test("#190 vLLM with URL .../v1: the OpenAI SDK path is forwarded, metered and capped, no 404 hint", async (t) => {
+  const r = await wrapVllm(t, "/v1");
+  assert.equal(r.code, 0);
+  assert.equal(r.out.trim(), "200 429");
+  assert.deepEqual(r.hits, ["/v1/chat/completions"]);
+  const first = r.lines.find((l) => l.provider === "u/vllm" && !l.blocked && !l.event);
+  assert.equal(first.cost_usd, 0.1);
+  assert.equal(first.cost_source, "user_prices");
+  assert.doesNotMatch(r.err, /returned 404/);
+});
+
+test("#190 vLLM without /v1: the 404 passes through uncharged with exactly one hint", async (t) => {
+  const r = await wrapVllm(t, "", 3);
+  assert.equal(r.code, 0);
+  assert.equal(r.out.trim(), "404 404 404");
+  assert.deepEqual(r.hits, ["/chat/completions", "/chat/completions", "/chat/completions"]);
+  const hints = r.err.split("\n").filter((l) => l.includes("returned 404"));
+  assert.deepEqual(hints, ['costcap: upstream "vllm" returned 404 for /chat/completions; does --upstream URL need a /v1 suffix?']);
+  const charged = r.lines.filter((l) => typeof l.cost_usd === "number" && l.cost_usd > 0);
+  assert.deepEqual(charged, []);
+});
+
+test("#190 wrap --help says --upstream URL is the SDK base_url", () => {
+  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--help"], { encoding: "utf8" });
+  assert.match(r.stdout + r.stderr, /--upstream URL is the base your SDK would use without costcap/);
 });
 
 test("wrap exits 2 and spawns nothing for a bad --upstream or prices file", () => {

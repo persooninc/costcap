@@ -313,6 +313,18 @@ export function isCloudError(raw) {
 
 const REJECTED_STATUSES = new Set([400, 401, 403, 404, 409, 413, 422, 429]);
 
+/**
+ * #190: a custom upstream's 404 for an unserved route (vLLM/FastAPI `{"detail":"Not Found"}`, a
+ * plain-text or HTML page) generated nothing. Any body that mentions usage stays unknown.
+ */
+export function isRouteNotFound(raw) {
+  const text = raw.toString("utf8");
+  try {
+    const body = JSON.parse(text);
+    return !!body && typeof body === "object" && !Array.isArray(body) && !Object.hasOwn(body, "usage") && !Object.hasOwn(body, "usageMetadata");
+  } catch { return !/usage/i.test(text); }
+}
+
 /** True when a body is a provider error object ({error:{...}}, Gemini may wrap it in an array) with no usage. */
 export function isProviderError(raw) {
   let body;
@@ -444,6 +456,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       try { onWarning(warningLine(done)); } catch { /* stderr is best effort */ }
     }
   };
+  // #190: one stderr hint when a custom upstream's first response is a 404 (usually a missing /v1).
+  const customFirstSeen = new Set();
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     let [, provider, ...rest] = url.pathname.split("/");
@@ -656,6 +670,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
             redirect: "manual",
             signal: abort.signal });
+          if (custom && !customFirstSeen.has(provider)) {
+            customFirstSeen.add(provider);
+            if (upstreamRes.status === 404) {
+              try { onWarning(`costcap: upstream "${provider.slice(2)}" returned 404 for /${rest.join("/")}; does --upstream URL need a /v1 suffix?`); } catch { /* stderr is best effort */ }
+            }
+          }
           if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
             clearTimeout(timer);
             res.off("close", onClientClose);
@@ -745,7 +765,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
             failMsg = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
-          } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && (isProviderError(raw) || (cloud && isCloudError(raw)))) {
+          } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && (isProviderError(raw) || (cloud && isCloudError(raw)) || (custom && upstreamRes.status === 404 && isRouteNotFound(raw)))) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
           } else if (raw && batchCreate && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchIdOf(raw)) {

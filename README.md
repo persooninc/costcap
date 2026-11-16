@@ -91,19 +91,25 @@ traffic bypasses CostCap.
 
 Groq, DeepSeek, Together, Mistral, a self-hosted vLLM/Ollama server or an Azure
 OpenAI deployment can be metered and capped with `--upstream NAME=URL[,env=VAR][,insecure]`
-(repeatable). The proxy forwards `/u/<NAME>/<rest>` to `URL/<rest>` (query and
+(repeatable). `URL` is the base your SDK would use *without* costcap (the same
+value you would put in `base_url`). The proxy forwards `/u/<NAME>/<rest>` to `URL/<rest>` (query and
 headers, including Azure's `api-key`, pass through; redirects are refused) and
 sets `COSTCAP_UPSTREAM_<NAME>_BASE_URL=http://127.0.0.1:<port>/u/<NAME>` for the
 child, plus `VAR` when `env=VAR` is given. `URL` must be `https`; plain `http` is
 allowed for loopback hosts, or any host with `,insecure` (warned on stderr).
-Receipts record `provider: "u/<NAME>"`.
+Receipts record `provider: "u/<NAME>"`. If a custom upstream's first response in a
+wrap is a 404, costcap prints one stderr hint per name:
+`costcap: upstream "<NAME>" returned 404 for /<path>; does --upstream URL need a /v1 suffix?`
 
 ```bash
-# Groq
-costcap wrap --upstream groq=https://api.groq.com/openai,env=GROQ_BASE_URL --upstream-prices prices.json --cap 1 -- node agent.js
-# Point an OpenAI SDK at a local vLLM box
-costcap wrap --upstream vllm=http://127.0.0.1:8000,env=OPENAI_BASE_URL --upstream-prices prices.json -- python agent.py
-# Azure OpenAI (send requests to $AZURE_OPENAI_ENDPOINT/openai/deployments/<dep>/...)
+# Groq with the OpenAI SDK (base_url https://api.groq.com/openai/v1)
+costcap wrap --upstream groq=https://api.groq.com/openai/v1,env=OPENAI_BASE_URL --upstream-prices prices.json --cap 1 -- node agent.js
+# Groq with the Groq SDK (it appends /openai/v1/... to GROQ_BASE_URL itself)
+costcap wrap --upstream groq=https://api.groq.com,env=GROQ_BASE_URL --upstream-prices prices.json --cap 1 -- node agent.js
+# Point an OpenAI SDK at a local vLLM box (vLLM serves the OpenAI API under /v1)
+costcap wrap --upstream vllm=http://127.0.0.1:8000/v1,env=OPENAI_BASE_URL --upstream-prices prices.json -- python agent.py
+# Azure OpenAI with the openai SDK's AzureOpenAI client: it appends /openai/deployments/<dep>/...
+# to AZURE_OPENAI_ENDPOINT, so URL is the bare resource endpoint (no /openai suffix)
 costcap wrap --upstream azure=https://my-resource.openai.azure.com,env=AZURE_OPENAI_ENDPOINT --upstream-prices prices.json -- node agent.js
 ```
 
