@@ -82,3 +82,25 @@ test("AC6: README embeds the actionlint-checked example workflow with documented
   const action = readFileSync("action.yml", "utf8");
   for (const m of y.matchAll(/^ {10}([a-z-]+):/gm)) if (/costcap@/.test(y)) assert.ok(["receipts", "cap", "summary-out", "baseline", "max-increase-pct", "max-increase-usd", "name", "path", "workflow", "branch"].includes(m[1]) && (["name", "path", "workflow", "branch"].includes(m[1]) || action.includes(`  ${m[1]}:`)), m[1]);
 });
+
+test("#231: summary of a ledger with an unknown tagged receipt, then diff --markdown shows ≥ rows", () => {
+  const d = tmp();
+  writeFileSync(join(d, "base.jsonl"), [
+    { id: "b1", ts: "2026-11-01T00:00:00Z", model: "gpt-5", cost_usd: 0.4, tags: { feature: "search" } },
+    { id: "b2", ts: "2026-11-01T00:00:01Z", model: "sonnet", cost_usd: 0.6, tags: { feature: "chat" } },
+  ].map((r) => JSON.stringify(r)).join("\n") + "\n");
+  writeFileSync(join(d, "head.jsonl"), [
+    { id: "h1", ts: "2026-11-01T00:00:00Z", model: "gpt-5", cost_usd: null, tags: { feature: "search" } },
+    { id: "h2", ts: "2026-11-01T00:00:01Z", model: "sonnet", cost_usd: 0.6, tags: { feature: "chat" } },
+  ].map((r) => JSON.stringify(r)).join("\n") + "\n");
+  for (const n of ["base", "head"]) {
+    const s = cli(["summary", "--receipts", join(d, `${n}.jsonl`), "--json"]);
+    assert.equal(s.status, 0, s.stderr); writeFileSync(join(d, `${n}.json`), s.stdout);
+  }
+  assert.deepEqual(JSON.parse(readFileSync(join(d, "head.json"), "utf8")).by_tag_unknown, { feature: { search: 1 } });
+  const r = cli(["diff", "--baseline", join(d, "base.json"), "--current", join(d, "head.json"), "--markdown"]);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stdout, /\| model \| gpt-5 \| unknown_cost \(1 unknown-cost\) \| \$0\.40 \| ≥\$0\.00 \| ≥-\$0\.40 \(≥-100%\) \|/);
+  assert.match(r.stdout, /\| tag \| feature=search \| unknown_cost/);
+  assert.doesNotMatch(r.stdout, /removed/);
+});

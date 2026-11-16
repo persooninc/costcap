@@ -86,3 +86,43 @@ test("diffOutputs: verdict escalation, inf pct, lower bound blanks", () => {
   const lb = diffOutputs({ verdict: "accounting_unavailable" }, diffSummaries(base, { ...head, unknown_cost_count: 1 }));
   assert.equal(lb["delta-usd"], ""); assert.equal(lb["delta-pct"], "");
 });
+
+// #231: per-row lower bounds for unknown cost.
+const ledger231 = (gptCost) => [
+  { model: "gpt-5", cost_usd: gptCost, tags: { feature: "search" } },
+  { model: "sonnet", cost_usd: 0.6, tags: { feature: "chat" } },
+];
+
+test("#231 AC1: by_tag_unknown counts unknown tagged receipts; omitted when empty; old summaries parse", () => {
+  const s = buildCostSummary(ledger231(null));
+  assert.deepEqual(s.by_tag_unknown, { feature: { search: 1 } });
+  assert.deepEqual(s.by_tag, { feature: { chat: 0.6 } });
+  assert.equal(Object.hasOwn(buildCostSummary(ledger231(0.4)), "by_tag_unknown"), false);
+  const old = parseSummary(JSON.stringify({ version: 1, total_usd: 1, by_model: {} }));
+  assert.deepEqual(old.by_tag_unknown, {});
+});
+
+test("#231 AC2/AC3: current-unknown rows are ≥ lower bounds, never removed; verdict unchanged", () => {
+  const d = diffSummaries(buildCostSummary(ledger231(0.4)), buildCostSummary(ledger231(null)));
+  assert.equal(d.verdict, "accounting_unavailable"); assert.equal(d.exit_code, 3);
+  const m = d.changes.find((r) => r.key === "gpt-5"), t = d.changes.find((r) => r.key === "feature=search");
+  for (const r of [m, t]) {
+    assert.equal(r.status, "unknown_cost"); assert.equal(r.current_unknown_count, 1); assert.equal(r.baseline_unknown_count, 0); assert.equal(r.lower_bound, true);
+  }
+  const txt = formatDiffText(d);
+  assert.match(txt, /model gpt-5: unknown_cost ≥-\$0\.40 \(≥-100%\)  \$0\.40 -> ≥\$0\.00/);
+  assert.match(txt, /tag feature=search: unknown_cost ≥-\$0\.40 \(≥-100%\)/);
+  assert.doesNotMatch(txt, /removed/);
+  const mdOut = formatDiffMarkdown(d);
+  assert.match(mdOut, /\| tag \| feature=search \| unknown_cost \(1 unknown-cost\) \| \$0\.40 \| ≥\$0\.00 \| ≥-\$0\.40 \(≥-100%\) \|/);
+  assert.doesNotMatch(mdOut, /removed/);
+});
+
+test("#231 AC4: baseline-only unknown rows are marked baseline_incomplete", () => {
+  const d = diffSummaries(buildCostSummary(ledger231(null)), buildCostSummary(ledger231(0.4)));
+  const m = d.changes.find((r) => r.key === "gpt-5"), t = d.changes.find((r) => r.key === "feature=search");
+  assert.equal(m.status, "changed"); assert.equal(m.baseline_incomplete, true);
+  assert.equal(t.status, "changed"); assert.equal(t.baseline_incomplete, true);
+  assert.match(formatDiffText(d), /tag feature=search: changed \+\$0\.40 \(\+∞%\)  \$0\.00 -> \$0\.40 \(baseline_incomplete: 1 unknown-cost\)/);
+  assert.equal(d.verdict, "ok");
+});

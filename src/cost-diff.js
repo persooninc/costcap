@@ -13,7 +13,7 @@ const r6 = (n) => Number(Number(n).toFixed(6));
 export function buildCostSummary(receipts, { runId } = {}) {
   let total = 0, calls = 0, unknown = 0;
   const tokens = { in: 0, out: 0, cached: 0 };
-  const by_model = {}, by_tag = {};
+  const by_model = {}, by_tag = {}, by_tag_unknown = {};
   for (const r of receipts) {
     if (!r || r.event || r.blocked) continue;
     if (runId != null && r.run_id !== runId) continue;
@@ -25,14 +25,16 @@ export function buildCostSummary(receipts, { runId } = {}) {
     m.calls++;
     const known = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd);
     if (known) { total += r.cost_usd; m.cost_usd = r6(m.cost_usd + r.cost_usd); } else { unknown++; m.unknown_cost_count++; }
-    if (r.tags && typeof r.tags === "object" && known) {
+    if (r.tags && typeof r.tags === "object") {
       for (const [k, v] of Object.entries(r.tags)) {
-        const t = (by_tag[k] ??= {});
-        t[v] = r6((t[v] ?? 0) + r.cost_usd);
+        if (known) { const t = (by_tag[k] ??= {}); t[v] = r6((t[v] ?? 0) + r.cost_usd); }
+        else { const t = (by_tag_unknown[k] ??= {}); t[v] = (t[v] ?? 0) + 1; }
       }
     }
   }
   const s = { version: SUMMARY_VERSION, total_usd: r6(total), calls, tokens, unknown_cost_count: unknown, by_model, by_tag };
+  // #231: per-tag unknown-cost counts; omitted when empty so fully-priced summaries stay byte-identical.
+  if (Object.keys(by_tag_unknown).length) s.by_tag_unknown = by_tag_unknown;
   if (runId != null) s.run_id = runId;
   return s;
 }
@@ -53,7 +55,7 @@ export function parseSummary(text, label = "summary") {
   try { s = JSON.parse(text); } catch (e) { throw new Error(`${label} is not valid JSON: ${e.message}`); }
   if (!s || s.version !== SUMMARY_VERSION || typeof s.total_usd !== "number" || typeof s.by_model !== "object")
     throw new Error(`${label} is not a costcap summary v${SUMMARY_VERSION} (make it with: costcap summary --json)`);
-  return { calls: 0, tokens: {}, unknown_cost_count: 0, by_tag: {}, ...s };
+  return { calls: 0, tokens: {}, unknown_cost_count: 0, by_tag: {}, by_tag_unknown: {}, ...s };
 }
 
 export const readSummary = (path, label = path) => parseSummary(readFileSync(path, "utf8"), label);
@@ -67,19 +69,35 @@ function delta(base, cur) {
   return { baseline: r6(base), current: r6(cur), delta: r6(cur - base), pct: pct(base, cur) };
 }
 
+// #231: b/c map key -> { usd, unknown }. A row with current unknown cost is a lower bound and never "removed";
+// a row with baseline-only unknown cost carries baseline_incomplete instead of looking like a plain add/drop.
 function rows(kind, b = {}, c = {}) {
   const out = [];
   for (const key of new Set([...Object.keys(b), ...Object.keys(c)])) {
     const inB = Object.hasOwn(b, key), inC = Object.hasOwn(c, key);
-    const d = delta(inB ? b[key] : 0, inC ? c[key] : 0);
-    const status = !inB ? "added" : !inC ? "removed" : d.delta === 0 ? "unchanged" : "changed";
-    out.push({ kind, key, status, ...d });
+    const bu = inB ? b[key].unknown : 0, cu = inC ? c[key].unknown : 0;
+    const d = delta(inB ? b[key].usd : 0, inC ? c[key].usd : 0);
+    const status = !inB ? "added" : !inC ? "removed" : cu > 0 ? "unknown_cost" : d.delta === 0 && bu === 0 ? "unchanged" : "changed";
+    const row = { kind, key, status, ...d, baseline_unknown_count: bu, current_unknown_count: cu, lower_bound: cu > 0 };
+    if (bu > 0 && cu === 0) row.baseline_incomplete = true;
+    out.push(row);
   }
   return out;
 }
 
-const modelUsd = (s) => Object.fromEntries(Object.entries(s.by_model).map(([k, v]) => [k, v?.cost_usd ?? 0]));
-const tagUsd = (s) => Object.fromEntries(Object.entries(s.by_tag ?? {}).flatMap(([k, vals]) => Object.entries(vals).map(([v, usd]) => [`${k}=${v}`, usd])));
+const modelUsd = (s) => Object.fromEntries(Object.entries(s.by_model).map(([k, v]) => [k, { usd: v?.cost_usd ?? 0, unknown: v?.unknown_cost_count ?? 0 }]));
+function tagUsd(s) {
+  const out = {};
+  for (const [k, vals] of Object.entries(s.by_tag ?? {})) for (const [v, usd] of Object.entries(vals ?? {})) (out[`${k}=${v}`] ??= { usd: 0, unknown: 0 }).usd = usd;
+  for (const [k, vals] of Object.entries(s.by_tag_unknown ?? {})) for (const [v, n] of Object.entries(vals ?? {})) (out[`${k}=${v}`] ??= { usd: 0, unknown: 0 }).unknown = Number(n) || 0;
+  return out;
+}
+
+function rowCells(r) {
+  const ge = r.lower_bound ? "≥" : "";
+  const note = r.lower_bound ? ` (${r.current_unknown_count} unknown-cost)` : r.baseline_incomplete ? ` (baseline_incomplete: ${r.baseline_unknown_count} unknown-cost)` : "";
+  return { cur: `${ge}${fmtUsd(r.current)}`, change: `${ge}${fmtUsd(r.delta, true)} (${ge}${fmtPct(r.pct)})`, note };
+}
 
 /** Compare two summaries. Thresholds are optional; maxPct/maxUsd fail when the increase is strictly greater. */
 export function diffSummaries(baseline, current, { maxPct, maxUsd } = {}) {
@@ -138,7 +156,7 @@ export function formatDiffText(d) {
     `calls: ${d.calls.baseline} -> ${d.calls.current}  ${fmtNum(d.calls.delta, true)} (${fmtPct(d.calls.pct)})`,
     ...["in", "out", "cached"].map((k) => `tokens ${k}: ${d.tokens[k].baseline} -> ${d.tokens[k].current}  ${fmtNum(d.tokens[k].delta, true)} (${fmtPct(d.tokens[k].pct)})`),
   ];
-  for (const r of d.changes.slice(0, MAX_ROWS)) lines.push(`${r.kind} ${r.key}: ${r.status} ${fmtUsd(r.delta, true)} (${fmtPct(r.pct)})  ${fmtUsd(r.baseline)} -> ${fmtUsd(r.current)}`);
+  for (const r of d.changes.slice(0, MAX_ROWS)) { const c = rowCells(r); lines.push(`${r.kind} ${r.key}: ${r.status} ${c.change}  ${fmtUsd(r.baseline)} -> ${c.cur}${c.note}`); }
   if (d.changes.length > MAX_ROWS) lines.push(`${d.changes.length - MAX_ROWS} more`);
   lines.push(verdictLine(d));
   return lines.join("\n");
@@ -154,7 +172,7 @@ export function formatDiffMarkdown(d) {
     ["in", "out", "cached"].map((k) => `| Tokens ${k} | ${d.tokens[k].baseline} | ${d.tokens[k].current} | ${fmtNum(d.tokens[k].delta, true)} (${fmtPct(d.tokens[k].pct)}) |\n`).join("");
   if (d.changes.length) {
     out += `\n| Kind | Name | Status | Baseline | Current | Change |\n| --- | --- | --- | --- | --- | --- |\n`;
-    for (const r of d.changes.slice(0, MAX_ROWS)) out += `| ${r.kind} | ${md(r.key)} | ${r.status} | ${fmtUsd(r.baseline)} | ${fmtUsd(r.current)} | ${fmtUsd(r.delta, true)} (${fmtPct(r.pct)}) |\n`;
+    for (const r of d.changes.slice(0, MAX_ROWS)) { const c = rowCells(r); out += `| ${r.kind} | ${md(r.key)} | ${r.status}${md(c.note)} | ${fmtUsd(r.baseline)} | ${c.cur} | ${c.change} |\n`; }
     if (d.changes.length > MAX_ROWS) out += `\n${d.changes.length - MAX_ROWS} more\n`;
   }
   return out + `\n${md(verdictLine(d))}\n`;
