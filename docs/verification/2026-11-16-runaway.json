@@ -1,5 +1,5 @@
 {
-  "checkedAt": "2026-11-16T06:21:59.448Z",
+  "checkedAt": "2026-11-16T06:53:08.742Z",
   "command": "npm run acceptance:runaway",
   "provider": "local fake OpenAI",
   "paidCalls": 0,
@@ -18,8 +18,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "61aec06e-227f-4dc8-ba03-9138ecd8ae69",
-          "ts": "2026-11-16T06:21:47.420Z",
+          "id": "628f720b-bd0b-42e9-ab57-5571174a2a3f",
+          "ts": "2026-11-16T06:53:05.401Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -31,14 +31,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "f0a0895e-e35c-4eaf-8a5b-76bfc921ce50",
-          "ts": "2026-11-16T06:21:47.469Z",
+          "id": "f8f31f28-05a9-437b-b310-9207e9043303",
+          "ts": "2026-11-16T06:53:05.416Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -68,8 +69,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "0561306b-b6f3-4e43-ba8e-cfe2241eb43f",
-          "ts": "2026-11-16T06:21:48.809Z",
+          "id": "96619850-8722-48aa-97c8-0e25039bab26",
+          "ts": "2026-11-16T06:53:05.792Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -81,14 +82,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "633381d0-2796-4c8d-831c-7d63f12c2eb4",
-          "ts": "2026-11-16T06:21:48.862Z",
+          "id": "26e2fadb-6b0b-4808-8602-187de0e2437b",
+          "ts": "2026-11-16T06:53:05.812Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -100,14 +102,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "f032863d-397f-4b03-b978-379174cabda6",
-          "ts": "2026-11-16T06:21:48.924Z",
+          "id": "2553636a-398a-475a-94df-8574ccac8240",
+          "ts": "2026-11-16T06:53:05.820Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -119,14 +122,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "d153109d-c936-462f-8780-c7dc2d6a9770",
-          "ts": "2026-11-16T06:21:48.975Z",
+          "id": "8b3814ff-bd83-4d73-9eec-c43747f61084",
+          "ts": "2026-11-16T06:53:05.829Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -138,14 +142,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "2d068912-3015-40f4-936d-f76caa26ba15",
-          "ts": "2026-11-16T06:21:49.006Z",
+          "id": "15870ef5-40fb-487d-ac2f-1e42dbe5bfc2",
+          "ts": "2026-11-16T06:53:05.837Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -157,14 +162,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "2b46bace-a75e-4564-9944-6bab3381dcd7",
-          "ts": "2026-11-16T06:21:49.019Z",
+          "id": "ee13ea22-ffa2-44d3-ab79-e61a9d3c48b9",
+          "ts": "2026-11-16T06:53:05.841Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -192,8 +198,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "f8a7f594-345a-48bd-9d97-ae6e45a0c501",
-          "ts": "2026-11-16T06:21:49.893Z",
+          "id": "4e69bc96-6711-40ac-b7b5-555e4d74bb93",
+          "ts": "2026-11-16T06:53:06.219Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -205,14 +211,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "8ddfd37a-5f4f-4701-8102-fb495abf86c2",
-          "ts": "2026-11-16T06:21:49.934Z",
+          "id": "835b601f-068d-44db-8dc1-c8abf8241efc",
+          "ts": "2026-11-16T06:53:06.237Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -224,14 +231,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "0c8e9fe5-ea11-4dc1-9c11-e96dc8b6821e",
-          "ts": "2026-11-16T06:21:49.956Z",
+          "id": "1d3f74ee-ad7b-4025-ae09-8f89ae0e4dd2",
+          "ts": "2026-11-16T06:53:06.246Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -243,14 +251,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "383d0dc7-001e-4797-a5d4-3e26532c892f",
-          "ts": "2026-11-16T06:21:49.966Z",
+          "id": "cbaa03d8-a8d9-47ae-9121-f32790e2cc2b",
+          "ts": "2026-11-16T06:53:06.249Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -275,13 +284,13 @@
       "receipts": [
         {
           "id": "seed-day",
-          "ts": "2026-11-16T06:21:50.226Z",
+          "ts": "2026-11-16T06:53:06.342Z",
           "cost_usd": 1,
           "model": "gpt-4o-mini"
         },
         {
-          "id": "6967bd6a-229f-47dc-a80f-0eb8590cd926",
-          "ts": "2026-11-16T06:21:50.792Z",
+          "id": "3fb085d3-bc9b-4b2d-b549-ee40b638e099",
+          "ts": "2026-11-16T06:53:06.603Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -312,8 +321,8 @@
           "model": "gpt-4o-mini"
         },
         {
-          "id": "82b6c461-a73c-43eb-b335-f2772f514d7a",
-          "ts": "2026-11-16T06:21:52.297Z",
+          "id": "763722fb-6afa-4589-b70b-fc459a92f186",
+          "ts": "2026-11-16T06:53:06.911Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -339,14 +348,14 @@
       "receipts": [
         {
           "id": "seed-unknown",
-          "ts": "2026-11-16T06:21:50.226Z",
+          "ts": "2026-11-16T06:53:06.342Z",
           "cost_usd": null,
           "model": "gpt-4o-mini",
           "reason": "usage_unavailable"
         },
         {
-          "id": "6078b33e-0d55-4762-ae4c-662a9442e8ce",
-          "ts": "2026-11-16T06:21:54.079Z",
+          "id": "aab20cb3-fa08-4975-953b-26552a7cced7",
+          "ts": "2026-11-16T06:53:07.194Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -371,15 +380,15 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "b39c3004-d214-4621-9c33-8badbf235b18",
-          "ts": "2026-11-16T06:21:58.891Z",
+          "id": "7e67df27-6d62-4f9a-b17e-be513b092a81",
+          "ts": "2026-11-16T06:53:08.701Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
           "reason": "killed",
           "cost_usd": 0,
           "kill_scope": "project",
-          "kill_file": "/tmp/cc-runaway-NKbDMJ/KILL",
+          "kill_file": "/tmp/cc-runaway-jBsfB2/KILL",
           "note": "synthetic frozen"
         }
       ]
@@ -398,8 +407,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "c61eed5c-9e1c-4e0e-b3ce-db379a8cc1ef",
-          "ts": "2026-11-16T06:21:56.094Z",
+          "id": "60d96028-47ed-4d87-8923-880faf752337",
+          "ts": "2026-11-16T06:53:08.240Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -411,14 +420,15 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "table_version": "2026-11-16",
-          "table_sha256": "9e780b39cc88b65c7aa5f842f7b424bfb430c66033753db439bc1de21a8e3758",
+          "pricing_tier": "standard",
+          "table_version": "2026-11-16.1",
+          "table_sha256": "3e24f1d525f2499a93902eddceafcad92ed704c3cdaf8f01cfaac9eaf8d60e66",
           "fallback": false,
           "cost_source": "table"
         },
         {
-          "id": "26827de1-2344-451f-a604-4a234198a3bc",
-          "ts": "2026-11-16T06:21:56.130Z",
+          "id": "a980ece0-8ddd-46be-b8dd-2040ab8cdfb6",
+          "ts": "2026-11-16T06:53:08.248Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,

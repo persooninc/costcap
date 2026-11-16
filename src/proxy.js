@@ -201,8 +201,14 @@ export function isProviderError(raw) {
   return Boolean(body.error) && typeof body.error === "object";
 }
 
+// #154: SDK-matching defaults. timeoutMs bounds time to the response headers (and a
+// non-streamed body); streamIdleMs bounds the gap between SSE chunks, not total length.
+export const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
+export const DEFAULT_STREAM_IDLE_MS = 300_000;
+export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -232,7 +238,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     req.on("data", (chunk) => { size += chunk.length; if (size > maxBodyBytes) { tooLarge = true; chunks.length = 0; } else if (!tooLarge) chunks.push(chunk); });
     req.on("error", () => {});
     req.on("end", () => {
-      if (tooLarge) { send(413, { error: "request_too_large" }); return; }
+      if (tooLarge) {
+        // #154: refused before forwarding, nothing billed. Recorded, never latched.
+        queue = queue.then(() => {
+          emit({ provider, path: receiptPath(`/${rest.join("/")}`, url.search), blocked: true, reason: "request_too_large", cost_usd: 0, bytes_limit: maxBodyBytes });
+          send(413, { error: "request_too_large", bytes_limit: maxBodyBytes,
+            message: `CostCap: request body is over the ${Number((maxBodyBytes / 1048576).toFixed(2))} MB proxy limit. Raise it with COSTCAP_MAX_REQUEST_MB. The upstream call was not made.` });
+        }).catch(() => { send(503, { error: "receipt_ledger_unavailable" }); });
+        return;
+      }
       const body = Buffer.concat(chunks);
       const run = async () => {
         if (res.destroyed) return;
@@ -293,14 +307,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
         try {
           const abort = new AbortController();
+          let timer;
+          const arm = (ms) => { clearTimeout(timer); timer = setTimeout(() => abort.abort(new Error("upstream_timeout")), ms); timer.unref?.(); };
+          arm(timeoutMs);
           const onClientClose = () => { if (!res.writableFinished) abort.abort(); };
           res.once("close", onClientClose);
           const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
             body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
             // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
             redirect: "manual",
-            signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), abort.signal]) });
+            signal: abort.signal });
           if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+            clearTimeout(timer);
             res.off("close", onClientClose);
             upstreamRes.body?.cancel().catch(() => {});
             // Nothing was generated: the provider answered with a redirect, not a completion.
@@ -316,6 +334,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             const parser = createSseUsageParser(provider, requestedModel);
             const decoder = new TextDecoder();
+            arm(streamIdleMs);
             if (!res.destroyed) {
               res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache" });
               res.flushHeaders();
@@ -325,6 +344,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                arm(streamIdleMs);
                 parser.push(decoder.decode(value, { stream: true }));
                 if (res.destroyed) throw new Error("client_closed");
                 if (!res.write(value)) {
@@ -345,6 +365,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
+          clearTimeout(timer);
           res.off("close", onClientClose);
           if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));

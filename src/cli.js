@@ -25,7 +25,8 @@ import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] -- <command...>\n" +
+  "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
@@ -75,7 +76,8 @@ export function parseWrapArgs(argv) {
     } else if (f === "--unknown-models") {
       if (v !== "refuse" && v !== "fallback") throw new Error(`--unknown-models must be refuse or fallback, got "${v}"`);
       opts.unknownModels = v;
-    } else if (f === "--receipts") opts.receiptsPath = v;
+    } else if (f === "--timeout") opts.timeoutS = positiveNumber(f, v);
+    else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
     else if (f === "--agent") opts.agentId = v;
@@ -84,6 +86,21 @@ export function parseWrapArgs(argv) {
     else throw new Error(`unknown flag ${f}`);
   }
   return opts;
+}
+
+function positiveNumber(name, v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number, got "${v}"`);
+  return n;
+}
+
+/** #154: proxy timeouts and body limit from --timeout and env, with SDK-matching defaults. */
+export function proxyLimits({ timeoutS } = {}, env = process.env) {
+  const fromEnv = (key) => (env[key] === undefined || env[key] === "" ? undefined : positiveNumber(key, env[key]));
+  const upstreamS = timeoutS ?? fromEnv("COSTCAP_UPSTREAM_TIMEOUT_S") ?? 600;
+  const idleS = fromEnv("COSTCAP_STREAM_IDLE_TIMEOUT_S") ?? 300;
+  const maxMb = fromEnv("COSTCAP_MAX_REQUEST_MB") ?? 32;
+  return { timeoutMs: Math.round(upstreamS * 1000), streamIdleMs: Math.round(idleS * 1000), maxBodyBytes: Math.round(maxMb * 1024 * 1024) };
 }
 
 function parseKillArgs(argv) {
@@ -101,7 +118,8 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS } = parseWrapArgs(argv);
+  const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
   // --preflight or COSTCAP_PREFLIGHT=1 (CC-9): refuse calls whose estimated worst case cannot fit.
@@ -142,7 +160,7 @@ export async function wrap(argv) {
   const runReceipts = [];
   const summaryRunId = who.run_id ?? randomUUID();
   const startedAt = new Date().toISOString();
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight,
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   const env = { ...process.env };

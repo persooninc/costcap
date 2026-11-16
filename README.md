@@ -180,7 +180,14 @@ traffic bypasses CostCap.
   blocks the **next** call; a call already in flight can overshoot the cap. A
   stream cut (upstream error, client abort or timeout) before usage arrives
   records `cost_usd: null` with `reason: "stream_incomplete"` and blocks further
-  calls. The proxy timeout covers the whole stream. OpenAI Responses API streams
+  calls. Timeouts match the official SDKs: the proxy waits up to 600s for the
+  first response byte (`wrap --timeout <seconds>` or `COSTCAP_UPSTREAM_TIMEOUT_S`),
+  then a stream is cut only after it goes silent for 300s
+  (`COSTCAP_STREAM_IDLE_TIMEOUT_S`), so long streams that keep sending chunks are
+  never cut. Request bodies up to 32 MB are forwarded (`COSTCAP_MAX_REQUEST_MB`);
+  a larger body gets a 413 naming the limit and a zero-cost
+  `reason: "request_too_large"` receipt with `bytes_limit`, and does not block
+  later calls. OpenAI Responses API streams
   are metered from the terminal `response.completed` / `response.incomplete` /
   `response.failed` event (cached input priced as cached); a Responses stream that
   ends without a terminal event records `stream_incomplete`. OpenAI chat/Responses,

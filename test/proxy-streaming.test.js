@@ -136,8 +136,8 @@ test("client abort mid-stream closes the upstream request and writes the incompl
   assert.equal(receipts[0].cost_usd, null);
 });
 
-test("timeout mid-stream is treated as a cut stream", async (t) => {
-  const { receipts, proxy } = await setup(t, OPENAI_EVENTS, { gapMs: 300 }, { timeoutMs: 150 });
+test("#154 idle timeout mid-stream (gap longer than streamIdleMs) is treated as a cut stream", async (t) => {
+  const { receipts, proxy } = await setup(t, OPENAI_EVENTS, { gapMs: 300 }, { streamIdleMs: 150 });
   await assert.rejects(streamCall(proxy, "/openai/v1/chat/completions"));
   for (let i = 0; i < 50 && !receipts.length; i++) await tick();
   assert.equal(receipts[0].reason, "stream_incomplete");
