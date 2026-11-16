@@ -49,7 +49,7 @@ test("#118 evidence audit is org-scoped, oldest first, with agent_ids normalized
   assert.deepEqual(doc.audit.map((e) => e.action), ["policy.change", "fleet.freeze", "fleet.resume"]);
   assert.deepEqual(doc.audit[0].detail.previous.caps, { day: 1 });
   assert.deepEqual(doc.audit[0].detail.policy.caps, { day: 5 });
-  assert.deepEqual(doc.audit[1], { ts: "2026-11-15T03:00:00.000Z", actor: "u1", action: "fleet.freeze", target: null, detail: { reason: "incident", agent_ids: ["a1"] } });
+  assert.deepEqual(doc.audit[1], { ts: "2026-11-15T03:00:00.000Z", actor: "u1", actor_label: "unknown", action: "fleet.freeze", target: null, target_label: null, detail: { reason: "incident", agent_ids: ["a1"] } });
   assert.deepEqual(doc.audit[2].detail, {});
   assert.equal(JSON.stringify(doc).includes("o2"), false);
 });

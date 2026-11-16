@@ -4,7 +4,7 @@
 const COLUMNS = ["ts", "agent_id", "receipt_id", "model", "cost_usd", "settled_cost_usd", "settle_source", "reason", "scope"];
 export const RECEIPT_CSV_LIMIT = 5000;
 
-function cell(value) {
+export function cell(value) {
   let text = value == null ? "" : String(value);
   if (/^[=+@\t\r]/.test(text) || /^-(?!\d)/.test(text)) text = `'${text}`;
   if (/[",\n\r]/.test(text)) text = `"${text.replace(/"/g, '""')}"`;

@@ -53,6 +53,13 @@ test("admin settles an unknown-cost receipt; viewer has no Settle control", asyn
     await expect(page.locator("#cost")).toHaveText("$3.50");
     await expect(row.getByRole("button", { name: "Settle" })).toHaveCount(0);
 
+    // Issue #133: the audit row names the human and the agent, not UUIDs; CSV link present.
+    await page.locator(".agent").first().locator("input[name=day]").fill("7");
+    await page.locator(".agent").first().getByRole("button", { name: "Save caps" }).click();
+    await expect(page.locator("#audit")).toContainText("settle-admin@example.invalid · policy.change · settle-agent");
+    await expect(page.locator("#audit")).not.toContainText(agent.agentId);
+    await expect(page.locator("#auditCsv")).toHaveAttribute("href", "/v1/audit.csv");
+
     // Viewer: sees the row, never the control.
     const ctx = await browser.newContext();
     await ctx.addCookies([{ name: "costcap_session", value: viewer.split("=")[1], url: origin }]);

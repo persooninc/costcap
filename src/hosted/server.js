@@ -10,6 +10,7 @@ import { evaluateAlerts, auditEntry, silentAfterMsFor } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
+import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
@@ -369,6 +370,19 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         if (csv.truncated) headers["x-costcap-truncated"] = "true";
         return res.writeHead(200, headers).end(csv.body);
       }
+      if (path === "/v1/audit.csv" && req.method === "GET") {
+        const csv = store.read((s) => {
+          const u = sessionUser(s, req);
+          const range = parseAuditRange(new URL(req.url, origin).searchParams);
+          return auditCsv(labelAudit(s, u.orgId, s.audit), range);
+        });
+        return res.writeHead(200, {
+          "content-type": "text/csv; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "content-disposition": 'attachment; filename="costcap-audit.csv"',
+        }).end(csv.body);
+      }
       if (path === "/v1/evidence.json" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = sessionUser(s, req);
@@ -376,7 +390,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
             alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active),
-            audit: s.audit.filter((e) => e.org_id === u.orgId),
+            audit: labelAudit(s, u.orgId, s.audit),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)) });
         }));
       }
@@ -385,7 +399,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = sessionUser(s, req);
           return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
             receipts: visibleReceipts(s, u.orgId),
-            audit: s.audit.filter((e) => e.org_id === u.orgId), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
+            audit: labelAudit(s, u.orgId, s.audit), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
             role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],

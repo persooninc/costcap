@@ -47,7 +47,7 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     .map(({ e }) => {
       const { agentIds, ...rest } = e.detail ?? {};
       const detail = agentIds !== undefined ? { ...rest, agent_ids: agentIds } : rest;
-      return { ts: e.ts ?? null, actor: e.actor ?? null, action: e.action, target: e.target ?? null, detail };
+      return { ts: e.ts ?? null, actor: e.actor ?? null, actor_label: e.actor_label ?? "unknown", action: e.action, target: e.target ?? null, target_label: e.target_label ?? e.target ?? null, detail };
     });
   const unknownTotal = rows.filter((r) => r.cost_usd === null && r.settled_cost_usd === null).length;
   return {
