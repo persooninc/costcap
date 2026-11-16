@@ -80,6 +80,11 @@ test("baseUrlOverrides emits env rewrites for the big four", () => {
   assert.ok(lines.some((l) => l.startsWith("GEMINI_BASE_URL=")));
 });
 
+test("#150 baseUrlOverrides emits GOOGLE_GEMINI_BASE_URL and keeps GEMINI_BASE_URL", () => {
+  const lines = baseUrlOverrides(8080, ["gemini"]);
+  assert.deepEqual(lines, ["GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8080/gemini", "GEMINI_BASE_URL=http://127.0.0.1:8080/gemini"]);
+});
+
 test("anthropic usage shape meters input/output/cache_read", async (t) => {
   const anthropicBody = JSON.stringify({
     model: "claude-unknown-future",

@@ -74,6 +74,17 @@ The wrapper sets provider base URL environment variables. Your SDK must honor
 them. Hardcoded endpoints and subprocesses that ignore these variables bypass
 CostCap. The local proxy binds to 127.0.0.1.
 
+| Provider | Variables set for the child |
+| --- | --- |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` |
+| Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
+| OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
+| Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
+
+The Python `google-genai` SDK has no base-URL environment variable; set
+`http_options={"base_url": os.environ["GOOGLE_GEMINI_BASE_URL"]}` in code or its
+traffic bypasses CostCap.
+
 ## Enforcement limits
 
 - Metering uses provider-reported usage after each response. A call can exceed

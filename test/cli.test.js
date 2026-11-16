@@ -341,3 +341,35 @@ for (const [label, cost, expected] of [["with usage.cost 1.5 blocks", 1.5, "200 
     assert.match(csv.stdout, cost === undefined ? /,fallback,/ : /,1\.5,provider,/);
   });
 }
+
+test("#150 wrap: GOOGLE_GEMINI_BASE_URL and GEMINI_BASE_URL point at the proxy; SDK-shaped Gemini calls are metered and capped", async (t) => {
+  const seen = [];
+  const up = await new Promise((r) => {
+    const s = http.createServer((req, res) => { seen.push({ url: req.url, key: req.headers["x-goog-api-key"] }); res.setHeader("content-type", "application/json"); res.end('{"modelVersion":"gemini-2.5-pro","usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":0}}'); });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-150-"));
+  const receipts = path.join(dir, "r.jsonl");
+  // Built the way go-genai / @google/genai build it: <base>/v1beta/models/<model>:generateContent, key in header.
+  const script = `
+    console.log("ENV", JSON.stringify({ g: process.env.GOOGLE_GEMINI_BASE_URL, l: process.env.GEMINI_BASE_URL }));
+    const u = process.env.GOOGLE_GEMINI_BASE_URL + "/v1beta/models/gemini-2.5-pro:generateContent";
+    const opt = { method: "POST", headers: { "x-goog-api-key": "k", "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: "hi" }] }] }) };
+    const a = await fetch(u, opt);
+    const b = await fetch(u, opt);
+    console.log("STATUS", a.status, b.status, (await b.json()).error?.type);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, GOOGLE_GEMINI_BASE_URL: "https://generativelanguage.googleapis.com", COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "") }));
+  });
+  const env = JSON.parse(res.out.match(/^ENV (.*)$/m)[1]);
+  assert.match(env.g, /^http:\/\/127\.0\.0\.1:\d+\/gemini$/);
+  assert.equal(env.l, env.g);
+  assert.match(res.out, /^STATUS 200 429 budget_exceeded$/m);
+  assert.deepEqual(seen, [{ url: "/v1beta/models/gemini-2.5-pro:generateContent", key: "k" }]);
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(lines.some((r) => r.provider === "gemini" && r.cost_usd > 0), "gemini receipt written");
+});

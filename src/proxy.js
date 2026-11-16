@@ -23,7 +23,12 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   if (providers.includes("openai")) lines.push(`OPENAI_BASE_URL=http://127.0.0.1:${port}/openai/v1`);
   if (providers.includes("anthropic")) lines.push(`ANTHROPIC_BASE_URL=http://127.0.0.1:${port}/anthropic`);
   if (providers.includes("openrouter")) lines.push(`OPENROUTER_BASE_URL=http://127.0.0.1:${port}/openrouter`);
-  if (providers.includes("gemini")) lines.push(`GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
+  if (providers.includes("gemini")) {
+    // Google's SDKs (go-genai, @google/genai) and Gemini CLI read GOOGLE_GEMINI_BASE_URL;
+    // GEMINI_BASE_URL is kept for backward compatibility.
+    lines.push(`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
+    lines.push(`GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
+  }
   return lines;
 }
 
