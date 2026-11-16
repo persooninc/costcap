@@ -18,7 +18,7 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
   // channels are not sent and not reported.
   return async (alert, { channels } = {}) => {
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
-    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : alert.model ? `agent ${alert.agentName ?? alert.agentId ?? "unknown"}, model ${alert.model}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team || alert.org || alert.tag || (alert.model && typeof alert.spent === "number") ? ` (spent $${alert.spent} of $${alert.cap} cap)` : alert.model ? ` ($${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (!want("email")) { /* already settled for this occurrence */ }
     else if (emailKey && emailFrom && emailTo?.length) {
@@ -92,6 +92,8 @@ export function webhookPayload(alert, { dashboardUrl } = {}) {
     id: alert.id ?? null, kind: alert.kind, org_id: alert.orgId ?? null,
     agent_id: alert.agentId ?? null, agent_name: alert.agentName ?? null, team: alert.team ?? null, org: Boolean(alert.org),
     tag: alert.tag && typeof alert.tag === "object" ? { key: alert.tag.key, value: alert.tag.value } : null,
+    // #244: per-model cap alerts carry the normalized model id; null on other kinds.
+    model: typeof alert.model === "string" ? alert.model : null,
     run_id: alert.run_id ?? null, scope: alert.scope ?? null, period: alert.period ?? null,
     fraction: num(alert.fraction), spent_usd: num(alert.spent), cap_usd: num(alert.cap),
     unknown_count: Number.isInteger(alert.unknown_count) ? alert.unknown_count : Number.isInteger(alert.unknownCount) ? alert.unknownCount : null,

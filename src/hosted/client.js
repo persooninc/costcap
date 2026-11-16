@@ -8,6 +8,7 @@ import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
+import { cachedFleetModelVerdict } from "../model-cap.js";
 import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
 export function serviceUrl(value) {
@@ -176,6 +177,16 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         teamName: data.team?.name ?? null,
         org: data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null,
       };
+    },
+    // #244: hosted day/month modelCaps against agent_spend.models (every host) plus
+    // this host's unsynced receipts. A server without the models snapshot: the whole
+    // local ledger counts, in the org budget period.
+    modelCheck(models, nowMs = Date.now()) {
+      const rules = policy(nowMs).modelCaps;
+      if (!Array.isArray(rules) || !rules.length) return null;
+      const snapshot = data.agentSpend?.models ? data.agentSpend : null;
+      const synced = new Set(snapshot ? data.syncedIds ?? [] : []);
+      return cachedFleetModelVerdict(rules, snapshot, models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,

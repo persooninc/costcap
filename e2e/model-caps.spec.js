@@ -1,6 +1,6 @@
 // Issue #238: an owner sets per-model caps through the agent policy API; the agent
 // card shows them read-only, GET /v1/policy ships them, and a viewer API key cannot
-// write them. Local server only; Turnstile is stubbed and no outbound call is made.
+// write them. #244: synced fleet spend pages cap_approaching per model and shows on the card. Local server only; Turnstile is stubbed and no outbound call is made.
 import { test, expect } from "@playwright/test";
 import net from "node:net";
 import { mkdtempSync } from "node:fs";
@@ -57,6 +57,16 @@ test("model caps: owner sets modelCaps by API, card shows them, policy sync ship
 
     await page.reload();
     await expect(page.locator("#agents .agent", { hasText: "mixer" })).toContainText("Model caps: claude-opus-4-8 day $1");
+
+    // #244: synced Opus spend from the fleet, then the alert worker: cap_approaching per model, card shows spend / cap.
+    expect((await post(`/v1/agents/${agent.agentId}/policy`, { modelCaps: [{ model: "claude-opus-4-8", scope: "day", usd: 5 }], warnFractions: [0.5, 0.8] })).status()).toBe(200);
+    const ts = new Date().toISOString();
+    const synced = await fetch(`${origin}/v1/receipts`, { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "h1-opus", ts, model: "claude-opus-4-8", cost_usd: 3 }, { id: "h2-opus", ts, model: "anthropic/claude-opus-4.8", provider: "openrouter", cost_usd: 1.1 }] }) });
+    expect(synced.status).toBe(200);
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#agents .agent", { hasText: "mixer" })).toContainText("claude-opus-4-8 day $4.10 / $5");
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_approaching" })).toContainText("model claude-opus-4-8 day");
 
     const key = await (await post("/v1/api-keys", { name: "ro", role: "viewer" })).json();
     expect(key.key).toMatch(/^cck_/);

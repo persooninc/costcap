@@ -9,7 +9,7 @@ import { billCheckCommand } from "./bill-check.js";
 import { serveMcp } from "./mcp.js";
 import { parseTagList } from "./tags.js";
 import { createTagCaps, parseTagCaps, withFleetTagCaps } from "./tag-cap.js";
-import { createModelCaps, parseModelCaps, mergeModelCapRules } from "./model-cap.js";
+import { createModelCaps, parseModelCaps, mergeModelCapRules, withFleetModelCaps, isFleetModelScope } from "./model-cap.js";
 import { enroll, createFleetClient, requestRaise } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
@@ -249,7 +249,8 @@ export async function wrap(argv) {
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
     fleetRate = { rpm: p.rpm, tpm: p.tpm };
-    modelCaps?.setRules(mergeModelCapRules(p.modelCaps ?? [], modelCapRules ?? []));
+    // #244: hosted day/month rules are enforced fleet-wide (fleet.modelCheck); hosted hour rules stay local.
+    modelCaps?.setRules(mergeModelCapRules((p.modelCaps ?? []).filter((r) => !isFleetModelScope(r.scope)), modelCapRules ?? []));
     applyRate();
   };
   if (enrollmentPath) {
@@ -294,7 +295,7 @@ export async function wrap(argv) {
   downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps: fleet && modelCaps ? withFleetModelCaps(modelCaps, fleet) : modelCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });

@@ -84,7 +84,7 @@ test("signed webhook: one POST per alert kind with documented fields and a verif
     assert.equal(options.redirect, "error");
     assert.ok(options.signal);
     const body = JSON.parse(options.body);
-    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "org", "tag", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
+    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "org", "tag", "model", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
     assert.equal(body.id, alerts[i].id);
     assert.equal(body.spent_usd, alerts[i].spent ?? null);
     assert.equal(body.cap_usd, alerts[i].cap ?? null);
@@ -143,4 +143,20 @@ test("org router sends org A's alert to org A's webhook only", async () => {
   await route({ kind: "cap_hit", orgId: "A" }, { emails: [], slackWebhook: null, webhook: { url: "https://a.example.com/h", secret } });
   await route({ kind: "cap_hit", orgId: "B" }, { emails: [], slackWebhook: null, webhook: null });
   assert.deepEqual(calls, ["https://a.example.com/h"]);
+});
+
+// Issue #244: per-model cap alerts name the agent and the model.
+test("#244 model cap alerts: text says agent, model and scope; webhook payload adds model", async () => {
+  const requests = [];
+  const send = createAlertDelivery({ emailKey: "k", emailFrom: "f@example.invalid", emailTo: ["a@example.invalid"], slackWebhook: "https://hooks.slack.com/services/t/t/t", webhook: { url: hookUrl, secret }, lookup: publicLookup,
+    fetchImpl: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200 }; } });
+  await send({ id: "m1", kind: "cap_approaching", agentId: "ag1", agentName: "opus-agent", model: "claude-opus-4-8", scope: "day", spent: 4.1, cap: 5, fraction: 0.8 });
+  const email = JSON.parse(requests[0].options.body).textContent;
+  assert.match(email, /agent opus-agent, model claude-opus-4-8, day \(spent \$4\.1 of \$5 cap\)/);
+  assert.match(JSON.parse(requests[1].options.body).text, /model claude-opus-4-8/);
+  assert.match(requests[2].options.body, /"model":"claude-opus-4-8"/);
+  requests.length = 0;
+  await send({ id: "m2", kind: "cap_hit", agentId: "ag1", model: "claude-opus-4-8", scope: "hour", cap: 1 });
+  assert.match(JSON.parse(requests[1].options.body).text, /agent ag1, model claude-opus-4-8, hour \(\$1 cap\)/);
+  assert.equal(webhookPayload({ kind: "cap_hit", agentId: "x" }).model, null);
 });

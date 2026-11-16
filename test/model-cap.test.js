@@ -379,3 +379,79 @@ test("check --model-cap and hosted modelCaps agree on a dotted-id ledger (#241 A
   const engine = createModelCaps({ rules: mergeModelCapRules(hosted, []), history: rows });
   assert.deepEqual(engine.over(), cli);
 });
+
+// #244: hosted day/month modelCaps enforced against the fleet snapshot plus unsynced local receipts.
+import { cachedFleetModelVerdict, withFleetModelCaps, isFleetModelScope } from "../src/model-cap.js";
+
+test("fleet model verdict: snapshot + pending over the cap refuses Opus only, fleet: true (#244 AC1)", () => {
+  const rules = [{ model: OPUS, scope: "day", usd: 5 }, { model: OPUS, scope: "hour", usd: 1 }];
+  const snap = { as_of: new Date(T0 - 60_000).toISOString(), models: { [OPUS]: { day: 3, month: 3, unknown: 0 } } };
+  const pending = [{ id: "p1", ts: ago(5), model: OPUS, cost_usd: 2.1 }, { id: "p2", ts: ago(5), model: "claude-haiku-4-5", cost_usd: 9 }, { id: "p3", ts: ago(5), model: OPUS, cost_usd: 9, blocked: true }];
+  assert.deepEqual(cachedFleetModelVerdict(rules, snap, ["claude-haiku-4-5", OPUS], pending, T0), { model: OPUS, rule_model: OPUS, scope: "day", spend_usd: 5.1, cap_usd: 5, fleet: true });
+  assert.equal(cachedFleetModelVerdict(rules, snap, ["claude-haiku-4-5"], pending, T0), null);
+  assert.equal(cachedFleetModelVerdict(rules, snap, [OPUS], pending.slice(1), T0), null); // $3 < $5
+  assert.equal(cachedFleetModelVerdict([{ model: OPUS, scope: "hour", usd: 0.01 }], snap, [OPUS], pending, T0), null); // hour stays local
+  assert.equal(cachedFleetModelVerdict([], snap, [OPUS], pending, T0), null);
+  // A snapshot from an earlier day no longer counts toward the day cap, only the month.
+  const old = { as_of: new Date(T0 - 2 * 86_400_000).toISOString(), models: { [OPUS]: { day: 4, month: 4, unknown: 0 } } };
+  assert.equal(cachedFleetModelVerdict(rules, old, [OPUS], pending, T0), null);
+  assert.equal(cachedFleetModelVerdict([{ model: OPUS, scope: "month", usd: 6 }], old, [OPUS], pending, T0).spend_usd, 6.1);
+  assert.equal(isFleetModelScope("hour"), false);
+  assert.equal(isFleetModelScope("month"), true);
+});
+
+test("fleet model verdict: unknown cost refuses that model only; OpenRouter dotted id shares the bucket (#244 AC2)", () => {
+  const rules = [{ model: OPUS, scope: "day", usd: 5 }];
+  const snap = { as_of: new Date(T0).toISOString(), models: { [OPUS]: { day: 1, month: 1, unknown: 1 } } };
+  const unk = cachedFleetModelVerdict(rules, snap, ["anthropic/claude-opus-4.8"], [], T0);
+  assert.equal(unk.verdict, "accounting_unavailable");
+  assert.equal(unk.model, "anthropic/claude-opus-4.8");
+  assert.equal(unk.fleet, true);
+  assert.equal(cachedFleetModelVerdict(rules, snap, ["claude-haiku-4-5"], [], T0), null);
+  // Settled (unknown 0): Opus is back; local dotted-id spend counts in the same bucket.
+  const settled = { ...snap, models: { [OPUS]: { day: 1, month: 1, unknown: 0 } } };
+  assert.equal(cachedFleetModelVerdict(rules, settled, [OPUS], [], T0), null);
+  const hit = cachedFleetModelVerdict(rules, settled, [OPUS], [{ id: "or", ts: ago(1), model: "anthropic/claude-opus-4.8", provider: "openrouter", cost_usd: 4 }], T0);
+  assert.equal(hit.spend_usd, 5);
+  // A pending local unknown-cost receipt refuses too; a pending batch does not.
+  assert.equal(cachedFleetModelVerdict(rules, settled, [OPUS], [{ id: "u", ts: ago(1), model: OPUS, cost_usd: null }], T0).verdict, "accounting_unavailable");
+  assert.equal(cachedFleetModelVerdict(rules, settled, [OPUS], [{ id: "b", ts: ago(1), model: OPUS, cost_usd: null, batch_pending: true, reason: "batch_pending" }], T0)?.verdict ?? null, null);
+  // No server snapshot: only the pending receipts count.
+  assert.equal(cachedFleetModelVerdict(rules, null, [OPUS], [{ id: "l", ts: ago(1), model: OPUS, cost_usd: 5 }], T0).spend_usd, 5);
+});
+
+test("fleet model verdict: the day follows the org budget period, not UTC (#244 AC3)", () => {
+  const la = { timezone: "America/Los_Angeles", monthStartDay: 1 };
+  const now = Date.parse("2026-11-16T09:00:00Z"); // 01:00 Nov 16 in LA
+  const rules = [{ model: OPUS, scope: "day", usd: 5 }];
+  const pending = [{ id: "late", ts: "2026-11-16T07:00:00Z", model: OPUS, cost_usd: 6 }]; // 23:00 Nov 15 in LA
+  assert.equal(cachedFleetModelVerdict(rules, null, [OPUS], pending, now, la), null);
+  assert.equal(cachedFleetModelVerdict(rules, null, [OPUS], pending, now).spend_usd, 6); // UTC: same day
+  // The cap resets at LA midnight (08:00 UTC), not UTC midnight.
+  const before = Date.parse("2026-11-16T07:30:00Z");
+  assert.equal(cachedFleetModelVerdict(rules, null, [OPUS], pending, before, la).spend_usd, 6);
+});
+
+test("withFleetModelCaps: local engine first, then the fleet check; other methods delegate", () => {
+  const local = createModelCaps({ rules: [rule("day", 1)], history: [{ id: "x", ts: new Date().toISOString(), model: OPUS, cost_usd: 2 }] });
+  const calls = [];
+  const fleet = { modelCheck: (m) => { calls.push(m); return { fleet: true }; } };
+  const w = withFleetModelCaps(local, fleet);
+  assert.equal(w.check([OPUS]).scope, "day");
+  assert.deepEqual(w.check(["claude-haiku-4-5"]), { fleet: true });
+  assert.deepEqual(calls, [["claude-haiku-4-5"]]);
+  w.setRules([]);
+  assert.deepEqual(w.rules(), []);
+  w.record({ id: "u", ts: new Date().toISOString(), model: OPUS, cost_usd: null });
+  assert.equal(w.settle("u", 1), true);
+  assert.deepEqual(w.remaining([OPUS]), []);
+  assert.equal(w.preflight([OPUS], 1), null);
+  assert.deepEqual(w.over(), []);
+  const bare = withFleetModelCaps(null, fleet);
+  assert.deepEqual(bare.rules(), []);
+  assert.equal(bare.settle("u", 1), false);
+  assert.deepEqual(bare.remaining([OPUS]), []);
+  assert.equal(bare.preflight([OPUS], 1), null);
+  assert.deepEqual(bare.over(), []);
+  assert.deepEqual(bare.check([OPUS]), { fleet: true });
+});

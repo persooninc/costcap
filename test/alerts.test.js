@@ -213,3 +213,26 @@ test("evaluateOrgAlerts: org keys, warn fractions, cap_hit, cap_projected, unkno
   assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 3, { month: 10 }), nowMs }).length, 0);
   assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 6, { month: 10 }), nowMs: Date.parse("2026-11-01T06:00:00Z") }).length, 0);
 });
+
+// #244: per-model hosted cap alerts.
+import { evaluateModelCapAlerts } from "../src/hosted/alerts.js";
+
+test("evaluateModelCapAlerts: approaching at the highest crossed fraction, cap_hit on spend or a fleet block, unknown fires nothing (#244 AC4)", () => {
+  const OPUS = "claude-opus-4-8";
+  const rules = [{ model: OPUS, scope: "day", usd: 5 }, { model: "anthropic/claude-haiku-4.5", scope: "day", usd: 1 }, { model: OPUS, scope: "hour", usd: 1 }];
+  const models = { [OPUS]: { day: 4.1, month: 4.1, unknown: 0 }, "claude-haiku-4-5": { day: 2, month: 2, unknown: 1 } };
+  const a = evaluateModelCapAlerts({ agentId: "A", rules, models }, { warnFractions: [0.5, 0.8] });
+  assert.deepEqual(a, [{ kind: "cap_approaching", key: "cap_approaching:A:model:claude-opus-4-8:day", model: OPUS, scope: "day", cap: 5, spent: 4.1, fraction: 0.8 }]);
+  const p50 = evaluateModelCapAlerts({ agentId: "A", rules: [rules[0]], models: { [OPUS]: { day: 3, month: 3, unknown: 0 } } }, { warnFractions: [0.5, 0.8] });
+  assert.equal(p50[0].key, "cap_approaching:A:model:claude-opus-4-8:day:p50");
+  // Default fractions [0.8] when the agent has none.
+  assert.equal(evaluateModelCapAlerts({ agentId: "A", rules: [rules[0]], models: { [OPUS]: { day: 3, month: 3, unknown: 0 } } }).length, 0);
+  // cap_hit on spend, and on a synced block (hour-scope too, matched by normalized model).
+  assert.equal(evaluateModelCapAlerts({ agentId: "A", rules: [rules[0]], models: { [OPUS]: { day: 5, month: 5, unknown: 0 } } })[0].kind, "cap_hit");
+  const blocked = evaluateModelCapAlerts({ agentId: "A", rules, models: {}, blockedHits: [{ model: "anthropic/claude-opus-4.8", scope: "hour", cap_usd: 1 }, { model: OPUS, scope: "day", fleet: true }] });
+  assert.deepEqual(blocked.map((x) => x.key), ["cap_hit:A:model:claude-opus-4-8:day", "cap_hit:A:model:claude-opus-4-8:hour"]);
+  assert.equal(blocked[1].spent, undefined);
+  // A local --model-cap refusal (other cap, not fleet) does not page the hosted rule.
+  assert.deepEqual(evaluateModelCapAlerts({ agentId: "A", rules: [rules[0]], models: {}, blockedHits: [{ model: OPUS, scope: "day", cap_usd: 2 }, { model: OPUS, scope: "day", fleet: false }] }), []);
+  assert.deepEqual(evaluateModelCapAlerts({ agentId: "A", rules: [{ model: "", scope: "day", usd: 1 }] }), []);
+});

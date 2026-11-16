@@ -1444,6 +1444,10 @@ test("issue #206: email failing retries only email; cap writes one gave_up row; 
 });
 
 // Issue #210: a pending occurrence interrupted by a restart is re-sent after the claim lease.
+// Pinned to midday UTC: the #210 tests advance the clock by up to 2.5h, and crossing UTC
+// midnight rolls the day cap period (#245), which resolves the cap_hit under test.
+const middayUtc = () => { const d = new Date(); d.setUTCHours(12, 0, 0, 0); return d.getTime(); };
+
 async function pendingFixture(t, deliverAlert, clockRef) {
   const f = await fixture(t, { now: () => clockRef.now, extra: { deliverAlert } });
   const owner = await f.login(`pending${Math.random().toString(36).slice(2, 8)}@example.invalid`);
@@ -1455,7 +1459,7 @@ async function pendingFixture(t, deliverAlert, clockRef) {
 }
 
 test("issue #210: hung send then restart re-sends once after the lease, audited recovered", async (t) => {
-  const clock = { now: Date.now() };
+  const clock = { now: middayUtc() };
   let calls = 0; let hang = true;
   const deliverAlert = async () => { calls++; if (hang) return new Promise(() => {}); return [{ status: "accepted" }]; };
   const { f, capHit } = await pendingFixture(t, deliverAlert, clock);
@@ -1477,7 +1481,7 @@ test("issue #210: hung send then restart re-sends once after the lease, audited 
 });
 
 test("issue #210: legacy pending record without a claim is re-sent; concurrent sweeps never double-page", async (t) => {
-  const clock = { now: Date.now() };
+  const clock = { now: middayUtc() };
   let calls = 0; let release;
   const gate = new Promise((r) => { release = r; });
   const deliverAlert = async () => { calls++; await gate; return [{ status: "accepted" }]; };
@@ -1571,4 +1575,65 @@ test("#240 /v1/org-budget: validation, viewer 403 (session and key), audit, rest
   // The day rolls over: a fresh day starts clean.
   clock += 86_400_000;
   await f.service().evaluateFleetAlerts();
+});
+
+// Issue #244: hosted modelCaps page cap_approaching / cap_hit per model on fleet-wide spend.
+test("#244 AC4/AC5: per-model cap alerts fire once, resolve on rule removal, rollover and revoke; org-isolated", async (t) => {
+  let nowMs = Date.parse("2026-11-16T22:30:00Z");
+  const f = await fixture(t, { now: () => nowMs });
+  const OPUS = "claude-opus-4-8";
+  const owner = await f.login("model-244@example.invalid");
+  const other = await f.login("model-244-other@example.invalid");
+  const enrollAs = async (who, name) => (await f.request("/v1/enroll", { name }, null, (await f.request("/v1/enrollment-tokens", { caps: {} }, who.cookie)).body.token)).body;
+  const A = await enrollAs(owner, "opus-agent");
+  const X = await enrollAs(other, "other-org");
+  const setCaps = (agent, who, modelCaps) => f.request(`/v1/agents/${agent.agentId}/policy`, { modelCaps, warnFractions: [0.5, 0.8] }, who.cookie);
+  assert.equal((await setCaps(A, owner, [{ model: OPUS, scope: "day", usd: 5 }, { model: "claude-haiku-4-5", scope: "day", usd: 1 }])).status, 200);
+  assert.equal((await setCaps(X, other, [{ model: OPUS, scope: "day", usd: 5 }])).status, 200);
+  const ts = () => new Date(nowMs - 60_000).toISOString();
+  const sync = (agent, receipts) => f.request("/v1/receipts", { receipts }, null, agent.token);
+  assert.equal((await sync(A, [{ id: "o1", ts: ts(), model: OPUS, cost_usd: 3 }, { id: "o2", ts: ts(), model: "anthropic/claude-opus-4.8", provider: "openrouter", cost_usd: 1.1 }, { id: "h1", ts: ts(), model: "claude-haiku-4-5", cost_usd: null, reason: "usage_unavailable" }])).status, 200);
+  assert.equal((await sync(X, [{ id: "x1", ts: ts(), model: OPUS, cost_usd: 40 }])).status, 200);
+  // The policy snapshot: this agent's own org receipts only, dotted OpenRouter id in the Opus bucket.
+  const pol = (await f.request("/v1/policy", undefined, null, A.token)).body;
+  assert.deepEqual(pol.agent_spend.models, { [OPUS]: { day: 4.1, month: 4.1, unknown: 0 }, "claude-haiku-4-5": { day: 0, month: 0, unknown: 1 } });
+  const alerts = async (status = "active") => (await f.request(`/v1/alerts?status=${status}`, undefined, owner.cookie)).body.alerts.filter((a) => a.model);
+  await f.service().evaluateFleetAlerts();
+  let act = await alerts();
+  assert.equal(act.length, 1); // the unknown-cost Haiku model raises nothing
+  assert.equal(act[0].kind, "cap_approaching");
+  assert.equal(act[0].fraction, 0.8);
+  assert.match(act[0].key, /:model:claude-opus-4-8:day/);
+  assert.equal(act[0].key, `cap_approaching:${A.agentId}:model:${OPUS}:day`);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await alerts("all")).length, 1); // not re-sent
+  // A synced fleet refusal fires cap_hit.
+  assert.equal((await sync(A, [{ id: "b1", ts: ts(), blocked: true, reason: "model_budget_exceeded", model: OPUS, scope: "day", spend_usd: 5.1, cap_usd: 5, fleet: true, cost_usd: 0 }])).status, 200);
+  await f.service().evaluateFleetAlerts();
+  act = await alerts();
+  assert.deepEqual(act.map((a) => a.kind).sort(), ["cap_hit"]);
+  assert.equal(act[0].key, `cap_hit:${A.agentId}:model:${OPUS}:day`);
+  // Removing the rule resolves.
+  assert.equal((await setCaps(A, owner, null)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await alerts()).length, 0);
+  // Re-adding it fires again; the next org day resolves it.
+  await setCaps(A, owner, [{ model: OPUS, scope: "day", usd: 5 }]);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await alerts()).length, 1);
+  nowMs += 2 * 3600_000; // next org (UTC) day
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await alerts()).length, 0);
+  // Back in a hot period, revoking the agent resolves.
+  await sync(A, [{ id: "o3", ts: ts(), model: OPUS, cost_usd: 6 }]);
+  await f.service().evaluateFleetAlerts();
+  assert.deepEqual((await alerts()).map((a) => a.kind), ["cap_hit"]);
+  assert.equal((await f.request(`/v1/agents/${A.agentId}/revoke`, {}, owner.cookie)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await alerts()).length, 0);
+  // The other org's $40 never reached this org's alert list.
+  assert.ok((await alerts("all")).every((a) => a.agentId === A.agentId));
+  // Agent card: fleet spend per rule (the other org's agent shows only its own spend).
+  const card = (await f.request("/v1/fleet", undefined, other.cookie)).body.agents.find((a) => a.id === X.agentId);
+  assert.deepEqual(card.modelSpend, { [OPUS]: { day: 0, month: 40, unknown: 0 } });
 });
