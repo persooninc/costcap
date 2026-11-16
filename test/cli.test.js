@@ -373,3 +373,27 @@ test("#150 wrap: GOOGLE_GEMINI_BASE_URL and GEMINI_BASE_URL point at the proxy; 
   const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.ok(lines.some((r) => r.provider === "gemini" && r.cost_usd > 0), "gemini receipt written");
 });
+
+test("#163: wrap meters Gemini audio at the audio rate, check --cap trips on it, pricing show lists it", async (t) => {
+  const up = await new Promise((r) => {
+    const s = http.createServer((req, res) => res.end(JSON.stringify({ modelVersion: "gemini-2.5-flash",
+      usageMetadata: { promptTokenCount: 101000, candidatesTokenCount: 500, promptTokensDetails: [{ modality: "TEXT", tokenCount: 1000 }, { modality: "AUDIO", tokenCount: 100000 }] } })));
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-163w-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `const a = await fetch(process.env.GEMINI_BASE_URL + "/v1beta/models/gemini-2.5-flash:generateContent",{method:"POST",body:"{}"}); console.log(a.status);`;
+  await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    c.stdout.on("data", () => {}); c.stderr.on("data", () => {}); c.on("exit", resolve);
+  });
+  const rec = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.provider === "gemini");
+  assert.equal(rec.cost_usd, 0.10155);
+  // Text-priced this would be ~$0.0316, under a $0.05 cap; audio-priced it trips.
+  const chk = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "0.05", "--receipts", receipts], { encoding: "utf8" });
+  assert.notEqual(chk.status, 0);
+  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gemini-2.5-flash"], { encoding: "utf8" });
+  assert.match(show.stdout, /gemini-2\.5-flash \(audio\): input \$1, cached_input \$0\.1/);
+});

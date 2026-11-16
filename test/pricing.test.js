@@ -113,3 +113,11 @@ test("#160 batch multiplier is 0.5 per provider and stacks with caching and long
   assert.equal(costForUsage("gpt-4o", { input_tokens: 10 }).batch_multiplier, undefined);
   assert.throws(() => costForUsage("gemini-2.5-pro", { input_tokens: 1 }, { batch: "gemini" }), /no batch rate/);
 });
+
+test("#163: text-only costs are unchanged by the modality breakdown", () => {
+  for (const model of ["gpt-4o", "gemini-2.5-flash", "claude-sonnet-4-6", "gpt-image-1", "unknown-xyz"]) {
+    const u = { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200 };
+    const text = { input: { text: 1000, image: 0, audio: 0, video: 0 }, cached_input: null, output: null };
+    assert.equal(costForUsage(model, { ...u, modality_tokens: text }).cost_usd, costForUsage(model, u).cost_usd, model);
+  }
+});

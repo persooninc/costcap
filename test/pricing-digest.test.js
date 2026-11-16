@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.4");
+  assert.equal(TABLE_VERSION, "2026-11-16.5");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -205,4 +205,22 @@ test("#155 table shape: premium fast / priority rate sets are complete and above
     for (const k of ["cache_write", "cache_write_1h"]) if (p[k] != null) assert.ok(p[k] > std[k], `${m} ${k}`);
   }
   assert.ok(t.sources.includes("https://platform.claude.com/docs/en/build-with-claude/fast-mode"));
+});
+
+test("#163: a table with modalities canonicalises, matches its digest, and a tampered modality rate fails verify", () => {
+  const { table, verification } = loadPricingTable();
+  assert.equal(verification.ok, true);
+  assert.equal(table.models["gemini-2.5-flash"].modalities.audio.input, 1);
+  const reordered = JSON.parse(JSON.stringify(table));
+  reordered.models["gpt-image-1"] = { modalities: table.models["gpt-image-1"].modalities, ...table.models["gpt-image-1"] };
+  assert.equal(tableDigest(reordered), verification.actual);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-163d-"));
+  const tp = path.join(dir, "pricing-table.json");
+  const tampered = JSON.parse(JSON.stringify(table));
+  tampered.models["gemini-2.5-flash"].modalities.audio.input = 0.30;
+  writeFileSync(tp, JSON.stringify(tampered));
+  writeFileSync(digestPathFor(tp), JSON.stringify({ version: table.version, sha256: verification.actual }));
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "verify"], { encoding: "utf8", env: { ...process.env, COSTCAP_PRICING_TABLE: tp } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /MISMATCH/);
 });

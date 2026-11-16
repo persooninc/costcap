@@ -74,6 +74,36 @@ export function isEmbeddingsPath(rawUrl) {
 
 const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
+// #163: per-modality token breakdown. Totals are unchanged; the breakdown lets
+// costForUsage price audio/image/video slices at their own rates (or mark them unknown).
+const MODALITIES = ["image", "audio", "video"];
+const emptySlice = () => ({ text: 0, image: 0, audio: 0, video: 0 });
+// Gemini ModalityTokenCount[] -> { text, image, audio, video } (null when absent).
+export function geminiModalitySlice(details) {
+  if (!Array.isArray(details) || !details.length) return null;
+  const out = emptySlice();
+  for (const d of details) {
+    const m = typeof d?.modality === "string" ? d.modality.toLowerCase() : "";
+    if (Object.hasOwn(out, m) && isCount(d.tokenCount)) out[m] += d.tokenCount;
+    else if (isCount(d?.tokenCount)) out.text += d.tokenCount; // DOCUMENT etc. bill as text
+  }
+  return out;
+}
+// OpenAI *_tokens_details -> slice of a known total (text = remainder), null when no non-text tokens reported.
+export function openaiModalitySlice(details, total) {
+  if (!details || typeof details !== "object") return null;
+  const image = isCount(details.image_tokens) ? details.image_tokens : 0;
+  const audio = isCount(details.audio_tokens) ? details.audio_tokens : 0;
+  if (image + audio === 0) return null;
+  return { text: Math.max(0, total - image - audio), image, audio, video: 0 };
+}
+const nonText = (slice) => (slice ? MODALITIES.reduce((n, m) => n + slice[m], 0) : 0);
+// Keep the breakdown only when some bucket carries non-text tokens.
+function modalityTokens(buckets) {
+  if (!Object.values(buckets).some((b) => nonText(b) > 0)) return undefined;
+  return Object.fromEntries(Object.entries(buckets).map(([k, b]) => [k, b ?? null]));
+}
+
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
 export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
@@ -111,6 +141,17 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       else if (u) usage = { input_tokens: (u.promptTokenCount ?? 0) + (isCount(u.toolUsePromptTokenCount) ? u.toolUsePromptTokenCount : 0) - (u.cachedContentTokenCount ?? 0),
         cached_input_tokens: u.cachedContentTokenCount ?? 0,
         output_tokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0) };
+      if (u && usage.input_tokens !== undefined) {
+        // promptTokensDetails includes cached tokens; cacheTokensDetails is the cached share.
+        const prompt = geminiModalitySlice(u.promptTokensDetails);
+        const cached = geminiModalitySlice(u.cacheTokensDetails);
+        const input = prompt ? Object.fromEntries(Object.keys(prompt).map((k) => [k, Math.max(0, prompt[k] - (cached?.[k] ?? 0))])) : null;
+        if (input && isCount(u.toolUsePromptTokenCount)) input.text += u.toolUsePromptTokenCount;
+        const output = geminiModalitySlice(u.candidatesTokensDetails);
+        if (output && isCount(u.thoughtsTokenCount)) output.text += u.thoughtsTokenCount;
+        const mt = modalityTokens({ input, cached_input: cached, output });
+        if (mt) usage.modality_tokens = mt;
+      }
     } else if (provider === "anthropic") {
       // message_start contains input usage; message_delta carries final output.
       const u = chunk.usage ?? chunk.message?.usage;
@@ -146,13 +187,23 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
         output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
         cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0 };
+      if (u && usage.input_tokens !== undefined) {
+        const inDetails = u.prompt_tokens_details ?? u.input_tokens_details;
+        const cachedDetails = inDetails?.cached_tokens_details;
+        const cached = openaiModalitySlice(cachedDetails, usage.cached_input_tokens);
+        const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens);
+        const input = all ? Object.fromEntries(Object.keys(all).map((k) => [k, Math.max(0, all[k] - (cached?.[k] ?? (k === "text" ? usage.cached_input_tokens : 0)))])) : null;
+        const output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details, usage.output_tokens);
+        const mt = modalityTokens({ input, cached_input: cached, output });
+        if (mt) usage.modality_tokens = mt;
+      }
     }
   };
   const result = () => {
     if (!Object.keys(usage).length) return null;
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
-    for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
+    for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
     return { model, usage: { ...usage, ...signal }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A Responses stream that never reached a terminal event is incomplete.
@@ -489,6 +540,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             cap?.record(receipt);
             if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.reason === "modality_unpriced") accountingFailure = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
             else if (receipt.reason === "service_tier_unpriced") accountingFailure = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
             else if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);

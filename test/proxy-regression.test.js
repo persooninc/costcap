@@ -481,3 +481,52 @@ test("#160 e2e OpenAI batch: create, retrieve, file content settle at 0.5x; unre
   assert.deepEqual([unrelated.cost_usd, unrelated.reason], [0, "non_billable_request"]);
   assert.equal(r.cli("check").status, 0);
 });
+
+// #163: modality pricing through the proxy, JSON and SSE, plus the unpriced 429.
+async function modalProxy(t, provider, handler) {
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; handler(req, res); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = join(mkdtempSync(join(tmpdir(), "cc-163-")), "r.jsonl");
+  const p = await startMeteringProxy({ upstreams: { [provider]: `http://127.0.0.1:${up.address().port}` }, receiptsPath: receipts });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  return { base: `http://127.0.0.1:${p.port}/${provider}`, receipts, hits: () => hits };
+}
+const readReceipts = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => !r.event);
+const AUDIO_META = { promptTokenCount: 101000, candidatesTokenCount: 500, promptTokensDetails: [{ modality: "TEXT", tokenCount: 1000 }, { modality: "AUDIO", tokenCount: 100000 }] };
+const AC1 = Number(((1000 * 0.30 + 100000 * 1.00 + 500 * 2.50) / 1e6).toFixed(6));
+
+for (const sse of [false, true]) {
+  test(`#163 AC1/AC5: gemini audio priced at the audio rate (${sse ? "SSE" : "JSON"})`, async (t) => {
+    const body = { modelVersion: "gemini-2.5-flash", usageMetadata: AUDIO_META };
+    const f = await modalProxy(t, "gemini", (req, res) => res.end(sse ? `data: ${JSON.stringify(body)}\n\n` : JSON.stringify(body)));
+    const verb = sse ? "streamGenerateContent?alt=sse" : "generateContent";
+    const r = await fetch(`${f.base}/v1beta/models/gemini-2.5-flash:${verb}`, { method: "POST", body: "{}" });
+    await r.text();
+    const [rec] = readReceipts(f.receipts);
+    assert.equal(rec.cost_usd, AC1);
+    assert.equal(rec.modality_tokens.input.audio, 100000);
+  });
+
+  test(`#163 AC3/AC5: unpriced audio on a fallback model blocks the next call with 429 (${sse ? "SSE" : "JSON"})`, async (t) => {
+    const body = { model: "mystery-audio-1", choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { audio_tokens: 40 } } };
+    const f = await modalProxy(t, "openai", (req, res) => res.end(sse ? `data: ${JSON.stringify(body)}\n\ndata: [DONE]\n\n` : JSON.stringify(body)));
+    const send = () => fetch(`${f.base}/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "mystery-audio-1", stream: sse, stream_options: { include_usage: true } }) });
+    await (await send()).text();
+    const second = await send();
+    assert.equal(second.status, 429);
+    assert.match(await second.text(), /accounting_unavailable/);
+    assert.equal(f.hits(), 1);
+    const [rec] = readReceipts(f.receipts);
+    assert.equal(rec.cost_usd, null);
+    assert.equal(rec.reason, "modality_unpriced");
+  });
+}
+
+test("#163 AC2: gpt-image-1 images/generations priced from the table", async (t) => {
+  const f = await modalProxy(t, "openai", (req, res) => res.end(JSON.stringify({ created: 1, data: [{ b64_json: "x" }], usage: { input_tokens: 50, output_tokens: 4160, total_tokens: 4210, input_tokens_details: { text_tokens: 50, image_tokens: 0 } } })));
+  await (await fetch(`${f.base}/v1/images/generations`, { method: "POST", body: JSON.stringify({ model: "gpt-image-1", prompt: "cat" }) })).text();
+  const [rec] = readReceipts(f.receipts);
+  assert.equal(rec.cost_usd, Number(((50 * 5 + 4160 * 40) / 1e6).toFixed(6)));
+  assert.equal(rec.cost_source, "table");
+});

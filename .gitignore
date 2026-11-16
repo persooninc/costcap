@@ -16,3 +16,6 @@ __pycache__/
 *.pyc
 .claude/worktrees/
 !.env.example
+
+# batch result fixtures are test data, not receipts (#160)
+!test/fixtures/**/*.jsonl

@@ -42,7 +42,11 @@ export function pricingCommand(args, { tablePath } = {}) {
   // A long-context tier (#151) prints as a second row for the same model.
   // Premium speed / service tiers (#155) print as (fast) / (priority) rows.
   const rowsFor = (name, r) => [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
-    ...["fast", "priority"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`))];
+    ...["fast", "priority"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
+    // Modality rates (#163) print as (audio) / (image) rows; uniform / text-rate notes follow.
+    ...Object.entries(r.modalities ?? {}).map(([m, mr]) => `${name} (${m}): input ${fmt(mr.input)}, cached_input ${fmt(mr.cached_input)}, output ${fmt(mr.output)}`),
+    ...(r.uniform_modalities ? [`${name}: all input modalities at the input rate`] : []),
+    ...(r.text_rate_modalities?.length ? [`${name}: ${r.text_rate_modalities.join("/")} input at the text rate`] : [])];
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };

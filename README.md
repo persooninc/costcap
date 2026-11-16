@@ -139,7 +139,17 @@ traffic bypasses CostCap.
   route is ignored. `costcap runs` shows each model's `cost_source`, and
   `costcap receipts --export csv`, `/v1/receipts.csv` and `/v1/evidence.json`
   include the column. Rates are the
-  standard text price in force on the table version date. When a model
+  standard text price in force on the table version date. Audio, image and
+  video tokens (Gemini `promptTokensDetails` / `cacheTokensDetails` /
+  `candidatesTokensDetails`, OpenAI `*_tokens_details.audio_tokens` /
+  `image_tokens`) are recorded on the receipt as `modality_tokens` and priced
+  at the model's published modality rate (Gemini 2.5 Flash / Flash-Lite audio,
+  `gpt-image-1` image input and output). Models with one price for all inputs
+  declare `uniform_modalities`; image/video input listed at the text rate is
+  declared `text_rate_modalities`. Any other non-text token (including every
+  unknown/fallback model) gives `cost_usd: null`, `reason: "modality_unpriced"`
+  and the next call returns `accounting_unavailable`: never priced as text.
+  `costcap pricing show` prints the modality rates. When a model
   publishes a prompt-length split (Gemini 2.5 Pro / 3.1 Pro, Claude Sonnet
   4.5 / 4.6 above 200K prompt tokens), a call whose whole prompt (input +
   cache read + cache writes) exceeds the threshold is priced entirely at the
