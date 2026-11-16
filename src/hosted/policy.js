@@ -8,6 +8,7 @@
 
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
+import { downgradeError } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 // Enrollment tokens are shown once. Only the SHA-256 hash is stored.
@@ -82,6 +83,9 @@ export function validatePolicy(p) {
   // Rate limits (issue #192): optional positive integers per 60 s.
   for (const k of ["rpm", "tpm"]) if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] > 0)) errors.push(`${k} must be a positive integer`);
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
+  // Budget-triggered model downgrade (issue #207): { at?, map }.
+  const dgErr = downgradeError(p.downgrade);
+  if (dgErr) errors.push(dgErr);
   const raiseErr = raiseError(p.raise);
   if (raiseErr) errors.push(raiseErr);
   return errors;
@@ -118,5 +122,5 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   const models = intersectModels(server?.models ?? null, local?.models ?? null);
   // #192: rate limits: the minimum wins, so local can tighten but never loosen.
   const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
-  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), ...(server?.downgrade ? { downgrade: server.downgrade } : {}), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }

@@ -14,6 +14,7 @@ import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
 import { warningLine } from "./cap-warn.js";
+import { DOWNGRADE_HEADER, downgradeLine, downgradeTrigger, rewriteModel } from "./downgrade.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, checkEstimate, estimateBatch, openRouterModels } from "./preflight.js";
 import { rateLimitedBody, usageTokens } from "./rate-limit.js";
@@ -416,7 +417,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrade = null, downgradeNotifier = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -490,6 +491,25 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const after = cap.spend();
     pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: isLowerBound(after) }));
   };
+  // #207: every cap whose spend can trigger a downgrade. Spend excludes unknown cost (a lower bound).
+  const downgradeSources = () => {
+    const out = [];
+    if (cap) out.push({ kind: "local", caps: cap.limits(), spend: cap.spend() });
+    if (agentBudgets?.limitsFor) {
+      const own = agentBudgets.limitsFor(who.agent_id ?? "unknown");
+      if (own) out.push({ kind: "agent", caps: own, spend: agentBudgets.spend(who) });
+      const team = agentBudgets.teamFor?.(who.agent_id ?? "unknown");
+      if (team) out.push({ kind: "team", caps: team, spend: agentBudgets.teamSpend(who) });
+    }
+    const fr = fleetRemaining?.();
+    for (const [kind, left, caps] of [["fleet_agent", fr?.agent, fr?.agentCaps], ["fleet_team", fr?.team, fr?.teamCaps]]) {
+      if (!left || !caps) continue;
+      const spend = {};
+      for (const sc of ["day", "month"]) if (caps[sc] != null && left[sc] != null) spend[sc] = Math.max(0, caps[sc] - left[sc]);
+      out.push({ kind, caps: { day: caps.day, month: caps.month }, spend });
+    }
+    return out;
+  };
   const flushWarnings = () => {
     const evs = pendingWarnings;
     pendingWarnings = [];
@@ -536,7 +556,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // #184: x-costcap-cache is CostCap's; never forwarded.
     const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
     delete req.headers[CACHE_HEADER];
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    // #207: set once a request's model was downgraded (or could not be); stamped on its receipt.
+    let dgFields = null;
+    const emit = (receipt) => emitBase(reqTags || dgFields ? { ...receipt, ...(dgFields ?? {}), ...(reqTags ? { tags: reqTags } : {}) } : receipt);
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
       req.resume();
@@ -560,7 +582,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         }).catch(() => { send(503, { error: "receipt_ledger_unavailable" }); });
         return;
       }
-      const body = Buffer.concat(chunks);
+      let body = Buffer.concat(chunks);
       const run = async () => {
         let failMsg = null;
         if (res.destroyed) return;
@@ -627,6 +649,24 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         };
         let preflightEst;
         const verdict = guarded(() => {
+          // #207: past the downgrade fraction, rewrite FROM -> TO before every check, so the
+          // allowlist, --unknown-models, preflight, tag caps and the cache key all see TO.
+          const dg = downgrade?.();
+          if (dg && requestedModel && Object.hasOwn(dg.map, requestedModel) && !["GET", "HEAD"].includes(req.method)) {
+            const trigger = downgradeTrigger({ at: dg.at, sources: downgradeSources() });
+            if (trigger) {
+              const rw = rewriteModel({ provider, body, parsed: parsedBody, model: requestedModel, map: dg.map,
+                route: { batch: !!batchCreate, audio: !!audio, realtime: false } });
+              if (rw?.unsupported) dgFields = { downgrade: "unsupported_route" };
+              else if (rw) {
+                body = rw.body; parsedBody = rw.parsed; requestedModel = rw.to;
+                dgFields = { requested_model: rw.from, downgrade: { scope: trigger.scope, fraction: trigger.fraction, ...(trigger.kind !== "local" && { source: trigger.kind }) } };
+                res.setHeader(DOWNGRADE_HEADER, `${rw.from}->${rw.to}`);
+                const ev = downgradeNotifier?.observe(trigger, { from: rw.from, to: rw.to });
+                if (ev) { const done = emitEvent(ev); try { onWarning(downgradeLine(done)); } catch { /* stderr is best effort */ } }
+              }
+            }
+          }
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
           const accountingFailure = accountingFailureNow();

@@ -783,7 +783,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           // rpm/tpm (issue #192): omitted keeps the current value, null clears it.
           const rpm = body.rpm === undefined ? a.policy.rpm : body.rpm;
           const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
+          // downgrade (issue #207): omitted keeps, null clears.
+          const downgrade = body.downgrade === undefined ? a.policy.downgrade : body.downgrade;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }) };

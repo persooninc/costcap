@@ -145,6 +145,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs) : null,
         teamName: data.team?.name ?? null,
+        // #207: the caps behind those remainders, for the downgrade trigger.
+        agentCaps: data.agentSpend ? policy(nowMs).caps : null,
+        teamCaps: data.team?.caps ?? null,
       };
     },
     tagCaps: () => data.tagCaps ?? null,

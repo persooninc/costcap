@@ -34,8 +34,12 @@ import { dirname, join } from "node:path";
 import { unpricedDiscountWarnings } from "./price-overrides.js";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
 import { awsCredentials } from "./sigv4.js";
+import { createDowngradeNotifier, mergeDowngrade, parseDowngradeAt, parseDowngradeMap } from "./downgrade.js";
+import { isPricedModel } from "./pricing.js";
+import { isPricedWithOverrides } from "./price-overrides.js";
+import { userPrice } from "./upstreams.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
@@ -96,6 +100,8 @@ export function parseWrapArgs(argv) {
       opts.unknownModels = v;
     } else if (f === "--timeout") opts.timeoutS = positiveNumber(f, v);
     else if (f === "--warn-at") opts.warnAt = parseWarnAt(v);
+    else if (f === "--downgrade") opts.downgradeMap = { ...(opts.downgradeMap ?? {}), ...parseDowngradeMap(v) };
+    else if (f === "--downgrade-at") opts.downgradeAt = parseDowngradeAt(v);
     else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
     else if (f === "--kill-file") opts.killFile = v;
@@ -120,7 +126,18 @@ export function parseWrapArgs(argv) {
   opts.upstreams = parseUpstreams(opts.upstreamSpecs ?? []);
   delete opts.upstreamSpecs;
   if (opts.upstreamPricesPath) opts.userPrices = loadUpstreamPrices(opts.upstreamPricesPath, opts.upstreams.map((u) => u.name));
+  // #207: a downgrade target with no price would make spend unknown; refused before spawning.
+  for (const to of new Set(Object.values(opts.downgradeMap ?? {}))) {
+    if (!isDowngradeTargetPriced(to, opts)) throw new Error(`--downgrade target "${to}" has no published rate; pick a priced model or add it to --upstream-prices`);
+  }
   return opts;
+}
+
+export function isDowngradeTargetPriced(model, { userPrices = null, upstreams = [] } = {}) {
+  if (isPricedModel(model)) return true;
+  if (!userPrices) return false;
+  if (["openai", "anthropic", "openrouter"].some((p) => isPricedWithOverrides(userPrices, p, model))) return true;
+  return upstreams.some((u) => userPrice(userPrices, `u/${u.name}`, model) !== null);
 }
 
 function positiveNumber(name, v) {
@@ -153,7 +170,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm, downgradeMap, downgradeAt } = parseWrapArgs(argv);
   for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   const limits = proxyLimits({ timeoutS });
@@ -202,6 +219,9 @@ export async function wrap(argv) {
     rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
   };
   let raiseTimer = null;
+  // #207: fleet downgrade (cached offline) merged with local flags; local only adds or lowers `at`.
+  let fleetDowngrade = null;
+  const localDowngrade = downgradeMap || downgradeAt != null ? { map: downgradeMap ?? null, at: downgradeAt } : null;
   const setPolicy = (p) => {
     fleetPolicy = p;
     // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
@@ -213,6 +233,7 @@ export async function wrap(argv) {
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
     fleetRate = { rpm: p.rpm, tpm: p.tpm };
+    fleetDowngrade = p.downgrade ?? null;
     applyRate();
   };
   if (enrollmentPath) {
@@ -238,6 +259,8 @@ export async function wrap(argv) {
   const { server, port } = await startMeteringProxy({ cache, onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
+    downgrade: () => mergeDowngrade(fleetDowngrade, localDowngrade),
+    downgradeNotifier: createDowngradeNotifier({ events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null }),
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);
   checkWarnings = () => server.checkWarnings();
