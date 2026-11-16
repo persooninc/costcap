@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts } from "../cap.js";
-import { validTeamPolicy, cachedTeamVerdict } from "./teams.js";
+import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict } from "./teams.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -65,6 +65,14 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
       const synced = new Set(data.syncedIds ?? []);
       return cachedTeamVerdict(data.team, loadReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
     },
+    agentSpend: () => data.agentSpend ?? null,
+    // Per-agent fleet caps (#127) against the agent's fleet-wide synced spend plus
+    // this host's unsynced receipts. No agent_spend from the server: no-op.
+    agentCheck(nowMs = Date.now()) {
+      if (!data.agentSpend) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedAgentVerdict(data.agentSpend, policy().caps, loadReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+    },
     revoked: () => revoked,
     async sync() {
       if (busy) return { skipped: true };
@@ -82,8 +90,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
           saveEnrollment(path, data);
         }
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, ...fetchedPolicy } = fetched ?? {};
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team)) throw new Error("Invalid fleet policy response");
+        const { team = null, agent_spend: agentSpend = null, ...fetchedPolicy } = fetched ?? {};
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend)) throw new Error("Invalid fleet policy response");
+        if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
         // Team membership and spend refresh on every poll; removal (null) stops team enforcement.
         if (JSON.stringify(team) !== JSON.stringify(data.team ?? null)) { data.team = team; saveEnrollment(path, data); }
         // Only strictly newer valid versions can replace a cached policy.

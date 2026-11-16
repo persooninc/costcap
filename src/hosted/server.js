@@ -14,7 +14,7 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { maskAlertSettings, validSlackWebhook } from "./delivery.js";
-import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy } from "./teams.js";
+import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
 
@@ -291,7 +291,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(agentReceipts(s, a.id), now()) }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {

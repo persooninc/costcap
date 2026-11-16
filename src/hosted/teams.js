@@ -93,27 +93,70 @@ export function validTeamPolicy(t) {
   return true;
 }
 
-// Offline enforcement in the wrapper from the cached team policy.
-// pending: this agent's receipts not yet synced (counted on top of `spent`).
-// Synced spend from an earlier UTC day/month than now no longer counts in that window.
-export function cachedTeamVerdict(team, pending, nowMs) {
-  if (!team) return null;
+// Synced spend plus pending local receipts, per UTC window. Shared by team (#123)
+// and per-agent (#127) cached enforcement. Synced spend from an earlier UTC
+// day/month than now no longer counts in that window.
+function cachedTotals(entry, pending, nowMs) {
   const now = new Date(nowMs).toISOString();
-  const asOf = new Date(team.as_of).toISOString();
+  const asOf = new Date(entry.as_of).toISOString();
   const window = { day: 10, month: 7 };
   const total = {};
-  let unknown = team.unknown;
-  for (const s of TEAM_SCOPES) total[s] = now.slice(0, window[s]) === asOf.slice(0, window[s]) ? team.spent[s] : 0;
+  let unknown = entry.unknown;
+  for (const s of TEAM_SCOPES) total[s] = now.slice(0, window[s]) === asOf.slice(0, window[s]) ? entry.spent[s] : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     const ts = new Date(r.ts).toISOString();
     for (const s of TEAM_SCOPES) if (ts.slice(0, window[s]) === now.slice(0, window[s])) total[s] += r.cost_usd;
   }
+  return { total, unknown };
+}
+
+// Offline enforcement in the wrapper from the cached team policy.
+// pending: this agent's receipts not yet synced (counted on top of `spent`).
+export function cachedTeamVerdict(team, pending, nowMs) {
+  if (!team) return null;
+  const { total, unknown } = cachedTotals(team, pending, nowMs);
   if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", team: team.name, unknown_receipts: unknown };
   for (const s of TEAM_SCOPES) {
     const cap = team.caps?.[s];
     if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: teamScope(team.name, s), team: team.name, cap_usd: cap, spent_usd: round6(total[s]) };
+  }
+  return null;
+}
+
+// Issue #127: the agent's own fleet-wide synced spend (all hosts/runners using
+// this identity), from settled-aware stored receipts. Pure.
+export function agentSpendPolicy(receipts, nowMs) {
+  const now = new Date(nowMs).toISOString();
+  const spent = { day: 0, month: 0 };
+  let unknown = 0;
+  for (const r of receipts) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
+    const ts = new Date(r.ts).toISOString();
+    if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    spent.month += r.cost_usd;
+    if (ts.slice(0, 10) === now.slice(0, 10)) spent.day += r.cost_usd;
+  }
+  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, as_of: now };
+}
+
+export function validAgentSpend(a) {
+  if (a === null || a === undefined) return true;
+  if (typeof a !== "object" || !Number.isFinite(Date.parse(a.as_of)) || !Number.isInteger(a.unknown) || a.unknown < 0) return false;
+  return TEAM_SCOPES.every((s) => typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0);
+}
+
+// Offline per-agent enforcement against the agent's fleet caps (#127).
+// caps: the resolved day/month caps; pending: unsynced local receipts.
+export function cachedAgentVerdict(spend, caps, pending, nowMs) {
+  if (!spend || !TEAM_SCOPES.some((s) => caps?.[s] != null)) return null;
+  const { total, unknown } = cachedTotals(spend, pending, nowMs);
+  if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", unknown_receipts: unknown };
+  for (const s of TEAM_SCOPES) {
+    const cap = caps[s];
+    if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: s, cap_usd: cap, spent_usd: round6(total[s]), fleet: true };
   }
   return null;
 }

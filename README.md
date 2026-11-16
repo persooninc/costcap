@@ -90,7 +90,7 @@ CostCap. The local proxy binds to 127.0.0.1.
   is provably gone; any other holder (another host, unreadable owner) is waited
   on for 5s and then the wrapper refuses calls with `receipt_ledger_unavailable`.
   Shared and exclusive (default) wrappers refuse to run on the same ledger.
-  Sharing across hosts is the hosted fleet's job.
+  Sharing across hosts is the hosted fleet's job (fleet-wide agent caps, #127).
 - `--preflight` (or `COSTCAP_PREFLIGHT=1`, off by default) refuses a call whose
   **estimated** worst case cannot fit the remaining run/day/month budget, before
   any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
@@ -180,6 +180,16 @@ Receipt IDs are acknowledged before marking them synced. Credentials are stored
 mode 0600. A 401/403 response freezes the wrapper. Redirects are refused to avoid
 forwarding agent credentials to another host. These paths have local test-server
 coverage, not production verification or a finished org dashboard.
+
+**Fleet-wide agent caps (#127):** `/v1/policy` also returns
+`agent_spend: { spent: { day, month }, unknown, as_of }`, the agent's synced
+spend across every host and runner using that identity (settled costs
+included). The wrapper refuses before calling upstream once synced spend plus
+its own unsynced receipts reach the fleet day/month cap (`429 budget_exceeded`,
+`scope: "day"|"month"`), and refuses with `accounting_unavailable` while any
+unknown cost is unsettled. Spend cached from an earlier UTC day/month counts 0
+for that window. A fresh runner or wiped `.costcap/` no longer starts from $0.
+Overshoot is still bounded by unsynced spend on other hosts (one poll interval).
 
 ## Per-agent budgets
 
