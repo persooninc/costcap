@@ -384,7 +384,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
     const r = lines.find((l) => !l.event && l.reason === "batch_pending" && l.batch_id === batchId && l.cost_usd === null);
     if (!r) return null;
-    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId };
+    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId, run_id: r.run_id ?? null };
     pendingBatches.set(batchId, entry);
     if (lines.some((l) => isSettlement(l) && l.receipt_id === r.id)) resolvedBatches.add(batchId);
     return entry;
@@ -398,10 +398,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   // #164: record spend and queue one cap_warning per newly crossed fraction.
   // flushWarnings() appends them after the receipt that caused them.
   let pendingWarnings = [];
-  const recordSpend = (receipt) => {
+  const recordSpend = (receipt, opts) => {
     if (!cap) return;
     const before = cap.spend();
-    cap.record(receipt);
+    cap.record(receipt, opts);
     if (!capWarner) return;
     const after = cap.spend();
     pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: after.unknown > 0 }));
@@ -625,7 +625,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "batch_pending", batch_id,
               ...(batchModels && { request_count: batchModels.length }) });
             const done = emit(receipt);
-            pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id });
+            pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id, run_id: done.run_id ?? null });
             if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw);
             return;
           } else if (raw && req.method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchReadPath(req.method, req.url)) {
@@ -647,7 +647,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               if (folded.ok) {
                 emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
                   succeeded: folded.succeeded, not_billed: folded.free });
-                recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts });
+                // #182: another run's (or wrapper's) batch counts toward day/month only, like src/settle.js.
+                const external = !(who.run_id != null && pending.run_id === who.run_id);
+                recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts }, { external });
                 // #179: --policy agent/team budgets count the batch at its original ts, no restart needed.
                 agentBudgets?.settle({ receipt_id: pending.id, cost_usd: folded.cost_usd });
                 flushWarnings();
