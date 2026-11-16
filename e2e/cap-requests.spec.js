@@ -18,9 +18,13 @@ test("agent requests a raise, admin approves in the dashboard, raise expires", a
   const origin = `http://127.0.0.1:${port}`;
   const codes = {};
   let skew = 0; // fake clock offset for the server
+  // The +4h expiry skew must not cross UTC midnight (a day rollover resets day spend, so the run
+  // failed after ~20:00 UTC). If it would, move the server clock forward to just after midnight.
+  const d0 = new Date(); d0.setUTCHours(24, 5, 0, 0);
+  const anchor = Date.now() + 5 * 3600_000 >= d0.getTime() - 5 * 60_000 ? d0.getTime() - Date.now() : 0;
   const service = createHostedServer({
     storePath: join(mkdtempSync(join(tmpdir(), "cc-capreq-e2e-")), "data.json"),
-    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {}, now: () => Date.now() + skew,
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {}, now: () => Date.now() + anchor + skew,
     verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
   });
   await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
@@ -35,7 +39,7 @@ test("agent requests a raise, admin approves in the dashboard, raise expires", a
     const token = await post("/v1/enrollment-tokens", { caps: { day: 5 } }, { cookie: owner }).then((r) => r.json());
     const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "batch-agent" }) }).then((r) => r.json());
     const asAgent = { authorization: `Bearer ${agent.token}` };
-    await post("/v1/receipts", { receipts: [{ id: "k-1", ts: new Date().toISOString(), cost_usd: 6, model: "m" }] }, asAgent);
+    await post("/v1/receipts", { receipts: [{ id: "k-1", ts: new Date(Date.now() + anchor).toISOString(), cost_usd: 6, model: "m" }] }, asAgent);
     const verdict = () => fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: asAgent }).then((r) => r.json());
     expect((await verdict()).verdict).toBe("budget_exceeded");
 
