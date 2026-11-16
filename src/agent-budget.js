@@ -1,4 +1,4 @@
-import { isPendingBatch } from "./cap.js";
+import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // Per-agent spend and step budgets. Follows the contract of the skills-library
 // ai-cost-tracking skill (references/agent-budget.mjs). Pure module, no I/O.
 // Separate from the wrapper's own caps: this answers "may this agent spend",
@@ -114,6 +114,20 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     return out;
   }
 
+  // #177: seconds until the hour spend of agentIds falls below cap (same rule as the wrapper's --hour-cap).
+  function hourRetryAfter(agentIds, spent, cap) {
+    const nowMs = now().getTime();
+    const entries = [];
+    for (const r of rows) {
+      if (!agentIds.includes(r.agent_id) || r.blocked || !r.cost_usd) continue;
+      const tsMs = Date.parse(r.ts);
+      if (tsMs > nowMs - HOUR_MS) entries.push([tsMs, r.cost_usd]);
+    }
+    entries.sort((a, b) => a[0] - b[0]);
+    return retryAfterSeconds(entries, spent, cap, nowMs);
+  }
+  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : {});
+
   // Effective model allowlist (#153): intersection of the agent's, its team's and the default lists.
   // null = unrestricted; [] = every model refused.
   const modelsFor = (agentId = UNKNOWN_AGENT) => intersectModels(policy.agents?.[agentId]?.models, teamFor(agentId)?.models, policy.default?.models);
@@ -141,13 +155,13 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       for (const scope of SCOPES) {
         const cap = limits?.[scope];
         if (cap != null && s[scope] >= cap) {
-          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, cap_usd: cap, spent_usd: round6(s[scope]), ...who };
+          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, cap_usd: cap, spent_usd: round6(s[scope]), ...hourHint(scope, [agentId], s[scope], cap), ...who };
         }
       }
       for (const scope of SCOPES) {
         const cap = team?.[scope];
         if (cap != null && ts[scope] >= cap) {
-          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, team: team.team, cap_usd: cap, spent_usd: round6(ts[scope]), ...who };
+          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, team: team.team, cap_usd: cap, spent_usd: round6(ts[scope]), ...hourHint(scope, team.agents, ts[scope], cap), ...who };
         }
       }
       if (limits?.maxSteps != null && s.steps >= limits.maxSteps) {

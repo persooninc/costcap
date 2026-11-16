@@ -115,12 +115,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
 
   // Seconds until hour spend falls below cap (spend ages out from the oldest entry).
   function retryAfter(cap, nowMs) {
-    let left = hourSpend(nowMs);
-    for (let i = head; i < win.length; i++) {
-      left -= win[i][1];
-      if (left < cap - 1e-9) return Math.max(1, Math.ceil((win[i][0] + HOUR_MS - nowMs) / 1000));
-    }
-    return Math.ceil(HOUR_MS / 1000);
+    return retryAfterSeconds(win.slice(head), hourSpend(nowMs), cap, nowMs);
   }
 
   return {
@@ -167,6 +162,17 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       add(receipt.ts ?? now(), receipt.cost_usd);
     },
   };
+}
+
+// Seconds until rolling-hour spend falls below cap. entries: in-window [tsMs, cost]
+// pairs, oldest first; spent: their total. Shared by the wrapper cap and agent policies (#177).
+export function retryAfterSeconds(entries, spent, cap, nowMs) {
+  let left = spent;
+  for (const [tsMs, cost] of entries) {
+    left -= cost;
+    if (left < cap - 1e-9) return Math.max(1, Math.ceil((tsMs + HOUR_MS - nowMs) / 1000));
+  }
+  return Math.ceil(HOUR_MS / 1000);
 }
 
 export function budgetExceededBody(hit) {
