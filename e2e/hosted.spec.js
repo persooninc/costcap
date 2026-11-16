@@ -95,6 +95,15 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await page.locator("#invite button").click();
     await expect(page.locator("#invites")).toContainText("teammate@example.invalid");
     expect(invites).toEqual([expect.objectContaining({ email: "teammate@example.invalid", role: "viewer" })]);
+    // Issue #137: members card and invitation revoke.
+    await expect(page.locator("#members .member")).toHaveCount(1);
+    await expect(page.locator("#members")).toContainText("fixture@example.invalid · owner");
+    await page.locator('#invites .invite button', { hasText: "Revoke" }).click();
+    await expect(page.locator("#status")).toContainText("Invitation revoked.");
+    await expect(page.locator("#invites")).toContainText("No pending invitations.");
+    await page.locator("#invite input[name=email]").fill("teammate@example.invalid");
+    await page.locator("#invite button").click();
+    await expect(page.locator("#invites")).toContainText("teammate@example.invalid");
     await page.locator("#logout").click();
     await expect(page.locator("#login")).toBeVisible();
     await expect(page.locator("#token")).toHaveText("");
@@ -249,6 +258,16 @@ test("#121 admin saves alert destinations, dashboard shows masked webhook, viewe
     await expect(page.locator("#alertForm")).toBeHidden();
     expect(await page.evaluate(async () => (await fetch("/v1/alert-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ emails: [] }) })).status)).toBe(403);
     expect(await page.content()).not.toContain("e2eFullSecretZ9Q1");
+    // Issue #137: viewers see members but no Remove; an admin removes the viewer with a confirm step.
+    await expect(page.locator("#members")).toContainText("viewer@example.invalid · viewer");
+    await expect(page.locator("#members button")).toHaveCount(0);
+    await page.locator("#logout").click();
+    await signIn("admin@example.invalid");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.locator('#members .member', { hasText: "viewer@example.invalid" }).locator("button", { hasText: "Remove" }).click();
+    await expect(page.locator("#status")).toContainText("Member removed.");
+    await expect(page.locator("#members")).not.toContainText("viewer@example.invalid");
+    await expect(page.locator("#alertEmails")).toHaveText("admin@example.invalid");
   } finally {
     service.server.closeAllConnections?.();
     await new Promise((resolve) => service.server.close(resolve));

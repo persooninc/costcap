@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
 
-async function fixture(t, { now } = {}) {
+async function fixture(t, { now, extra = {} } = {}) {
   let code, delivery = [], failDelivery = false, deliveryResult = null, invites = [], failInvite = false, failCode = false;
   const storePath = join(mkdtempSync(join(tmpdir(), "cc-service-")), "store.json");
   let service;
   const origin = "http://localhost";
   const start = async () => {
-    service = createHostedServer({ storePath, origin, secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (value) => value === "test-pass", sendCode: async (data) => { if (failCode) throw new Error("mail down"); code = data.code; }, sendInvite: async (data) => { if (failInvite) throw new Error("mail down"); invites.push(data); }, deliverAlert: async (a) => { delivery.push(a); return deliveryResult ?? [{ status: failDelivery ? "failed" : "accepted" }]; } });
+    service = createHostedServer({ storePath, origin, secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (value) => value === "test-pass", sendCode: async (data) => { if (failCode) throw new Error("mail down"); code = data.code; }, sendInvite: async (data) => { if (failInvite) throw new Error("mail down"); invites.push(data); }, deliverAlert: async (a) => { delivery.push(a); return deliveryResult ?? [{ status: failDelivery ? "failed" : "accepted" }]; }, ...extra });
     // Regression: on slow runners undici reused a socket the server had just
     // idle-closed (5s default) and fetch failed mid-test. Outlive the client.
     service.server.keepAliveTimeout = 60_000;
@@ -942,4 +942,66 @@ test("#134 per-agent silentAfterHours: validation, audit, worker threshold, off,
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.filter((d) => d.kind === "agent_silent").length, 3); // default re-arms past 48h; off never
   assert.equal(f.delivery.some((d) => d.agentId === off.agentId), false);
+});
+
+// Issue #137: member list, removal and role change.
+test("#137 members: list, remove, role change, last-owner guard, isolation, audit, sessions, alert recipients", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("owner@m.invalid");
+  const outsider = await f.login("owner@n.invalid");
+  await f.request("/v1/invitations", { email: "admin@m.invalid", role: "admin" }, owner.cookie);
+  await f.request("/v1/invitations", { email: "viewer@m.invalid", role: "viewer" }, owner.cookie);
+  const adm = await f.login("admin@m.invalid");
+  const viewer = await f.login("viewer@m.invalid");
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.deepEqual(fleet.members.map((m) => [m.email, m.role, m.verified]), [["admin@m.invalid", "admin", true], ["owner@m.invalid", "owner", true], ["viewer@m.invalid", "viewer", true]]);
+  assert.deepEqual(Object.keys(fleet.members[0]).sort(), ["email", "id", "role", "verified"]);
+  const outsiderFleet = (await f.request("/v1/fleet", undefined, outsider.cookie)).body;
+  assert.deepEqual(outsiderFleet.members.map((m) => m.email), ["owner@n.invalid"]);
+  const id = (email) => fleet.members.find((m) => m.email === email).id;
+  // Role rules.
+  assert.equal((await f.request(`/v1/members/${id("admin@m.invalid")}/remove`, {}, viewer.cookie)).status, 403);
+  assert.equal((await f.request(`/v1/members/${id("owner@m.invalid")}/remove`, {}, adm.cookie)).status, 403);
+  assert.equal((await f.request(`/v1/members/${id("owner@m.invalid")}/remove`, {}, owner.cookie)).status, 409);
+  assert.equal((await f.request(`/v1/members/${id("owner@m.invalid")}/role`, { role: "admin" }, owner.cookie)).status, 409);
+  assert.equal((await f.request(`/v1/members/${id("viewer@m.invalid")}/role`, { role: "admin" }, adm.cookie)).status, 403);
+  assert.equal((await f.request(`/v1/members/${id("viewer@m.invalid")}/role`, { role: "owner" }, owner.cookie)).status, 400);
+  assert.equal((await f.request(`/v1/members/${id("viewer@m.invalid")}/remove`, {}, outsider.cookie)).status, 404);
+  assert.equal((await f.request("/v1/members/nope/remove", {}, owner.cookie)).status, 404);
+  assert.equal((await f.request(`/v1/members/${id("viewer@m.invalid")}/remove`, {})).status, 401);
+  // Role change.
+  const changed = await f.request(`/v1/members/${id("viewer@m.invalid")}/role`, { role: "admin" }, owner.cookie);
+  assert.deepEqual([changed.status, changed.body.role], [200, "admin"]);
+  assert.equal((await f.request("/v1/fleet", undefined, viewer.cookie)).body.role, "admin");
+  await f.request(`/v1/members/${id("viewer@m.invalid")}/role`, { role: "viewer" }, owner.cookie);
+  // Alert recipient cleanup on removal.
+  assert.equal((await f.request("/v1/alert-settings", { emails: ["owner@m.invalid", "viewer@m.invalid"] }, owner.cookie)).status, 200);
+  const removed = await f.request(`/v1/members/${id("viewer@m.invalid")}/remove`, {}, adm.cookie);
+  assert.deepEqual([removed.status, removed.body.removed], [200, true]);
+  assert.equal((await f.request("/v1/fleet", undefined, viewer.cookie)).status, 401);
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body.emails, ["owner@m.invalid"]);
+  const after = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal(after.members.length, 2);
+  assert.equal(after.plan.usage.seats, 2);
+  const rm = after.audit.find((e) => e.action === "member.remove");
+  assert.equal(rm.detail.email, "viewer@m.invalid");
+  assert.equal(rm.actor, adm.body.id);
+  assert.ok(after.audit.some((e) => e.action === "member.role" && e.detail.previous === "viewer" && e.detail.role === "admin"));
+  assert.equal(outsiderFleet.audit.some((e) => e.action.startsWith("member.")), false);
+  // Removal survives restart and the address can be re-invited.
+  await f.restart();
+  assert.equal((await f.request("/v1/fleet", undefined, owner.cookie)).body.members.length, 2);
+  assert.equal((await f.request("/v1/invitations", { email: "viewer@m.invalid", role: "viewer" }, owner.cookie)).status, 201);
+});
+
+test("#137 removing a member frees a seat so an over-limit invite succeeds", async (t) => {
+  const f = await fixture(t, { extra: { enforceEntitlements: true, billingFactory: async () => ({ status: async () => ({ status: "free_beta" }), checkout: async () => ({}), portal: async () => ({}), webhook: async () => ({ received: true }) }) } });
+  const owner = await f.login("owner@seat.invalid");
+  const limit = (await f.request("/v1/fleet", undefined, owner.cookie)).body.plan.limits.seats;
+  for (let i = 1; i < limit; i++) assert.equal((await f.request("/v1/invitations", { email: `m${i}@seat.invalid`, role: "viewer" }, owner.cookie)).status, 201);
+  for (let i = 1; i < limit; i++) await f.login(`m${i}@seat.invalid`);
+  assert.equal((await f.request("/v1/invitations", { email: "late@seat.invalid", role: "viewer" }, owner.cookie)).status, 402);
+  const target = (await f.request("/v1/fleet", undefined, owner.cookie)).body.members.find((m) => m.email === "m1@seat.invalid");
+  assert.equal((await f.request(`/v1/members/${target.id}/remove`, {}, owner.cookie)).status, 200);
+  assert.equal((await f.request("/v1/invitations", { email: "late@seat.invalid", role: "viewer" }, owner.cookie)).status, 201);
 });

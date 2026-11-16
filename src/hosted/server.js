@@ -181,6 +181,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     return agent;
   };
   const admin = (s, req) => { const u = sessionUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
+  const ownerOnly = (s, req) => { const u = sessionUser(s, req); if (u.role !== "owner") fail(403, "Workspace owner required"); return u; };
+  const orgMembers = (s, orgId) => Object.values(s.users).filter((m) => m.orgId === orgId).map((m) => ({ id: m.id, email: m.email, role: m.role, verified: Boolean(m.verified) })).sort((a, b) => a.email.localeCompare(b.email));
   // Issue #123: org teams and their verdicts from synced receipts.
   const orgTeams = (s, orgId) => Object.values(s.teams ?? {}).filter((t) => t.orgId === orgId).sort((a, b) => a.name.localeCompare(b.name));
   const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map(costedReceipt);
@@ -402,7 +404,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             audit: labelAudit(s, u.orgId, s.audit), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
             fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
-            role: u.role, invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
+            role: u.role, members: orgMembers(s, u.orgId), invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
             beta: true, billing: billing ? "enabled" : "disabled",
             plan: { ...entitlements(s, u.orgId), usage: planUsage(s, u.orgId, now(), { pending: false }), upgradeUrl },
             onboarding: onboardingState({
@@ -447,6 +449,33 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           audit(s, user.orgId, user.id, "invitation.revoke", invite.id);
         });
         return json(200, { revoked: true });
+      }
+      // Issue #137: member removal and role change. Org-scoped; the last owner is never removed or demoted.
+      const memberAction = /^\/v1\/members\/([^/]+)\/(remove|role)$/.exec(path);
+      if (memberAction && req.method === "POST") {
+        const [, targetId, action] = memberAction;
+        if (action === "role" && !["admin", "viewer"].includes(body.role)) fail(400, "Role must be admin or viewer");
+        const result = store.transaction((s) => {
+          const actor = action === "role" ? ownerOnly(s, req) : admin(s, req);
+          const target = s.users[targetId];
+          if (!target || target.orgId !== actor.orgId) fail(404, "Member not found");
+          const owners = Object.values(s.users).filter((m) => m.orgId === actor.orgId && m.role === "owner");
+          if (target.role === "owner" && actor.role !== "owner") fail(403, "Only an owner can remove an owner");
+          if (target.role === "owner" && owners.length <= 1) fail(409, action === "role" ? "Cannot demote the last owner" : "Cannot remove the last owner");
+          if (action === "role") {
+            const previous = target.role;
+            target.role = body.role;
+            audit(s, actor.orgId, actor.id, "member.role", target.id, { email: target.email, previous, role: body.role });
+            return { id: target.id, email: target.email, role: target.role, verified: Boolean(target.verified) };
+          }
+          for (const [key, session] of Object.entries(s.sessions)) if (session.userId === target.id) delete s.sessions[key];
+          const org = s.orgs[actor.orgId];
+          if (org?.alertSettings?.emails?.includes(target.email)) org.alertSettings = { ...org.alertSettings, emails: org.alertSettings.emails.filter((e) => e !== target.email) };
+          delete s.users[target.id];
+          audit(s, actor.orgId, actor.id, "member.remove", target.id, { email: target.email, role: target.role });
+          return { removed: true, id: target.id };
+        });
+        return json(200, result);
       }
       // Issue #121: per-org alert destinations. Any member reads the masked view;
       // owner/admin writes. The full Slack webhook is never returned or audited.
