@@ -2,6 +2,7 @@
 // Requests are serialized per proxy, so the next decision sees prior usage.
 // A request already accepted by a provider can exceed the remaining budget.
 import http from "node:http";
+import https from "node:https";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
@@ -21,6 +22,7 @@ import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
+import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
 
 const PROVIDERS = {
@@ -35,7 +37,11 @@ const PROVIDERS = {
 
 export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   const lines = [];
-  if (providers.includes("openai")) lines.push(`OPENAI_BASE_URL=http://127.0.0.1:${port}/openai/v1`);
+  if (providers.includes("openai")) {
+    lines.push(`OPENAI_BASE_URL=http://127.0.0.1:${port}/openai/v1`);
+    // #194: raw-socket Realtime clients (the Python SDK derives ws:// from OPENAI_BASE_URL).
+    lines.push(`COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:${port}/openai/v1/realtime`);
+  }
   if (providers.includes("anthropic")) lines.push(`ANTHROPIC_BASE_URL=http://127.0.0.1:${port}/anthropic`);
   if (providers.includes("openrouter")) lines.push(`OPENROUTER_BASE_URL=http://127.0.0.1:${port}/openrouter`);
   if (providers.includes("gemini")) {
@@ -875,6 +881,236 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       queue = queue.then(run).catch(() => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); });
     });
   });
+  // #194: OpenAI Realtime API over WebSocket. Every other upgrade is refused locally (never
+  // reaches the HTTP path, never latches). Admission runs before 101; each response.done is
+  // metered and the gate re-checked between responses; kill closes open sessions.
+  const sessions = new Set();
+  let killTimer = null;
+  const sessionGate = (model, tags) => {
+    const killed = killCheck?.();
+    if (killed) return { status: 429, reason: "killed", detail: killed, body: { error: "killed", ...killed } };
+    const accountingFailure = accountingFailureNow();
+    if (accountingFailure) return { status: 429, reason: "accounting_unavailable", detail: {}, body: { error: "accounting_unavailable", message: accountingFailure } };
+    const agentHit = agentBudgets?.check(who);
+    if (agentHit) return { status: 429, reason: agentHit.reason, detail: agentHit, body: { error: agentHit.verdict, ...agentHit } };
+    const teamHit = teamCheck?.();
+    if (teamHit) return { status: 429, reason: teamHit.reason, detail: teamHit, body: { error: teamHit.verdict, ...teamHit } };
+    const hit = cap?.check();
+    if (hit) return { status: 429, reason: "budget_exceeded", detail: hit, body: budgetExceededBody(hit) };
+    const tagHit = tagCaps?.check(tags);
+    if (tagHit) return { status: 429, reason: "tag_budget_exceeded", detail: tagHit, body: tagBudgetExceededBody(tagHit) };
+    void model;
+    return null;
+  };
+  const ensureKillTimer = () => {
+    if (killTimer || !killCheck) return;
+    killTimer = setInterval(() => {
+      if (!sessions.size) { clearInterval(killTimer); killTimer = null; return; }
+      const k = killCheck();
+      if (k) for (const s of [...sessions]) s.terminate("killed", k);
+    }, 200);
+    killTimer.unref?.();
+  };
+  server.on("upgrade", (req, socket, head) => {
+    socket.on("error", () => {});
+    const url = new URL(req.url, "http://localhost");
+    const rawPathname = req.url.split(/[?#]/, 1)[0];
+    const upstream = upstreams.openai;
+    if (!REALTIME_PATH.test(rawPathname) || !upstream) {
+      writeHttpJson(socket, 501, { error: "websocket_unsupported", message: "CostCap proxies WebSocket upgrades only on /openai/v1/realtime. The upstream call was not made." });
+      return;
+    }
+    let reqTags = null;
+    try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) {
+      writeHttpJson(socket, 400, { error: "invalid_tags", message: `CostCap: ${e.message}. The upstream call was not made.` });
+      return;
+    }
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    const storedPath = receiptPath("/v1/realtime", url.search);
+    const queryModel = url.searchParams.get("model") || undefined;
+    let model = queryModel ?? "unknown";
+    const base = { provider: "openai", path: storedPath, transport: "websocket" };
+    let verdict;
+    try {
+      verdict = guarded(() => {
+        const g = sessionGate(queryModel, reqTags);
+        if (g) return g;
+        const allow = allowedModels?.() ?? null;
+        if (allow && (!queryModel || !allow.includes(queryModel))) return { status: 403, reason: "model_not_allowed", model: true,
+          body: { error: "model_not_allowed", model: queryModel ?? null, message: `CostCap: model "${queryModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.` } };
+        const priced = userPrices ? isPricedWithOverrides(userPrices, "openai", queryModel) : isPricedModel(queryModel);
+        if (unknownModels === "refuse" && (!queryModel || !priced)) return { status: 403, reason: "model_unpriced", model: true,
+          body: { error: "model_unpriced", model: queryModel ?? null, message: `CostCap: model "${queryModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.` } };
+        return null;
+      });
+      if (verdict) {
+        emit({ ...base, blocked: true, reason: verdict.reason, cost_usd: 0, ...(verdict.model ? { outcome: "blocked_model", model } : verdict.detail) });
+        writeHttpJson(socket, verdict.status, verdict.body, verdict.detail?.retry_after_s != null ? { "retry-after": String(verdict.detail.retry_after_s) } : {});
+        return;
+      }
+    } catch {
+      writeHttpJson(socket, 503, { error: "receipt_ledger_unavailable" });
+      return;
+    }
+    // Dial the upstream. Compression is stripped so frames stay parseable; CostCap headers never leave.
+    const target = new URL(`${upstream}/v1/realtime${url.search}`);
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (k === "host" || k.startsWith("x-costcap-") || k === "sec-websocket-extensions") continue;
+      headers[k] = v;
+    }
+    headers.host = target.host;
+    const client = target.protocol === "https:" ? https : http;
+    const upReq = client.request(target, { method: "GET", headers });
+    let settledHandshake = false;
+    const handshakeTimer = setTimeout(() => upReq.destroy(new Error("upstream_timeout")), timeoutMs);
+    handshakeTimer.unref?.();
+    const noUpgrade = (status, body, reason) => {
+      if (settledHandshake) return;
+      settledHandshake = true;
+      clearTimeout(handshakeTimer);
+      // #135: a handshake that never got 101 generated nothing: $0 with status, no latch.
+      try { emit({ ...base, status, blocked: false, model, cost_usd: 0, reason }); } catch { /* ledger failure surfaces on the next call */ }
+      writeHttpJson(socket, status, body);
+    };
+    upReq.on("error", () => noUpgrade(502, { error: "upstream_unreachable", message: "CostCap could not open the Realtime WebSocket upstream." }, "upstream_handshake_failed"));
+    upReq.on("response", (res) => {
+      const parts = [];
+      res.on("data", (c) => parts.push(c));
+      res.on("end", () => {
+        let body;
+        try { body = JSON.parse(Buffer.concat(parts).toString("utf8")); } catch { body = { error: "upstream_handshake_rejected" }; }
+        noUpgrade(res.statusCode, body, "upstream_rejected");
+      });
+      res.on("error", () => noUpgrade(502, { error: "upstream_handshake_rejected" }, "upstream_rejected"));
+    });
+    upReq.on("upgrade", (upRes, upSocket, upHead) => {
+      settledHandshake = true;
+      clearTimeout(handshakeTimer);
+      upSocket.on("error", () => {});
+      if (socket.destroyed) { upSocket.destroy(); return; }
+      const lines = ["HTTP/1.1 101 Switching Protocols"];
+      for (let i = 0; i < upRes.rawHeaders.length; i += 2) {
+        if (upRes.rawHeaders[i].toLowerCase() === "sec-websocket-extensions") continue;
+        lines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
+      }
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+      let sessionId = null, closed = false;
+      const inflight = new Set();
+      const down = createFrameParser();
+      const latch = (receipt, msg) => {
+        const done = emit(receipt);
+        failures.set(done.id, msg);
+        recordSpend(done);
+        flushWarnings();
+        return done;
+      };
+      const shutdown = (code, reason, errorCode) => {
+        if (closed) return;
+        closed = true;
+        sessions.delete(session);
+        try {
+          if (errorCode) socket.write(encodeFrame(0x1, JSON.stringify({ type: "error", error: { type: "costcap", code: errorCode, message: `CostCap: ${reason}. The session was closed.` } })));
+          socket.write(encodeFrame(0x8, closePayload(code, `costcap: ${reason}`)));
+        } catch { /* client already gone */ }
+        socket.end();
+        try { upSocket.write(encodeFrame(0x8, closePayload(1000, "costcap"), { mask: true })); } catch { /* upstream already gone */ }
+        upSocket.end();
+        setTimeout(() => { socket.destroy(); upSocket.destroy(); }, 1000).unref?.();
+      };
+      const finishIncomplete = () => {
+        for (const id of inflight) {
+          try { latch({ ...base, status: 101, blocked: false, model, session_id: sessionId, response_id: id, cost_usd: null, reason: "stream_incomplete" },
+            "A Realtime response was cut before usage arrived. Restart only after reconciling this request."); } catch { hardFailure = "Receipt ledger unavailable."; }
+        }
+        inflight.clear();
+      };
+      const onEvent = (ev) => {
+        if (!ev || typeof ev !== "object") return false;
+        if ((ev.type === "session.created" || ev.type === "session.updated") && ev.session && typeof ev.session === "object") {
+          if (typeof ev.session.id === "string") sessionId = ev.session.id;
+          if (typeof ev.session.model === "string" && ev.session.model) model = ev.session.model;
+        } else if (ev.type === "response.created" && typeof ev.response?.id === "string") {
+          inflight.add(ev.response.id);
+        } else if (ev.type === "response.done" && ev.response && typeof ev.response === "object") {
+          const responseId = typeof ev.response.id === "string" ? ev.response.id : null;
+          inflight.delete(responseId);
+          const usage = realtimeUsage(ev.response.usage);
+          const receiptBase = { ...base, status: 101, blocked: false, session_id: sessionId, response_id: responseId };
+          if (!usage) {
+            latch({ ...receiptBase, model, cost_usd: null, reason: "usage_unavailable" }, "A Realtime response reported no usable token usage. Restart only after reconciling this request.");
+            return true;
+          }
+          const priced = costWithOverrides(userPrices, "openai", model, usage);
+          const receipt = { ...receiptBase, ...priced };
+          rateLimit?.record(usageTokens(usage));
+          if (receipt.cost_usd === null) {
+            latch(receipt, receipt.reason === "modality_unpriced"
+              ? `Non-text (audio/image) Realtime tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`
+              : "A Realtime response has no published rate. Restart only after reconciling this request.");
+          } else {
+            const done = emit(receipt);
+            recordSpend(done);
+            velocity?.record(done.cost_usd);
+            flushWarnings();
+          }
+          return true;
+        } else if (ev.type === "conversation.item.input_audio_transcription.completed" && ev.usage && typeof ev.usage === "object") {
+          latch({ ...base, status: 101, blocked: false, model, session_id: sessionId, item_id: typeof ev.item_id === "string" ? ev.item_id : null, cost_usd: null, reason: "transcription_unpriced" },
+            "A Realtime input transcription was billed with no published rate. Restart only after reconciling this request.");
+          return true;
+        }
+        return false;
+      };
+      const session = {
+        terminate(reason, detail) {
+          if (closed) return;
+          try { emit({ ...base, blocked: true, reason, cost_usd: 0, model, session_id: sessionId, ...detail }); } catch { /* ledger */ }
+          finishIncomplete();
+          shutdown(1008, reason, reason);
+        },
+      };
+      sessions.add(session);
+      session.close = () => shutdown(1001, "proxy_closed");
+      ensureKillTimer();
+      const fromUpstream = (bytes) => {
+        if (closed) return;
+        for (const frame of down.push(bytes)) {
+          if (closed) return;
+          socket.write(frame.raw);
+          if (!frame.message || frame.message.opcode !== 0x1) continue;
+          let ev;
+          try { ev = JSON.parse(frame.message.data.toString("utf8")); } catch { continue; }
+          let metered;
+          try { metered = onEvent(ev); } catch { hardFailure = "Receipt ledger unavailable."; shutdown(1011, "accounting_unavailable", "accounting_unavailable"); return; }
+          if (!metered) continue;
+          const g = guarded(() => sessionGate(model, reqTags));
+          if (g) {
+            if (g.reason === "killed") { session.terminate("killed", g.detail); return; }
+            finishIncomplete();
+            shutdown(1008, g.reason, g.reason);
+            return;
+          }
+        }
+        if (down.corrupt) { finishIncomplete(); shutdown(1009, "frame_too_large", "frame_too_large"); }
+      };
+      if (upHead?.length) fromUpstream(upHead);
+      upSocket.on("data", fromUpstream);
+      socket.on("data", (bytes) => { if (!closed) upSocket.write(bytes); });
+      if (head?.length) upSocket.write(head);
+      const onEnd = () => {
+        if (closed) return;
+        closed = true;
+        sessions.delete(session);
+        finishIncomplete();
+        socket.end(); upSocket.end();
+        setTimeout(() => { socket.destroy(); upSocket.destroy(); }, 1000).unref?.();
+      };
+      // The HTTP server allows half-open sockets, so a peer FIN alone ends the session.
+      for (const s of [socket, upSocket]) { s.on("end", onEnd); s.on("close", onEnd); }
+    });
+    upReq.end();
+  });
   // #171: a settlement (hosted poll or reconciliation) of a receipt that caused an
   // accounting failure clears that failure; the block lifts once all are settled.
   // #176: a settled pending batch is resolved, so a later results read in this run
@@ -893,6 +1129,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return failures.delete(id);
   };
   server.accountingFailure = accountingFailureNow;
+  // Upgraded sockets are detached from the HTTP server, so close() shuts open sessions itself.
+  const closeServer = server.close.bind(server);
+  server.close = (cb) => { for (const s of [...sessions]) s.close(); if (killTimer) { clearInterval(killTimer); killTimer = null; } return closeServer(cb); };
   return server;
 }
 

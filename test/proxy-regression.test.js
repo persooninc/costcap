@@ -547,3 +547,21 @@ test("#184 without a cache every receipt keeps its exact pre-cache shape and no 
   assert.deepEqual(Object.keys(receipts[1]).sort(), Object.keys(receipts[0]).sort());
   for (const r of receipts) for (const k of ["cache", "saved_usd", "cache_source_receipt"]) assert.equal(k in r, false);
 });
+
+// #194 AC5: a WebSocket upgrade on a non-realtime route used to reach the HTTP path, fail fetch,
+// latch upstream_outcome_unknown and refuse every later call. It is now refused locally.
+test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hits, next call 200", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream();
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url, anthropic: up.url } });
+  t.after(async () => { server.close(); await up.close(); });
+  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages"]) {
+    const c = await connectRealtime(port, p);
+    assert.equal(c.status, 501);
+    assert.equal(c.body.error, "websocket_unsupported");
+  }
+  assert.equal(up.requests + up.handshakes.length, 0);
+  const r = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) });
+  assert.equal(r.status, 200);
+  assert.equal(server.accountingFailure(), null);
+});

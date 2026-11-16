@@ -181,3 +181,27 @@ test("#144 kill/resume --host CLI: separate files, scoped receipts, --status JSO
   assert.equal(events[0].kill_file, join(home, "KILL"));
   assert.equal(events[0].note, "runaway");
 });
+
+test("#194 kill closes an open Realtime session mid-stream and refuses new handshakes", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  let conn;
+  const up = await startRealtimeUpstream({ onSession: (c) => { conn = c; } });
+  const f = join(mkdtempSync(join(tmpdir(), "cc-")), "KILL");
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url }, killCheck: createKillCheck(f), onReceipt: (r) => receipts.push(r) });
+  t.after(async () => { server.close(); await up.close(); });
+  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime");
+  while (!conn) await new Promise((r) => setTimeout(r, 10));
+  conn.send({ type: "response.created", response: { id: "r_live" } });
+  const t0 = Date.now();
+  kill(f, "stop");
+  await c.closed;
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(c.closeCode, 1008);
+  assert.ok(receipts.some((r) => r.blocked && r.reason === "killed" && r.transport === "websocket"));
+  // The in-flight response is an honest unknown.
+  assert.equal(receipts.find((r) => r.response_id === "r_live").reason, "stream_incomplete");
+  const again = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime");
+  assert.equal(again.status, 429);
+  assert.equal(up.upgrades, 1);
+});

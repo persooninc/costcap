@@ -90,3 +90,21 @@ test("helpers: slices, null/garbage inputs", () => {
 
 import { readFileSync } from "node:fs";
 function require_table() { return readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"); }
+
+// #194: Realtime usage uses singular input_token_details/output_token_details with a cached split.
+test("#194 realtime usage shape prices audio at realtime rates with the cached split", async () => {
+  const { realtimeUsage } = await import("../src/realtime.js");
+  const usage = realtimeUsage({ input_tokens: 1300, output_tokens: 600,
+    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
+    output_token_details: { text_tokens: 100, audio_tokens: 500 } });
+  const c = costForUsage("gpt-realtime-2025-08-28", usage);
+  assert.equal(c.cost_usd, 0.0538);
+  assert.equal(c.cost_source, "table");
+  // Image input at $5 / cached $0.50.
+  const img = costForUsage("gpt-realtime", realtimeUsage({ input_tokens: 1000, output_tokens: 0, input_token_details: { image_tokens: 1000 } }));
+  assert.equal(img.cost_usd, 0.005);
+  // gpt-realtime-mini has text rates only: audio is unknown, never text-priced.
+  assert.equal(costForUsage("gpt-realtime-mini", usage).reason, "modality_unpriced");
+  assert.equal(costForUsage("gpt-realtime-2.1", usage).cost_usd, Number(((200 * 4 + 100 * 0.4 + 600 * 32 + 400 * 0.4 + 100 * 24 + 500 * 64) / 1e6).toFixed(6)));
+  assert.equal(lookupPrice("gpt-realtime-2.1-mini").modalities.audio.output, 20);
+});

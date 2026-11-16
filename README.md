@@ -76,7 +76,7 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 | Provider | Variables set for the child |
 | --- | --- |
-| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` and `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` |
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
@@ -86,6 +86,27 @@ CostCap. The local proxy binds to 127.0.0.1.
 The Python `google-genai` SDK has no base-URL environment variable; set
 `http_options={"base_url": os.environ["GOOGLE_GEMINI_BASE_URL"]}` in code or its
 traffic bypasses CostCap.
+
+### Realtime API
+
+The OpenAI Realtime API (`/v1/realtime` WebSocket) is proxied and metered. CostCap
+writes one receipt per `response.done` (`transport: "websocket"`, `session_id`,
+`response_id`), pricing text, audio and image tokens at the `gpt-realtime*` rates with
+the cached split. Admission (kill, allowlist, `--unknown-models refuse`, agent/team,
+tag and spend caps) runs before the `101`; a refusal is a plain HTTP error and nothing
+reaches OpenAI. After each response the caps are re-checked: on a hit the client gets
+that `response.done`, then `{"type":"error","error":{"type":"costcap","code":"budget_exceeded"}}`,
+then close `1008`. `costcap kill` closes open sessions within a second.
+
+- **Python SDK:** works as is. `client.realtime.connect()` derives `ws://…/realtime` from `OPENAI_BASE_URL`.
+- **Raw WebSocket apps:** connect to `COSTCAP_OPENAI_REALTIME_URL` (add `?model=…`).
+- **Node SDK:** unsupported. It forces `wss:`, and the loopback proxy is plain HTTP.
+- **Hardcoded `wss://api.openai.com`:** bypasses CostCap.
+
+A response cut before `response.done`, audio on a model with no audio rate
+(`gpt-realtime-mini` is text only here) and a billed input transcription are recorded as
+unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
+pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
 
 ### Other OpenAI-compatible providers
 

@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.6",
+  "version": "2026-11-16.7",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -16,7 +16,8 @@
     "https://developers.openai.com/api/docs/guides/batch (Batch API: 50% cost discount; retrieved 2026-11-16)",
     "https://ai.google.dev/gemini-api/docs/pricing (Gemini 2.5 Flash / Flash-Lite audio input and audio cache rates; text/image/video share the text rate; retrieved 2026-11-16)",
     "https://platform.openai.com/docs/models/gpt-image-1 (text $5 / cached $1.25, image input $10 / cached $2.50, image output $40; retrieved 2026-11-16)",
-    "https://platform.claude.com/docs/en/about-claude/pricing (Regional and multi-region endpoint pricing: Claude 4.5+ on Amazon Bedrock and Google Vertex AI regional endpoints cost 10% over global; retrieved 2026-11-16)"
+    "https://platform.claude.com/docs/en/about-claude/pricing (Regional and multi-region endpoint pricing: Claude 4.5+ on Amazon Bedrock and Google Vertex AI regional endpoints cost 10% over global; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/models/gpt-realtime and https://developers.openai.com/api/docs/pricing (Realtime: gpt-realtime, gpt-realtime-2.1, gpt-realtime-2.1-mini text/audio/image; gpt-realtime-mini text only per #194, audio stays unpriced; retrieved 2026-11-16)"
   ],
   "batch": { "openai": 0.5, "anthropic": 0.5 },
   "regional_endpoint": { "multiplier": 1.1, "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"] },
@@ -55,6 +56,10 @@
     "gemini-2.5-pro": { "input": 1.25, "cached_input": 0.125, "output": 10.00, "long_context": { "threshold_input_tokens": 200000, "input": 2.50, "cached_input": 0.25, "output": 15.00 }, "uniform_modalities": true },
     "gemini-3.8-flash": { "input": 0.75, "cached_input": 0.075, "output": 3.75, "uniform_modalities": true },
     "gemini-3.1-pro-preview": { "input": 2.00, "cached_input": 0.20, "output": 12.00, "long_context": { "threshold_input_tokens": 200000, "input": 4.00, "cached_input": 0.40, "output": 18.00 }, "uniform_modalities": true },
+    "gpt-realtime": { "input": 4.00, "cached_input": 0.40, "output": 16.00, "modalities": { "audio": { "input": 32.00, "cached_input": 0.40, "output": 64.00 }, "image": { "input": 5.00, "cached_input": 0.50 } } },
+    "gpt-realtime-2.1": { "input": 4.00, "cached_input": 0.40, "output": 24.00, "modalities": { "audio": { "input": 32.00, "cached_input": 0.40, "output": 64.00 }, "image": { "input": 5.00, "cached_input": 0.50 } } },
+    "gpt-realtime-2.1-mini": { "input": 0.60, "cached_input": 0.06, "output": 2.40, "modalities": { "audio": { "input": 10.00, "cached_input": 0.30, "output": 20.00 }, "image": { "input": 0.80, "cached_input": 0.08 } } },
+    "gpt-realtime-mini": { "input": 0.60, "cached_input": 0.06, "output": 2.40 },
     "gpt-image-1": { "input": 5.00, "cached_input": 1.25, "output": 40.00, "modalities": { "image": { "input": 10.00, "cached_input": 2.50, "output": 40.00 } } },
     "anthropic/claude-sonnet-4.6": { "input": 3.00, "cached_input": 0.30, "output": 15.00 },
     "anthropic/claude-opus-4.6": { "input": 5.00, "cached_input": 0.50, "output": 25.00 },
