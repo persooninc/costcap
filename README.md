@@ -209,7 +209,10 @@ traffic bypasses CostCap.
   OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
   (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
   run, but the run total stays unknown and `costcap check` fails until the batch
-  settles. Reading the results through the proxy settles it: Anthropic
+  settles. Enrolled fleet day/month caps and hosted team caps (`costcap wrap
+  --enrollment`) follow the same rule: a pending batch is shown as pending, not as an
+  unreconciled unknown, and its settled cost counts toward the fleet/team total.
+  Reading the results through the proxy settles it: Anthropic
   `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
   links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
   Succeeded lines are priced at the published 50% batch rate (pricing table

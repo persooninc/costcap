@@ -24,7 +24,7 @@ test("unit: agentSpendPolicy sums known costs per UTC window, counts unknowns, s
     { id: "f", ts: "2026-10-01T03:00:00Z", cost_usd: null },
     { id: "g", ts: "bogus", cost_usd: 1 }, null,
   ], NOW);
-  assert.deepEqual(p, { spent: { day: 0.5, month: 0.75 }, unknown: 1, as_of: "2026-11-15T12:00:00.000Z" });
+  assert.deepEqual(p, { spent: { day: 0.5, month: 0.75 }, unknown: 1, pending_batches: 0, as_of: "2026-11-15T12:00:00.000Z" });
   assert.equal(validAgentSpend(p), true);
 });
 

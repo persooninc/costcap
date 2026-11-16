@@ -5,6 +5,7 @@
 // (cost_usd: null) from any member makes the team verdict accounting_unavailable;
 // it is never treated as $0.
 import { createAgentBudgets } from "../agent-budget.js";
+import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 export const TEAM_SCOPES = Object.freeze(["day", "month"]);
@@ -114,6 +115,9 @@ function cachedTotals(entry, pending, nowMs) {
   for (const s of TEAM_SCOPES) total[s] = now.slice(0, window[s]) === asOf.slice(0, window[s]) ? entry.spent[s] : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
+    // #183: a pending batch is not unknown spend (same rule as cap.js); its cost
+    // arrives as a settlement, which settled-aware loading has already applied.
+    if (isPendingBatch(r)) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     const ts = new Date(r.ts).toISOString();
     for (const s of TEAM_SCOPES) if (ts.slice(0, window[s]) === now.slice(0, window[s])) total[s] += r.cost_usd;
@@ -140,15 +144,17 @@ export function agentSpendPolicy(receipts, nowMs) {
   const now = new Date(nowMs).toISOString();
   const spent = { day: 0, month: 0 };
   let unknown = 0;
+  let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     const ts = new Date(r.ts).toISOString();
     if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+    if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     spent.month += r.cost_usd;
     if (ts.slice(0, 10) === now.slice(0, 10)) spent.day += r.cost_usd;
   }
-  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, as_of: now };
+  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
 }
 
 export function validAgentSpend(a) {
