@@ -150,6 +150,19 @@ delivery, npm publication, marketplace distribution, and two-week dogfood are
 not certified by this repository's tests. `costcap reconcile` compares a local
 receipt file with a provider charge file and does not call a provider.
 
+To settle unknown-cost receipts from that provider evidence, add `--apply`:
+
+```sh
+costcap reconcile --receipts .costcap/receipts.jsonl --provider charges.jsonl --apply
+```
+
+For each `cost_usd: null` receipt with a matching charge whose `cost_usd` is a
+finite number >= 0, one `{"event":"reconciliation","receipt_id",...,"provider_sha256"}`
+line is appended; the original receipt line is never edited. The settled cost
+counts toward the original receipt's run/day/month. A missing, null or negative
+charge never settles (it is not $0): the command exits 1 and lists the ids still
+unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.jsonl`.
+
 ## Enrollment client (service not yet deployed)
 
 ```sh

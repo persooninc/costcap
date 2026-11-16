@@ -98,3 +98,38 @@ test("wrap --max-steps 2 lets two calls through and breaks the third with breake
   assert.equal(res.code, 0);
   assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "200 200 429 breaker_open");
 });
+
+test("e2e: unknown-cost receipt blocks the next run until reconcile --apply settles it (costcap#124)", async (t) => {
+  const { writeFileSync } = await import("node:fs");
+  // Upstream answers with no usage block, so the receipt cost is unknown.
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini" })));
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-settle-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions",{method:"POST",body:"{}"}); console.log(r.status);`;
+  const run = () => new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--day-cap", "5", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim() }));
+  });
+  const first = await run();
+  assert.match(first.out, /200/);
+  const unknown = readFileSync(receipts, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => !r.event && r.cost_usd === null);
+  assert.equal(unknown.length, 1);
+  const second = await run();
+  assert.match(second.out, /429/, "next run is refused while cost is unknown");
+  const provider = path.join(dir, "provider.jsonl");
+  writeFileSync(provider, JSON.stringify({ id: unknown[0].id, cost_usd: 0.42 }) + "\n");
+  const ap = spawnSync(process.execPath, ["src/cli.js", "reconcile", "--receipts", receipts, "--provider", provider, "--apply"], { encoding: "utf8" });
+  assert.equal(ap.status, 0, ap.stderr);
+  assert.deepEqual(JSON.parse(ap.stdout).settled, [{ receipt_id: unknown[0].id, cost_usd: 0.42 }]);
+  const third = await run();
+  assert.match(third.out, /200/, "settled ledger allows the next run");
+  const chk = spawnSync(process.execPath, ["src/cli.js", "check", "--receipts", receipts], { encoding: "utf8" });
+  const body = JSON.parse(chk.stdout);
+  assert.equal(body.total_usd >= 0.42, true);
+});

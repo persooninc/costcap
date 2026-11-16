@@ -1,5 +1,5 @@
 // Read-only CI guard: rejects unknown cost rather than treating it as free.
-import { loadReceipts, createCapEngine } from "./cap.js";
+import { loadSettledReceipts as loadReceipts, createCapEngine } from "./cap.js";
 import { budgetRemaining, createAgentBudgets } from "./agent-budget.js";
 export function checkBudget({ receiptsPath, caps = {}, now }) {
   const history = loadReceipts(receiptsPath);

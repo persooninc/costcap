@@ -7,6 +7,7 @@
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, openSync, readSync, fstatSync, closeSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { hostname } from "node:os";
+import { applySettlements } from "./cap.js";
 
 const readOwner = (file) => { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; } };
 
@@ -123,13 +124,13 @@ export function openSharedLedger(path, { onExternal = () => {}, timeoutMs } = {}
     // Reads the full ledger under the critical section and starts tracking from there.
     history() {
       const release = acquireCriticalSection(path, { timeoutMs });
-      try { return readNew().filter((r) => !r.event); } finally { release(); }
+      try { return applySettlements(readNew()); } finally { release(); }
     },
     // Folds other wrappers' receipts in, then runs fn, all inside the critical section.
     withLock(fn) {
       const release = acquireCriticalSection(path, { timeoutMs });
       try {
-        for (const r of readNew()) if (!r.event) onExternal(r);
+        for (const r of applySettlements(readNew())) onExternal(r);
         const out = fn();
         // Our own append (if any) is already accounted for by the caller.
         if (existsSync(path)) { const size = statSync(path).size; if (size > offset) { offset = size; pending = ""; } }

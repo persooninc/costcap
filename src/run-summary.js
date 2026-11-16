@@ -1,3 +1,4 @@
+import { applySettlements } from "./cap.js";
 // Local per-run JSON summary (costcap.run-summary/v1): calls, tokens and cost per
 // model, unknown-cost count, caps and stop reason. Written to <ledger-dir>/runs/.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -19,8 +20,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   const by_model = {};
   let calls = 0, blocked_calls = 0, unknown_cost_calls = 0, total = 0;
   let stopped_by = killed ? "killed" : null, stopped_scope = null;
-  for (const r of receipts) {
-    if (!r || r.event) continue;
+  for (const r of applySettlements(receipts.filter(Boolean))) {
     if (r.blocked) {
       blocked_calls++;
       const s = stopReason(r.reason);

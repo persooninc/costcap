@@ -18,6 +18,34 @@ export function loadReceipts(path) {
   return loadLines(path).filter((r) => !r.event);
 }
 
+// Settlement view (costcap#124): an append-only {"event":"reconciliation"} line
+// gives a null-cost receipt its provider cost. The original line is never
+// edited; the settled cost keeps the original receipt's ts, so it counts toward
+// that run/day/month. Only the first valid settlement per receipt_id counts, and
+// a settlement never overrides a receipt that already has a cost.
+export function isSettlement(e) {
+  return !!e && e.event === "reconciliation" && typeof e.receipt_id === "string" && !!e.receipt_id &&
+    typeof e.cost_usd === "number" && Number.isFinite(e.cost_usd) && e.cost_usd >= 0;
+}
+
+export function applySettlements(lines) {
+  const settle = new Map();
+  for (const e of lines) if (isSettlement(e) && !settle.has(e.receipt_id)) settle.set(e.receipt_id, e);
+  return lines.filter((r) => !r.event).map((r) => {
+    const e = r.cost_usd === null && typeof r.id === "string" ? settle.get(r.id) : undefined;
+    return e ? { ...r, cost_usd: e.cost_usd, settled: { source: e.source ?? null, provider_sha256: e.provider_sha256 ?? null, ts: e.ts ?? null } } : r;
+  });
+}
+
+// Receipts with provider settlements applied: what spend and verdicts read.
+export function loadSettledReceipts(path) {
+  return applySettlements(loadLines(path));
+}
+
+export function loadLedgerLines(path) {
+  return loadLines(path);
+}
+
 export function loadEvents(path) {
   return loadLines(path).filter((r) => r.event);
 }

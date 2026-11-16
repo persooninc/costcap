@@ -64,3 +64,19 @@ test("regression: bucketed spend keeps day and month boundaries exact (stress fi
   cap.record({ cost_usd: 3 });
   assert.equal(cap.check().scope, "day");
 });
+
+test("cap engine honours reconciliation settlements by original ts (costcap#124)", async () => {
+  const { applySettlements } = await import("../src/cap.js");
+  const history = applySettlements([
+    { id: "u", ts: "2026-10-31T23:00:00Z", cost_usd: null },
+    { event: "reconciliation", receipt_id: "u", cost_usd: 4, ts: "2026-11-02T00:00:00Z" },
+    { event: "reconciliation", receipt_id: "u", cost_usd: 40 },
+  ]);
+  const oct = createCapEngine({ caps: { day: 5 }, history, now: () => new Date("2026-10-31T23:30:00Z") });
+  assert.equal(oct.check(), null);
+  assert.equal(oct.spend().day, 4);
+  assert.equal(oct.spend().unknown, 0);
+  const nov = createCapEngine({ caps: { day: 5 }, history, now: () => new Date("2026-11-02T00:00:00Z") });
+  assert.equal(nov.spend().day, 0);
+  assert.equal(nov.spend().month, 0);
+});

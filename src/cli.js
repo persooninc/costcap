@@ -5,14 +5,14 @@
 // Guardrails, not guarantees: only traffic through the proxy is metered.
 
 import { checkBudget } from "./check.js";
-import { reconcileFiles } from "./reconcile.js";
+import { reconcileFiles, applyReconciliation } from "./reconcile.js";
 import { serveMcp } from "./mcp.js";
 import { enroll, createFleetClient } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
-import { createCapEngine, loadReceipts } from "./cap.js";
+import { createCapEngine, loadSettledReceipts } from "./cap.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
 import { agentBudgetStatus } from "./check.js";
@@ -27,7 +27,7 @@ import { pricingCommand } from "./pricing-cli.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--receipts FILE] [--github-output]\n" +
-  "       costcap reconcile --receipts FILE --provider FILE\n" +
+  "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
@@ -103,7 +103,7 @@ export async function wrap(argv) {
   const sharedLedger = shared ? openSharedLedger(receiptsPath, { onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); } }) : null;
   const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
-  const history = sharedLedger ? sharedLedger.history() : loadReceipts(receiptsPath);
+  const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
   cap = createCapEngine({ caps, history });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
@@ -203,10 +203,18 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
       const receiptsPath = option("--receipts");
       const providerPath = option("--provider");
-      if (!receiptsPath || !providerPath) throw new Error("usage: costcap reconcile --receipts FILE --provider FILE");
-      const result = reconcileFiles({ receiptsPath, providerPath });
-      console.log(JSON.stringify(result));
-      process.exitCode = result.ok ? 0 : 1;
+      if (!receiptsPath || !providerPath) throw new Error("usage: costcap reconcile --receipts FILE --provider FILE [--apply]");
+      if (rest.includes("--apply")) {
+        // Settle unknown-cost receipts from provider evidence (append-only, never $0 without a charge).
+        const result = applyReconciliation({ receiptsPath, providerPath });
+        console.log(JSON.stringify(result));
+        if (result.still_unknown.length) console.error(`costcap: still unknown (no provider cost): ${result.still_unknown.join(", ")}`);
+        process.exitCode = result.still_unknown.length ? 1 : 0;
+      } else {
+        const result = reconcileFiles({ receiptsPath, providerPath });
+        console.log(JSON.stringify(result));
+        process.exitCode = result.ok ? 0 : 1;
+      }
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
   } else if (cmd === "pricing") {
     try {
