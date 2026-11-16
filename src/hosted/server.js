@@ -384,7 +384,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const orgId = caller.agent?.orgId ?? caller.user.orgId;
           if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
           const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
-          return hostedAgentVerdict({ agent: a, receipts, nowMs: now() });
+          const runId = new URL(req.url, origin).searchParams.get("run_id");
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null });
         }));
       }
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
@@ -403,7 +404,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (!a || a.orgId !== u.orgId) fail(404, "Agent not found");
           if (update[2] === "revoke") { a.revoked = true; audit(s, u.orgId, u.id, "agent.revoke", a.id); return { revoked: true }; }
           const reason = fleetReason(body.reason, false);
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed };
+          // maxSteps: omitted keeps the current value, null clears it.
+          const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           a.policy = policy;
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { policy, reason } : { policy });

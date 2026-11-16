@@ -637,3 +637,108 @@ test("#113 fleet freeze state round-trips through the Postgres record mapping", 
   assert.equal(recs.get("fleetFreezes\u0000org1").orgId, "org1");
   assert.deepEqual(fromRecords([...recs.values()], EMPTY_STATE), state);
 });
+
+test("#114 hosted maxSteps: validated, versioned, audited, and reported per run", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("steps-owner@example.invalid");
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: { day: 50 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "steps" }, null, tok)).body;
+  const path = `/v1/agents/${agent.agentId}/policy`;
+  const ok = await f.request(path, { maxSteps: 5 }, owner.cookie);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.version, 2);
+  assert.equal(ok.body.maxSteps, 5);
+  assert.deepEqual(ok.body.caps, { day: 50 });
+  for (const bad of [0, -3, 2.5, "5"]) {
+    const r = await f.request(path, { maxSteps: bad }, owner.cookie);
+    assert.equal(r.status, 400, String(bad));
+  }
+  assert.deepEqual((await f.request("/v1/policy", undefined, null, agent.token)).body, ok.body);
+  // Changing caps keeps the step budget; null clears it.
+  assert.equal((await f.request(path, { caps: { day: 40 } }, owner.cookie)).body.maxSteps, 5);
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.ok(fleet.audit.some((e) => e.action === "policy.change" && e.detail.policy.maxSteps === 5));
+
+  const ts = new Date().toISOString();
+  await f.request("/v1/receipts", { receipts: [
+    ...[1, 2, 3, 4, 5].map((i) => ({ id: `s${i}`, ts, cost_usd: 0.01, agent_id: agent.agentId, run_id: "run-a" })),
+    { id: "s6", ts, cost_usd: 0, blocked: true, reason: "step_budget", agent_id: agent.agentId, run_id: "run-a" },
+    { id: "o1", ts, cost_usd: 0.01, agent_id: agent.agentId, run_id: "run-b" },
+  ] }, null, agent.token);
+  const budget = (q = "") => f.request(`/v1/agents/${agent.agentId}/budget${q}`, undefined, owner.cookie);
+  let r = await budget("?run_id=run-a");
+  assert.equal(r.body.verdict, "breaker_open");
+  assert.equal(r.body.reason, "step_budget");
+  assert.equal(r.body.max_steps, 5);
+  assert.equal(r.body.steps, 5);
+  r = await budget("?run_id=run-b");
+  assert.equal(r.body.verdict, "ok");
+  assert.equal(r.body.steps, 1);
+  assert.equal(r.body.max_steps, 5);
+  r = await budget();
+  assert.equal(r.body.verdict, "ok");
+  assert.ok(!("max_steps" in r.body));
+  const cleared = await f.request(path, { maxSteps: null }, owner.cookie);
+  assert.equal(cleared.status, 200);
+  assert.ok(!("maxSteps" in cleared.body));
+});
+
+test("#114 enrolled wrapper enforces hosted maxSteps per run, offline from cache, tighter-wins", async (t) => {
+  const http = await import("node:http");
+  const { spawn } = await import("node:child_process");
+  const { enroll } = await import("../src/hosted/client.js");
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; req.resume(); req.on("end", () => res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 0 } }))); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const f = await fixture(t);
+  const owner = await f.login("steps-wrap@example.invalid");
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token;
+  const dir = mkdtempSync(join(tmpdir(), "cc-steps-"));
+  const enrollment = join(dir, "enrollment.json");
+  const receipts = join(dir, "r.jsonl");
+  const { agentId } = await enroll({ url: `http://127.0.0.1:${f.service().server.address().port}`, token: tok, name: "looper", path: enrollment });
+  assert.equal((await f.request(`/v1/agents/${agentId}/policy`, { maxSteps: 5 }, owner.cookie)).status, 200);
+  const script = `for (let i = 0; i < 12; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: "{}" }); await r.text(); if (r.status !== 200) { console.log("blocked " + i); break; } }`;
+  const run = (extra = []) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/cli.js", "wrap", ...extra, "--agent", agentId, "--enrollment", enrollment, "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (code) => resolve({ code, out: out.trim(), err }));
+  });
+  // Criterion 2: the 6th call is refused with a step_budget receipt; a new run starts at 0.
+  let r = await run();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+  const blocked = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.blocked);
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].reason, "step_budget");
+  assert.equal(blocked[0].max_steps, 5);
+  assert.equal(blocked[0].agent_id, agentId);
+  hits = 0;
+  r = await run();
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+  // Criterion 4: a local value tightens, never loosens.
+  r = await run(["--max-steps", "3"]);
+  assert.equal(r.out, "blocked 3");
+  r = await run(["--max-steps", "10"]);
+  assert.equal(r.out, "blocked 5");
+  // Criterion 3: hosted API stopped, the cached maxSteps still applies.
+  f.service().server.closeAllConnections();
+  await new Promise((res) => f.service().server.close(res));
+  hits = 0;
+  r = await run();
+  assert.match(r.err, /fleet offline; cached policy enforced/);
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+});
+
+test("#114 maxSteps round-trips through the Postgres record mapping", async () => {
+  const { toRecords, fromRecords } = await import("../src/hosted/store-records.js");
+  const { EMPTY_STATE } = await import("../src/hosted/store.js");
+  const state = { ...structuredClone(EMPTY_STATE), agents: { a1: { id: "a1", orgId: "o", name: "n", hash: "h", policy: { version: 2, caps: {}, killed: false, maxSteps: 5 }, lastSeen: 1, revoked: false } } };
+  assert.deepEqual(fromRecords([...toRecords(state).values()], EMPTY_STATE), state);
+});

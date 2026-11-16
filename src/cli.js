@@ -90,9 +90,12 @@ export async function wrap(argv) {
   const cap = createCapEngine({ caps, history: loadReceipts(receiptsPath) });
   let fleet;
   let fleetPolicy;
+  const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   const setPolicy = (p) => {
     fleetPolicy = p;
-    cap.updateCaps(resolvePolicy({ local: caps, lastKnown: { version: p.version, caps: p.caps, killed: p.killed } }).caps);
+    const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, ...(p.maxSteps != null ? { maxSteps: p.maxSteps } : {}) } });
+    cap.updateCaps(resolved.caps);
+    velocity.setMaxSteps(resolved.maxSteps);
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy });
@@ -102,7 +105,6 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
   const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });

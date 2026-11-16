@@ -50,6 +50,8 @@ export function createVelocityBreaker({
       }
       return null;
     },
+    // Tighten or set the step budget after creation (fleet policy arrives later).
+    setMaxSteps(n) { maxSteps = n ?? undefined; },
     resume() { tripped = null; steps = 0; buckets.clear(); },
   };
 }

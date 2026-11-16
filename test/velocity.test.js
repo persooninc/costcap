@@ -43,3 +43,15 @@ test("step budget trips at max steps", () => {
   for (let i = 0; i < 3; i++) { assert.equal(b.check(), null); b.record(0); }
   assert.equal(b.check().reason, "step_budget");
 });
+
+test("#114 setMaxSteps applies a step budget set after creation", () => {
+  const v = createVelocityBreaker();
+  v.record(0); v.record(0);
+  assert.equal(v.check(), null);
+  v.setMaxSteps(2);
+  assert.equal(v.check().reason, "step_budget");
+  const w = createVelocityBreaker({ maxSteps: 1 });
+  w.setMaxSteps(null);
+  w.record(0);
+  assert.equal(w.check(), null);
+});

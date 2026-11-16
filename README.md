@@ -128,6 +128,13 @@ mode 0600. A 401/403 response freezes the wrapper. Redirects are refused to avoi
 forwarding agent credentials to another host. These paths have local test-server
 coverage, not production verification or a finished org dashboard.
 
+A fleet policy can also carry `maxSteps`, the most upstream calls one wrapped
+run may make (dashboard: "Max steps per run"). An enrolled wrapper enforces it
+from its cached policy, offline too, with the same `breaker_open` /
+`step_budget` receipt as `--max-steps`. A local `--max-steps` can tighten it,
+never loosen it. `GET /v1/agents/:id/budget?run_id=RUN` reports `max_steps` and
+`steps` for that run.
+
 ## Per-agent budgets
 
 ```sh
