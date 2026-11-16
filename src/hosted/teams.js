@@ -64,9 +64,11 @@ export function teamVerdict({ team, receiptsByAgent, nowMs }) {
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
       if (!Number.isFinite(Date.parse(r?.ts)) || new Date(r.ts).toISOString().slice(0, 7) !== month) continue;
-      history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null });
+      history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
+  // #183: keep `reason` so a synced pending batch is pending, not unknown, server side too.
+  const pendingBatches = history.filter(isPendingBatch).length;
   const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate });
   const spend = budgets.spend({ agent_id: team.agents[0] }, team.agents);
   // Any member's view of the team is the same once its own receipts are folded in.
@@ -76,7 +78,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs }) {
     name: team.name,
     agents: [...team.agents],
     caps,
-    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, cost_complete: spend.unknown === 0 },
+    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
     verdict: hit ? hit.verdict : "ok",
     ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
