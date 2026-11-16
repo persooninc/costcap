@@ -237,6 +237,16 @@ Enrolled agents can also get a fleet step budget: an admin sets "Max steps per r
 An agent entry replaces the default. An agent with no entry and no default is
 refused (`no_budget_policy`).
 
+Usage is known only when the provider's required token counters are present as
+finite numbers: prompt/input **and** completion/output for OpenAI and OpenRouter,
+`promptTokenCount` **and** `candidatesTokenCount` for Gemini. An empty or
+duration-shaped usage object (for example `{"seconds": 42}`) is recorded as
+`cost_usd: null`, `reason: "usage_unavailable"`, and pauses the run. It is never
+zero-filled to $0. Real explicit zeros still record a known $0. The proxy never
+follows a provider redirect, so your API key is not sent to another host. A 3xx
+returns 502 `upstream_redirect` to the client, with a $0 receipt because nothing
+was generated.
+
 Team budgets share one cap across a group of agents:
 `"teams": { "ops": { "agents": ["release-bot", "triage-bot"], "day": 30, "month": 400 } }`.
 Each agent's own cap applies first, then the team's summed spend. A team cap

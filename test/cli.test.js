@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawnSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseWrapArgs } from "../src/cli.js";
@@ -192,4 +192,42 @@ test("#135 wrap: first call 429 (provider rejected), second 200 with usage; both
   const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stdout + check.stderr);
   assert.match(check.stdout + check.stderr, /unknown[^0-9]*0|"unknown_cost_count":\s*0/i);
+});
+
+test("#138 wrap: duration-style usage pauses the run, check exits 1 accounting_unavailable, reconcile --apply settles it", async (t) => {
+  let n = 0;
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => { n++; q.resume(); res.writeHead(200, { "content-type": "application/json" }).end('{"model":"whisper-1","usage":{"type":"duration","seconds":42}}'); });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `
+    const u = process.env.OPENAI_BASE_URL + "/audio/transcriptions";
+    const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"whisper-1"})});
+    const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"whisper-1"})});
+    console.log(a.status, b.status, (await b.json()).error);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "200 429 accounting_unavailable");
+  assert.equal(n, 1);
+  const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
+  const unknown = rows.find((r) => r.reason === "usage_unavailable");
+  assert.equal(unknown.cost_usd, null);
+  const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(check.status, 1);
+  const verdict = JSON.parse(check.stdout);
+  assert.deepEqual([verdict.ok, verdict.unknown_cost_count, verdict.hit.scope, verdict.hit.reason], [false, 1, "accounting", "unreconciled_receipt"]);
+  const provider = path.join(dir, "provider.jsonl");
+  writeFileSync(provider, JSON.stringify({ id: unknown.id, cost_usd: 0.0042 }) + "\n");
+  const rec = spawnSync(process.execPath, ["src/cli.js", "reconcile", "--receipts", receipts, "--provider", provider, "--apply"], { encoding: "utf8" });
+  assert.equal(rec.status, 0, rec.stdout + rec.stderr);
+  assert.deepEqual(JSON.parse(rec.stdout).settled, [{ receipt_id: unknown.id, cost_usd: 0.0042 }]);
+  const after = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(after.status, 0, after.stdout + after.stderr);
 });

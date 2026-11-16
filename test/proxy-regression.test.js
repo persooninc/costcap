@@ -177,3 +177,65 @@ test("#135 repeated identical requests that keep getting 429 still trip the spir
   assert.equal(hits, 2);
   assert.equal(receipts.at(-1).reason, "spiral_detected");
 });
+
+test("#138 usage without both priceable counters is unknown, never a zero-filled $0", () => {
+  assert.equal(extractUsage("openai", '{"usage":{}}'), null);
+  assert.equal(extractUsage("openai", '{"usage":{"type":"duration","seconds":42}}'), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":10}}'), null);
+  assert.equal(extractUsage("openai", '{"usage":{"completion_tokens":10}}'), null);
+  assert.equal(extractUsage("openai", '{"usage":{"prompt_tokens":"10","completion_tokens":1}}'), null);
+  assert.equal(extractUsage("openrouter", '{"usage":{"seconds":3}}'), null);
+  assert.equal(extractUsage("gemini", '{"usageMetadata":{}}'), null);
+  assert.equal(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":10}}'), null);
+  assert.equal(extractUsage("gemini", '{"usageMetadata":{"candidatesTokenCount":10,"thoughtsTokenCount":3}}'), null);
+  assert.equal(extractUsage("anthropic", '{"usage":{}}'), null);
+  assert.deepEqual(extractUsage("openai", '{"usage":{"prompt_tokens":0,"completion_tokens":0}}', "m"), { model: "m", usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 } });
+  assert.deepEqual(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0}}', "g"), { model: "g", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } });
+});
+
+test("#138 a 200 with duration-style usage records usage_unavailable and pauses", async (t) => {
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; req.resume(); res.writeHead(200, { "content-type": "application/json" }).end('{"model":"whisper-1","usage":{"seconds":3}}'); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = () => fetch(`http://127.0.0.1:${p.port}/openai/v1/audio/transcriptions`, { method: "POST", body: '{"model":"whisper-1"}' });
+  assert.equal((await call()).status, 200);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"]);
+  const r2 = await call();
+  assert.equal(r2.status, 429);
+  assert.equal((await r2.json()).error, "accounting_unavailable");
+  assert.equal(hits, 1);
+});
+
+test("#138 explicit zero counters through the proxy stay a known $0 and do not pause", async (t) => {
+  const up = http.createServer((req, res) => { req.resume(); res.writeHead(200, { "content-type": "application/json" }).end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":0,"completion_tokens":0}}'); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = () => fetch(`http://127.0.0.1:${p.port}/openai/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini"}' });
+  assert.equal((await call()).status, 200);
+  assert.equal(receipts[0].cost_usd, 0);
+  assert.equal(receipts[0].reason, undefined);
+  assert.equal((await call()).status, 200);
+});
+
+for (const [provider, path, keyHeader] of [["anthropic", "/anthropic/v1/messages", "x-api-key"], ["gemini", "/gemini/v1beta/models/gemini-2.0-flash:generateContent", "x-goog-api-key"], ["openai", "/openai/v1/chat/completions", "authorization"]]) {
+  test(`#138 ${provider} upstream redirect is not followed and the key never reaches another host`, async (t) => {
+    const seen = [];
+    const second = http.createServer((req, res) => { seen.push(req.headers); req.resume(); res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}'); });
+    await new Promise((r) => second.listen(0, "127.0.0.1", r));
+    const first = http.createServer((req, res) => { req.resume(); res.writeHead(302, { location: `http://localhost:${second.address().port}/steal` }).end(); });
+    await new Promise((r) => first.listen(0, "127.0.0.1", r));
+    const receipts = [];
+    const p = await startMeteringProxy({ upstreams: { [provider]: `http://127.0.0.1:${first.address().port}` }, onReceipt: (r) => receipts.push(r) });
+    t.after(() => { p.server.closeAllConnections(); p.server.close(); for (const s of [first, second]) { s.closeAllConnections(); s.close(); } });
+    const r = await fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", headers: { [keyHeader]: "test-key-not-real" }, body: '{"model":"m"}' });
+    assert.equal(r.status, 502);
+    assert.equal((await r.json()).error, "upstream_redirect");
+    assert.equal(seen.length, 0);
+    assert.deepEqual([receipts[0].reason, receipts[0].cost_usd, receipts[0].status], ["upstream_redirect", 0, 302]);
+  });
+}

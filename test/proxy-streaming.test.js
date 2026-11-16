@@ -163,3 +163,20 @@ test("a cap hit by a streamed call's cost blocks the next call (in-flight call m
   assert.ok(receipts[0].cost_usd > 0.10, "the in-flight streamed call overshot the cap");
   assert.equal(receipts.at(-1).reason, "budget_exceeded");
 });
+
+test("#138 a streamed final chunk with usage: {} is unknown (usage_unavailable), not $0", async (t) => {
+  const events = ['data: {"model":"gpt-4o-mini","choices":[{"delta":{"content":"hi"}}]}\n\n', 'data: {"model":"gpt-4o-mini","choices":[],"usage":{}}\n\n', "data: [DONE]\n\n"];
+  const parser = createSseUsageParser("openai", "gpt-4o-mini");
+  for (const e of events) parser.push(e);
+  assert.equal(parser.end(), null);
+  const up = fakeUpstream(events, { gapMs: 5 });
+  const upPort = await listen(up.server);
+  const receipts = [];
+  const proxy = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${upPort}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { proxy.server.closeAllConnections(); proxy.server.close(); up.server.closeAllConnections(); up.server.close(); });
+  const r = await fetch(`http://127.0.0.1:${proxy.port}/openai/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini","stream":true}' });
+  await r.text();
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"]);
+  const r2 = await fetch(`http://127.0.0.1:${proxy.port}/openai/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini","stream":true}' });
+  assert.equal(r2.status, 429);
+});

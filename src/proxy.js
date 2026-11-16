@@ -27,6 +27,8 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   return lines;
 }
 
+const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
 export function createUsageAccumulator(provider, requestedModel) {
   let model = requestedModel ?? "unknown";
@@ -45,7 +47,9 @@ export function createUsageAccumulator(provider, requestedModel) {
     if (chunk.model || chunk.modelVersion || chunk.message?.model) model = chunk.model ?? chunk.modelVersion ?? chunk.message.model;
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
-      if (u) usage = { input_tokens: (u.promptTokenCount ?? 0) - (u.cachedContentTokenCount ?? 0),
+      // Known only with both required counters; {} or partial shapes are unpriceable (never $0).
+      if (u && !(isCount(u.promptTokenCount) && isCount(u.candidatesTokenCount))) usage = { unpriceable: NaN };
+      else if (u) usage = { input_tokens: (u.promptTokenCount ?? 0) - (u.cachedContentTokenCount ?? 0),
         cached_input_tokens: u.cachedContentTokenCount ?? 0,
         output_tokens: (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0) };
     } else if (provider === "anthropic") {
@@ -64,7 +68,9 @@ export function createUsageAccumulator(provider, requestedModel) {
       }
     } else {
       const u = chunk.usage;
-      if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
+      // Both prompt/input and completion/output counters are required; duration-billed or empty shapes are unknown.
+      if (u && !(isCount(u.prompt_tokens ?? u.input_tokens) && isCount(u.completion_tokens ?? u.output_tokens))) usage = { unpriceable: NaN };
+      else if (u) usage = { input_tokens: (u.prompt_tokens ?? u.input_tokens ?? 0) - (u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0),
         output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
         cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0 };
     }
@@ -220,7 +226,17 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           res.once("close", onClientClose);
           const upstreamRes = await fetch(`${upstream}${path}`, { method: req.method, headers,
             body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
+            // Never follow redirects: x-api-key / x-goog-api-key would be forwarded to another host.
+            redirect: "manual",
             signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), abort.signal]) });
+          if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+            res.off("close", onClientClose);
+            upstreamRes.body?.cancel().catch(() => {});
+            // Nothing was generated: the provider answered with a redirect, not a completion.
+            emit({ provider, path: storedPath, status: upstreamRes.status, blocked: false, model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_redirect" });
+            send(502, { error: "upstream_redirect", message: "CostCap does not follow provider redirects, so your API key is never sent to another host." });
+            return;
+          }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
