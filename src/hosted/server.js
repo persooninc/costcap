@@ -133,7 +133,20 @@ const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(aud
 export const ALERT_MAX_ATTEMPTS = 10;
 export const alertBackoffMs = (attempts) => Math.min(2 ** Math.max(0, attempts - 1), 30) * 60_000;
 /** Channels due for a retry now, `null` for a legacy/untagged full resend, or [] when nothing is due. */
+// Issue #210: a queued send stamps `delivery_claimed_at`. While that claim is
+// within ALERT_CLAIM_LEASE_MS no other sweep re-sends it (no double page). A
+// `pending` occurrence whose claim expired (or legacy, unclaimed) was cut off
+// by a restart, so every channel is re-sent.
+export const ALERT_CLAIM_LEASE_MS = 2 * 60_000;
+const claimLive = (record, nowMs) => {
+  const at = Date.parse(record.delivery_claimed_at ?? "");
+  return Number.isFinite(at) && nowMs - at < ALERT_CLAIM_LEASE_MS;
+};
+/** True when a `pending` occurrence was interrupted and must be re-sent. */
+export const pendingRecovered = (record, nowMs) => record.delivery === "pending" && !claimLive(record, nowMs);
 export function dueRetryChannels(record, nowMs) {
+  if (claimLive(record, nowMs)) return [];
+  if (record.delivery === "pending") return null;
   if (record.delivery !== "failed") return [];
   const chans = record.deliveryChannels;
   if (!chans) return null;
@@ -888,6 +901,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     };
   }
   const warnExtra = (alert) => (alert.fraction !== undefined && alert.run_id === undefined ? { period: capPeriod(alert.scope, now()) } : {});
+  const claim = (record) => { record.delivery_claimed_at = new Date(now()).toISOString(); return record; };
+  const queueRetry = ([id, record], out) => {
+    const recovered = pendingRecovered(record, now());
+    const ch = recovered ? null : dueRetryChannels(record, now());
+    if (ch === null || ch.length) out.push({ ...claim(record), id, retryChannels: ch, ...(recovered ? { recovered: true } : {}) });
+  };
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {
       sweepRaises(s);
@@ -929,8 +948,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
-          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
-          else { const ch = dueRetryChannels(prior[1], now()); if (ch === null || ch.length) out.push({ ...prior[1], id: prior[0], retryChannels: ch }); }
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
         }
       }
       // Issue #139: team day/month caps alert too, keyed per org and team.
@@ -946,15 +965,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           teamKeys.add(alert.key);
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
-          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
-          else { const ch = dueRetryChannels(prior[1], now()); if (ch === null || ch.length) out.push({ ...prior[1], id: prior[0], retryChannels: ch }); }
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
         }
       }
       for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) resolveAlert(prior, now());
       return out;
     });
     for (const queuedAlert of queued) {
-      const { retryChannels, deliveryChannels: _c, deliveryRetry: _r, ...a } = queuedAlert;
+      const { retryChannels, recovered, deliveryChannels: _c, deliveryRetry: _r, delivery_claimed_at: _k, ...a } = queuedAlert;
       const requested = retryChannels ?? null;
       let result;
       try { // Only addresses that are still verified members of the org receive the alert.
@@ -970,8 +989,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       store.transaction((s) => {
         const target = a.agentId ?? `team:${a.team}`;
         const extra = a.team ? { team: a.team, scope: a.scope } : {};
-        const gaveUp = s.alerts[a.id] ? applyDeliveryResult(s.alerts[a.id], result, requested, now()) : [];
-        audit(s, a.orgId, "alert-worker", "alert.delivery", target, { kind: a.kind, ...extra, alert_id: a.id, ...(requested ? { channels: requested } : {}), result });
+        const rec = s.alerts[a.id];
+        if (rec) delete rec.delivery_claimed_at;
+        const gaveUp = rec ? applyDeliveryResult(rec, result, requested, now()) : [];
+        audit(s, a.orgId, "alert-worker", "alert.delivery", target, { kind: a.kind, ...extra, alert_id: a.id, ...(requested ? { channels: requested } : {}), ...(recovered ? { recovered: true } : {}), result });
         for (const channel of gaveUp) audit(s, a.orgId, "alert-worker", "alert.delivery_gave_up", target, { kind: a.kind, ...extra, alert_id: a.id, channel, attempts: ALERT_MAX_ATTEMPTS });
       });
     }

@@ -139,14 +139,19 @@ test("estimateBatch: sums entries at the batch multiplier; rejects unusable bodi
 
 test("stress: 200 mixed preflight routes, none mis-refused", async () => {
   const h = await harness();
-  const reqs = [];
-  for (let i = 0; i < 50; i++) {
-    reqs.push(h.call(`/openai/v1/responses/resp_${i}`));
-    reqs.push(h.call("/openai/v1/files", { method: "POST", ...multipart({ purpose: "batch", file: String(i) }) }));
-    reqs.push(h.call("/anthropic/v1/messages/batches", { method: "POST", body: anthropicBatch(1 + (i % 5), 100 + i) }));
-    reqs.push(h.call(`/openai/v1/models?page=${i}`));
+  // Waves of 40 concurrent requests: 200 simultaneous connects overflow the
+  // default macOS listen backlog (ECONNRESET), unrelated to preflight.
+  const res = [];
+  for (let w = 0; w < 50; w += 10) {
+    const reqs = [];
+    for (let i = w; i < w + 10; i++) {
+      reqs.push(h.call(`/openai/v1/responses/resp_${i}`));
+      reqs.push(h.call("/openai/v1/files", { method: "POST", ...multipart({ purpose: "batch", file: String(i) }) }));
+      reqs.push(h.call("/anthropic/v1/messages/batches", { method: "POST", body: anthropicBatch(1 + (i % 5), 100 + i) }));
+      reqs.push(h.call(`/openai/v1/models?page=${i}`));
+    }
+    res.push(...(await Promise.all(reqs)));
   }
-  const res = await Promise.all(reqs);
   for (const r of res) { const t = await r.text(); assert.equal(r.status, 200, t); }
   assert.equal(h.seen.length, 200);
   h.close();

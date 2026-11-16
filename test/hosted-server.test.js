@@ -1442,3 +1442,75 @@ test("issue #206: email failing retries only email; cap writes one gave_up row; 
   await sweep();
   assert.deepEqual(calls, { email: before.email + 1, slack: before.slack + 1, webhook: before.webhook + 1 });
 });
+
+// Issue #210: a pending occurrence interrupted by a restart is re-sent after the claim lease.
+async function pendingFixture(t, deliverAlert, clockRef) {
+  const f = await fixture(t, { now: () => clockRef.now, extra: { deliverAlert } });
+  const owner = await f.login(`pending${Math.random().toString(36).slice(2, 8)}@example.invalid`);
+  const token = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "pending" }, null, token)).body;
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-p", ts: new Date(clockRef.now).toISOString(), cost_usd: 2, model: "test" }] }, null, agent.token)).status, 200);
+  const capHit = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.find((a) => a.agentId === agent.agentId && a.kind === "cap_hit" && a.status !== "resolved");
+  return { f, capHit };
+}
+
+test("issue #210: hung send then restart re-sends once after the lease, audited recovered", async (t) => {
+  const clock = { now: Date.now() };
+  let calls = 0; let hang = true;
+  const deliverAlert = async () => { calls++; if (hang) return new Promise(() => {}); return [{ status: "accepted" }]; };
+  const { f, capHit } = await pendingFixture(t, deliverAlert, clock);
+  void f.service().evaluateFleetAlerts(); // first send never returns (process dies mid-send)
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls, 1);
+  hang = false;
+  await f.restart();
+  await f.service().evaluateFleetAlerts(); // within lease: no resend
+  assert.equal(calls, 1);
+  assert.equal((await capHit()).delivery, "pending");
+  for (let i = 0; i < 5; i++) { clock.now += 30 * 60_000; await f.service().evaluateFleetAlerts(); }
+  assert.equal(calls, 2);
+  const alert = await capHit();
+  assert.equal(alert.delivery, "accepted");
+  const audit = JSON.parse(readFileSync(f.storePath, "utf8")).audit.filter((r) => r.action === "alert.delivery");
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].detail.recovered, true);
+});
+
+test("issue #210: legacy pending record without a claim is re-sent; concurrent sweeps never double-page", async (t) => {
+  const clock = { now: Date.now() };
+  let calls = 0; let release;
+  const gate = new Promise((r) => { release = r; });
+  const deliverAlert = async () => { calls++; await gate; return [{ status: "accepted" }]; };
+  const { f, capHit } = await pendingFixture(t, deliverAlert, clock);
+  // AC2: two overlapping sweeps send once.
+  const p1 = f.service().evaluateFleetAlerts();
+  const p2 = f.service().evaluateFleetAlerts();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls, 1);
+  release(); await Promise.all([p1, p2]);
+  assert.equal((await capHit()).delivery, "accepted");
+  // Legacy: force the record back to pending with no claim, then restart.
+  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+  for (const a of Object.values(raw.alerts)) if (a.kind === "cap_hit") { a.delivery = "pending"; delete a.delivery_claimed_at; delete a.deliveryChannels; delete a.deliveryRetry; }
+  writeFileSync(f.storePath, JSON.stringify(raw));
+  await f.restart();
+  await f.service().evaluateFleetAlerts();
+  assert.equal(calls, 2);
+  assert.equal((await capHit()).delivery, "accepted");
+  await f.service().evaluateFleetAlerts();
+  assert.equal(calls, 2);
+});
+
+test("issue #210: dueRetryChannels honours the claim lease", async () => {
+  const { dueRetryChannels, pendingRecovered, ALERT_CLAIM_LEASE_MS } = await import("../src/hosted/server.js");
+  const now = Date.parse("2026-11-16T12:00:00Z");
+  const fresh = new Date(now - 1000).toISOString();
+  const stale = new Date(now - ALERT_CLAIM_LEASE_MS).toISOString();
+  assert.deepEqual(dueRetryChannels({ delivery: "pending", delivery_claimed_at: fresh }, now), []);
+  assert.equal(dueRetryChannels({ delivery: "pending", delivery_claimed_at: stale }, now), null);
+  assert.equal(dueRetryChannels({ delivery: "pending" }, now), null);
+  assert.equal(pendingRecovered({ delivery: "pending", delivery_claimed_at: "junk" }, now), true);
+  assert.equal(pendingRecovered({ delivery: "accepted" }, now), false);
+  assert.deepEqual(dueRetryChannels({ delivery: "failed", delivery_claimed_at: fresh }, now), []);
+  assert.deepEqual(dueRetryChannels({ delivery: "accepted" }, now), []);
+});
