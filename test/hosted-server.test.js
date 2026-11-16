@@ -1005,3 +1005,98 @@ test("#137 removing a member frees a seat so an over-limit invite succeeds", asy
   assert.equal((await f.request(`/v1/members/${target.id}/remove`, {}, owner.cookie)).status, 200);
   assert.equal((await f.request("/v1/invitations", { email: "late@seat.invalid", role: "viewer" }, owner.cookie)).status, 201);
 });
+
+// Issue #143: alert lifecycle (occurrences, resolve, re-fire, ack, status filter, legacy records).
+test("alert lifecycle: fired_at/resolved_at history, re-fire is a new occurrence, ack is audited and role-checked", async (t) => {
+  let clock = Date.parse("2026-11-15T10:00:00.000Z");
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("life-owner@example.invalid");
+  const outsider = await f.login("life-outsider@example.invalid");
+  const invited = await f.request("/v1/invitations", { email: "life-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  assert.equal(invited.status, 201);
+  const viewer = await f.login("life-viewer@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "spender" }, null, enrollment.body.token)).body;
+  const spend = (id) => f.request("/v1/receipts", { receipts: [{ id, ts: new Date(clock).toISOString(), cost_usd: 1.5, model: "m" }] }, null, agent.token);
+  assert.equal((await spend("r-day1")).status, 200);
+  await f.service().evaluateFleetAlerts();
+  const capHits = async (status = "all", cookie = owner.cookie) => (await f.request(`/v1/alerts?status=${status}`, undefined, cookie)).body.alerts.filter((a) => a.kind === "cap_hit");
+  let hits = await capHits();
+  assert.equal(hits.length, 1);
+  const first = hits[0];
+  assert.equal(first.fired_at, "2026-11-15T10:00:00.000Z");
+  assert.equal(first.resolved_at, null);
+  assert.equal(first.acknowledged_at, null);
+  assert.equal(first.active, true);
+  assert.ok(first.id);
+  // Ack: viewer 403, outsider 404, admin 200 once, repeat is a no-op.
+  assert.equal((await f.request(`/v1/alerts/${first.id}/ack`, {}, viewer.cookie)).status, 403);
+  assert.equal((await f.request(`/v1/alerts/${first.id}/ack`, {}, outsider.cookie)).status, 404);
+  assert.equal((await f.request("/v1/alerts/nope/ack", {}, owner.cookie)).status, 404);
+  assert.equal((await f.request(`/v1/alerts?status=all`, undefined, outsider.cookie)).body.alerts.length, 0);
+  clock += 60_000;
+  const acked = await f.request(`/v1/alerts/${first.id}/ack`, {}, owner.cookie);
+  assert.equal(acked.status, 200);
+  assert.equal(acked.body.alert.acknowledged_by, "life-owner@example.invalid");
+  assert.equal(acked.body.alert.acknowledged_at, "2026-11-15T10:01:00.000Z");
+  assert.equal((await f.request(`/v1/alerts/${first.id}/ack`, {}, owner.cookie)).status, 200);
+  let fleet = await f.request("/v1/fleet", undefined, owner.cookie);
+  const ackRows = fleet.body.audit.filter((e) => e.action === "alert.ack");
+  assert.equal(ackRows.length, 1);
+  assert.equal(ackRows[0].actor_label, "life-owner@example.invalid");
+  // Ack does not resolve and does not re-deliver.
+  const delivered = f.delivery.length;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, delivered);
+  assert.equal((await capHits("acknowledged")).length, 1);
+  assert.equal((await capHits("active")).length, 0);
+  assert.equal((await capHits("resolved")).length, 0);
+  assert.equal((await f.request("/v1/alerts?status=bogus", undefined, owner.cookie)).status, 400);
+  // New UTC day: spend clears, the occurrence resolves and stays in history.
+  clock = Date.parse("2026-11-16T09:00:00.000Z");
+  await f.service().evaluateFleetAlerts();
+  hits = await capHits("resolved");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].id, first.id);
+  assert.equal(hits[0].resolved_at, "2026-11-16T09:00:00.000Z");
+  assert.equal(hits[0].fired_at, first.fired_at);
+  // Re-fire after resolve: a second occurrence with a distinct id.
+  assert.equal((await spend("r-day2")).status, 200);
+  await f.service().evaluateFleetAlerts();
+  hits = await capHits("all");
+  assert.equal(hits.length, 2);
+  assert.notEqual(hits[0].id, hits[1].id);
+  assert.equal(hits[0].active, true); // active first
+  assert.equal(hits[0].fired_at, "2026-11-16T09:00:00.000Z");
+  assert.equal(hits[1].resolved_at, "2026-11-16T09:00:00.000Z");
+  assert.equal(hits[1].fired_at, "2026-11-15T10:00:00.000Z");
+  assert.equal((await capHits("all", viewer.cookie)).length, 2);
+  // since/until filter by fired_at.
+  assert.equal((await f.request("/v1/alerts?status=all&since=2026-11-16T00:00:00Z", undefined, owner.cookie)).body.alerts.filter((a) => a.kind === "cap_hit").length, 1);
+  assert.equal((await f.request("/v1/alerts?status=all&until=2026-11-15T23:00:00Z", undefined, owner.cookie)).body.alerts.filter((a) => a.kind === "cap_hit").length, 1);
+  // Evidence carries the lifecycle.
+  const evidence = await f.request("/v1/evidence.json", undefined, owner.cookie);
+  const ev = evidence.body.alerts.filter((a) => a.kind === "cap_hit");
+  assert.equal(ev.length, 2);
+  assert.ok(ev.every((a) => "fired_at" in a && "resolved_at" in a && "acknowledged_at" in a && "acknowledged_by" in a && a.id));
+});
+
+test("legacy alert records (keyed by alert key, no timestamps) are kept with fired_at null", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("legacy-owner@example.invalid");
+  const { writeFileSync } = await import("node:fs");
+  const state = JSON.parse(readFileSync(f.storePath, "utf8"));
+  state.alerts["cap_hit:old:day"] = { kind: "cap_hit", key: "cap_hit:old:day", scope: "day", orgId: owner.body.orgId, agentId: "old", active: false, delivery: "accepted" };
+  writeFileSync(f.storePath, JSON.stringify(state));
+  await f.restart();
+  const list = (await f.request("/v1/alerts?status=all", undefined, owner.cookie)).body.alerts;
+  assert.equal(list.length, 1);
+  assert.equal(list[0].id, "cap_hit:old:day");
+  assert.equal(list[0].fired_at, null);
+  assert.equal(list[0].resolved_at, null);
+  const ev = (await f.request("/v1/evidence.json", undefined, owner.cookie)).body.alerts;
+  assert.deepEqual(ev.map((a) => [a.id, a.fired_at]), [["cap_hit:old:day", null]]);
+  // A since/until filter cannot place an unknown time, so it excludes legacy rows.
+  assert.equal((await f.request("/v1/alerts?since=2020-01-01T00:00:00Z", undefined, owner.cookie)).body.alerts.length, 0);
+  assert.equal((await f.request(`/v1/alerts/${encodeURIComponent("cap_hit:old:day")}/ack`, {}, owner.cookie)).status, 200);
+});

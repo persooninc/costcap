@@ -254,6 +254,15 @@ test("regression: a two-agent team alerts once at 80% and once at 100%, re-arms,
   await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], day: 30 }, owner.cookie);
   await f.sweep();
   assert.deepEqual(delivered.map((a) => a.kind), ["cap_approaching", "cap_hit", "cap_hit"]);
+  // Issue #143: team alerts carry lifecycle fields; the re-fire is a new occurrence and the first one keeps its resolved_at.
+  const hits = (await teamAlerts()).filter((a) => a.kind === "cap_hit");
+  assert.equal(hits.length, 2);
+  assert.notEqual(hits[0].id, hits[1].id);
+  assert.equal(hits[0].active, true);
+  assert.equal(hits[0].resolved_at, null);
+  assert.ok(!Number.isNaN(Date.parse(hits[0].fired_at)));
+  assert.ok(!Number.isNaN(Date.parse(hits[1].resolved_at)));
+  assert.equal(hits[1].active, false);
   // Unknown cost: no cap alert, even with a fresh team-scope block.
   await f.request("/v1/receipts", { receipts: [{ id: "r3", ts, cost_usd: null }, { id: "b1", ts, cost_usd: 0, blocked: true, reason: "budget_exceeded", scope: "team:ops:day" }] }, null, rb.token);
   await f.sweep();

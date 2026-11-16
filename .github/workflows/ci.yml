@@ -41,7 +41,7 @@ jobs:
       - run: npx playwright test
       - name: playwright-trace (failure only -> dev-home-01)
         if: failure()
-        uses: persooninc/infra/actions/ci-artifacts@ci-artifacts-v1.1
+        uses: persooninc/infra/actions/ci-artifacts@9ab9a6f644acfbe51137f78b8e80f0e82e712e5f # ci-artifacts-v1.1
         with:
           name: playwright-trace
           path: |

@@ -6,7 +6,7 @@ import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor } from "./alerts.js";
+import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
@@ -391,7 +391,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
-            alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId && a.active),
+            alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
             audit: labelAudit(s, u.orgId, s.audit),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)) });
         }));
@@ -401,7 +401,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = sessionUser(s, req);
           return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
             receipts: visibleReceipts(s, u.orgId),
-            audit: labelAudit(s, u.orgId, s.audit), alerts: Object.values(s.alerts).filter((a) => a.orgId === u.orgId),
+            audit: labelAudit(s, u.orgId, s.audit), alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
             fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
             role: u.role, members: orgMembers(s, u.orgId), invitations: ["owner", "admin"].includes(u.role) ? Object.values(s.invitations ?? {}).filter((item) => item.orgId === u.orgId && item.expires > now()).map(({ invitedBy, ...item }) => item) : [],
@@ -595,6 +595,31 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      if (path === "/v1/alerts" && req.method === "GET") {
+        const params = new URL(req.url, origin).searchParams;
+        const status = params.get("status") ?? "all";
+        if (!ALERT_STATUSES.includes(status)) fail(400, "status must be active, acknowledged, resolved or all");
+        const range = parseAuditRange(params);
+        return json(200, store.read((s) => {
+          const u = sessionUser(s, req);
+          return { alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId), { status, ...range }) };
+        }));
+      }
+      const ackRoute = /^\/v1\/alerts\/([^/]+)\/ack$/.exec(path);
+      if (ackRoute && req.method === "POST") {
+        const id = decodeURIComponent(ackRoute[1]);
+        return json(200, store.transaction((s) => {
+          const u = admin(s, req);
+          const record = Object.hasOwn(s.alerts, id) ? s.alerts[id] : null;
+          if (!record || record.orgId !== u.orgId) fail(404, "Alert not found");
+          if (!record.acknowledged_at) {
+            record.acknowledged_at = new Date(now()).toISOString();
+            record.acknowledged_by = u.email;
+            audit(s, u.orgId, u.id, "alert.ack", id, { kind: record.kind ?? null, key: record.key ?? null });
+          }
+          return { alert: alertOccurrences({ [id]: record })[0] };
+        }));
+      }
       const settleRoute = /^\/v1\/receipts\/([^/]+)\/settle$/.exec(path);
       if (settleRoute && req.method === "POST") {
         const input = settleInput(body);
@@ -621,7 +646,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       const out = [];
       for (const a of Object.values(s.agents)) {
         if (a.revoked) {
-          for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && x.active)) prior.active = false;
+          for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && x.active)) resolveAlert(prior, now());
           continue;
         }
         const receipts = agentReceipts(s, a.id);
@@ -635,13 +660,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
-        for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) prior.active = false;
+        for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
         for (const alert of alerts) {
-          const prior = s.alerts[alert.key];
-          if (!prior?.active) {
-            s.alerts[alert.key] = { ...alert, orgId: a.orgId, agentId: a.id, active: true, delivery: "pending" };
-            out.push(s.alerts[alert.key]);
-          } else if (prior.delivery === "failed") out.push(prior);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id }, { nowMs: now(), id: randomUUID() }) });
+          else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
         }
       }
       // Issue #139: team day/month caps alert too, keyed per org and team.
@@ -653,14 +676,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           .map((r) => r.scope.slice(prefix.length));
         for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict: verdictOf(s, t), blockedScopes })) {
           teamKeys.add(alert.key);
-          const prior = s.alerts[alert.key];
-          if (!prior?.active) {
-            s.alerts[alert.key] = { ...alert, orgId: t.orgId, agentId: null, active: true, delivery: "pending" };
-            out.push(s.alerts[alert.key]);
-          } else if (prior.delivery === "failed") out.push(prior);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null }, { nowMs: now(), id: randomUUID() }) });
+          else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
         }
       }
-      for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) prior.active = false;
+      for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) resolveAlert(prior, now());
       return out;
     });
     for (const a of queued) {
@@ -675,7 +696,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         result = deliverAlert ? await deliverAlert(a, settings) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
-        s.alerts[a.key].delivery = alertDeliveryState(result);
+        if (s.alerts[a.id]) s.alerts[a.id].delivery = alertDeliveryState(result);
         audit(s, a.orgId, "alert-worker", "alert.delivery", a.agentId ?? `team:${a.team}`, { kind: a.kind, ...(a.team ? { team: a.team, scope: a.scope } : {}), result });
       });
     }

@@ -115,3 +115,30 @@ test("#134 per-agent silent threshold: default 6h, override, 0 = off", async () 
   for (const ok of [undefined, null, 0, 0.5, 24, 720]) assert.deepEqual(validatePolicy({ version: 1, caps: {}, silentAfterHours: ok }), [], String(ok));
   for (const bad of [-1, 721, "6", NaN, Infinity, true]) assert.equal(validatePolicy({ version: 1, caps: {}, silentAfterHours: bad }).length, 1, String(bad));
 });
+
+// Issue #143: occurrence lifecycle helpers.
+import { alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, alertStatus } from "../src/hosted/alerts.js";
+test("occurrence lifecycle: fire, resolve, re-fire keeps history; legacy records keep fired_at null", () => {
+  const alerts = { legacy: { kind: "cap_hit", key: "k-old", active: false } };
+  const t0 = Date.parse("2026-11-15T00:00:00Z"), t1 = Date.parse("2026-11-16T00:00:00Z");
+  const a = fireAlert(alerts, { kind: "cap_hit", key: "k" }, { orgId: "o" }, { nowMs: t0, id: "one" });
+  assert.equal(a.fired_at, "2026-11-15T00:00:00.000Z");
+  assert.equal(a.resolved_at, null);
+  assert.deepEqual(activeOccurrence(alerts, "k")[0], "one");
+  resolveAlert(alerts.one, t1);
+  resolveAlert(alerts.one, t1 + 5); // idempotent
+  assert.equal(alerts.one.resolved_at, "2026-11-16T00:00:00.000Z");
+  assert.equal(activeOccurrence(alerts, "k"), null);
+  fireAlert(alerts, { kind: "cap_hit", key: "k" }, { orgId: "o" }, { nowMs: t1, id: "two" });
+  const list = alertOccurrences(alerts);
+  assert.equal(list.length, 3);
+  const legacy = list.find((x) => x.id === "legacy");
+  assert.equal(legacy.fired_at, null);
+  assert.equal(alertStatus(legacy), "resolved");
+  assert.deepEqual(filterAlerts(list).map((x) => x.id), ["two", "one", "legacy"]);
+  assert.deepEqual(filterAlerts(list, { status: "active" }).map((x) => x.id), ["two"]);
+  alerts.two.acknowledged_at = "2026-11-16T01:00:00.000Z";
+  assert.deepEqual(filterAlerts(alertOccurrences(alerts), { status: "acknowledged" }).map((x) => x.id), ["two"]);
+  assert.deepEqual(filterAlerts(list, { since: t1 }).map((x) => x.id), ["two"]);
+  assert.deepEqual(filterAlerts(list, { until: t0 }).map((x) => x.id), ["one"]);
+});

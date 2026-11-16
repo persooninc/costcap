@@ -106,3 +106,51 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { app
   }
   return out;
 }
+
+// Issue #143: alert lifecycle. s.alerts holds one record per firing (occurrence),
+// keyed by occurrence id. Records never get deleted: clearing sets resolved_at.
+// Legacy records (keyed by alert key, no id/fired_at) keep fired_at null.
+export const ALERT_STATUSES = ["active", "acknowledged", "resolved", "all"];
+
+export function alertOccurrences(alerts = {}) {
+  return Object.entries(alerts).map(([id, a]) => ({
+    ...a, id: a.id ?? id, fired_at: a.fired_at ?? null,
+    resolved_at: a.resolved_at ?? null,
+    acknowledged_at: a.acknowledged_at ?? null, acknowledged_by: a.acknowledged_by ?? null,
+  }));
+}
+
+export function activeOccurrence(alerts, key) {
+  for (const [id, a] of Object.entries(alerts)) if (a.key === key && a.active) return [id, a];
+  return null;
+}
+
+export function fireAlert(alerts, alert, extra, { nowMs, id }) {
+  const record = { ...alert, ...extra, id, active: true, delivery: "pending", fired_at: new Date(nowMs).toISOString(), resolved_at: null, acknowledged_at: null, acknowledged_by: null };
+  alerts[id] = record;
+  return record;
+}
+
+export function resolveAlert(record, nowMs) {
+  if (!record.active) return;
+  record.active = false;
+  record.resolved_at ??= new Date(nowMs).toISOString();
+}
+
+export function alertStatus(a) {
+  if (!a.active) return "resolved";
+  return a.acknowledged_at ? "acknowledged" : "active";
+}
+
+export function filterAlerts(list, { status = "all", since, until } = {}) {
+  return list.filter((a) => {
+    if (status !== "all" && alertStatus(a) !== status) return false;
+    if (since !== undefined || until !== undefined) {
+      const ms = Date.parse(a.fired_at);
+      if (Number.isNaN(ms)) return false;
+      if (since !== undefined && ms < since) return false;
+      if (until !== undefined && ms > until) return false;
+    }
+    return true;
+  }).sort((x, y) => Number(!x.active) - Number(!y.active) || String(y.fired_at ?? "").localeCompare(String(x.fired_at ?? "")));
+}

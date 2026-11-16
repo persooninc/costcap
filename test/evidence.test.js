@@ -27,7 +27,7 @@ test("evidence keeps unknown cost null and marks spend incomplete", () => {
   assert.deepEqual(a2, { agent_id: "a2", name: null, revoked: false, killed: false, caps: {}, team: null, spend: { day: { usd_known: 0, unknown_count: 0, cost_complete: true }, month: { usd_known: 0, unknown_count: 0, cost_complete: true } } });
   assert.equal(doc.receipts[1].cost_usd, null);
   assert.deepEqual(doc.receipts[2], { agent_id: "a1", receipt_id: null, ts: null, model: null, cost_usd: null, settled_cost_usd: null, settled_at: null, settled_by: null, settle_source: null, settle_reason: null, blocked: false, reason: null, scope: null });
-  assert.deepEqual(doc.alerts[1], { kind: null, key: null, agent_id: null, scope: null });
+  assert.deepEqual(doc.alerts[1], { id: null, kind: null, key: null, agent_id: null, team: null, scope: null, active: false, fired_at: null, resolved_at: null, acknowledged_at: null, acknowledged_by: null });
   assert.deepEqual(doc.totals, { agents: 2, receipts: 3, unknown_cost_receipts: 2, cost_complete: false });
 });
 
