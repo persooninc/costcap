@@ -7,7 +7,7 @@
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, openSync, readSync, fstatSync, closeSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { hostname } from "node:os";
-import { applySettlements } from "./cap.js";
+import { applySettlements, isSettlement } from "./cap.js";
 
 const readOwner = (file) => { try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; } };
 
@@ -89,7 +89,10 @@ function breakStale(lock, host) {
 
 // Shared-ledger handle. onExternal(receipt) is called for every receipt another
 // wrapper appended since this wrapper last looked (never for its own).
-export function openSharedLedger(path, { onExternal = () => {}, timeoutMs } = {}) {
+// onExternalSettle(settlement, receipt) (#174) is called once when a later chunk
+// settles an unknown-cost receipt (incl. batch_pending) this wrapper folded in
+// from the ledger; settlements of its own or already-costed receipts are ignored.
+export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, timeoutMs } = {}) {
   mkdirSync(dirname(path), { recursive: true });
   const dir = `${path}.shared`;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -104,6 +107,20 @@ export function openSharedLedger(path, { onExternal = () => {}, timeoutMs } = {}
   }
   let offset = 0;
   let pending = "";
+  const unknown = new Map(); // receipt id -> folded-in receipt still at null cost
+  // Settle tracked unknowns first (first valid settlement wins), then track new ones.
+  const fold = (lines) => {
+    const settled = [];
+    for (const e of lines) {
+      if (!isSettlement(e) || !unknown.has(e.receipt_id)) continue;
+      const r = unknown.get(e.receipt_id);
+      unknown.delete(e.receipt_id);
+      settled.push([e, r]);
+    }
+    const receipts = applySettlements(lines);
+    for (const r of receipts) if (r.cost_usd === null && typeof r.id === "string") unknown.set(r.id, r);
+    return { receipts, settled };
+  };
   const readNew = () => {
     if (!existsSync(path)) return [];
     const fd = openSync(path, "r");
@@ -124,13 +141,15 @@ export function openSharedLedger(path, { onExternal = () => {}, timeoutMs } = {}
     // Reads the full ledger under the critical section and starts tracking from there.
     history() {
       const release = acquireCriticalSection(path, { timeoutMs });
-      try { return applySettlements(readNew()); } finally { release(); }
+      try { return fold(readNew()).receipts; } finally { release(); }
     },
     // Folds other wrappers' receipts in, then runs fn, all inside the critical section.
     withLock(fn) {
       const release = acquireCriticalSection(path, { timeoutMs });
       try {
-        for (const r of applySettlements(readNew())) onExternal(r);
+        const { receipts, settled } = fold(readNew());
+        for (const [e, r] of settled) onExternalSettle(e, r);
+        for (const r of receipts) onExternal(r);
         const out = fn();
         // Our own append (if any) is already accounted for by the caller.
         if (existsSync(path)) { const size = statSync(path).size; if (size > offset) { offset = size; pending = ""; } }

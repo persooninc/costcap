@@ -12,7 +12,7 @@ import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
-import { createCapEngine, loadSettledReceipts, loadEvents } from "./cap.js";
+import { createCapEngine, loadSettledReceipts, loadEvents, isPendingBatch } from "./cap.js";
 import { DEFAULT_WARN_AT, createCapWarner, parseWarnAt } from "./cap-warn.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
@@ -138,14 +138,25 @@ export async function wrap(argv) {
   const who = { ...(agentId ? { agent_id: agentId } : {}), run_id: runId ?? randomUUID() };
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
   let cap, agentBudgets;
-  const sharedLedger = shared ? openSharedLedger(receiptsPath, { onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); } }) : null;
+  let proxySettle = () => {}; // #171: bound once the proxy is listening
+  const sharedLedger = shared ? openSharedLedger(receiptsPath, {
+    onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); },
+    // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
+    // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
+    onExternalSettle: (s, r) => {
+      const settled = { ...r, cost_usd: s.cost_usd };
+      if (isPendingBatch(r)) cap.record({ ts: r.ts, cost_usd: s.cost_usd }, { external: true });
+      else cap.settle(settled);
+      agentBudgets?.settle?.(s);
+      proxySettle(s);
+    },
+  }) : null;
   const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
   cap = createCapEngine({ caps, history });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
-  let proxySettle = () => {}; // #171: bound once the proxy is listening
   let fleetPolicy;
   let fleetModels = models ?? null;
   const setPolicy = (p) => {

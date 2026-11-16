@@ -217,3 +217,106 @@ test("a holder SIGKILLed inside the critical section does not deadlock other wra
   for (const r of runs) assert.equal(r.out.trim(), "200 200 200", r.err);
   assert.equal(readFileSync(path, "utf8").split("\n").filter(Boolean).length, 6);
 });
+
+// ---- #174: settlements appended after the receipt (another chunk) ----
+const line = (o) => JSON.stringify(o) + "\n";
+
+test("#174: a later-chunk settlement of an external unknown unblocks this wrapper and counts on the receipt's day", () => {
+  const path = tmp();
+  const day = "2026-11-15T10:00:00.000Z";
+  let cap;
+  const settles = [];
+  const led = openSharedLedger(path, {
+    onExternal: (r) => cap.record(r, { external: true }),
+    onExternalSettle: (s, r) => { settles.push([s.receipt_id, r.id]); cap.settle({ ...r, cost_usd: s.cost_usd }); },
+  });
+  cap = createCapEngine({ caps: { day: 5 }, history: led.history(), now: () => new Date("2026-11-15T12:00:00.000Z") });
+  appendFileSync(path, line({ id: "b1", ts: day, cost_usd: null }));
+  led.withLock(() => {});
+  assert.equal(cap.check().reason, "unreconciled_receipt");
+  appendFileSync(path, line({ event: "reconciliation", receipt_id: "b1", cost_usd: 0.4 }));
+  led.withLock(() => {});
+  assert.equal(cap.check(), null);
+  assert.equal(cap.spend().day, 0.4);
+  assert.deepEqual(settles, [["b1", "b1"]]);
+  // A duplicate settlement is ignored.
+  appendFileSync(path, line({ event: "reconciliation", receipt_id: "b1", cost_usd: 9 }));
+  led.withLock(() => {});
+  assert.equal(settles.length, 1);
+  led.close();
+});
+
+test("#174: an external batch_pending settled later by batch_results counts exactly once", () => {
+  const path = tmp();
+  const ts = new Date().toISOString();
+  const cap = createCapEngine({ caps: { day: 50 } });
+  const led = openSharedLedger(path, {
+    onExternal: (r) => cap.record(r, { external: true }),
+    onExternalSettle: (s, r) => cap.record({ ts: r.ts, cost_usd: s.cost_usd }, { external: true }),
+  });
+  led.history();
+  appendFileSync(path, line({ id: "b2", ts, cost_usd: null, reason: "batch_pending" }));
+  led.withLock(() => {});
+  assert.equal(cap.check(), null);
+  assert.equal(cap.spend().day, 0);
+  appendFileSync(path, line({ event: "reconciliation", receipt_id: "b2", cost_usd: 3, source: "batch_results" }));
+  led.withLock(() => {});
+  assert.equal(cap.spend().day, 3);
+  appendFileSync(path, line({ event: "reconciliation", receipt_id: "b2", cost_usd: 3, source: "batch_results" }));
+  led.withLock(() => {});
+  assert.equal(cap.spend().day, 3);
+  led.close();
+});
+
+test("#174: settlements of own, already-costed, same-chunk or never-seen receipts are not re-settled", () => {
+  const path = tmp();
+  appendFileSync(path, line({ id: "old", ts: new Date().toISOString(), cost_usd: null }));
+  const settles = [];
+  const ext = [];
+  const led = openSharedLedger(path, { onExternal: (r) => ext.push(r), onExternalSettle: (s) => settles.push(s.receipt_id) });
+  assert.equal(led.history()[0].cost_usd, null);
+  led.withLock(() => appendFileSync(path, line({ id: "mine", cost_usd: null })));
+  appendFileSync(path, line({ id: "priced", cost_usd: 1 }) + line({ id: "same", cost_usd: null }) + line({ event: "reconciliation", receipt_id: "same", cost_usd: 2 }));
+  led.withLock(() => {});
+  assert.equal(ext.find((r) => r.id === "same").cost_usd, 2, "same-chunk settlement is applied by applySettlements");
+  appendFileSync(path, ["mine", "priced", "same", "ghost"].map((id) => line({ event: "reconciliation", receipt_id: id, cost_usd: 1 })).join("")
+    + line({ event: "reconciliation", receipt_id: "old", cost_usd: -1 }) + line({ event: "reconciliation", receipt_id: "old", cost_usd: 0.5 }));
+  led.withLock(() => {});
+  assert.deepEqual(settles, ["old"], "only a history unknown, with its first valid settlement");
+  led.close();
+});
+
+test("#174 e2e: reconcile --apply of a sibling's unknown receipt unblocks a running --shared-ledger wrapper", { timeout: 60_000 }, async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(join(tmpdir(), "cc-shared-"));
+  const path = join(dir, "r.jsonl"), go1 = join(dir, "go1"), go2 = join(dir, "go2");
+  const env = { COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}`, GO1: go1, GO2: go2 };
+  const victim = `
+    import { existsSync } from "node:fs";
+    const wait = async (f) => { while (!existsSync(f)) await new Promise((r) => setTimeout(r, 20)); };
+    const u = process.env.OPENAI_BASE_URL + "/chat/completions";
+    const a = await fetch(u,{method:"POST",body:"{}"});
+    await wait(process.env.GO1);
+    const b = await fetch(u,{method:"POST",body:'{"n":2}'});
+    const j = await b.json();
+    await wait(process.env.GO2);
+    const c = await fetch(u,{method:"POST",body:'{"n":3}'});
+    console.log(a.status, b.status, j.error.type, j.error.scope, c.status);`;
+  const args = ["--shared-ledger", "--day-cap", "5", "--receipts", path];
+  const vp = runWrap(args, victim, env);
+  const rows = () => { try { return readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  while (!rows().some((r) => r.cost_usd > 0)) await new Promise((r) => setTimeout(r, 20));
+  const p = await runWrap(args, `const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions",{method:"POST",body:'{"poison":1}'}); console.log(r.status);`, env);
+  assert.equal(p.out.trim(), "200", p.err);
+  const unknown = rows().find((r) => !r.event && r.cost_usd === null);
+  assert.ok(unknown);
+  writeFileSync(go1, "1");
+  while (!rows().some((r) => r.blocked)) await new Promise((r) => setTimeout(r, 20));
+  const provider = join(dir, "provider.jsonl");
+  writeFileSync(provider, JSON.stringify({ id: unknown.id, cost_usd: 0.42 }) + "\n");
+  const ap = spawnSync(process.execPath, ["src/cli.js", "reconcile", "--receipts", path, "--provider", provider, "--apply"], { encoding: "utf8" });
+  assert.equal(ap.status, 0, ap.stderr);
+  writeFileSync(go2, "1");
+  const v = await vp;
+  assert.equal(v.out.trim(), "200 429 budget_exceeded accounting 200", v.err);
+});
