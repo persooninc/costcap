@@ -204,7 +204,8 @@ test("#204 fleet tag caps: cached offline, merged with local rules, invalid payl
 // after expires_at, with no fetch, and a local cap still tightens the raised cap.
 test("regression #208: offline wrapper reverts to base caps when a cached raise expires", async (t) => {
   const f = await setup(t);
-  const now = Date.now();
+  // Midday UTC today: now + 1h never crosses the UTC day, so day spend still applies (was red 23:00-24:00 UTC).
+  const now = Date.parse(`${new Date().toISOString().slice(0, 10)}T12:00:00.000Z`);
   const data = loadEnrollment(f.path);
   data.policy = { version: 5, caps: { day: 5 }, killed: false, raise: { day: { cap: 25, expires_at: new Date(now + 3600_000).toISOString(), request_id: "req-1" } } };
   data.agentSpend = { spent: { day: 6, month: 6 }, unknown: 0, as_of: new Date(now).toISOString() };
