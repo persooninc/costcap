@@ -5,6 +5,7 @@ import { uiResponse } from "./ui.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy, effectiveCaps } from "./policy.js";
+import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
@@ -710,6 +711,26 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      // Issue #223: org default spend-anomaly settings. Any member reads, owner/admin writes (audited).
+      if (path === "/v1/anomaly-settings" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = sessionUser(s, req); return { anomaly: resolveAnomaly(s.orgs[u.orgId]?.anomaly), defaults: { ...DEFAULT_ANOMALY }, canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/anomaly-settings" && (req.method === "POST" || req.method === "PUT")) {
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const input = body?.anomaly ?? body;
+          const err = anomalyError(input);
+          if (err) fail(400, err);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const before = resolveAnomaly(org.anomaly);
+          const after = resolveAnomaly(org.anomaly, input);
+          org.anomaly = after;
+          audit(s, u.orgId, u.id, "anomaly.change", u.orgId, { scope: "org", before, after });
+          return { anomaly: after, defaults: { ...DEFAULT_ANOMALY }, canEdit: true };
+        });
+        return json(200, result);
+      }
       // Issue #209: org budget period. Owner/admin write (audited before/after), any member reads.
       if (path === "/v1/budget-period" && req.method === "GET") {
         return json(200, store.read((s) => { const u = sessionUser(s, req); return { budgetPeriod: { ...orgPeriod(s, u.orgId) }, canEdit: ["owner", "admin"].includes(u.role) }; }));
@@ -787,7 +808,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           }
           const { name, agents, day, month } = input;
           const warnFractions = input.warnFractions === undefined ? current?.warnFractions : input.warnFractions;
-          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}) };
+          const anomaly = input.anomaly === undefined ? current?.anomaly : input.anomaly;
+          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}), ...(anomaly ? { anomaly } : {}) };
+          if (JSON.stringify(current?.anomaly ?? null) !== JSON.stringify(anomaly ?? null)) audit(s, u.orgId, u.id, "anomaly.change", name, { scope: "team", before: current?.anomaly ?? null, after: anomaly ?? null });
           audit(s, u.orgId, u.id, "team.change", name, { previous: strip(current), next: strip(s.teams[key]) });
           return verdictOf(s, s.teams[key]);
         });
@@ -902,11 +925,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
           // downgrade (issue #207): omitted keeps, null clears.
           const downgrade = body.downgrade === undefined ? a.policy.downgrade : body.downgrade;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
+          // anomaly (issue #223): omitted keeps, null clears (org default applies).
+          const anomaly = body.anomaly === undefined ? a.policy.anomaly : body.anomaly;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(anomaly != null ? { anomaly } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
           { const errs = validatePolicy(policy); if (errs.length) fail(400, `Invalid policy: ${errs.join("; ")}`); }
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }) };
           a.policy = policy;
+          if (JSON.stringify(prev.anomaly ?? null) !== JSON.stringify(policy.anomaly ?? null)) audit(s, u.orgId, u.id, "anomaly.change", a.id, { scope: "agent", before: prev.anomaly ?? null, after: policy.anomaly ?? null });
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;
         });
@@ -1044,6 +1070,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // alert is not flap-resolved when newer runs sync.
         const runAlerts = evaluateRunAlerts({ agentId: a.id, cap: hasRunCap ? runCap : null, runs: activeRuns, blockedRunIds }, { warnFractions: a.policy.warnFractions });
         alerts.push(...runAlerts);
+        // Issue #223: spend anomaly vs the agent's own 14-day median (no cap needed).
+        const anomaly = evaluateAnomaly({ id: a.id, receipts, nowMs: now(), budgetPeriod: bp, settings: resolveAnomaly(s.orgs?.[a.orgId]?.anomaly, a.policy.anomaly) });
+        if (anomaly) alerts.push(anomaly);
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
@@ -1071,6 +1100,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
           if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert, orgPeriod(s, t.orgId)) }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
+        }
+        // Issue #223: team-scoped anomaly on the members' summed daily spend.
+        const teamAnomaly = evaluateAnomaly({ id: `team:${t.orgId}:${t.name}`, receipts: t.agents.flatMap((id) => agentReceipts(s, id)), nowMs: now(), budgetPeriod: orgPeriod(s, t.orgId), settings: resolveAnomaly(s.orgs?.[t.orgId]?.anomaly, t.anomaly) });
+        if (teamAnomaly) {
+          const alert = { ...teamAnomaly, team: t.name };
+          teamKeys.add(alert.key);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }

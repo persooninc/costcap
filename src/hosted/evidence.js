@@ -66,7 +66,9 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
       // Warning fraction (#165) only when the alert carries one.
       ...(a.fraction != null ? { fraction: a.fraction } : {}),
       // Run-scope alerts (#168) carry their run_id.
-      ...(a.run_id != null ? { run_id: a.run_id } : {}) })),
+      ...(a.run_id != null ? { run_id: a.run_id } : {}),
+      // Spend anomaly (#223): today vs baseline, and the unknown-cost flags.
+      ...(a.kind === "spend_anomaly" ? { date: a.date ?? null, today: a.today ?? null, baseline: a.baseline ?? null, multiplier: a.multiplier ?? null, lower_bound: Boolean(a.lower_bound), baseline_lower_bound: Boolean(a.baseline_lower_bound) } : {}) })),
     // Team budgets (#123): shared cap, synced spend and verdict per team.
     teams: teams.map((t) => ({ name: t.name, agents: [...t.agents], caps: { ...t.caps }, spend: { ...t.spend }, verdict: t.verdict, scope: t.scope ?? null })),
     receipts: rows,

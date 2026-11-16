@@ -6,7 +6,7 @@ const state = (over = {}) => ({ agentId: "a1", caps: {}, spend: {}, blockedReaso
 const kinds = (alerts) => alerts.map((a) => a.kind);
 
 test("alert kinds are the documented set", () => {
-  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected"]);
+  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"]);
 });
 
 test("no caps and no activity raise nothing", () => {
@@ -171,4 +171,20 @@ test("#209 cap_projected uses the elapsed share of the configured month period",
   const fired = evaluateAlerts({ agentId: "a", caps: { month: 20 }, spend: { month: 5 }, nowMs: now }, { budgetPeriod: bp });
   assert.ok(fired.some((x) => x.kind === "cap_projected"));
   assert.ok(!evaluateAlerts({ agentId: "a", caps: { month: 20 }, spend: { month: 5 }, nowMs: now }).some((x) => x.kind === "cap_projected"));
+});
+
+// Issue #223 regression: anomaly evaluation leaves cap alerts unchanged, and an
+// agent still under its caps gets a spend_anomaly.
+import { evaluateAnomaly } from "../src/hosted/alerts.js";
+test("regression #223: cap alerts unchanged with anomaly on; under-cap agent still gets spend_anomaly", () => {
+  const now = Date.parse("2026-11-16T15:00:00Z");
+  const receipts = [];
+  for (let i = 1; i <= 14; i += 1) receipts.push({ ts: new Date(now - i * 86_400_000).toISOString(), cost_usd: 2 });
+  receipts.push({ ts: new Date(now - 60_000).toISOString(), cost_usd: 7 });
+  const state = { agentId: "a", caps: { day: 100, month: 1000 }, spend: { day: 7, month: 35 }, nowMs: now };
+  const caps = evaluateAlerts(state);
+  assert.deepEqual(caps, []);
+  const anomaly = evaluateAnomaly({ id: "a", receipts, nowMs: now });
+  assert.equal(anomaly.kind, "spend_anomaly");
+  assert.deepEqual(evaluateAlerts({ ...state, spend: { day: 85, month: 35 } }).map((x) => x.kind), ["cap_approaching"]);
 });

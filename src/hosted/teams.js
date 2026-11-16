@@ -8,6 +8,7 @@ import { periodKey, samePeriod } from "../period.js";
 import { createAgentBudgets } from "../agent-budget.js";
 import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
+import { anomalyError } from "./anomaly.js";
 
 export const TEAM_SCOPES = Object.freeze(["day", "month"]);
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
@@ -24,7 +25,7 @@ export function parseTeamInput(body, { orgAgents, teams, orgId }) {
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!NAME.test(name)) bad("Team name must be 1-40 letters, digits, - or _");
   if (body.remove === true) return { name, remove: true };
-  for (const key of Object.keys(body)) if (!["name", "agents", "day", "month", "warnFractions"].includes(key)) bad(`Unknown team field ${key}`);
+  for (const key of Object.keys(body)) if (!["name", "agents", "day", "month", "warnFractions", "anomaly"].includes(key)) bad(`Unknown team field ${key}`);
   if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > 100 || body.agents.some((a) => typeof a !== "string" || !a)) bad("Team agents must be a non-empty list of agent ids");
   const agents = [...new Set(body.agents)];
   const inOrg = new Set(orgAgents.filter((a) => a.orgId === orgId).map((a) => a.id));
@@ -48,6 +49,13 @@ export function parseTeamInput(body, { orgAgents, teams, orgId }) {
     const err = warnFractionsError(body.warnFractions);
     if (err) bad(err);
     out.warnFractions = sortWarnFractions(body.warnFractions);
+  }
+  // Issue #223: undefined keeps the saved anomaly override, null clears it.
+  if (body.anomaly === null) out.anomaly = null;
+  else if (body.anomaly !== undefined) {
+    const err = anomalyError(body.anomaly);
+    if (err) bad(err);
+    out.anomaly = { ...body.anomaly };
   }
   return out;
 }
@@ -84,6 +92,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
     ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
     ...(Array.isArray(team.warnFractions) ? { warnFractions: [...team.warnFractions] } : {}),
+    ...(team.anomaly ? { anomaly: { ...team.anomaly } } : {}),
   };
 }
 

@@ -4,7 +4,8 @@ import { periodBounds, periodKey } from "../period.js";
 // them (Brevo email, Slack) and writes the audit log. Dedupe: an alert
 // with the same key does not fire again until it clears and re-arms.
 
-export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected"];
+export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"];
+export { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 
 // state: { agentId, caps:{run,day,month}, spend:{run,day,month},
 //          blockedReasons:[...recent blocked receipts' reason/error],

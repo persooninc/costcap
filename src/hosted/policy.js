@@ -8,6 +8,7 @@
 
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
+import { anomalyError } from "./anomaly.js";
 import { downgradeError, mergeDowngrade } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
@@ -113,6 +114,11 @@ export function validatePolicy(p) {
   // Budget-triggered model downgrade (issue #207): optional { at, map }.
   if (p.downgrade !== undefined && p.downgrade !== null) {
     const err = downgradeError(p.downgrade);
+    if (err) errors.push(err);
+  }
+  // Spend anomaly override (issue #223): optional { enabled, multiplier, min_usd }.
+  if (p.anomaly !== undefined && p.anomaly !== null) {
+    const err = anomalyError(p.anomaly);
     if (err) errors.push(err);
   }
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");

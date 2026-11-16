@@ -17,7 +17,7 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
   // channels are not sent and not reported.
   return async (alert, { channels } = {}) => {
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
-    const text = `CostCap ${alert.kind}: ${alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.team ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = `CostCap ${alert.kind}: ${alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.team ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (!want("email")) { /* already settled for this occurrence */ }
     else if (emailKey && emailFrom && emailTo?.length) {
@@ -93,6 +93,10 @@ export function webhookPayload(alert, { dashboardUrl } = {}) {
     run_id: alert.run_id ?? null, scope: alert.scope ?? null, period: alert.period ?? null,
     fraction: num(alert.fraction), spent_usd: num(alert.spent), cap_usd: num(alert.cap),
     unknown_count: Number.isInteger(alert.unknown_count) ? alert.unknown_count : Number.isInteger(alert.unknownCount) ? alert.unknownCount : null,
+    // Spend anomaly (#223) fields; null on other kinds.
+    today_usd: num(alert.today), baseline_usd: num(alert.baseline), multiplier: num(alert.multiplier),
+    top_models: Array.isArray(alert.top_models) ? alert.top_models.map((m) => ({ model: m.model, usd: num(m.usd) })) : null,
+    lower_bound: typeof alert.lower_bound === "boolean" ? alert.lower_bound : null,
     fired_at: alert.fired_at ?? null, dashboard_url: dashboardUrl ?? null,
   };
 }
