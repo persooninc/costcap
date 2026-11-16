@@ -55,3 +55,27 @@ test("MCP stdio handles malformed lines without crashing", () => {
   assert.equal(replies[0].error.code, -32700);
   assert.deepEqual(replies[1].result, {});
 });
+
+test("#144 host kill: mcp budget_status, agent-status and check return killed/host ahead of budget", () => {
+  const d = mkdtempSync(join(tmpdir(), "cc-hostk-")), home = join(d, "home");
+  const env = { ...process.env, COSTCAP_HOME: home };
+  const receipts = ledger([0.1]);
+  const policy = join(d, "policy.json");
+  writeFileSync(policy, JSON.stringify({ agents: { a1: { day: 100 } } }));
+  const run = (...a) => spawnSync(process.execPath, ["src/cli.js", ...a], { encoding: "utf8", env, input: a[0] === "mcp" ? JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "budget_status" } }) + "\n" : undefined });
+  // Not killed: check passes.
+  assert.equal(run("check", "--receipts", receipts, "--cap", "1").status, 0);
+  assert.equal(run("kill", "--host", "stop all", "--receipts", join(d, "ev.jsonl")).status, 0);
+  const chk = run("check", "--receipts", receipts, "--cap", "1");
+  assert.equal(chk.status, 1);
+  const cj = JSON.parse(chk.stdout);
+  assert.deepEqual([cj.verdict, cj.kill.kill_scope, cj.kill.kill_file], ["killed", "host", join(home, "KILL")]);
+  const mcp = run("mcp", "--receipts", receipts, "--cap", "1", "--kill-file", join(d, "proj", "KILL"));
+  const mj = JSON.parse(JSON.parse(mcp.stdout.trim().split("\n")[0]).result.content[0].text);
+  assert.deepEqual([mj.verdict, mj.kill.kill_scope], ["killed", "host"]);
+  const ag = run("agent-status", "--agent", "a1", "--policy", policy, "--receipts", receipts);
+  const aj = JSON.parse(ag.stdout);
+  assert.deepEqual([aj.verdict, aj.kill.kill_scope, aj.agent_id], ["killed", "host", "a1"]);
+  run("resume", "--host", "--receipts", join(d, "ev.jsonl"));
+  assert.equal(run("check", "--receipts", receipts, "--cap", "1").status, 0);
+});

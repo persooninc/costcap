@@ -5,22 +5,42 @@
 // not stopped.
 
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 export const DEFAULT_KILL_FILE = ".costcap/KILL";
 
-export function createKillCheck(killFile = DEFAULT_KILL_FILE) {
-  return () => {
-    // A stat error other than "not found" means the state is unknown, so it kills.
-    try { statSync(killFile); }
-    catch (err) {
-      if (err.code === "ENOENT") return null;
-      return { reason: "killed", kill_file: killFile, note: `kill state unknown: ${err.code}` };
-    }
-    let reason = "";
-    try { reason = readFileSync(killFile, "utf8").trim(); } catch { /* unreadable: still killed */ }
-    return { reason: "killed", kill_file: killFile, note: reason || undefined };
+// Host kill file: $COSTCAP_HOME/KILL (COSTCAP_HOME defaults to ~/.costcap).
+// It freezes every wrapped agent on this machine, whatever its working directory.
+export function hostKillFile(env = process.env) {
+  return join(env.COSTCAP_HOME || join(homedir(), ".costcap"), "KILL");
+}
+
+// One file's state. A stat error other than "not found" means the state is
+// unknown, so it kills (fail closed).
+export function readKillFile(file, scope) {
+  try { statSync(file); }
+  catch (err) {
+    if (err.code === "ENOENT") return null;
+    return { reason: "killed", kill_scope: scope, kill_file: file, note: `kill state unknown: ${err.code}` };
+  }
+  let reason = "";
+  try { reason = readFileSync(file, "utf8").trim(); } catch { /* unreadable (e.g. a directory): still killed */ }
+  return { reason: "killed", kill_scope: scope, kill_file: file, note: reason || undefined };
+}
+
+// Host OR project: either file present means killed. Host is checked first.
+// Pass killFile = null to check only the host file.
+export function createKillCheck(killFile = DEFAULT_KILL_FILE, { hostFile = hostKillFile() } = {}) {
+  return () => (hostFile ? readKillFile(hostFile, "host") : null) || (killFile ? readKillFile(killFile, "project") : null);
+}
+
+export function killStatus(killFile = DEFAULT_KILL_FILE, hostFile = hostKillFile()) {
+  const one = (file, scope) => {
+    const k = readKillFile(file, scope);
+    return { killed: Boolean(k), file, note: k?.note ?? null };
   };
+  return { host: one(hostFile, "host"), project: one(killFile, "project") };
 }
 
 export function kill(killFile = DEFAULT_KILL_FILE, note = "") {
@@ -40,9 +60,9 @@ export function resume(killFile = DEFAULT_KILL_FILE) {
 // work then, so this appends one line without taking the lock. The kill file is
 // the control and the event is the record: callers change the file first, so a
 // ledger failure can't undo a kill.
-export function recordKillEvent(receiptsPath, event, killFile, note = "", now = () => new Date()) {
+export function recordKillEvent(receiptsPath, event, killFile, note = "", now = () => new Date(), scope = "project") {
   mkdirSync(dirname(receiptsPath), { recursive: true });
-  const line = { event, ts: now().toISOString(), kill_file: killFile };
+  const line = { event, ts: now().toISOString(), scope, kill_file: killFile };
   if (note) line.note = note;
   appendFileSync(receiptsPath, `${JSON.stringify(line)}\n`);
 }

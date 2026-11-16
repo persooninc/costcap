@@ -4,7 +4,6 @@
 // process's provider base URLs at it, and exits with the child's exit code.
 // Guardrails, not guarantees: only traffic through the proxy is metered.
 
-import { checkBudget } from "./check.js";
 import { reconcileFiles, applyReconciliation } from "./reconcile.js";
 import { serveMcp } from "./mcp.js";
 import { enroll, createFleetClient } from "./hosted/client.js";
@@ -15,11 +14,11 @@ import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadSettledReceipts } from "./cap.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
-import { guardedAgentStatus } from "./check.js";
+import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run-summary.js";
-import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
+import { createKillCheck, hostKillFile, kill, killStatus, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
 import { assertTableIntegrity } from "./pricing.js";
@@ -35,7 +34,8 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap runs [--json] [--receipts FILE]\n" +
   "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv]\n" +
   "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
-  "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
+  "       costcap kill [note] [--host] [--kill-file FILE] [--receipts FILE] | costcap kill --status | costcap resume [--host] [--kill-file FILE] [--receipts FILE]\n" +
+  "       (--host uses $COSTCAP_HOME/KILL, default ~/.costcap/KILL, and freezes every wrapped agent on this machine)\n" +
   "       costcap --version | costcap --help";
 
 export function parseWrapArgs(argv) {
@@ -79,9 +79,11 @@ export function parseWrapArgs(argv) {
 }
 
 function parseKillArgs(argv) {
-  const opts = { file: DEFAULT_KILL_FILE, receipts: ".costcap/receipts.jsonl", words: [] };
+  const opts = { file: DEFAULT_KILL_FILE, receipts: ".costcap/receipts.jsonl", words: [], host: false, status: false };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--kill-file") opts.file = argv[++i];
+    else if (argv[i] === "--host") opts.host = true;
+    else if (argv[i] === "--status") opts.status = true;
     else if (argv[i] === "--receipts") opts.receipts = argv[++i];
     else opts.words.push(argv[i]);
   }
@@ -140,10 +142,13 @@ export async function wrap(argv) {
   // Kill switch also stops the wrapped child: SIGTERM, then SIGKILL after 5s.
   const killCheck = combinedKill;
   const syncTimer = fleet ? setInterval(() => fleet.sync(), 60_000) : null;
-  let killedByCostcap = false;
+  let killedByCostcap = false, killInfo = null;
   const watcher = setInterval(() => {
-    if (killedByCostcap || !killCheck()) return;
+    if (killedByCostcap) return;
+    const k = killCheck();
+    if (!k) return;
     killedByCostcap = true;
+    killInfo = k;
     console.error("costcap: kill file present, stopping wrapped process");
     child.kill("SIGTERM");
     setTimeout(() => child.kill("SIGKILL"), 5000).unref();
@@ -160,7 +165,7 @@ export async function wrap(argv) {
   const s = cap.spend();
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
   const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
-    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap });
+    receipts: runReceipts, caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo });
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
   return code;
@@ -184,7 +189,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       if (cmd === "check" && parsed.runId !== undefined) options.runId = parsed.runId;
       if (cmd === "mcp") serveMcp({ ...options, killFile: parsed.killFile, enrollmentPath: parsed.enrollmentPath });
       else {
-        const result = checkBudget(options);
+        // The host kill file always applies; the project kill file only with an explicit --kill-file.
+        const result = guardedBudgetStatus({ ...options, killFile: rest.includes("--kill-file") ? parsed.killFile : null });
         if (parsed.githubOutput) writeGithubOutputs(result, parsed.caps);
         console.log(JSON.stringify(result));
         process.exitCode = result.ok ? 0 : 1;
@@ -232,21 +238,29 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else if (cmd === "runs") {
     runsCommand(rest);
   } else if (cmd === "kill" || cmd === "resume") {
-    const { file, receipts, words } = parseKillArgs(rest);
+    const { file: projectFile, receipts, words, host, status } = parseKillArgs(rest);
+    if (status) {
+      console.log(JSON.stringify(killStatus(projectFile, hostKillFile())));
+    } else {
+    const file = host ? hostKillFile() : projectFile;
+    const scope = host ? "host" : "project";
     const logEvent = (note) => {
       // The kill state already changed, so a ledger failure is a warning, not a failure.
-      try { recordKillEvent(receipts, cmd, file, note); }
+      try { recordKillEvent(receipts, cmd, file, note, undefined, scope); }
       catch (err) { console.error(`costcap: warning: ${cmd} took effect but was not recorded in ${receipts}: ${err.code ?? err.message}`); }
     };
     if (cmd === "kill") {
       const note = words.join(" ");
       kill(file, note);
       logEvent(note);
-      console.error(`costcap: killed. Wrapped agents sharing ${file} are refused until \`costcap resume\`.`);
+      console.error(host
+        ? `costcap: killed (host). Every wrapped agent on this machine is refused until \`costcap resume --host\` (${file}).`
+        : `costcap: killed. Wrapped agents sharing ${file} are refused until \`costcap resume\`.`);
     } else if (resume(file)) {
       logEvent(words.join(" "));
-      console.error("costcap: resumed.");
+      console.error(`costcap: resumed (${scope}).`);
     } else console.error("costcap: nothing to resume (not killed).");
+    }
   } else {
     console.error(`costcap: unknown command "${cmd}"\n${USAGE}`);
     process.exit(2);

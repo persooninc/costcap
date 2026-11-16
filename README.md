@@ -65,6 +65,9 @@ npm test
 node src/cli.js wrap --cap 5 --day-cap 10 --max-steps 40 -- node your-agent.js
 node src/cli.js kill "pause local wrapped agents"
 node src/cli.js resume
+node src/cli.js kill --host "runaway"   # freeze every wrapped agent on this machine
+node src/cli.js resume --host
+node src/cli.js kill --status           # {"host":{...},"project":{...}}
 ```
 
 The wrapper sets provider base URL environment variables. Your SDK must honor
@@ -158,7 +161,12 @@ CostCap. The local proxy binds to 127.0.0.1.
   published rate records `cost_usd: null` and blocks further calls. Other billable
   features and dynamic pricing may differ.
 - The default kill file is relative to the working directory. Only agents sharing
-  that file are affected. Polling defaults to 500ms, with SIGKILL after 5 seconds.
+  that file are affected. The host kill file `$COSTCAP_HOME/KILL` (`COSTCAP_HOME`
+  defaults to `~/.costcap`) is checked in addition, by `wrap`, `mcp`, `agent-status`
+  and `check`: either file present means killed (`kill_scope: "host"|"project"` and
+  `kill_file` in the verdict, blocked receipt and run summary). `costcap kill --host` /
+  `costcap resume --host` change only the host file; plain `resume` never lifts a host
+  kill. A host-file stat error other than not-found counts as killed. Polling defaults to 500ms, with SIGKILL after 5 seconds.
   It does not undo a request already accepted by the provider or stop remote agents.
 - This proxy is for a trusted local machine, not an exposed multi-tenant service.
   It does not establish an authentication boundary against other local processes.

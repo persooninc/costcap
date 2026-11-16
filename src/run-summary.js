@@ -16,15 +16,17 @@ export function stopReason(reason) {
 }
 
 // Build a summary from this run's receipt lines (event lines are ignored).
-export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false }) {
+export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null }) {
   const by_model = {};
   let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, total = 0;
-  let stopped_by = killed ? "killed" : null, stopped_scope = null;
+  let stopped_by = killed ? "killed" : null, stopped_scope = killed ? (kill?.kill_scope ?? null) : null;
+  let killInfo = killed && kill?.kill_scope ? { kill_scope: kill.kill_scope, kill_file: kill.kill_file } : null;
   for (const r of applySettlements(receipts.filter(Boolean))) {
     if (r.blocked) {
       blocked_calls++;
       const s = stopReason(r.reason);
-      if (s && !stopped_by) { stopped_by = s; stopped_scope = r.scope ?? null; }
+      if (s && !stopped_by) { stopped_by = s; stopped_scope = r.scope ?? r.kill_scope ?? null; }
+      if (s === "killed" && !killInfo && r.kill_scope) killInfo = { kill_scope: r.kill_scope, kill_file: r.kill_file };
       continue;
     }
     calls++;
@@ -46,7 +48,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   return {
     schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
     total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls,
-    caps: capsOut, stopped_by, ...(stopped_scope ? { stopped_scope } : {}),
+    caps: capsOut, stopped_by, ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
   };
 }
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -101,4 +101,83 @@ test("recordKillEvent throws so the caller decides what a failure means", () => 
   const blocker = join(dir, "file");
   writeFileSync(blocker, "");
   assert.throws(() => recordKillEvent(join(blocker, "r.jsonl"), "kill", "KILL"));
+});
+
+// #144 host-wide kill switch
+import { hostKillFile, killStatus, readKillFile } from "../src/kill.js";
+import { mkdirSync, chmodSync } from "node:fs";
+const tdir = () => mkdtempSync(join(tmpdir(), "cc-host-"));
+
+test("#144 hostKillFile honours COSTCAP_HOME and defaults under the home dir", () => {
+  assert.equal(hostKillFile({ COSTCAP_HOME: "/tmp/x" }), "/tmp/x/KILL");
+  assert.match(hostKillFile({}), /\.costcap[\\/]KILL$/);
+});
+
+test("#144 host OR project: either file kills, host checked first, scopes reported", () => {
+  const d = tdir(), host = join(d, "home", "KILL"), proj = join(d, "proj", "KILL");
+  const check = createKillCheck(proj, { hostFile: host });
+  assert.equal(check(), null);
+  kill(proj, "p");
+  assert.deepEqual([check().kill_scope, check().kill_file, check().note], ["project", proj, "p"]);
+  kill(host, "runaway");
+  assert.deepEqual([check().kill_scope, check().kill_file, check().note], ["host", host, "runaway"]);
+  resume(host);
+  assert.equal(check().kill_scope, "project", "project kill still blocks after host resume");
+  resume(proj);
+  kill(host);
+  assert.equal(check().kill_scope, "host", "project resume does not lift a host kill");
+  assert.equal(createKillCheck(null, { hostFile: host })().kill_scope, "host");
+  assert.equal(createKillCheck(null, { hostFile: null })(), null);
+});
+
+test("#144 host stat error other than ENOENT fails closed", { skip: process.getuid?.() === 0 }, () => {
+  const d = tdir();
+  const blocker = join(d, "file");
+  writeFileSync(blocker, "");
+  const k = readKillFile(join(blocker, "KILL"), "host"); // ENOTDIR
+  assert.equal(k.reason, "killed");
+  assert.equal(k.kill_scope, "host");
+  assert.match(k.note, /kill state unknown/);
+  const asDir = join(d, "KILLDIR");
+  mkdirSync(asDir);
+  assert.equal(readKillFile(asDir, "host").reason, "killed");
+  const locked = join(d, "locked");
+  mkdirSync(locked);
+  chmodSync(locked, 0o000);
+  try { assert.match(readKillFile(join(locked, "KILL"), "host").note, /kill state unknown: EACCES/); }
+  finally { chmodSync(locked, 0o700); }
+});
+
+test("#144 killStatus reports both scopes in all four combinations", () => {
+  const d = tdir(), host = join(d, "h", "KILL"), proj = join(d, "p", "KILL");
+  for (const [h, p] of [[false, false], [true, false], [false, true], [true, true]]) {
+    resume(host); resume(proj);
+    if (h) kill(host, "hn");
+    if (p) kill(proj);
+    const s = killStatus(proj, host);
+    assert.deepEqual(s, { host: { killed: h, file: host, note: h ? "hn" : null }, project: { killed: p, file: proj, note: null } });
+  }
+});
+
+test("#144 kill/resume --host CLI: separate files, scoped receipts, --status JSON", () => {
+  const d = tdir(), home = join(d, "home"), receipts = join(d, "r.jsonl"), proj = join(d, "KILL");
+  const env = { ...process.env, COSTCAP_HOME: home };
+  const run = (...a) => spawnSync(process.execPath, ["src/cli.js", ...a], { encoding: "utf8", env });
+  assert.equal(run("kill", "--host", "runaway", "--receipts", receipts).status, 0);
+  assert.equal(existsSync(join(home, "KILL")), true);
+  run("kill", "--kill-file", proj, "--receipts", receipts);
+  let st = JSON.parse(run("kill", "--status", "--kill-file", proj).stdout);
+  assert.equal(st.host.killed && st.project.killed && st.host.note === "runaway", true);
+  run("resume", "--kill-file", proj, "--receipts", receipts);
+  assert.equal(existsSync(join(home, "KILL")), true, "project resume leaves host file");
+  run("kill", "--kill-file", proj, "--receipts", receipts);
+  run("resume", "--host", "--receipts", receipts);
+  assert.equal(existsSync(join(home, "KILL")), false);
+  assert.equal(existsSync(proj), true, "host resume leaves project file");
+  st = JSON.parse(run("kill", "--status", "--kill-file", proj).stdout);
+  assert.deepEqual([st.host.killed, st.project.killed], [false, true]);
+  const events = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(events.map((e) => `${e.event}:${e.scope}`), ["kill:host", "kill:project", "resume:project", "kill:project", "resume:host"]);
+  assert.equal(events[0].kill_file, join(home, "KILL"));
+  assert.equal(events[0].note, "runaway");
 });

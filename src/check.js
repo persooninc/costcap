@@ -62,10 +62,11 @@ export function agentBudgetStatus({ receiptsPath, policy, agent_id: agentId, run
 // call. Same order as the proxy: kill switch (local file or cached fleet kill /
 // revoked credentials), then the agent policy, then the cached fleet per-agent
 // caps and team caps, then min(local, fleet) day/month caps. Read-only: the
-// enrollment cache is read, never synced or rewritten. With neither a kill file
+// enrollment cache is read, never synced or rewritten. With no kill file (host or project)
 // present nor an enrollment, the base result is returned unchanged.
 export function fleetGuard({ killFile, enrollmentPath, receiptsPath, now }) {
-  const killed = killFile ? createKillCheck(killFile)() : null;
+  // The host kill file ($COSTCAP_HOME/KILL) is always checked, ahead of the project file.
+  const killed = createKillCheck(killFile ?? null)();
   if (killed) return { killed };
   if (!enrollmentPath) return {};
   const fleet = createFleetClient({ path: enrollmentPath, receiptsPath });
