@@ -673,3 +673,62 @@ test("#114 hosted maxSteps: validation, versioning, clearing, budget run steps",
   assert.equal(r.status, 200);
   assert.equal("maxSteps" in r.body, false);
 });
+test("#114 enrolled wrapper enforces hosted maxSteps per run, offline from cache, tighter-wins", async (t) => {
+  const http = await import("node:http");
+  const { spawn } = await import("node:child_process");
+  const { enroll } = await import("../src/hosted/client.js");
+  let hits = 0;
+  const up = http.createServer((req, res) => { hits++; req.resume(); req.on("end", () => res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 0 } }))); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const f = await fixture(t);
+  const owner = await f.login("steps-wrap@example.invalid");
+  const tok = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token;
+  const dir = mkdtempSync(join(tmpdir(), "cc-steps-"));
+  const enrollment = join(dir, "enrollment.json");
+  const receipts = join(dir, "r.jsonl");
+  const { agentId } = await enroll({ url: `http://127.0.0.1:${f.service().server.address().port}`, token: tok, name: "looper", path: enrollment });
+  assert.equal((await f.request(`/v1/agents/${agentId}/policy`, { maxSteps: 5 }, owner.cookie)).status, 200);
+  const script = `for (let i = 0; i < 12; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: "{}" }); await r.text(); if (r.status !== 200) { console.log("blocked " + i); break; } }`;
+  const run = (extra = []) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/cli.js", "wrap", ...extra, "--agent", agentId, "--enrollment", enrollment, "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (code) => resolve({ code, out: out.trim(), err }));
+  });
+  // Criterion 2: the 6th call is refused with a step_budget receipt; a new run starts at 0.
+  let r = await run();
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+  const blocked = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.blocked);
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].reason, "step_budget");
+  assert.equal(blocked[0].max_steps, 5);
+  assert.equal(blocked[0].agent_id, agentId);
+  hits = 0;
+  r = await run();
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+  // Criterion 4: a local value tightens, never loosens.
+  r = await run(["--max-steps", "3"]);
+  assert.equal(r.out, "blocked 3");
+  r = await run(["--max-steps", "10"]);
+  assert.equal(r.out, "blocked 5");
+  // Criterion 3: hosted API stopped, the cached maxSteps still applies.
+  f.service().server.closeAllConnections();
+  await new Promise((res) => f.service().server.close(res));
+  hits = 0;
+  r = await run();
+  assert.match(r.err, /fleet offline; cached policy enforced/);
+  assert.equal(r.out, "blocked 5");
+  assert.equal(hits, 5);
+});
+
+test("#114 maxSteps round-trips through the Postgres record mapping", async () => {
+  const { toRecords, fromRecords } = await import("../src/hosted/store-records.js");
+  const { EMPTY_STATE } = await import("../src/hosted/store.js");
+  const state = { ...structuredClone(EMPTY_STATE), agents: { a1: { id: "a1", orgId: "o", name: "n", hash: "h", policy: { version: 2, caps: {}, killed: false, maxSteps: 5 }, lastSeen: 1, revoked: false } } };
+  assert.deepEqual(fromRecords([...toRecords(state).values()], EMPTY_STATE), state);
+});
