@@ -176,7 +176,7 @@ test("an unknown-cost receipt from one wrapper blocks every wrapper sharing the 
   const up = await fakeUpstream(t);
   const dir = mkdtempSync(join(tmpdir(), "cc-shared-"));
   const path = join(dir, "r.jsonl"), go = join(dir, "go");
-  const env = { COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}`, GO_FILE: go };
+  const env = { COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}`, GO_FILE: go, LEDGER: path };
   const victim = `
     import { existsSync } from "node:fs";
     const u = process.env.OPENAI_BASE_URL + "/chat/completions";
@@ -186,8 +186,10 @@ test("an unknown-cost receipt from one wrapper blocks every wrapper sharing the 
     const j = await b.json();
     console.log(a.status, b.status, j.error.type, j.error.scope);`;
   const poisoner = `
-    import { writeFileSync } from "node:fs";
-    await new Promise((r) => setTimeout(r, 300));
+    import { writeFileSync, readFileSync } from "node:fs";
+    // Wait until both victims' first (priced) calls are in the ledger, not a fixed delay.
+    const priced = () => { try { return readFileSync(process.env.LEDGER, "utf8").split("\\n").filter((l) => l && JSON.parse(l).cost_usd > 0).length; } catch { return 0; } };
+    while (priced() < 2) await new Promise((r) => setTimeout(r, 20));
     const u = process.env.OPENAI_BASE_URL + "/chat/completions";
     const a = await fetch(u,{method:"POST",body:'{"poison":1}'});
     writeFileSync(process.env.GO_FILE, "1");
