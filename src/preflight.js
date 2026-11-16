@@ -60,7 +60,7 @@ export function estimateWorstCase(provider, body, path = "") {
   const output_tokens = out.tokens * mult.multiplier;
   const estimate_usd = Number(((input_tokens * price.input + output_tokens * price.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
 }
 
 // Compares the estimate with the remaining run/day/month budget.

@@ -356,6 +356,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             receipt_id: item.receipt?.id ?? "",
             model: item.receipt?.model ?? "",
             cost_usd: item.receipt?.cost_usd == null ? "" : item.receipt.cost_usd,
+            cost_source: item.receipt?.cost_source ?? "",
             settled_cost_usd: item.settlement?.cost_usd ?? "",
             settle_source: item.settlement?.source ?? "",
             reason: item.receipt?.reason ?? "",

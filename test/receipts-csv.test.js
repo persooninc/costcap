@@ -5,14 +5,14 @@ import { receiptsCsv, RECEIPT_CSV_LIMIT } from "../src/hosted/receipts-csv.js";
 test("receipt csv quotes formulas and keeps an empty cost empty", () => {
   const { body, truncated, count } = receiptsCsv([
     { ts: "2026-10-13T00:00:00.000Z", agent_id: "a", receipt_id: "1", model: "=cmd()", cost_usd: "", reason: "+sum", scope: "day" },
-    { ts: "2026-10-12T00:00:00.000Z", agent_id: "a", receipt_id: "0", model: "gpt", cost_usd: 1.5, reason: "", scope: "" },
+    { ts: "2026-10-12T00:00:00.000Z", agent_id: "a", receipt_id: "0", model: "gpt", cost_usd: 1.5, cost_source: "provider", reason: "", scope: "" },
   ]);
   assert.equal(truncated, false);
   assert.equal(count, 2);
   const lines = body.trim().split("\n");
-  assert.equal(lines[0], "ts,agent_id,receipt_id,model,cost_usd,settled_cost_usd,settle_source,reason,scope");
-  assert.equal(lines[1], "2026-10-12T00:00:00.000Z,a,0,gpt,1.5,,,,");
-  assert.equal(lines[2], "2026-10-13T00:00:00.000Z,a,1,'=cmd(),,,,'+sum,day");
+  assert.equal(lines[0], "ts,agent_id,receipt_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope");
+  assert.equal(lines[1], "2026-10-12T00:00:00.000Z,a,0,gpt,1.5,provider,,,,");
+  assert.equal(lines[2], "2026-10-13T00:00:00.000Z,a,1,'=cmd(),,,,,'+sum,day");
 });
 
 test("receipt csv keeps only the newest rows past the limit", () => {

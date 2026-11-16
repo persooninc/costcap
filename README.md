@@ -120,7 +120,14 @@ CostCap. The local proxy binds to 127.0.0.1.
   `scope`, and costs $0 toward spend.
 - Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
-  OpenRouter model ids. Unknown models use the declared fallback. Rates are the
+  OpenRouter model ids. Unknown models use the declared fallback. On the
+  `/openrouter` route only, a finite, non-negative `usage.cost` in the response
+  (or the last SSE usage chunk) is OpenRouter's exact USD charge and replaces
+  the table/fallback price for any routed model. Every priced receipt carries
+  `cost_source`: `provider`, `table` or `fallback`. A `usage.cost` on any other
+  route is ignored. `costcap runs` shows each model's `cost_source`, and
+  `costcap receipts --export csv`, `/v1/receipts.csv` and `/v1/evidence.json`
+  include the column. Rates are the
   standard text price in force on the table version date (the lower tier when a
   model publishes a prompt-length split). Check `src/pricing-table.json` before
   relying on rates.
@@ -261,7 +268,9 @@ duration-shaped usage object (for example `{"seconds": 42}`) is recorded as
 zero-filled to $0. Real explicit zeros still record a known $0. The proxy never
 follows a provider redirect, so your API key is not sent to another host. A 3xx
 returns 502 `upstream_redirect` to the client, with a $0 receipt because nothing
-was generated.
+was generated. A missing, negative, non-finite or non-numeric OpenRouter
+`usage.cost` falls back to table/fallback pricing, never $0, and `usage.cost`
+without the token counters is still `usage_unavailable`.
 
 Provider-side tools are never silently free. Anthropic `server_tool_use`
 requests (for example `web_search_requests`) and OpenAI Responses

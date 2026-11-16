@@ -39,7 +39,7 @@ export function parseReceiptsArgs(argv, now = new Date()) {
 function toRow(r) {
   return {
     ts: r.ts, agent_id: r.agent_id ?? null, run_id: r.run_id ?? null, receipt_id: r.id ?? null, model: r.model ?? null,
-    cost_usd: r.settled ? null : (r.cost_usd ?? null),
+    cost_usd: r.settled ? null : (r.cost_usd ?? null), cost_source: r.cost_source ?? null,
     settled_cost_usd: r.settled ? r.cost_usd : null,
     settle_source: r.settled?.source ?? null, reason: r.reason ?? null, scope: r.scope ?? null,
   };

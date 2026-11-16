@@ -1,7 +1,7 @@
 // Session export of synced receipts. This is the operator's copy of what
 // the proxy reported. It is not a provider bill.
 
-const COLUMNS = ["ts", "agent_id", "receipt_id", "model", "cost_usd", "settled_cost_usd", "settle_source", "reason", "scope"];
+const COLUMNS = ["ts", "agent_id", "receipt_id", "model", "cost_usd", "cost_source", "settled_cost_usd", "settle_source", "reason", "scope"];
 export const RECEIPT_CSV_LIMIT = 5000;
 
 export function cell(value) {

@@ -152,7 +152,7 @@ test("AC3-6: settlement is audited, unblocks verdicts, completes evidence and su
     assert.equal(entry.target, "unk");
     assert.deepEqual(entry.detail, { event: "reconciliation", agent_id: agent.agentId, before: null, after: 2.5, source: "provider_invoice", reason: "Invoice INV-1 line 3" });
     const csv = (await f.request("/v1/receipts.csv", undefined, owner)).body;
-    assert.match(csv, /,unk,m,,2\.5,provider_invoice,/);
+    assert.match(csv, /,unk,m,,,2\.5,provider_invoice,/);
   };
   await check();
   await f.restart();

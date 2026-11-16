@@ -38,6 +38,8 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     b.output_tokens += r.output_tokens ?? 0;
     b.cache_read_tokens += r.cached_input_tokens ?? 0;
     b.cache_write_tokens += (r.cache_write_input_tokens ?? 0) + (r.cache_write_1h_input_tokens ?? 0);
+    // #148: where each model's cost came from (provider-reported, table or fallback rate); "mixed" if it varied.
+    if (r.cost_source) b.cost_source = b.cost_source && b.cost_source !== r.cost_source ? "mixed" : r.cost_source;
     if (r.cost_usd == null) { unknown_cost_calls++; b.cost_usd = null; }
     else { total += r.cost_usd; if (b.cost_usd !== null) b.cost_usd = r6(b.cost_usd + r.cost_usd); }
   }

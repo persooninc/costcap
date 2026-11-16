@@ -26,7 +26,7 @@ test("baseUrlOverrides points OPENROUTER_BASE_URL at the proxy's openrouter path
   assert.equal(line, "OPENROUTER_BASE_URL=http://127.0.0.1:8080/openrouter");
 });
 
-test("a request routed through /openrouter meters an unknown model at the fallback rate and the cap hard-stops the next call", async (t) => {
+test("a request routed through /openrouter meters an unknown model with no usage.cost at the fallback rate and the cap hard-stops the next call", async (t) => {
   let hits = 0;
   const up = http.createServer((req, res) => {
     hits++;
@@ -55,6 +55,105 @@ test("a request routed through /openrouter meters an unknown model at the fallba
   assert.equal(receipts[0].path, "/api/v1/chat/completions");
   assert.equal(receipts[0].cost_usd, 2.5);
   assert.equal(receipts[0].fallback, true);
+  assert.equal(receipts[0].cost_source, "fallback");
   assert.equal(receipts[1].blocked, true);
   assert.equal(receipts[1].reason, "budget_exceeded");
+});
+
+// #148: OpenRouter's provider-reported usage.cost is the exact USD charge for any routed model.
+
+async function orProxy(t, bodies, { cap = 1, stream = false } = {}) {
+  let hits = 0;
+  const up = http.createServer((req, res) => {
+    const body = bodies[Math.min(hits++, bodies.length - 1)];
+    if (stream) {
+      res.setHeader("content-type", "text/event-stream");
+      res.write(`data: ${JSON.stringify({ model: body.model, choices: [{ delta: { content: "hi" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify(body)}\n\n`);
+      return res.end("data: [DONE]\n\n");
+    }
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(body));
+  });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const file = join(mkdtempSync(join(tmpdir(), "cc-or148-")), "receipts.jsonl");
+  const { server, port } = await startMeteringProxy({
+    upstreams: { openrouter: `http://127.0.0.1:${up.address().port}` },
+    cap: createCapEngine({ caps: { run: cap } }),
+    receiptsPath: file,
+  });
+  t.after(() => { server.closeAllConnections(); server.close(); up.closeAllConnections(); up.close(); });
+  const call = async (n) => { const r = await fetch(`http://127.0.0.1:${port}/openrouter/api/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: bodies[0].model, n, stream }) }); await r.text(); return r.status; };
+  return { call, hits: () => hits, receipts: () => readFileSync(file, "utf8").trim().split("\n").map(JSON.parse) };
+}
+
+test("#148 extractUsage keeps a valid openrouter usage.cost and drops invalid ones", () => {
+  const body = (cost) => JSON.stringify({ model: "x/y", usage: { prompt_tokens: 8, completion_tokens: 2, ...(cost !== undefined && { cost }) } });
+  assert.equal(extractUsage("openrouter", body(0.5)).providerCost, 0.5);
+  assert.equal(extractUsage("openrouter", body(0)).providerCost, 0);
+  for (const bad of [undefined, -1, "0.5", null, true, 1e400]) {
+    const r = extractUsage("openrouter", body(bad));
+    assert.equal(r.providerCost, undefined, `cost ${bad}`);
+    assert.deepEqual(r.usage, { input_tokens: 8, output_tokens: 2, cached_input_tokens: 0 });
+  }
+  // Never trusted on another route.
+  assert.equal(extractUsage("openai", body(0.5)).providerCost, undefined);
+  // Cost without token counters is still unknown usage (#138), never priced from cost alone.
+  assert.equal(extractUsage("openrouter", JSON.stringify({ model: "x/y", usage: { cost: 0.5 } })), null);
+});
+
+test("#148 AC1: provider cost wins over the table rate, even for a table model", async (t) => {
+  const f = await orProxy(t, [{ model: "openai/gpt-4o-mini", usage: { prompt_tokens: 1000, completion_tokens: 10, cost: 0.0123 } }], { cap: 100 });
+  assert.equal(await f.call(1), 200);
+  const [r] = f.receipts();
+  assert.equal(r.cost_usd, 0.0123);
+  assert.equal(r.cost_source, "provider");
+  assert.equal(r.fallback, false);
+  assert.equal(r.input_tokens, 1000);
+  assert.equal(r.output_tokens, 10);
+});
+
+test("#148 AC2: a streamed final chunk's usage.cost is recorded and the next cap check sees it", async (t) => {
+  const f = await orProxy(t, [{ model: "acme/premium", choices: [], usage: { prompt_tokens: 10, completion_tokens: 10, cost: 1.5 } }], { stream: true });
+  assert.equal(await f.call(1), 200);
+  assert.equal(await f.call(2), 429);
+  assert.equal(f.hits(), 1);
+  const [r, blocked] = f.receipts();
+  assert.deepEqual([r.cost_usd, r.cost_source, r.fallback], [1.5, "provider", false]);
+  assert.equal(blocked.reason, "budget_exceeded");
+});
+
+test("#148 AC3: invalid cost falls back to table/fallback pricing, never $0", async (t) => {
+  for (const cost of [-1, "1.5", null, "NaN"]) {
+    const f = await orProxy(t, [{ model: "mistralai/mistral-large", usage: { prompt_tokens: 1_000_000, completion_tokens: 0, cost } }], { cap: 100 });
+    assert.equal(await f.call(1), 200);
+    const [r] = f.receipts();
+    assert.deepEqual([r.cost_usd, r.cost_source, r.fallback], [2.5, "fallback", true], `cost ${cost}`);
+  }
+});
+
+test("#148 AC5: an unknown premium model's provider cost trips the cap that fallback pricing missed", async (t) => {
+  const usage = { prompt_tokens: 1000, completion_tokens: 1000 };
+  const withCost = await orProxy(t, [{ model: "acme/premium", usage: { ...usage, cost: 1.5 } }]);
+  assert.equal(await withCost.call(1), 200);
+  assert.equal(await withCost.call(2), 429);
+  assert.equal(withCost.receipts()[0].cost_usd, 1.5);
+  // Old behaviour: the same call at the flat fallback rate is far under $1 and passes.
+  const noCost = await orProxy(t, [{ model: "acme/premium", usage }]);
+  assert.equal(await noCost.call(1), 200);
+  assert.equal(await noCost.call(2), 200);
+  const old = noCost.receipts();
+  assert.ok(old[0].cost_usd < 0.1);
+  assert.equal(old[0].cost_source, "fallback");
+});
+
+test("#148 run summary reports each model's cost_source", async () => {
+  const { buildRunSummary: summarizeRun } = await import("../src/run-summary.js");
+  const s = summarizeRun({ receipts: [
+    { model: "a/x", cost_usd: 1, cost_source: "provider" },
+    { model: "b/y", cost_usd: 1, cost_source: "fallback" },
+    { model: "b/y", cost_usd: 1, cost_source: "provider" },
+  ] });
+  assert.equal(s.by_model["a/x"].cost_source, "provider");
+  assert.equal(s.by_model["b/y"].cost_source, "mixed");
 });

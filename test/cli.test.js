@@ -312,3 +312,32 @@ test("#145 wrap: embeddings spend crosses --cap and the next call is blocked", a
   const { res } = await embedWrap(t, "0.2");
   assert.equal(res.out, "200 200 429");
 });
+
+for (const [label, cost, expected] of [["with usage.cost 1.5 blocks", 1.5, "200 429"], ["without usage.cost keeps fallback pricing", undefined, "200 200"]]) {
+  test(`#148 wrap --cap 1 through OpenRouter ${label}`, async (t) => {
+    const up = await new Promise((r) => {
+      const s = http.createServer((q, res) => res.writeHead(200, { "content-type": "application/json" })
+        .end(JSON.stringify({ model: "acme/premium", usage: { prompt_tokens: 1000, completion_tokens: 1000, ...(cost !== undefined && { cost }) } })));
+      s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+    });
+    t.after(() => up.s.close());
+    const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+    const script = `
+      const u = process.env.OPENROUTER_BASE_URL + "/api/v1/chat/completions";
+      const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"acme/premium",n:1})});
+      const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"acme/premium",n:2})});
+      console.log(a.status, b.status);`;
+    const res = await new Promise((resolve) => {
+      const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "1", "--receipts", path.join(dir, "r.jsonl"), "--", process.execPath, "--input-type=module", "-e", script],
+        { env: { ...process.env, COSTCAP_TEST_OPENROUTER_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+      let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+      c.on("exit", (code) => resolve({ code, out }));
+    });
+    assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n").pop(), expected);
+    const first = JSON.parse(readFileSync(path.join(dir, "r.jsonl"), "utf8").split("\n")[0]);
+    assert.equal(first.cost_source, cost === undefined ? "fallback" : "provider");
+    const csv = spawnSync(process.execPath, ["src/cli.js", "receipts", "--receipts", path.join(dir, "r.jsonl"), "--export", "csv"], { encoding: "utf8" });
+    assert.match(csv.stdout, /cost_source/);
+    assert.match(csv.stdout, cost === undefined ? /,fallback,/ : /,1\.5,provider,/);
+  });
+}

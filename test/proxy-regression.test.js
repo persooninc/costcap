@@ -381,3 +381,16 @@ test("#145 embeddings spend counts toward the cap", async (t) => {
   assert.equal(r.status, 429);
   assert.equal(receipts.filter((x) => x.cost_usd === 0.13).length, 2);
 });
+
+test("#148 AC4: a usage.cost on /openai is ignored; table pricing applies", async (t) => {
+  const file = join(mkdtempSync(join(tmpdir(), "cc-148-")), "r.jsonl");
+  const call = await fixture(t, (q, res) => res.writeHead(200, { "content-type": "application/json" })
+    .end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1_000_000, completion_tokens: 0, cost: 99 } })), { receiptsPath: file });
+  assert.equal((await call(1)).status, 200);
+  const [r] = readFileSync(file, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(r.cost_usd, costForUsage("gpt-4o-mini", { input_tokens: 1_000_000 }).cost_usd);
+  assert.equal(r.cost_source, "table");
+  for (const p of ["anthropic", "gemini"]) {
+    assert.equal(extractUsage(p, JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1, cost: 9 }, usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, cost: 9 } })).providerCost, undefined);
+  }
+});

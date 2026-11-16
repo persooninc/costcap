@@ -69,5 +69,6 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     table_version: price.table_version,
     table_sha256: price.table_sha256,
     fallback: price.fallback,
+    cost_source: price.fallback ? "fallback" : "table",
   };
 }

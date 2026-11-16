@@ -62,6 +62,9 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   let responsesStream = false, responsesTerminal = false;
   // Provider-side tools billed per request/call have no published rate in the table: never priced as $0.
   let toolUseUnpriced = false;
+  // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
+  // Absent/invalid values are ignored so pricing falls back to the table; it is never trusted on other routes.
+  let providerCost;
   const noteResponsesItems = (items) => {
     if (Array.isArray(items) && items.some((it) => it && UNPRICED_RESPONSES_ITEMS.has(it.type))) toolUseUnpriced = true;
   };
@@ -104,6 +107,9 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       }
     } else {
       const u = chunk.usage;
+      if (provider === "openrouter" && u && typeof u === "object") {
+        providerCost = typeof u.cost === "number" && Number.isFinite(u.cost) && u.cost >= 0 ? u.cost : undefined;
+      }
       if (embeddings && provider === "openai") {
         // Embeddings carry only prompt_tokens (input-only billing); anything else is unknown.
         usage = u && isCount(u.prompt_tokens) && u.completion_tokens == null ? { input_tokens: u.prompt_tokens, output_tokens: 0, cached_input_tokens: 0 } : { unpriceable: NaN };
@@ -121,7 +127,7 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
-    return { model, usage: { ...usage }, ...(toolUseUnpriced && { toolUseUnpriced: true }) };
+    return { model, usage: { ...usage }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A Responses stream that never reached a terminal event is incomplete.
   return { add, result, get incomplete() { return responsesStream && !responsesTerminal; } };
@@ -320,6 +326,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           res.off("close", onClientClose);
           if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
+            if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             cap?.record(receipt);
             if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
