@@ -30,7 +30,7 @@ const deliverAlert = createOrgAlertRouter({ emailKey, emailFrom: from, dashboard
 const databaseUrl = process.env.COSTCAP_DATABASE_URL || "";
 if (databaseUrl && !/^postgres(ql)?:\/\//.test(databaseUrl)) throw new Error("COSTCAP_DATABASE_URL must be a postgres:// URL");
 const store = databaseUrl ? await openPostgresStore({ connectionString: databaseUrl }) : undefined;
-const { server, evaluateFleetAlerts, billingReady } = createHostedServer({
+const { server, evaluateFleetAlerts, purgeExpiredReceipts, billingReady } = createHostedServer({
   origin,
   store,
   stripeMode,
@@ -71,6 +71,10 @@ const interval = setInterval(async () => {
   try { await evaluateFleetAlerts(); } catch { console.error("costcap: alert sweep failed"); }
   finally { alertRunning = false; }
 }, 60_000);
+// Issue #211: delete receipts past each org's retention setting. Startup, then nightly.
+const purge = () => { try { const done = purgeExpiredReceipts(); if (done.length) console.error(`costcap: retention sweep removed receipts in ${done.length} org(s)`); } catch { console.error("costcap: retention sweep failed"); } };
+const purgeStart = setTimeout(purge, 60_000);
+const purgeInterval = setInterval(purge, 24 * 3600_000);
 server.listen(Number(process.env.PORT ?? 3000), "0.0.0.0", () => console.error("costcap: beta service ready"));
-const stop = () => { clearInterval(interval); server.close(() => process.exit(0)); };
+const stop = () => { clearInterval(interval); clearInterval(purgeInterval); clearTimeout(purgeStart); server.close(() => process.exit(0)); };
 process.on("SIGTERM", stop); process.on("SIGINT", stop);

@@ -54,6 +54,7 @@ export function trustDocument(path, { operator = "Persoon.ai Inc", contact = DEF
       ] },
       { heading: "Retention and deletion", items: [
         "Workspace data stays while the workspace exists. Your plan sets how far back receipts are shown.",
+        "An owner or admin can set receipt retention (7 days up to the plan limit) in the dashboard. A nightly job then permanently deletes older synced receipts and their settlements and records the count in the audit log. It never deletes receipts from the last 32 days or the current budget month, or receipts whose cost is still unknown or pending. The audit log and alerts are kept.",
         "To delete a workspace or an account, contact us from the owner's email address. We confirm the request against that address before deleting anything.",
         `Contact: ${reach}. Do not post personal data in a public issue. Ask for a private channel instead.`,
       ] },

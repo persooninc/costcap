@@ -22,6 +22,7 @@ import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
+import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
 import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
@@ -218,7 +219,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   // Gating applies only when checkout exists, so a limited workspace always has an upgrade path.
   const enforced = () => Boolean(billing) && (enforceEntitlements ?? billingConfig.enforceEntitlements);
   const entitlements = (s, orgId) => entitlementsFor({ status: s.orgs[orgId]?.billing?.status ?? null, plan: s.orgs[orgId]?.billing?.plan ?? null, enforced: enforced(), catalog: plans });
-  // Receipts older than the plan retention window are hidden (never deleted) when entitlements are enforced.
+  // Receipts older than the plan retention window are hidden when entitlements are enforced.
+  // Deletion is opt-in per org (#211, /v1/retention + purgeExpiredReceipts).
   const visibleReceipts = (s, orgId) => {
     const cutoff = retentionCutoff(entitlements(s, orgId), now());
     return Object.values(s.receipts).filter((r) => r.orgId === orgId && (cutoff === null || !(Date.parse(r.receipt?.ts) < cutoff)));
@@ -259,6 +261,30 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const orgReceipts = (s, orgId) => Object.values(s.receipts).filter((r) => r.orgId === orgId).map(costedReceipt);
   // Issue #209: the org budget period (timezone + month start day); UTC/day 1 when unset.
   const orgPeriod = (s, orgId) => normalizeBudgetPeriod(s.orgs?.[orgId]?.budgetPeriod);
+  // Issue #211: org receipt retention (null = keep). Deleted receipts take their settlement with them.
+  const orgRetention = (s, orgId) => { const days = s.orgs?.[orgId]?.receiptRetentionDays; return Number.isInteger(days) ? days : null; };
+  const retentionWindow = (s, orgId) => ({ cutoff: retentionCutoffMs(orgRetention(s, orgId), now()), floor: retentionFloorMs(now(), orgPeriod(s, orgId)) });
+  const retentionView = (s, orgId, role) => {
+    const days = orgRetention(s, orgId);
+    const { cutoff, floor } = retentionWindow(s, orgId);
+    return { days, cutoff: cutoff === null ? null : new Date(cutoff).toISOString(), protected_since: new Date(floor).toISOString(), eligible_count: expiredReceiptKeys(s.receipts, orgId, cutoff, floor).length,
+      min: RETENTION_MIN_DAYS, max: retentionMaxDays(entitlements(s, orgId)), canEdit: ["owner", "admin"].includes(role) };
+  };
+  // Nightly sweep (run.js): one receipts.purge audit entry per org that lost receipts.
+  function purgeExpiredReceipts() {
+    return store.transaction((s) => {
+      const out = [];
+      for (const orgId of Object.keys(s.orgs ?? {})) {
+        const { cutoff, floor } = retentionWindow(s, orgId);
+        const keys = expiredReceiptKeys(s.receipts, orgId, cutoff, floor);
+        if (!keys.length) continue;
+        for (const key of keys) delete s.receipts[key];
+        audit(s, orgId, "retention-sweep", "receipts.purge", orgId, { count: keys.length, cutoff: new Date(cutoff).toISOString() });
+        out.push({ orgId, count: keys.length });
+      }
+      return out;
+    });
+  }
   const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), budgetPeriod: orgPeriod(s, team.orgId), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -445,19 +471,23 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const result = store.transaction((s) => {
           const a = agentUser(s, req);
           const acceptedIds = [];
+          let expired = 0;
+          const keep = retentionWindow(s, a.orgId);
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
             // #184: saved_usd only on a $0 cache_hit receipt, as a finite number >= 0.
             if ("saved_usd" in r && (r.reason !== "cache_hit" || r.cost_usd !== 0 || typeof r.saved_usd !== "number" || !Number.isFinite(r.saved_usd) || r.saved_usd < 0)) fail(400, "Invalid receipt: saved_usd");
             const key = `${a.id}:${r.id}`;
+            // #211: older than the org retention cutoff: acknowledged so the backlog drains, never stored.
+            if (!s.receipts[key] && isExpired({ receipt: r }, keep.cutoff, keep.floor)) { expired++; acceptedIds.push(r.id); continue; }
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");
             s.receipts[key] ??= { orgId: a.orgId, agentId: a.id, receipt: r };
             acceptedIds.push(r.id);
           }
           a.lastSeen = now();
-          audit(s, a.orgId, a.id, "receipts.sync", a.id, { count: acceptedIds.length });
-          return { acceptedIds };
+          audit(s, a.orgId, a.id, "receipts.sync", a.id, expired ? { count: acceptedIds.length, expired } : { count: acceptedIds.length });
+          return { acceptedIds, expired };
         });
         return json(200, result);
       }
@@ -680,6 +710,26 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           org.budgetPeriod = after;
           audit(s, u.orgId, u.id, "budget_period.change", u.orgId, { before, after });
           return { budgetPeriod: after, canEdit: true };
+        });
+        return json(200, result);
+      }
+      // Issue #211: receipt retention. Owner/admin session writes (audited), any member reads.
+      if (path === "/v1/retention" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = member(s, req); return retentionView(s, u.orgId, u.role); }));
+      }
+      if (path === "/v1/retention" && (req.method === "POST" || req.method === "PUT")) {
+        sessionOnly(req);
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const days = body?.days === undefined ? undefined : body.days;
+          const err = days === undefined ? "days required" : retentionDaysError(days, retentionMaxDays(entitlements(s, u.orgId)));
+          if (err) fail(400, err);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const before = orgRetention(s, u.orgId);
+          org.receiptRetentionDays = days;
+          audit(s, u.orgId, u.id, "retention.change", u.orgId, { before, after: days });
+          return retentionView(s, u.orgId, u.role);
         });
         return json(200, result);
       }
@@ -1036,5 +1086,5 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     }
     return queued.length;
   }
-  return { server, billingReady, evaluateFleetAlerts };
+  return { server, billingReady, evaluateFleetAlerts, purgeExpiredReceipts };
 }

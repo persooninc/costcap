@@ -911,3 +911,23 @@ non-midnight resets.
 `GET /v1/spend?since=&until=&group_by=day|model|agent` (any session role, including viewer) returns the org's synced receipt spend in buckets. Each bucket has `usd_known`, `calls`, `unknown_count`, `blocked_count` and `cost_complete`, plus a `total`. Days follow the org budget period (UTC unless set, see below) and the response reports `budget_period`. `since`/`until` take an ISO instant or `YYYY-MM-DD`; a date-only `until` covers that whole day. A `cost_usd: null` receipt adds to `unknown_count` and marks the bucket incomplete; it never adds $0. Once settled it counts at the settled value in its original bucket. With entitlements enforced, the period is clamped to the plan's receipt retention, and the response reports the clamped `since` with `retention_clamped: true`. An invalid `group_by`, `since` or `until` returns `400`. The dashboard's Spend card reads it with a 7-day, 30-day or this-month period.
 
 **Team chargeback (#213).** `GET /v1/spend?group_by=team` returns one bucket per org team plus `(no team)`, each with a `label`, and `team_membership: "current"`: spend is allocated by today's team membership, not membership history. `GET /v1/spend.csv?group_by=team&period=month|day&since=&until=` (any member or viewer API key) downloads a finance summary with columns `period,group_by,key,label,usd_known,calls,unknown_count,cost_complete,blocked_count`, one row per budget period and group. It takes every `/v1/spend` `group_by`. In-band `# retention_clamped`, `# cost_incomplete` and `# team_membership` lines precede the header when they apply. The Spend card shows a By team section and a Download CSV link that follows the selected period.
+
+### Receipt retention (hosted, #211)
+
+By default synced receipts are kept. An owner or admin can turn on deletion in the
+dashboard's **Receipt retention** card or with `POST /v1/retention {"days":30}` (a
+session is required; a viewer or an API key gets `403`). `days` is an integer from 7 to
+the plan's `receiptRetentionDays` (365 when entitlements are not enforced), or `null`
+to keep everything; anything else returns `400`. Each change is audited as
+`retention.change` with `before`/`after`. Any member can `GET /v1/retention` for `days`,
+`cutoff` and `eligible_count` (what the next sweep would delete).
+
+A sweep runs at startup and then nightly. It permanently deletes that org's receipts (and
+their settlements) with `ts` before the cutoff, and writes one `receipts.purge` audit
+entry per org with `count` and `cutoff`. It never deletes receipts from the last 32 days,
+the current UTC month or the org's current budget-period month, so cap, team and
+projection totals do not change. It also never deletes unsettled unknown-cost receipts or
+`batch_pending`/`background_pending` receipts. When a wrapper syncs a receipt that is
+already past the cutoff, the receipt is listed in `acceptedIds` so the backlog drains, but
+it is not stored, and the response reports `expired: n`. The audit log, alerts and the
+local CLI ledger are not trimmed.
