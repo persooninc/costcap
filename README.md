@@ -75,6 +75,13 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 - Metering uses provider-reported usage after each response. A call can exceed
   the remaining budget; this is **not** a prepaid reservation or bill guarantee.
+- Receipts never store credentials passed in the URL. Every receipt (success,
+  blocked, unknown outcome) records the request path with credential-like query
+  parameters (`key`, `api_key`, `apikey`, `access_token`, `token`, `sig`,
+  `signature`, case-insensitive) replaced by `REDACTED`, so Gemini's `?key=` is
+  never written to the ledger or the hosted store. The upstream still receives
+  the full query. The hosted ingest redacts older clients' uploads too, and
+  stored receipts are scrubbed once at server startup.
 - Requests are serialized inside a proxy. A receipt ledger is exclusively locked
   for each wrapper. Separate ledgers do not share day/month caps. A crashed
   wrapper leaves a lock that you must remove only after checking it stopped.

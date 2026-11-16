@@ -133,3 +133,31 @@ test("e2e: unknown-cost receipt blocks the next run until reconcile --apply sett
   const body = JSON.parse(chk.stdout);
   assert.equal(body.total_usd >= 0.42, true);
 });
+
+test("regression #130: wrap blocks a Gemini ?key= call by cap and no file under the receipts dir holds the key", async (t) => {
+  const { readdirSync } = await import("node:fs");
+  const seen = [];
+  const up = await new Promise((r) => {
+    const s = http.createServer((req, res) => { seen.push(req.url); res.end('{"modelVersion":"gemini-2.5-pro","usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":0}}'); });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-130w-"));
+  const script = `
+    const u = process.env.GEMINI_BASE_URL + "/v1beta/models/gemini-2.5-pro:generateContent?key=SECRET123";
+    const a = await fetch(u,{method:"POST",body:"{}"});
+    const b = await fetch(u,{method:"POST",body:"{}"});
+    console.log(a.status, b.status);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", path.join(dir, "r.jsonl"), "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out }));
+  });
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n").at(-1), "200 429");
+  assert.deepEqual(seen, ["/v1beta/models/gemini-2.5-pro:generateContent?key=SECRET123"]);
+  const files = readdirSync(dir, { recursive: true }).map((f) => path.join(dir, f)).filter((f) => { try { readFileSync(f); return true; } catch { return false; } });
+  assert.ok(files.length > 0);
+  for (const f of files) assert.doesNotMatch(readFileSync(f, "utf8"), /SECRET123/, f);
+  assert.match(readFileSync(path.join(dir, "r.jsonl"), "utf8"), /key=REDACTED/);
+});

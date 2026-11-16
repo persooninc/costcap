@@ -4,6 +4,7 @@
 import http from "node:http";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { receiptPath } from "./receipt-path.js";
 import { randomUUID } from "node:crypto";
 import { costForUsage } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
@@ -153,8 +154,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       const run = async () => {
         if (res.destroyed) return;
         const path = `/${rest.join("/")}${url.search}`;
+        const storedPath = receiptPath(`/${rest.join("/")}`, url.search);
         const block = (reason, detail, response) => {
-          emit({ provider, path, blocked: true, reason, cost_usd: 0, ...detail });
+          emit({ provider, path: storedPath, blocked: true, reason, cost_usd: 0, ...detail });
           send(429, response);
           return "blocked";
         };
@@ -197,7 +199,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
             signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), abort.signal]) });
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
-          const receipt = { provider, path: url.pathname.replace(`/${provider}`, ""), status: upstreamRes.status, blocked: false,
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false;
           if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
@@ -252,7 +254,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         } catch {
           // A failed fetch may already have billed upstream. Do not assume zero.
           accountingFailure = "Upstream outcome or receipt persistence is uncertain. Reconcile before restarting.";
-          try { emit({ provider, path, blocked: false, cost_usd: null, reason: "upstream_outcome_unknown" }); } catch { /* stop on broken ledger */ }
+          try { emit({ provider, path: storedPath, blocked: false, cost_usd: null, reason: "upstream_outcome_unknown" }); } catch { /* stop on broken ledger */ }
           send(502, { error: "upstream_outcome_unknown" });
         }
       };

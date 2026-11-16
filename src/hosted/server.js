@@ -10,6 +10,7 @@ import { evaluateAlerts, auditEntry } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv } from "./receipts-csv.js";
+import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
@@ -17,6 +18,24 @@ import { maskAlertSettings, validSlackWebhook } from "./delivery.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
+
+// Issue #130: one-time, idempotent startup scrub of credential query parameters in
+// receipts stored by older clients. Only rows that change are written.
+export function scrubStoredReceipts(store) {
+  const dirty = store.read((s) => Object.values(s.receipts ?? {}).some((r) => typeof r.receipt?.path === "string" && scrubReceiptPath(r.receipt.path) !== r.receipt.path));
+  if (!dirty) return 0;
+  let changed = 0;
+  store.transaction((s) => {
+    for (const item of Object.values(s.receipts ?? {})) {
+      const p = item.receipt?.path;
+      if (typeof p !== "string") continue;
+      const next = scrubReceiptPath(p);
+      if (next !== p) { item.receipt.path = next; changed++; }
+    }
+  });
+  Promise.resolve(store.flush?.()).catch(() => {});
+  return changed;
+}
 
 // Plan usage counted from the store. Pending enrollment tokens and invitations
 // hold a slot so a free workspace cannot issue ten tokens and redeem them all.
@@ -130,6 +149,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   plans = DEFAULT_PLANS, enforceEntitlements, publicPricing } = {}) {
   if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
   const store = injectedStore ?? openStore(storePath);
+  scrubStoredReceipts(store);
   const billingConfig = resolveBillingConfig({ ...stripeEnv, COSTCAP_STRIPE_MODE: stripeMode });
   const pricingPublic = publicPricing ?? billingConfig.publicPricing;
   const upgradeUrl = pricingPublic ? "/pricing" : "/#plan";
@@ -311,6 +331,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const a = agentUser(s, req);
           const acceptedIds = [];
           for (const r of body.receipts) {
+            if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) fail(400, "Invalid receipt");
             const key = `${a.id}:${r.id}`;
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");

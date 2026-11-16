@@ -854,3 +854,40 @@ test("alert worker passes each org's own settings (members only) and none for un
   await service.evaluateFleetAlerts();
   assert.equal(seen.length, 0);
 });
+
+test("regression #130: legacy receipt with ?key= is stored, listed, exported and backfilled without the secret", async (t) => {
+  const { scrubStoredReceipts } = await import("../src/hosted/server.js");
+  const { memoryCore } = await import("../src/hosted/store.js");
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const f = await fixture(t);
+  const owner = await f.login("owner130@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "gemini" }, null, enrollment.body.token)).body;
+  const legacy = { id: "r-130", ts: new Date().toISOString(), cost_usd: 0, blocked: true, reason: "cap_exceeded", provider: "gemini", path: "/v1beta/models/x:generateContent?alt=sse&KEY=SECRET123" };
+  assert.equal((await f.request("/v1/receipts", { receipts: [legacy] }, null, agent.token)).status, 200);
+  assert.equal((await f.request("/v1/receipts", { receipts: [legacy] }, null, agent.token)).status, 200, "legacy retry is idempotent after redaction");
+  const fleet = await f.request("/v1/fleet", undefined, owner.cookie);
+  assert.equal(fleet.body.receipts[0].receipt.path, "/v1beta/models/x:generateContent?alt=sse&KEY=REDACTED");
+  const port = f.service().server.address().port;
+  const csv = await (await fetch(`http://127.0.0.1:${port}/v1/receipts.csv`, { headers: { cookie: owner.cookie } })).text();
+  assert.match(csv, /r-130/);
+  const evidence = await (await fetch(`http://127.0.0.1:${port}/v1/evidence.json`, { headers: { cookie: owner.cookie } })).text();
+  for (const text of [JSON.stringify(fleet.body), csv, evidence, readFileSync(f.storePath, "utf8")]) assert.doesNotMatch(text, /SECRET123/);
+
+  // Backfill: a row written by an older server is scrubbed on startup.
+  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+  const key = Object.keys(raw.receipts).find((k) => k.endsWith(":r-130"));
+  raw.receipts[key].receipt.path = "/v1beta/models/x:generateContent?key=SECRET123";
+  writeFileSync(f.storePath, JSON.stringify(raw));
+  await f.restart();
+  assert.doesNotMatch(readFileSync(f.storePath, "utf8"), /SECRET123/);
+  assert.equal((await f.request("/v1/fleet", undefined, owner.cookie)).body.receipts[0].receipt.path, "/v1beta/models/x:generateContent?key=REDACTED");
+
+  // Exactly once: a second pass changes nothing and writes nothing.
+  let commits = 0;
+  const store = memoryCore({ receipts: { a: { receipt: { path: "/p?token=SECRET123&x=1" } }, b: { receipt: {} } } }, () => { commits++; });
+  assert.equal(scrubStoredReceipts(store), 1);
+  assert.equal(store.read((s) => s.receipts.a.receipt.path), "/p?token=REDACTED&x=1");
+  assert.equal(scrubStoredReceipts(store), 0);
+  assert.equal(commits, 1);
+});
