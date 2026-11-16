@@ -26,7 +26,7 @@ import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
-  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--receipts FILE] [--github-output]\n" +
+  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--run-id ID] [--receipts FILE] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
@@ -178,6 +178,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     try {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
       const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined };
+      if (cmd === "check" && parsed.runId !== undefined) options.runId = parsed.runId;
       if (cmd === "mcp") serveMcp(options);
       else {
         const result = checkBudget(options);

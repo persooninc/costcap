@@ -17,6 +17,9 @@ inputs:
   month-cap:
     description: Optional UTC month cap in estimated USD
     required: false
+  run-id:
+    description: Optional run_id; the cap then counts only that run's receipts (day/month caps still cover the whole ledger). List ids with `costcap runs`
+    required: false
 outputs:
   verdict:
     description: ok, budget_exceeded or accounting_unavailable
@@ -39,6 +42,9 @@ outputs:
   receipts-count:
     description: Number of receipts read
     value: ${{ steps.check.outputs.receipts-count }}
+  run-id:
+    description: The run_id the cap was scoped to; empty for a whole-ledger check
+    value: ${{ steps.check.outputs.run-id }}
 runs:
   using: composite
   steps:
@@ -52,9 +58,11 @@ runs:
         COSTCAP_CAP: ${{ inputs.cap }}
         COSTCAP_DAY_CAP: ${{ inputs.day-cap }}
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
+        COSTCAP_RUN_ID: ${{ inputs.run-id }}
         COSTCAP_ACTION_PATH: ${{ github.action_path }}
       run: |
         args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP" --github-output)
         if [ -n "$COSTCAP_DAY_CAP" ]; then args+=(--day-cap "$COSTCAP_DAY_CAP"); fi
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
+        if [ -n "$COSTCAP_RUN_ID" ]; then args+=(--run-id "$COSTCAP_RUN_ID"); fi
         node "$COSTCAP_ACTION_PATH/src/cli.js" "${args[@]}"

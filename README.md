@@ -50,6 +50,7 @@ any receipt has unknown cost):
     cap: "5"
     day-cap: "10"   # optional, UTC day
     month-cap: "50" # optional, UTC month
+    run-id: ${{ env.RUN_ID }} # optional: cap only this run's receipts
 ```
 
 The CLI and the Action are free. The optional hosted workspace plans are
@@ -239,6 +240,12 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
 receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC.
+With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
+`run_id` is `ID`; output adds `run_id`, `scope: "run"` and separate
+`run`/`day`/`month` totals, while day/month caps still cover the whole ledger.
+Unknown cost inside the run exits 1 (`accounting_unavailable`); unknown cost in
+another run only affects day/month caps. A run id with no receipts exits 2.
+List run ids with `costcap runs`.
 `action.yml` exposes this check as a composite GitHub Action (Marketplace
 branding included); no Marketplace listing or public release has been made yet. MCP exposes only `budget_status` via
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
