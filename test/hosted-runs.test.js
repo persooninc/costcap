@@ -73,7 +73,7 @@ test("unit: receipts CSV has run_id after receipt_id and filters by run_id", () 
   const rows = [{ ts: T(1), agent_id: "a", receipt_id: "1", run_id: "r1" }, { ts: T(2), agent_id: "a", receipt_id: "2", run_id: "r2" }];
   const { body, count } = receiptsCsv(rows, { runId: "r2" });
   assert.equal(count, 1);
-  assert.equal(body.split("\n")[0], "ts,agent_id,receipt_id,run_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome");
+  assert.equal(body.split("\n")[0], "ts,agent_id,receipt_id,run_id,model,cost_usd,cost_source,settled_cost_usd,settle_source,reason,scope,outcome,tags");
   assert.match(body.split("\n")[1], /^.*,a,2,r2,/);
   const range = () => ({});
   assert.deepEqual(parseReceiptsQuery(new URLSearchParams("run_id=r1"), new Set(), range), { runId: "r1" });

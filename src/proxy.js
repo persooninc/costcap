@@ -5,6 +5,7 @@ import http from "node:http";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
+import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
 import { costForUsage, isPricedModel } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
@@ -347,7 +348,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -362,7 +363,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     if (!sharedLedger || held) return fn();
     return sharedLedger.withLock(() => { held = true; try { return fn(); } finally { held = false; } });
   };
-  const emit = (receipt) => guarded(() => {
+  const emitBase = (receipt) => guarded(() => {
     const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
@@ -418,6 +419,20 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const upstream = upstreams[provider];
     const send = (status, body) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
+    // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
+    let reqTags = null, tagError = null;
+    try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
+    delete req.headers[TAG_HEADER];
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
+    if (tagError) {
+      reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
+      req.resume();
+      queue = queue.then(() => {
+        emit({ provider, path: receiptPath(`/${rest.join("/")}`, url.search), blocked: false, status: 400, reason: "invalid_tags", cost_usd: 0 });
+        send(400, { error: "invalid_tags", message: `CostCap: ${tagError}. The upstream call was not made.` });
+      }).catch(() => { send(503, { error: "receipt_ledger_unavailable" }); });
+      return;
+    }
     const chunks = [];
     let size = 0, tooLarge = false;
     req.on("data", (chunk) => { size += chunk.length; if (size > maxBodyBytes) { tooLarge = true; chunks.length = 0; } else if (!tooLarge) chunks.push(chunk); });

@@ -109,3 +109,13 @@ test('#156 Spend card markup, period label and textContent-only rendering', () =
   assert.match(js, /\/v1\/spend\?group_by=/);
   assert.match(js, /addEventListener\('change',spendLoad\)/);
 });
+
+test('#169 Spend card has a By tag key field wired to group_by=tag', () => {
+  const html = uiResponse('/').body;
+  assert.match(html, /<h3>By tag<\/h3><form id="spendTagForm"/);
+  assert.match(html, /id="spendTagKey"[^>]*maxlength="32"/);
+  assert.match(html, /<div id="spendTags"><\/div>/);
+  const js = uiResponse('/assets/app.js').body;
+  assert.match(js, /group_by=tag&tag_key='\+encodeURIComponent\(k\)/);
+  assert.doesNotThrow(() => new Script(js));
+});

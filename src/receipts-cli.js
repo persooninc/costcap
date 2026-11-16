@@ -4,6 +4,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { applySettlements } from "./cap.js";
 import { receiptsCsv } from "./hosted/receipts-csv.js";
+import { parseTagPair, tagsCell, tagsMatch } from "./tags.js";
 
 export const DEFAULT_LEDGER = ".costcap/receipts.jsonl";
 
@@ -30,6 +31,7 @@ export function parseReceiptsArgs(argv, now = new Date()) {
     else if (f === "--until") opts.until = parseTime(v, f, now);
     else if (f === "--agent") opts.agentId = v;
     else if (f === "--run-id") opts.runId = v;
+    else if (f === "--tag") { const [k, val] = parseTagPair(v); opts.tags = { ...(opts.tags ?? {}), [k]: val }; }
     else if (f === "--export") { if (v !== "csv") throw new Error(`--export supports only csv, got "${v}"`); opts.exportCsv = true; }
     else throw new Error(`unknown flag ${f}`);
   }
@@ -42,6 +44,7 @@ function toRow(r) {
     cost_usd: r.settled ? null : (r.cost_usd ?? null), cost_source: r.cost_source ?? null,
     settled_cost_usd: r.settled ? r.cost_usd : null,
     settle_source: r.settled?.source ?? null, reason: r.reason ?? null, scope: r.scope ?? null, outcome: r.outcome ?? null,
+    ...(r.tags ? { tags: r.tags } : {}),
   };
 }
 
@@ -62,6 +65,7 @@ export function listReceipts(opts) {
       if (opts.until !== undefined && !(t <= opts.until)) return false;
       if (opts.agentId !== undefined && r.agent_id !== opts.agentId) return false;
       if (opts.runId !== undefined && r.run_id !== opts.runId) return false;
+      if (!tagsMatch(r.tags, opts.tags)) return false;
       return true;
     })
     .map(toRow)
@@ -80,7 +84,7 @@ export function receiptsCommand(argv, { log = console.log, warn = console.error,
   else if (!rows.length) log("no receipts match");
   else for (const r of rows) {
     const cost = r.settled_cost_usd !== null ? `settled_cost_usd=${money(r.settled_cost_usd)}` : `cost=${money(r.cost_usd)}`;
-    log(`${r.ts}  ${r.receipt_id}  agent=${r.agent_id ?? "-"}  run=${r.run_id ?? "-"}  model=${r.model ?? "-"}  ${cost}`);
+    log(`${r.ts}  ${r.receipt_id}  agent=${r.agent_id ?? "-"}  run=${r.run_id ?? "-"}  model=${r.model ?? "-"}  ${cost}${r.tags ? `  tags=${tagsCell(r.tags)}` : ""}`);
   }
   return 0;
 }

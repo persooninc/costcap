@@ -68,13 +68,27 @@ test("Spend card: day, model and agent rows, incomplete badge, period switch, vi
     await expect(page.locator('#spendModels [data-key="claude-sonnet-4"]')).toContainText("$4.50");
     expect(dialogs).toBe(0);
 
+    // #169: By tag. Tagged receipts, one unknown-cost, one untagged.
+    await sync(a, [{ id: "t1", ts: now.toISOString(), cost_usd: 2, model: "gpt-4.1", tags: { customer: "acme" } },
+      { id: "t2", ts: now.toISOString(), cost_usd: null, model: "o3", tags: { customer: "beta" } }]);
+    await page.locator("#spendTagKey").fill("customer");
+    await page.locator("#spendTagForm button").click();
+    await expect(page.locator('#spendTags [data-key="acme"]')).toContainText("$2.00");
+    await expect(page.locator('#spendTags [data-key="beta"] .incomplete')).toContainText("1 unknown");
+    await expect(page.locator('#spendTags [data-key="(untagged)"]')).toBeVisible();
+    await expect(page.locator('#spendTags [data-key="acme"] .incomplete')).toHaveCount(0);
+
     const ctx = await browser.newContext();
     await ctx.addCookies([{ name: "costcap_session", value: viewer.split("=")[1], url: origin }]);
     const vp = await ctx.newPage();
     await vp.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "" }));
     await vp.goto(origin);
-    await expect(vp.locator(`#spendDays [data-key="${today}"]`)).toContainText("$1.75");
+    await expect(vp.locator(`#spendDays [data-key="${today}"]`)).toContainText("$3.75"); // includes the #169 tagged receipts
     await expect(vp.locator('#spendAgents [data-key]')).toHaveCount(2);
+    await vp.locator("#spendTagKey").fill("customer");
+    await vp.locator("#spendTagForm button").click();
+    await expect(vp.locator('#spendTags [data-key="acme"]')).toContainText("$2.00");
+    await expect(vp.locator('#spendTags [data-key="beta"] .incomplete')).toBeVisible();
     await ctx.close();
   } finally {
     service.server.closeAllConnections?.();

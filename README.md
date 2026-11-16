@@ -443,13 +443,26 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
 receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC.
+### Cost attribution tags
+
+Label spend for chargeback with `costcap wrap --tag feature=search --tag env=prod -- <command>`
+(repeatable), or per request with the header `x-costcap-tag: customer=acme[,k=v]`. Keys match
+`[a-z0-9_.-]{1,32}`, values are 1-64 printable characters, at most 10 tags. Wrapper tags win
+on a key clash, so the agent cannot relabel what the operator set. The header is always removed
+before the request reaches the provider. A malformed header gets `400 invalid_tags` and a $0
+receipt; the call is not forwarded and later calls are not blocked. Every receipt for a tagged
+request carries `tags`. Filter with `costcap receipts --tag customer=acme`; both CSV exports have
+a `tags` column (`k=v;k=v`, sorted). Hosted: `GET /v1/spend?group_by=tag&tag_key=customer`
+returns one bucket per value plus `(untagged)`, and the dashboard Spend card has a "By tag" field.
+Tags are attribution only; there are no per-tag caps.
+
 With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
 `run_id` is `ID`; output adds `run_id`, `scope: "run"` and separate
 `run`/`day`/`month` totals, while day/month caps still cover the whole ledger.
 Unknown cost inside the run exits 1 (`accounting_unavailable`); unknown cost in
 another run only affects day/month caps. A run id with no receipts exits 2.
 List run ids with `costcap runs`.
-List and export local receipts with `costcap receipts [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv] [--receipts FILE]`
+List and export local receipts with `costcap receipts [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE] [--json] [--export csv] [--receipts FILE]`
 (oldest first; kill/resume/reconciliation lines skipped; unknown cost prints `unknown`, settled receipts show `settled_cost_usd`;
 CSV uses the hosted export columns and formula-injection escaping; exit 2 on a bad time or unreadable ledger).
 `action.yml` exposes this check as a composite GitHub Action (Marketplace

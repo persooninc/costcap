@@ -6,6 +6,7 @@
 
 import { reconcileFiles, applyReconciliation } from "./reconcile.js";
 import { serveMcp } from "./mcp.js";
+import { parseTagList } from "./tags.js";
 import { enroll, createFleetClient } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
@@ -26,7 +27,7 @@ import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
@@ -34,7 +35,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
-  "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv]\n" +
+  "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--json] [--export csv]\n" +
   "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
   "       costcap kill [note] [--host] [--kill-file FILE] [--receipts FILE] | costcap kill --status | costcap resume [--host] [--kill-file FILE] [--receipts FILE]\n" +
   "       (--host uses $COSTCAP_HOME/KILL, default ~/.costcap/KILL, and freezes every wrapped agent on this machine)\n" +
@@ -84,9 +85,12 @@ export function parseWrapArgs(argv) {
     else if (f === "--kill-file") opts.killFile = v;
     else if (f === "--agent") opts.agentId = v;
     else if (f === "--run-id") opts.runId = v;
+    else if (f === "--tag") opts.tagPairs = [...(opts.tagPairs ?? []), v];
     else if (f === "--policy") opts.policyPath = v;
     else throw new Error(`unknown flag ${f}`);
   }
+  // #169: validated here so a bad --tag exits 2 before anything is spawned.
+  if (opts.tagPairs) { opts.tags = parseTagList(opts.tagPairs); delete opts.tagPairs; }
   return opts;
 }
 
@@ -120,7 +124,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags } = parseWrapArgs(argv);
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
@@ -167,7 +171,7 @@ export async function wrap(argv) {
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
   const capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, ...limits,
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);

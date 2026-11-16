@@ -2,7 +2,10 @@
 // Pure: no store access. Unknown cost is counted, never added as $0. A settled
 // unknown cost counts at its settled value in its original bucket.
 
-export const SPEND_GROUPS = ["day", "model", "agent"];
+import { TAG_KEY } from "../tags.js";
+
+export const SPEND_GROUPS = ["day", "model", "agent", "tag"];
+export const UNTAGGED = "(untagged)";
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86_400_000;
 const round6 = (n) => Math.round(n * 1e6) / 1e6;
@@ -14,6 +17,11 @@ export function parseSpendQuery(params) {
   const groupBy = params.get("group_by") ?? "day";
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   const out = { groupBy };
+  if (groupBy === "tag") {
+    const tagKey = params.get("tag_key");
+    if (!tagKey || !TAG_KEY.test(tagKey)) throw bad("tag_key is required with group_by=tag and must match [a-z0-9_.-]{1,32}");
+    out.tagKey = tagKey;
+  }
   for (const key of ["since", "until"]) {
     const v = params.get(key);
     if (v === null) continue;
@@ -27,8 +35,9 @@ export function parseSpendQuery(params) {
 }
 
 // items: [{ agentId, receipt, settlement? }]. names: { agentId: label }.
-export function spendBreakdown(items, { groupBy = "day", since, until, untilExclusive = false, cutoff = null, names = {} } = {}) {
+export function spendBreakdown(items, { groupBy = "day", since, until, untilExclusive = false, cutoff = null, names = {}, tagKey } = {}) {
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
+  if (groupBy === "tag" && (!tagKey || !TAG_KEY.test(tagKey))) throw bad("tag_key is required with group_by=tag");
   let from = since, clamped = false;
   if (cutoff !== null && cutoff !== undefined && (from === undefined || from < cutoff)) { from = cutoff; clamped = true; }
   const buckets = new Map();
@@ -41,6 +50,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
     if (until !== undefined && (untilExclusive ? ms >= until : ms > until)) continue;
     const key = groupBy === "day" ? new Date(ms).toISOString().slice(0, 10)
       : groupBy === "model" ? (typeof r.model === "string" && r.model ? r.model : "unknown")
+      : groupBy === "tag" ? (typeof r.tags?.[tagKey] === "string" ? r.tags[tagKey] : UNTAGGED)
       : String(item.agentId ?? "unknown");
     let b = buckets.get(key);
     if (!b) {
@@ -61,6 +71,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
   rows.sort(groupBy === "day" ? (a, b) => a.key.localeCompare(b.key) : (a, b) => b.usd_known - a.usd_known || b.unknown_count - a.unknown_count || a.key.localeCompare(b.key));
   return {
     group_by: groupBy,
+    ...(groupBy === "tag" ? { tag_key: tagKey } : {}),
     since: from === undefined ? null : new Date(from).toISOString(),
     until: until === undefined ? null : new Date(until).toISOString(),
     retention_clamped: clamped,

@@ -1,7 +1,9 @@
+import { tagsCell } from "../tags.js";
+
 // Session export of synced receipts. This is the operator's copy of what
 // the proxy reported. It is not a provider bill.
 
-const COLUMNS = ["ts", "agent_id", "receipt_id", "run_id", "model", "cost_usd", "cost_source", "settled_cost_usd", "settle_source", "reason", "scope", "outcome"];
+const COLUMNS = ["ts", "agent_id", "receipt_id", "run_id", "model", "cost_usd", "cost_source", "settled_cost_usd", "settle_source", "reason", "scope", "outcome", "tags"];
 export const RECEIPT_CSV_LIMIT = 5000;
 
 export function cell(value) {
@@ -31,7 +33,7 @@ export function receiptsCsv(rows, { limit = RECEIPT_CSV_LIMIT, since, until, age
   const lines = truncated ? [`# truncated: showing newest ${kept.length} of ${total} receipts; narrow with since/until`] : [];
   lines.push(COLUMNS.join(","));
   for (const row of kept) {
-    lines.push(COLUMNS.map((key) => cell(row[key])).join(","));
+    lines.push(COLUMNS.map((key) => cell(key === "tags" ? tagsCell(row.tags) : row[key])).join(","));
   }
   return { body: `${lines.join("\n")}\n`, truncated, count: kept.length, total };
 }

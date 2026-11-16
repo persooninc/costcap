@@ -12,6 +12,7 @@ import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
 import { parseSpendQuery, spendBreakdown } from "./spend.js";
+import { validTags } from "../tags.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
@@ -354,7 +355,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const acceptedIds = [];
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
-            if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) fail(400, "Invalid receipt");
+            if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
             const key = `${a.id}:${r.id}`;
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");
             s.receipts[key] ??= { orgId: a.orgId, agentId: a.id, receipt: r };
@@ -384,6 +385,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             reason: item.receipt?.reason ?? "",
             scope: item.receipt?.scope ?? "",
             outcome: item.receipt?.outcome ?? "",
+            tags: item.receipt?.tags ?? null,
           }));
           return receiptsCsv(rows, query);
         });
