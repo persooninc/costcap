@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..");
-const tap = spawnSync(process.execPath, ["--test", "--test-reporter=tap", "test/*.test.js"], { cwd: repo, encoding: "utf8" });
+const tap = spawnSync(process.execPath, ["--test", "--test-reporter=tap", "test/*.test.js"], { cwd: repo, encoding: "utf8", env: { COSTCAP_PRICING_CLOCK: "2026-11-16T12:00:00Z", ...process.env } });
 const passed = new Set();
 for (const line of `${tap.stdout}\n${tap.stderr}`.split("\n")) {
   const ok = /^ok \d+ - (.+)$/.exec(line);

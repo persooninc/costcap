@@ -3,8 +3,18 @@
 // #236: effective-dated rows. A model row may carry `effective: [{from: "YYYY-MM-DD", ...rates}]`
 // (ascending); from 00:00 UTC on `from` the listed fields replace the base row's. An entry
 // `{from, billed_as: id}` prices the model exactly as that id at the same instant.
+// #237: COSTCAP_PRICING_CLOCK (an ISO instant) pins the pricing clock: it replaces wall-clock "now"
+// when no instant is passed, and the proxy prices at it instead of the request time. The npm test
+// scripts set it so price expectations do not flip on the day a dated row takes effect. Unset in
+// production. An explicit `at` passed to dayOf/costForUsage is never overridden.
+export function pricingAt(at) {
+  const pinned = process.env.COSTCAP_PRICING_CLOCK;
+  return pinned ? pinned : at;
+}
+
 export function dayOf(at) {
-  const d = at === undefined || at === null ? new Date() : new Date(at);
+  const inst = at === undefined || at === null ? pricingAt(undefined) : at;
+  const d = inst === undefined ? new Date() : new Date(inst);
   if (Number.isNaN(d.getTime())) throw new Error(`invalid pricing instant: ${at}`);
   return d.toISOString().slice(0, 10);
 }

@@ -56,7 +56,7 @@ export function resolveModelId(model) {
   return null;
 }
 
-export { dayOf, datedRow, validateSchedules } from "./pricing-schedule.js";
+export { dayOf, datedRow, validateSchedules, pricingAt } from "./pricing-schedule.js";
 
 // opts.undated: price from the base row only (Vertex keeps its 2.5 rows undated).
 export function lookupPrice(model, at, { undated = false } = {}) {
