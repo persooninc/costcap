@@ -35,7 +35,7 @@ Runaway execution is the most expensive agent failure class: documented multi-ag
 - Org-first (engineering standards: no orphan users, company email -> company org, email verification + Turnstile).
 - Fleet view: every enrolled agent, its caps, live spend, kill/resume state.
 - Spend view (`GET /v1/spend`, dashboard Spend card): spend by UTC day, model and agent for 7 days, 30 days or this month, clamped to plan retention. Unknown cost is counted per bucket and marked incomplete, never shown as $0.
-- Alerts: cap-approaching (default 80%, configurable per agent/team), cap-hit, loop-detected, agent-silent - email (Brevo) + Slack.
+- Alerts: cap-approaching (default 80%, configurable per agent/team), cap-hit, loop-detected, agent-silent - email (Brevo) + Slack + one HMAC-signed generic HTTPS webhook per org (#199).
 - Central cap management: change caps for a fleet without redeploying agents (CLI phones home for policy when enrolled; offline = last-known policy, receipts sync on reconnect).
 - Audit log: who raised a cap, who killed an agent, when. Each entry carries `actor_label` (member email, agent name or `system:alert-worker`) and `target_label`; the full org trail exports from `GET /v1/audit.csv` (optional `?since=until=` ISO filters).
 - Trial: 14 days, no card. Churn safety: cancel anytime, CLI keeps working free forever.

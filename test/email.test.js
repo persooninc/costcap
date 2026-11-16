@@ -28,7 +28,7 @@ test("non-Brevo providers are rejected and a Brevo failure is not retried elsewh
 
 test("alert delivery uses the Brevo adapter and reports missing Slack explicitly", async () => {
   const send = createAlertDelivery({ emailKey: "test", emailFrom: "noreply@costcap.dev", emailTo: ["qa@example.invalid"], fetchImpl: async (url) => { assert.equal(url, "https://api.brevo.com/v3/smtp/email"); return { ok: true }; } });
-  assert.deepEqual(await send({ kind: "cap_hit" }), [{ channel: "email", status: "accepted" }, { channel: "slack", status: "unconfigured" }]);
+  assert.deepEqual(await send({ kind: "cap_hit" }), [{ channel: "email", status: "accepted" }, { channel: "slack", status: "unconfigured" }, { channel: "webhook", status: "unconfigured" }]);
 });
 
 test("production launcher rejects a non-Brevo mail provider before listening", () => {

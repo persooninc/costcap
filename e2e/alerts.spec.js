@@ -188,3 +188,88 @@ test("run cap: receipts for one run past 80% show cap_approaching 80% · run <id
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #199: signed generic webhook destination. The receiver is an in-process
+// fixture behind an injected fetch; nothing leaves the host.
+test("admin saves a signed webhook, sees it masked, viewer is read-only, fixture receiver gets a signed alert", async ({ page }) => {
+  const { createOrgAlertRouter, verifyWebhookSignature } = await import("../src/hosted/delivery.js");
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const received = [];
+  const resolveHost = async () => [{ address: "93.184.216.34", family: 4 }];
+  const deliverAlert = createOrgAlertRouter({ lookup: resolveHost, dashboardUrl: origin, fetchImpl: async (url, o) => { received.push({ url, body: o.body, sig: o.headers["x-costcap-signature"] }); return { ok: true, status: 200 }; } });
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-webhook-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", resolveHost,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert,
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  const signIn = async (email) => {
+    await page.goto(origin);
+    await page.locator("#email").fill(email);
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await expect(page.locator("#verify")).toBeVisible();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+  };
+  try {
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await signIn("hook-owner@example.invalid");
+    await page.locator("#alertForm input[name=webhook]").fill("https://receiver.example.com/costcap/e2ePathK3");
+    await page.locator("#alertForm button.primary").click();
+    await expect(page.locator("#alertWebhook")).toHaveText(/^https:\/\/receiver\.example\.com\/… · secret whsec_…[0-9a-f]{4}$/);
+    await expect(page.locator("#webhookSecretBox")).toBeVisible();
+    const secret1 = (await page.locator("#webhookSecret").innerText()).trim();
+    expect(secret1).toMatch(/^whsec_[0-9a-f]{48}$/);
+    await page.locator("#rotateWebhook").click();
+    await expect(page.locator("#status")).toContainText("Webhook secret rotated.");
+    const secret = (await page.locator("#webhookSecret").innerText()).trim();
+    expect(secret).not.toBe(secret1);
+    await expect(page.locator("#alertWebhook")).toContainText(secret.slice(-4));
+    // Enroll and overspend so an alert fires.
+    await page.locator("#enroll input[name=day]").fill("1");
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const status = await page.evaluate(async ({ credential, ts }) => {
+      const agent = await (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "hooked" }) })).json();
+      return (await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "r1", ts, cost_usd: 2, model: "m" }] }) })).status;
+    }, { credential: token, ts: new Date().toISOString() });
+    expect(status).toBe(200);
+    await service.evaluateFleetAlerts();
+    expect(received.length).toBe(1);
+    expect(received[0].url).toBe("https://receiver.example.com/costcap/e2ePathK3");
+    expect(verifyWebhookSignature(secret, received[0].body, received[0].sig)).toBe(true);
+    expect(verifyWebhookSignature(secret1, received[0].body, received[0].sig)).toBe(false);
+    const payload = JSON.parse(received[0].body);
+    expect(payload).toMatchObject({ kind: "cap_hit", agent_name: "hooked", spent_usd: 2, cap_usd: 1 });
+    // Invite a viewer: read-only masked view, 403 on write.
+    await page.locator("#invite input[name=email]").fill("hook-viewer@example.invalid");
+    await page.locator("#invite button").click();
+    await expect(page.locator("#invites")).toContainText("hook-viewer@example.invalid");
+    await page.reload();
+    expect(await page.content()).not.toContain(secret);
+    await page.locator("#logout").click();
+    await signIn("hook-viewer@example.invalid");
+    await expect(page.locator("#alertWebhook")).toContainText("https://receiver.example.com/…");
+    await expect(page.locator("#rotateWebhook")).toBeHidden();
+    await expect(page.locator("#alertForm")).toBeHidden();
+    expect(await page.evaluate(async () => (await fetch("/v1/alert-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rotateWebhookSecret: true }) })).status)).toBe(403);
+    const html = await page.content();
+    expect(html).not.toContain(secret);
+    expect(html).not.toContain("e2ePathK3");
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

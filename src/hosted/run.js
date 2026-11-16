@@ -24,7 +24,7 @@ const authorizedOrg = process.env.COSTCAP_ALERT_ORG_ID;
 const sendEmail = createTransactionalEmail({ provider: "brevo", apiKey: emailKey, from });
 // Issue #121: each org's alerts go to that org's saved settings. COSTCAP_ALERT_ORG_ID
 // (+ COSTCAP_ALERT_EMAILS / COSTCAP_SLACK_WEBHOOK) is a documented fallback for that one org only.
-const deliverAlert = createOrgAlertRouter({ emailKey, emailFrom: from, fallback: authorizedOrg ? { orgId: authorizedOrg, emailTo, slackWebhook: process.env.COSTCAP_SLACK_WEBHOOK } : undefined });
+const deliverAlert = createOrgAlertRouter({ emailKey, emailFrom: from, dashboardUrl: origin, fallback: authorizedOrg ? { orgId: authorizedOrg, emailTo, slackWebhook: process.env.COSTCAP_SLACK_WEBHOOK } : undefined });
 // FA-CC-04: COSTCAP_DATABASE_URL (application role, not the migration role) switches the
 // datastore to Postgres. Unset keeps the JSON file. A database that cannot be read stops startup.
 const databaseUrl = process.env.COSTCAP_DATABASE_URL || "";

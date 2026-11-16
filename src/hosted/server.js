@@ -18,7 +18,7 @@ import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
-import { maskAlertSettings, validSlackWebhook } from "./delivery.js";
+import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -158,7 +158,7 @@ export function spendSummary(receipts, nowMs) {
 export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
-  plans = DEFAULT_PLANS, enforceEntitlements, publicPricing } = {}) {
+  plans = DEFAULT_PLANS, enforceEntitlements, publicPricing, resolveHost } = {}) {
   if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
   const store = injectedStore ?? openStore(storePath);
   scrubStoredReceipts(store);
@@ -522,6 +522,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/alert-settings" && req.method === "POST") {
         if (body.emails !== undefined && (!Array.isArray(body.emails) || body.emails.length > 20 || body.emails.some((e) => typeof e !== "string"))) fail(400, "emails must be a list of up to 20 addresses");
         if (body.slackWebhook !== undefined && body.slackWebhook !== null && body.slackWebhook !== "" && !validSlackWebhook(body.slackWebhook)) fail(400, "Slack webhook must be https://hooks.slack.com/services/...");
+        if (body.webhook !== undefined && body.webhook !== null && body.webhook !== "") {
+          store.read((s) => admin(s, req)); // Role check before any DNS lookup.
+          await assertWebhookTarget(body.webhook, resolveHost);
+        }
+        if (body.rotateWebhookSecret !== undefined && typeof body.rotateWebhookSecret !== "boolean") fail(400, "rotateWebhookSecret must be a boolean");
         const result = store.transaction((s) => {
           const u = admin(s, req);
           const org = s.orgs[u.orgId];
@@ -535,10 +540,18 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             if (bad.length) fail(400, "Alert emails must be verified members of this organization");
           }
           const slackWebhook = body.slackWebhook === undefined ? (current.slackWebhook ?? null) : (body.slackWebhook || null);
-          const next = { emails, slackWebhook };
+          // Issue #199: the signing secret is server-generated and returned in full only here, on create or rotate.
+          let webhook = current.webhook ?? null, issued = null;
+          if (body.webhook === null || body.webhook === "") webhook = null;
+          else if (body.webhook !== undefined && body.webhook !== webhook?.url) { issued = newWebhookSecret(); webhook = { url: body.webhook, secret: issued }; }
+          if (body.rotateWebhookSecret === true) {
+            if (!webhook) fail(400, "No webhook to rotate");
+            if (!issued) { issued = newWebhookSecret(); webhook = { url: webhook.url, secret: issued }; }
+          }
+          const next = { emails, slackWebhook, ...(webhook ? { webhook } : {}) };
           org.alertSettings = next;
-          audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next) });
-          return { ...maskAlertSettings(next), canEdit: true };
+          audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next), ...(issued ? { webhookSecret: "issued" } : {}) });
+          return { ...maskAlertSettings(next), canEdit: true, ...(issued ? { webhookSecret: issued } : {}) };
         });
         return json(200, result);
       }
@@ -803,9 +816,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const saved = s.orgs[a.orgId]?.alertSettings;
           if (!saved) return null;
           const members = new Set(Object.values(s.users).filter((m) => m.orgId === a.orgId && m.verified).map((m) => m.email));
-          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null };
+          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null };
         });
-        result = deliverAlert ? await deliverAlert(a, settings) : [{ status: "unconfigured" }]; }
+        const agentName = a.agentId ? store.read((s) => s.agents[a.agentId]?.name ?? null) : null;
+        result = deliverAlert ? await deliverAlert({ ...a, agentName }, settings) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
         if (s.alerts[a.id]) s.alerts[a.id].delivery = alertDeliveryState(result);

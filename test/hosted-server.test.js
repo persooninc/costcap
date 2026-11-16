@@ -811,7 +811,7 @@ test("alert settings: roles, isolation, validation, masking, audit, per-org rout
   assert.equal((await f.request("/v1/invitations", { email: "viewer@a.invalid", role: "viewer" }, owner.cookie)).status, 201);
   const viewer = await f.login("viewer@a.invalid");
   assert.equal(viewer.body.role, "viewer");
-  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body, { emails: [], slackWebhook: null, configured: false, canEdit: true });
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body, { emails: [], slackWebhook: null, webhook: null, configured: false, canEdit: true });
   assert.equal((await f.request("/v1/alert-settings")).status, 401);
   assert.equal((await f.request("/v1/alert-settings", { slackWebhook: "https://evil.invalid/services/x" }, owner.cookie)).status, 400);
   assert.equal((await f.request("/v1/alert-settings", { slackWebhook: "http://hooks.slack.com/services/x" }, owner.cookie)).status, 400);
@@ -821,7 +821,7 @@ test("alert settings: roles, isolation, validation, masking, audit, per-org rout
   assert.equal((await f.request("/v1/alert-settings", { emails: ["owner@a.invalid"], slackWebhook: hook }, viewer.cookie)).status, 403);
   const saved = await f.request("/v1/alert-settings", { emails: ["Owner@a.invalid", "viewer@a.invalid"], slackWebhook: hook }, owner.cookie);
   assert.equal(saved.status, 200);
-  assert.deepEqual(saved.body, { emails: ["owner@a.invalid", "viewer@a.invalid"], slackWebhook: "https://hooks.slack.com/services/…lue9", configured: true, canEdit: true });
+  assert.deepEqual(saved.body, { emails: ["owner@a.invalid", "viewer@a.invalid"], slackWebhook: "https://hooks.slack.com/services/…lue9", webhook: null, configured: true, canEdit: true });
   const asViewer = await f.request("/v1/alert-settings", undefined, viewer.cookie);
   assert.equal(asViewer.body.slackWebhook, "https://hooks.slack.com/services/…lue9");
   assert.equal(asViewer.body.canEdit, false);
@@ -880,7 +880,7 @@ test("alert worker passes each org's own settings (members only) and none for un
   await service.evaluateFleetAlerts();
   const forA = seen.filter((x) => x.orgId === a.body.orgId), forB = seen.filter((x) => x.orgId === b.body.orgId);
   assert.ok(forA.length && forB.length);
-  for (const x of forA) assert.deepEqual(x.settings, { emails: ["a@a.invalid"], slackWebhook: "https://hooks.slack.com/services/T/B/aaaa" });
+  for (const x of forA) assert.deepEqual(x.settings, { emails: ["a@a.invalid"], slackWebhook: "https://hooks.slack.com/services/T/B/aaaa", webhook: null });
   for (const x of forB) assert.equal(x.settings, null);
   // Unconfigured org B is not retried on the next sweep; accepted A is not resent.
   seen.length = 0;
@@ -1228,4 +1228,95 @@ test("#184 receipt ingest accepts saved_usd only on a $0 cache_hit receipt; /v1/
     assert.equal(s.body.total.usd_known, 0.3);
     assert.equal(s.body.buckets[0].cache_hits, 1);
   }
+});
+
+// Issue #199: signed generic webhook alert destination.
+import { createOrgAlertRouter as routerFor199, verifyWebhookSignature as verify199 } from "../src/hosted/delivery.js";
+test("signed webhook: roles, isolation, SSRF, masking, rotation, audit, delivery, retry, restart, no secret leak", async (t) => {
+  const posts = [];
+  let receiverStatus = 200;
+  const resolveHost = async (host) => (host.startsWith("private.") ? [{ address: "10.0.0.8", family: 4 }] : [{ address: "93.184.216.34", family: 4 }]);
+  const router = routerFor199({ lookup: resolveHost, dashboardUrl: "https://app.costcap.dev", fetchImpl: async (url, o) => { posts.push({ url, body: o.body, sig: o.headers["x-costcap-signature"] }); return { ok: receiverStatus < 300, status: receiverStatus }; } });
+  const f = await fixture(t, { extra: { resolveHost, deliverAlert: router } });
+  const owner = await f.login("owner@w.invalid");
+  const other = await f.login("owner@x.invalid");
+  assert.equal((await f.request("/v1/invitations", { email: "viewer@w.invalid", role: "viewer" }, owner.cookie)).status, 201);
+  assert.equal((await f.request("/v1/invitations", { email: "admin@w.invalid", role: "admin" }, owner.cookie)).status, 201);
+  const viewer = await f.login("viewer@w.invalid");
+  const adminU = await f.login("admin@w.invalid");
+  const url = "https://hooks.receiver.example.com/costcap/privatePathQ7";
+  assert.equal((await f.request("/v1/alert-settings", { webhook: url }, viewer.cookie)).status, 403);
+  for (const bad of ["http://hooks.receiver.example.com/x", "https://u:p@hooks.receiver.example.com/x", "https://hooks.receiver.example.com:8443/x", "https://127.0.0.1/x", "https://localhost/x", "https://private.example.com/x"])
+    assert.equal((await f.request("/v1/alert-settings", { webhook: bad }, owner.cookie)).status, 400, bad);
+  assert.equal((await f.request("/v1/alert-settings", { rotateWebhookSecret: true }, owner.cookie)).status, 400);
+  assert.equal((await f.request("/v1/alert-settings", { rotateWebhookSecret: "yes" }, owner.cookie)).status, 400);
+  const created = await f.request("/v1/alert-settings", { webhook: url }, adminU.cookie);
+  assert.equal(created.status, 200);
+  const secret1 = created.body.webhookSecret;
+  assert.match(secret1, /^whsec_[0-9a-f]{48}$/);
+  assert.deepEqual(created.body.webhook, { url: "https://hooks.receiver.example.com/…", secret: `whsec_…${secret1.slice(-4)}` });
+  // Re-saving the same URL keeps the secret and does not re-issue it.
+  const same = await f.request("/v1/alert-settings", { webhook: url }, owner.cookie);
+  assert.equal(same.body.webhookSecret, undefined);
+  const asViewer = await f.request("/v1/alert-settings", undefined, viewer.cookie);
+  assert.equal(asViewer.body.webhook.url, "https://hooks.receiver.example.com/…");
+  assert.equal(asViewer.body.canEdit, false);
+  assert.equal((await f.request("/v1/alert-settings", undefined, other.cookie)).body.webhook, null);
+  // Delivery: org W's agent alert reaches W's webhook, signed with secret1. Org X has nothing.
+  const enroll = async (u, name) => { const tok = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, u.cookie)).body.token; return (await f.request("/v1/enroll", { name }, null, tok)).body; };
+  const agentW = await enroll(owner, "spender"), agentX = await enroll(other, "other");
+  const ts = new Date().toISOString();
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 2 }] }, null, agentW.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 2 }] }, null, agentX.token);
+  receiverStatus = 503;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, url);
+  const payload = JSON.parse(posts[0].body);
+  assert.equal(payload.kind, "cap_hit");
+  assert.equal(payload.agent_id, agentW.agentId);
+  assert.equal(payload.agent_name, "spender");
+  assert.equal(payload.spent_usd, 2);
+  assert.equal(payload.cap_usd, 1);
+  assert.equal(payload.dashboard_url, "https://app.costcap.dev");
+  assert.ok(verify199(secret1, posts[0].body, posts[0].sig));
+  const firstId = payload.id;
+  let alerts = (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => a.agentId === agentW.agentId);
+  assert.equal(alerts[0].delivery, "failed");
+  // Retry on the next sweep, same occurrence id; then 2xx is not resent.
+  receiverStatus = 200;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(posts.length, 2);
+  assert.equal(JSON.parse(posts[1].body).id, firstId);
+  await f.service().evaluateFleetAlerts();
+  assert.equal(posts.length, 2);
+  // Rotation: new secret only.
+  const rotated = await f.request("/v1/alert-settings", { rotateWebhookSecret: true }, owner.cookie);
+  const secret2 = rotated.body.webhookSecret;
+  assert.ok(secret2 && secret2 !== secret1);
+  await f.request("/v1/receipts", { receipts: [{ id: "r2", ts, cost_usd: 1, run_id: "run-1" }] }, null, agentW.token);
+  const enrollTeam = await f.request("/v1/teams", { name: "ops", agents: [agentW.agentId], day: 1 }, owner.cookie);
+  assert.equal(enrollTeam.status, 200);
+  await f.service().evaluateFleetAlerts();
+  const later = posts.slice(2);
+  assert.ok(later.length >= 1);
+  assert.ok(later.some((p) => JSON.parse(p.body).team === "ops"), "team alert delivered");
+  for (const p of later) { assert.ok(verify199(secret2, p.body, p.sig)); assert.equal(verify199(secret1, p.body, p.sig), false); }
+  // Audit holds masked values only.
+  const fleet = await f.request("/v1/fleet", undefined, owner.cookie);
+  const changes = fleet.body.audit.filter((e) => e.action === "alert_settings.change");
+  assert.equal(changes.at(-1).detail.previous.webhook.secret, `whsec_…${secret1.slice(-4)}`);
+  assert.equal(changes.at(-1).detail.next.webhook.secret, `whsec_…${secret2.slice(-4)}`);
+  // Restart keeps the setting.
+  await f.restart();
+  assert.equal((await f.request("/v1/alert-settings", undefined, owner.cookie)).body.webhook.secret, `whsec_…${secret2.slice(-4)}`);
+  // No response body ever carries a full secret or the URL path.
+  const bodies = [];
+  for (const p of ["/v1/fleet", "/v1/evidence.json", "/v1/alert-settings"]) for (const u of [owner, viewer, other]) bodies.push(JSON.stringify((await f.request(p, undefined, u.cookie)).body));
+  const port = f.service().server.address().port;
+  bodies.push(await (await fetch(`http://127.0.0.1:${port}/v1/receipts.csv`, { headers: { cookie: owner.cookie } })).text());
+  for (const b of bodies) { assert.ok(!b.includes(secret1) && !b.includes(secret2), "secret leaked"); assert.ok(!b.includes("privatePathQ7"), "webhook path leaked"); }
+  // Clear.
+  const cleared = await f.request("/v1/alert-settings", { webhook: null }, owner.cookie);
+  assert.equal(cleared.body.webhook, null);
 });

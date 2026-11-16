@@ -792,6 +792,18 @@ npm test
 
 **Alert destinations.** `GET /v1/alert-settings` (any member) returns the org's alert emails and the Slack webhook masked (`https://hooks.slack.com/services/…` + last 4). `POST /v1/alert-settings` (owner or admin) takes `{ "emails": [...verified member emails], "slackWebhook": "https://hooks.slack.com/services/..." | null }`; an omitted field keeps its value. Each org's alerts go only to its own destinations; changes are audited as `alert_settings.change` with masked values.
 
+**Signed webhook.** Owners and admins can also set one generic HTTPS endpoint per org: `POST /v1/alert-settings` with `{ "webhook": "https://alerts.example.com/costcap" }` (or `null` to remove), and `{ "rotateWebhookSecret": true }` to issue a new signing secret. CostCap generates the secret and returns it in full only in that create or rotate response, as `webhookSecret`. Everywhere else it is masked (`whsec_…` + last 4), and the URL shows only its origin. The URL must be `https` on port 443, with no credentials and no IP literal or `localhost`/`.local`/`.internal` host. It must also resolve to a public address, and it is checked again at every send. Redirects are refused, and each send times out after 5s. Every hosted alert is POSTed once as JSON with `id` (the alert occurrence, use it for idempotency), `kind`, `org_id`, `agent_id`, `agent_name`, `team`, `run_id`, `scope`, `period`, `fraction`, `spent_usd`, `cap_usd`, `unknown_count` (null when not known, never 0), `fired_at` and `dashboard_url`. A non-2xx response or a timeout is retried on the next alert sweep; a 2xx is not resent until the alert clears and re-arms. Verify the `x-costcap-signature: t=<unix>,v1=<hex>` header:
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+function verifyCostCap(secret, rawBody, header, toleranceSec = 300) {
+  const { t, v1 } = Object.fromEntries(header.split(",").map((kv) => kv.split("=")));
+  if (!t || !v1 || Math.abs(Date.now() / 1000 - Number(t)) > toleranceSec) return false;
+  const expected = createHmac("sha256", secret).update(`${t}.${rawBody}`).digest("hex");
+  return v1.length === expected.length && timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
+}
+```
+
 ### Fleet freeze (kill switch)
 
 `POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
