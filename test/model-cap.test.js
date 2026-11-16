@@ -300,3 +300,82 @@ test("e2e: enrolled wrapper merges fleet modelCaps with local rules and enforces
   const r = await wrapRun(t, up, receipts, ["--enrollment", enrollment, "--model-cap", `${OPUS}:day=2`], [OPUS, OPUS, OPUS, OPUS]);
   assert.deepEqual(r.lines.map((l) => l.status), [200, 200, 200, 429]);
 });
+
+// #241: OpenRouter's dotted ids (`anthropic/claude-opus-4.6`) and variant suffixes share the first-party bucket.
+const OPUS46 = "claude-opus-4-6";
+const orCall = (port, model, i) => call(port, { model, max_tokens: 100, messages: [{ role: "user", content: `distinct ${model} ${i}` }] }, "openrouter");
+
+test("normalize: OpenRouter dotted ids, vendor prefixes and variant suffixes map to the priced first-party id (#241)", () => {
+  assert.equal(normalizeModel("anthropic/claude-opus-4.6"), OPUS46);
+  assert.equal(normalizeModel("anthropic/claude-opus-4-6"), OPUS46);
+  assert.equal(normalizeModel("anthropic/claude-opus-4.6:thinking"), OPUS46);
+  assert.equal(normalizeModel("claude-opus-4.6"), OPUS46);
+  assert.equal(normalizeModel("openai/gpt-4o"), "gpt-4o");
+  assert.equal(normalizeModel("openai/gpt-4o:online"), "gpt-4o");
+  assert.equal(normalizeModel("google/gemini-2.5-pro"), "gemini-2.5-pro");
+  assert.equal(normalizeModel("anthropic.claude-opus-4-8-v1:0"), OPUS);
+  // No pricing row after normalization: exact match, unchanged (today's behaviour).
+  assert.equal(normalizeModel("acme/mystery-1.2"), "acme/mystery-1.2");
+  assert.equal(normalizeModel("mystery-1.2:thinking"), "mystery-1.2:thinking");
+  assert.throws(() => parseModelCaps([`${OPUS46}:day=1`, "anthropic/claude-opus-4.6:day=2"]), /duplicate/);
+});
+
+test("proxy: 3rd dotted OpenRouter Opus call refused, dotted and hyphenated share one bucket (#241 AC1, AC2)", async (t) => {
+  const up = await upstream(t);
+  const modelCaps = createModelCaps({ rules: [rule("day", 1, OPUS46)] });
+  const { server, port } = await startMeteringProxy({ upstreams: { openrouter: up.url }, modelCaps });
+  t.after(() => server.close());
+  for (let i = 0; i < 2; i++) assert.equal((await orCall(port, "anthropic/claude-opus-4.6", i)).status, 200);
+  assert.deepEqual(modelCaps.remaining([OPUS46]).map((r) => r.remaining_usd), [0.2]);
+  assert.equal((await orCall(port, "anthropic/claude-opus-4-6", 2)).status, 200);
+  const r = await orCall(port, "anthropic/claude-opus-4.6", 3);
+  assert.equal(r.status, 429);
+  assert.equal((await r.json()).error, "model_budget_exceeded");
+  assert.equal((await orCall(port, "anthropic/claude-opus-4-6", 4)).status, 429);
+  assert.equal((await orCall(port, "anthropic/claude-opus-4.6:thinking", 5)).status, 429);
+  assert.equal(up.hits.length, 3);
+  assert.ok(modelCaps.check(["anthropic/claude-opus-4.6"]));
+});
+
+test("proxy: a dotted-form rule caps first-party Opus on the /anthropic route (#241 AC3)", async (t) => {
+  const up = { hits: 0 };
+  up.server = http.createServer((q, s) => { q.resume(); q.on("end", () => { up.hits += 1; s.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: OPUS46, usage: { input_tokens: 30_000, output_tokens: 10_000 } })); }); });
+  await new Promise((res) => up.server.listen(0, "127.0.0.1", res));
+  t.after(() => up.server.close());
+  const modelCaps = createModelCaps({ rules: parseModelCaps(["anthropic/claude-opus-4.6:day=1"]) });
+  const { server, port } = await startMeteringProxy({ upstreams: { anthropic: `http://127.0.0.1:${up.server.address().port}` }, modelCaps });
+  t.after(() => server.close());
+  const msg = (i) => fetch(`http://127.0.0.1:${port}/anthropic/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: OPUS46, max_tokens: 100, messages: [{ role: "user", content: `m${i}` }] }) });
+  const codes = [];
+  for (let i = 0; i < 4; i++) codes.push((await msg(i)).status);
+  assert.deepEqual(codes, [200, 200, 200, 429]);
+  assert.equal(up.hits, 3);
+});
+
+for (const [vendorId, ruleModel] of [["openai/gpt-4o", "gpt-4o"], ["google/gemini-2.5-pro", "gemini-2.5-pro"]]) {
+  test(`proxy: ${vendorId} on OpenRouter is capped by a ${ruleModel} rule (#241 AC4)`, async (t) => {
+    const up = await upstream(t);
+    const modelCaps = createModelCaps({ rules: [rule("day", 0.01, ruleModel)] });
+    const { server, port } = await startMeteringProxy({ upstreams: { openrouter: up.url }, modelCaps });
+    t.after(() => server.close());
+    assert.equal((await orCall(port, vendorId, 0)).status, 200);
+    const r = await orCall(port, vendorId, 1);
+    assert.equal(r.status, 429);
+    assert.equal((await r.json()).model, vendorId);
+    assert.equal(up.hits.length, 1);
+  });
+}
+
+test("check --model-cap and hosted modelCaps agree on a dotted-id ledger (#241 AC6)", () => {
+  const now = new Date().toISOString();
+  const rows = [0.4, 0.4, 0.4].map((c, i) => ({ id: `d${i}`, ts: now, model: i ? "anthropic/claude-opus-4.6" : "anthropic/claude-opus-4.6:thinking", provider: "openrouter", cost_usd: c }));
+  const { p } = ledgerFile(rows);
+  const res = spawnSync(process.execPath, ["src/cli.js", "check", "--receipts", p, "--model-cap", `${OPUS46}:day=1`], { encoding: "utf8" });
+  assert.equal(res.status, 1, res.stderr);
+  const cli = JSON.parse(res.stdout).model_caps;
+  assert.deepEqual(cli, [{ model: OPUS46, scope: "day", spend_usd: 1.2, cap_usd: 1, verdict: "model_budget_exceeded" }]);
+  const hosted = [{ model: OPUS46, scope: "day", usd: 1 }];
+  assert.equal(modelCapsError(hosted), null);
+  const engine = createModelCaps({ rules: mergeModelCapRules(hosted, []), history: rows });
+  assert.deepEqual(engine.over(), cli);
+});

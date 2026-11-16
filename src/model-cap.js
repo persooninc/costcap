@@ -14,15 +14,28 @@ const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/;
 
 const fail = (msg) => { const e = new Error(`${msg} (${MODEL_CAP_RULE})`); e.code = "invalid_model_cap"; throw e; };
 
+// #241: OpenRouter variant suffixes (`anthropic/claude-opus-4.6:thinking`) bill the base model.
+const OPENROUTER_VARIANT = /:(thinking|online|free|nitro|floor|beta|extended|exacto)$/;
+// #241: OpenRouter writes version dots (`claude-opus-4.6`); first-party ids use hyphens.
+const dehyphenate = (id) => id.replace(/(\d)\.(?=\d)/g, "$1-");
+const resolveLoose = (id) => resolveModelId(id) ?? resolveModelId(dehyphenate(id));
+
 /** The model id a cap rule and a receipt are compared on. */
 export function normalizeModel(model) {
   if (typeof model !== "string" || !model) return null;
+  const slash = model.indexOf("/");
+  if (slash > 0) {
+    // #241: a `<vendor>/<id>` id resolves to the first-party id it prices, even when
+    // the table also has the prefixed OpenRouter row, so dotted and hyphenated spend share one bucket.
+    const rest = model.slice(slash + 1).replace(OPENROUTER_VARIANT, "");
+    const r = resolveLoose(rest);
+    if (r) return r;
+  }
   const direct = resolveModelId(model);
   if (direct) return direct;
   for (const p of ["bedrock", "vertex"]) { const m = mapCloudModel(p, model); if (m) return m; }
-  const slash = model.indexOf("/");
-  if (slash > 0) { const r = resolveModelId(model.slice(slash + 1)); if (r) return r; }
-  return model;
+  const bare = model.replace(OPENROUTER_VARIANT, "");
+  return resolveLoose(bare) ?? model;
 }
 
 /** Parse one "MODEL:SCOPE=USD" rule; the split is on the last ":" so Bedrock ids keep their ":0". */
