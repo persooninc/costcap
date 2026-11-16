@@ -8,6 +8,7 @@ import { hashToken, validatePolicy, effectiveCaps } from "./policy.js";
 import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
+import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
 import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
@@ -207,7 +208,7 @@ export function spendSummary(receipts, nowMs, budgetPeriod = null) {
 
 // `store` (optional) injects any adapter with the store interface (mode, read, transaction,
 // flush), for example openPostgresStore(); otherwise the JSON file at `storePath` is used.
-export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert,
+export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert, deliverDigest,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
   plans = DEFAULT_PLANS, enforceEntitlements, publicPricing, resolveHost } = {}) {
@@ -384,7 +385,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
               audit(s, invite.orgId, id, "invitation.accept", invite.id, { role: invite.role });
             } else {
               const orgId = randomUUID();
-              s.orgs[orgId] = { id: orgId, name: challenge.email.split("@")[1], created: now() };
+              s.orgs[orgId] = { id: orgId, name: challenge.email.split("@")[1], created: now(), digest: newOrgDigest() };
               user = { id, email: challenge.email, orgId, role: "owner", verified: true };
               s.users[id] = user;
               audit(s, orgId, id, "org.create", orgId);
@@ -730,6 +731,39 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return { anomaly: after, defaults: { ...DEFAULT_ANOMALY }, canEdit: true };
         });
         return json(200, result);
+      }
+      // Issue #224: weekly spend digest settings. Any member reads, owner/admin writes (audited).
+      if (path === "/v1/digest-settings" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = member(s, req); return { digest: resolveDigest(s.orgs[u.orgId]?.digest), timezone: orgPeriod(s, u.orgId).timezone, canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/digest-settings" && (req.method === "POST" || req.method === "PUT")) {
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const input = body?.digest ?? body;
+          const err = digestSettingsError(input);
+          if (err) fail(400, err);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const before = resolveDigest(org.digest);
+          const after = resolveDigest(org.digest, input);
+          org.digest = after;
+          if (after.enabled && !before.enabled) org.digestSince = now();
+          audit(s, u.orgId, u.id, "digest.settings", u.orgId, { before, after });
+          return { digest: after, timezone: orgPeriod(s, u.orgId).timezone, canEdit: true };
+        });
+        return json(200, result);
+      }
+      // Preview: the exact digest the scheduler would send for ?week=YYYY-Www (default: last week). Never sends.
+      if (path === "/v1/digest/preview" && req.method === "GET") {
+        return json(200, store.read((s) => {
+          const u = member(s, req);
+          const tz = orgPeriod(s, u.orgId).timezone;
+          const asked = new URL(req.url, origin).searchParams.get("week");
+          if (asked !== null && !parseWeek(asked)) fail(400, "week must be an ISO week like 2026-W46");
+          const week = asked ?? previousWeek(weekLabel(now(), tz), tz);
+          const digest = buildDigest(s, u.orgId, { week, nowMs: now(), dashboardUrl: origin });
+          return { digest, text: digestText(digest) };
+        }));
       }
       // Issue #209: org budget period. Owner/admin write (audited before/after), any member reads.
       if (path === "/v1/budget-period" && req.method === "GET") {
@@ -1141,5 +1175,61 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     }
     return queued.length;
   }
-  return { server, billingReady, evaluateFleetAlerts, purgeExpiredReceipts };
+  // Issue #224: weekly digest scheduler, called from the hosted interval (run.js).
+  // At most one digest per org and ISO week (ledger s.digests["org:week"]). A
+  // failed channel is retried alone with the alert backoff (#206 semantics).
+  const digestDestinations = (s, orgId) => {
+    const saved = s.orgs[orgId]?.alertSettings;
+    const members = new Set(Object.values(s.users).filter((m) => m.orgId === orgId && m.verified).map((m) => m.email));
+    return { emails: (saved?.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved?.slackWebhook ?? null, webhook: saved?.webhook ?? null };
+  };
+  const configuredChannels = (dest, channels) => channels.filter((c) => (c === "email" ? dest.emails.length > 0 : c === "slack" ? Boolean(dest.slackWebhook) : Boolean(dest.webhook?.url)));
+  async function runDigests() {
+    const queued = store.transaction((s) => {
+      s.digests ??= {};
+      const out = [];
+      for (const [key, rec] of Object.entries(s.digests)) {
+        if (!s.orgs[rec.orgId] || !["failed", "pending"].includes(rec.delivery)) continue;
+        const recovered = pendingRecovered(rec, now());
+        const due = recovered ? rec.channels.filter((c) => rec.deliveryChannels?.[c] !== "accepted") : dueRetryChannels(rec, now());
+        if (!due?.length) continue;
+        rec.delivery_claimed_at = new Date(now()).toISOString();
+        out.push({ key, orgId: rec.orgId, week: rec.week, channels: due, retry: true });
+      }
+      for (const [orgId, org] of Object.entries(s.orgs)) {
+        const settings = resolveDigest(org.digest);
+        if (!settings.enabled) continue;
+        const tz = orgPeriod(s, orgId).timezone;
+        const due = digestDue(now(), settings, orgId, s.digests, tz, { since: org.digestSince ?? org.created ?? 0 });
+        if (due.action === "skip") {
+          s.digests[digestKey(orgId, due.week)] = { orgId, week: due.week, delivery: "skipped", at: new Date(now()).toISOString() };
+          audit(s, orgId, "digest-worker", "digest.skipped", orgId, { week: due.week, slot: new Date(due.slot).toISOString(), reason: "missed send slot by more than 24h" });
+          continue;
+        }
+        if (due.action !== "send") continue;
+        const channels = configuredChannels(digestDestinations(s, orgId), settings.channels);
+        if (!channels.length) { s.digests[digestKey(orgId, due.week)] = { orgId, week: due.week, delivery: "unconfigured", at: new Date(now()).toISOString() }; continue; }
+        const key = digestKey(orgId, due.week);
+        s.digests[key] = { orgId, week: due.week, channels, delivery: "pending", at: new Date(now()).toISOString(), delivery_claimed_at: new Date(now()).toISOString() };
+        out.push({ key, orgId, week: due.week, channels });
+      }
+      return out;
+    });
+    for (const job of queued) {
+      const { digest, dest } = store.read((s) => ({ digest: buildDigest(s, job.orgId, { week: job.week, nowMs: now(), dashboardUrl: origin }), dest: digestDestinations(s, job.orgId) }));
+      let result;
+      try { result = deliverDigest ? await deliverDigest(digest, dest, { channels: job.channels }) : job.channels.map((channel) => ({ channel, status: "unconfigured" })); }
+      catch { result = [{ status: "failed" }]; }
+      store.transaction((s) => {
+        const rec = s.digests?.[job.key];
+        if (!rec) return;
+        delete rec.delivery_claimed_at;
+        applyDeliveryResult(rec, result, job.channels, now());
+        const outcome = Object.fromEntries(job.channels.map((c) => [c, rec.deliveryChannels?.[c] ?? "failed"]));
+        audit(s, job.orgId, "digest-worker", "digest.sent", job.orgId, { week: job.week, channels: job.channels, outcome, ...(job.retry ? { retry: true } : {}) });
+      });
+    }
+    return queued.length;
+  }
+  return { server, billingReady, evaluateFleetAlerts, purgeExpiredReceipts, runDigests };
 }

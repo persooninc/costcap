@@ -6,10 +6,10 @@ export function createTransactionalEmail({ provider = "brevo", apiKey, from, fet
   const address = /^(?:[^<>]+<)?([^<>\s]+@[^<>\s]+)>?$/.exec(from)?.[1];
   if (!address) throw new Error("Invalid sender address");
   const name = from.includes("<") ? from.slice(0, from.indexOf("<")).trim() : "CostCap";
-  return async ({ to, subject, text }) => {
+  return async ({ to, subject, text, html }) => {
     if (!Array.isArray(to) || !to.length || to.some((email) => typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) throw new Error("Valid authorized recipients required");
     const escape = (value) => value.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-    const body = { sender: { email: address, name }, to: to.map((email) => ({ email })), subject, textContent: text, htmlContent: `<pre>${escape(text)}</pre>` };
+    const body = { sender: { email: address, name }, to: to.map((email) => ({ email })), subject, textContent: text, htmlContent: typeof html === "string" && html ? html : `<pre>${escape(text)}</pre>` };
     const response = await fetchImpl("https://api.brevo.com/v3/smtp/email", {
       method: "POST",
       headers: { "content-type": "application/json", "api-key": apiKey },

@@ -2,7 +2,7 @@
 // caller's org, and export the full org audit trail as CSV.
 import { cell } from "./receipts-csv.js";
 
-export const SYSTEM_ACTORS = Object.freeze({ "alert-worker": "system:alert-worker" });
+export const SYSTEM_ACTORS = Object.freeze({ "alert-worker": "system:alert-worker", "digest-worker": "system:digest-worker" });
 export const AUDIT_CSV_COLUMNS = ["ts", "actor", "actor_label", "action", "target", "target_label", "reason", "detail_json"];
 
 // Labels never cross orgs: only users, agents, teams, invitations and the org

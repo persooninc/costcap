@@ -1,7 +1,7 @@
 import { createStripeBilling, createTestModeStripeBilling, TEAM_BUNDLE_LOOKUP_KEY } from "./billing.js";
 import { createTransactionalEmail } from "./email.js";
 import { createHostedServer } from "./server.js";
-import { createOrgAlertRouter } from "./delivery.js";
+import { createOrgAlertRouter, createDigestDelivery } from "./delivery.js";
 import { verifyProductionChallenge } from "./turnstile.js";
 import { openPostgresStore } from "./store-postgres.js";
 const required = (key) => { if (!process.env[key]) throw new Error(`${key} required`); return process.env[key]; };
@@ -30,7 +30,7 @@ const deliverAlert = createOrgAlertRouter({ emailKey, emailFrom: from, dashboard
 const databaseUrl = process.env.COSTCAP_DATABASE_URL || "";
 if (databaseUrl && !/^postgres(ql)?:\/\//.test(databaseUrl)) throw new Error("COSTCAP_DATABASE_URL must be a postgres:// URL");
 const store = databaseUrl ? await openPostgresStore({ connectionString: databaseUrl }) : undefined;
-const { server, evaluateFleetAlerts, purgeExpiredReceipts, billingReady } = createHostedServer({
+const { server, evaluateFleetAlerts, purgeExpiredReceipts, runDigests, billingReady } = createHostedServer({
   origin,
   store,
   stripeMode,
@@ -60,6 +60,8 @@ const { server, evaluateFleetAlerts, purgeExpiredReceipts, billingReady } = crea
     await sendEmail({ to: [email], subject: "CostCap organization invitation", text: `You were invited to the ${orgName} CostCap organization as ${role}. Sign in with this email address. The invitation expires in 7 days. If you did not expect it, ignore it. Guardrails, not guarantees.` });
   },
   deliverAlert,
+  // Issue #224: weekly digest to each org's own alert destinations.
+  deliverDigest: createDigestDelivery({ emailKey, emailFrom: from }),
   requestLog: (line) => process.stderr.write(`${line}\n`),
 });
 try { await billingReady; }
@@ -69,6 +71,7 @@ const interval = setInterval(async () => {
   if (alertRunning) return;
   alertRunning = true;
   try { await evaluateFleetAlerts(); } catch { console.error("costcap: alert sweep failed"); }
+  try { await runDigests(); } catch { console.error("costcap: digest sweep failed"); }
   finally { alertRunning = false; }
 }, 60_000);
 // Issue #211: delete receipts past each org's retention setting. Startup, then nightly.

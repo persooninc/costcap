@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { createTransactionalEmail } from "./email.js";
+import { digestText, digestHtml, digestSlack, digestWebhookPayload, digestSubject } from "./digest.js";
 // Hosted delivery adapter. The caller authorizes recipients and supplies secrets.
 // Tests pass a fake fetch. This module does not send by itself.
 export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook, webhook, dashboardUrl, lookup = dnsLookup, fetchImpl = fetch, nowMs = () => Date.now() } = {}) {
@@ -150,5 +151,34 @@ export function createOrgAlertRouter({ emailKey, emailFrom, fetchImpl = fetch, f
     if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
     if (fallbackDelivery && alert.orgId === fallback.orgId) return fallbackDelivery(alert, opts);
     return [{ status: "unconfigured" }];
+  };
+}
+
+// Issue #224: weekly digest delivery to the org's own alert destinations.
+// `channels` is the list to send (a retry passes only the failed ones). One
+// result row per requested channel, same shape as alert delivery (#206).
+export function createDigestDelivery({ emailKey, emailFrom, fetchImpl = fetch, lookup = dnsLookup, nowMs = () => Date.now() } = {}) {
+  return async (digest, settings, { channels = ["email", "slack", "webhook"] } = {}) => {
+    const results = [];
+    const attempt = async (channel, configured, send) => {
+      if (!channels.includes(channel)) return;
+      if (!configured) { results.push({ channel, status: "unconfigured" }); return; }
+      try { await send(); results.push({ channel, status: "accepted" }); }
+      catch (err) { results.push({ channel, status: "failed", error: err.message }); }
+    };
+    await attempt("email", emailKey && emailFrom && settings?.emails?.length, () =>
+      createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to: settings.emails, subject: digestSubject(digest), text: digestText(digest), html: digestHtml(digest) }));
+    await attempt("slack", settings?.slackWebhook && validSlackWebhook(settings.slackWebhook), async () => {
+      const response = await fetchImpl(settings.slackWebhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(digestSlack(digest)), redirect: "error", signal: AbortSignal.timeout(5000) });
+      if (!response.ok) throw new Error(`delivery HTTP ${response.status}`);
+    });
+    await attempt("webhook", settings?.webhook?.url && settings?.webhook?.secret, async () => {
+      await assertWebhookTarget(settings.webhook.url, lookup);
+      const body = JSON.stringify(digestWebhookPayload(digest));
+      const t = Math.floor(nowMs() / 1000);
+      const response = await fetchImpl(settings.webhook.url, { method: "POST", headers: { "content-type": "application/json", "user-agent": "CostCap-Webhook/1", "x-costcap-signature": signWebhook(settings.webhook.secret, body, t) }, body, redirect: "error", signal: AbortSignal.timeout(5000) });
+      if (!response.ok) throw new Error(`delivery HTTP ${response.status}`);
+    });
+    return results;
   };
 }
