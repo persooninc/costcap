@@ -76,6 +76,35 @@ export function capPeriod(scope, nowMs, budgetPeriod = null) {
   return periodKey(scope === "month" ? "month" : "day", nowMs, budgetPeriod);
 }
 
+// Issue #245: blocked receipts that count toward cap_hit. Only a block with the
+// given reason, synced in the lookback window, AND in the scope's current cap
+// period counts, so yesterday's 23:50 block never re-pages just after rollover.
+// scopeOf(r) returns the cap scope ("day"/"month") or null to drop the receipt.
+// Shared by the org, team and tag sweeps (and #244 model caps).
+export function blocksInCurrentPeriod(receipts, { reason, nowMs, budgetPeriod = null, scopeOf = (r) => r.scope, lookbackMs = 3600_000 }) {
+  const out = [];
+  for (const r of receipts ?? []) {
+    if (!r || r.reason !== reason) continue;
+    const ts = Date.parse(r.ts);
+    if (!Number.isFinite(ts) || ts <= nowMs - lookbackMs) continue;
+    const scope = scopeOf(r);
+    if (scope !== "day" && scope !== "month") continue;
+    if (capPeriod(scope, ts, budgetPeriod) !== capPeriod(scope, nowMs, budgetPeriod)) continue;
+    out.push(r);
+  }
+  return out;
+}
+
+// Issue #245: a tag block pages a fleet rule only when the fleet rule refused
+// it (fleet: true). An older wrapper without `fleet` counts when it carries no
+// cap or the rule's own cap; a local --tag-cap refusal (other cap) never does.
+export function isFleetTagBlock(h, rule) {
+  if (h?.fleet === true) return true;
+  if (h?.fleet !== undefined) return false;
+  const cap = h?.cap_usd ?? h?.cap;
+  return cap === undefined || cap === null || cap === rule.usd;
+}
+
 // Once-per-period gate for explicit fractions. arm[id:scope] = { period, fired }.
 // A new period clears it. A fraction re-arms only when its threshold at the
 // current cap sits above current spend (e.g. the cap was raised mid-period).
@@ -247,7 +276,7 @@ export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits =
   for (const rule of rules) {
     const values = spend?.[rule.key] ?? {};
     const fractions = Array.isArray(rule.warnFractions) ? rule.warnFractions : DEFAULT_WARN_FRACTIONS;
-    const blocked = new Set(blockedHits.filter((h) => h?.tag_key === rule.key && h?.scope === rule.scope).map((h) => h.tag_value));
+    const blocked = new Set(blockedHits.filter((h) => h?.tag_key === rule.key && h?.scope === rule.scope && isFleetTagBlock(h, rule)).map((h) => h.tag_value));
     const names = new Set([...Object.keys(values), ...blocked]);
     for (const value of [...names].sort()) {
       const e = values[value] ?? { day: 0, month: 0, unknown: 0 };

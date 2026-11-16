@@ -9,7 +9,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -1195,9 +1195,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       const teamKeys = new Set();
       for (const t of Object.values(s.teams ?? {})) {
         const prefix = `team:${t.name}:`;
-        const blockedScopes = t.agents.flatMap((id) => agentReceipts(s, id))
-          .filter((r) => Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith(prefix))
-          .map((r) => r.scope.slice(prefix.length));
+        const teamScope = (r) => (typeof r.scope === "string" && r.scope.startsWith(prefix) ? r.scope.slice(prefix.length) : null);
+        const blockedScopes = blocksInCurrentPeriod(t.agents.flatMap((id) => agentReceipts(s, id)), { reason: "budget_exceeded", nowMs: now(), budgetPeriod: orgPeriod(s, t.orgId), scopeOf: teamScope }).map(teamScope);
         const verdict = verdictOf(s, t);
         const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, t.warnFractions, orgPeriod(s, t.orgId));
         for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes }, { warnFractions: t.warnFractions })) {
@@ -1224,9 +1223,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const verdict = orgBudgetOfOrg(s, orgId);
         if (!verdict) continue;
         const bp = orgPeriod(s, orgId);
-        const blockedScopes = Object.values(s.receipts).filter((i) => i.orgId === orgId).map((i) => i.receipt)
-          .filter((r) => r && Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith("org:"))
-          .map((r) => r.scope.slice(4));
+        const orgScope = (r) => (typeof r.scope === "string" && r.scope.startsWith("org:") ? r.scope.slice(4) : null);
+        const blockedScopes = blocksInCurrentPeriod(Object.values(s.receipts).filter((i) => i.orgId === orgId).map((i) => i.receipt), { reason: "budget_exceeded", nowMs: now(), budgetPeriod: bp, scopeOf: orgScope }).map(orgScope);
         const warnOk = gateWarnings(s, `org:${orgId}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, verdict.warnFractions, bp);
         for (const alert of evaluateOrgAlerts({ orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: bp }, { warnFractions: verdict.warnFractions })) {
           orgKeys.add(alert.key);
@@ -1246,7 +1244,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const bp = orgPeriod(s, orgId);
         const receipts = orgReceipts(s, orgId);
         const spend = fleetTagCapsPolicy(rules, receipts, now(), Infinity, bp)?.spend ?? {};
-        const blockedHits = receipts.filter((r) => r && r.reason === "tag_budget_exceeded" && Date.parse(r.ts) > now() - 3600_000 && typeof r.tag_key === "string" && typeof r.tag_value === "string");
+        const blockedHits = blocksInCurrentPeriod(receipts, { reason: "tag_budget_exceeded", nowMs: now(), budgetPeriod: bp }).filter((r) => typeof r.tag_key === "string" && typeof r.tag_value === "string");
         const ruleOf = Object.fromEntries(rules.map((r) => [`${r.key}:${r.scope}`, r]));
         for (const alert of evaluateTagAlerts({ orgId, rules, spend, blockedHits })) {
           tagKeys.add(alert.key);
