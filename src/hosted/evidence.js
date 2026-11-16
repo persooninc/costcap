@@ -59,7 +59,9 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     agents: out,
     alerts: alerts.map((a) => ({ id: a.id ?? null, kind: a.kind ?? null, key: a.key ?? null, agent_id: a.agentId ?? null, team: a.team ?? null, scope: a.scope ?? null,
       // Lifecycle (#143): legacy records without a timestamp export fired_at null, never an invented time.
-      active: Boolean(a.active), fired_at: a.fired_at ?? null, resolved_at: a.resolved_at ?? null, acknowledged_at: a.acknowledged_at ?? null, acknowledged_by: a.acknowledged_by ?? null })),
+      active: Boolean(a.active), fired_at: a.fired_at ?? null, resolved_at: a.resolved_at ?? null, acknowledged_at: a.acknowledged_at ?? null, acknowledged_by: a.acknowledged_by ?? null,
+      // Warning fraction (#165) only when the alert carries one.
+      ...(a.fraction != null ? { fraction: a.fraction } : {}) })),
     // Team budgets (#123): shared cap, synced spend and verdict per team.
     teams: teams.map((t) => ({ name: t.name, agents: [...t.agents], caps: { ...t.caps }, spend: { ...t.spend }, verdict: t.verdict, scope: t.scope ?? null })),
     receipts: rows,

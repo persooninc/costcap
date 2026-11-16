@@ -7,6 +7,7 @@
 // loosens when the server actually delivers a newer version.
 
 import { intersectModels, isModelList } from "../agent-budget.js";
+import { warnFractionsError } from "./alerts.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 // Enrollment tokens are shown once. Only the SHA-256 hash is stored.
@@ -41,6 +42,11 @@ export function validatePolicy(p) {
   if (p.silentAfterHours !== undefined && p.silentAfterHours !== null && !(typeof p.silentAfterHours === "number" && Number.isFinite(p.silentAfterHours) && p.silentAfterHours >= 0 && p.silentAfterHours <= 720)) errors.push("silentAfterHours must be 0 (off) or a number up to 720");
   // Model allowlist (issue #153): optional non-empty array of exact model ids.
   if (p.models !== undefined && p.models !== null && !isModelList(p.models)) errors.push("models must be a non-empty array of model ids");
+  // Warning fractions (issue #165): null/missing = default [0.8], [] = cap_approaching off.
+  if (p.warnFractions !== undefined && p.warnFractions !== null) {
+    const err = warnFractionsError(p.warnFractions);
+    if (err) errors.push(err);
+  }
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   return errors;
 }

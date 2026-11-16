@@ -5,6 +5,7 @@
 // (cost_usd: null) from any member makes the team verdict accounting_unavailable;
 // it is never treated as $0.
 import { createAgentBudgets } from "../agent-budget.js";
+import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 export const TEAM_SCOPES = Object.freeze(["day", "month"]);
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
@@ -21,7 +22,7 @@ export function parseTeamInput(body, { orgAgents, teams, orgId }) {
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!NAME.test(name)) bad("Team name must be 1-40 letters, digits, - or _");
   if (body.remove === true) return { name, remove: true };
-  for (const key of Object.keys(body)) if (!["name", "agents", "day", "month"].includes(key)) bad(`Unknown team field ${key}`);
+  for (const key of Object.keys(body)) if (!["name", "agents", "day", "month", "warnFractions"].includes(key)) bad(`Unknown team field ${key}`);
   if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > 100 || body.agents.some((a) => typeof a !== "string" || !a)) bad("Team agents must be a non-empty list of agent ids");
   const agents = [...new Set(body.agents)];
   const inOrg = new Set(orgAgents.filter((a) => a.orgId === orgId).map((a) => a.id));
@@ -39,6 +40,13 @@ export function parseTeamInput(body, { orgAgents, teams, orgId }) {
     out[scope] = v;
   }
   if (!TEAM_SCOPES.some((s) => out[s] != null)) bad("Team needs a day or month cap");
+  // Issue #165: undefined keeps the saved value, null resets to the default, [] turns warnings off.
+  if (body.warnFractions === null) out.warnFractions = null;
+  else if (body.warnFractions !== undefined) {
+    const err = warnFractionsError(body.warnFractions);
+    if (err) bad(err);
+    out.warnFractions = sortWarnFractions(body.warnFractions);
+  }
   return out;
 }
 
@@ -71,6 +79,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs }) {
     verdict: hit ? hit.verdict : "ok",
     ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
+    ...(Array.isArray(team.warnFractions) ? { warnFractions: [...team.warnFractions] } : {}),
   };
 }
 

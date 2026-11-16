@@ -31,15 +31,81 @@ export function silentAfterMsFor(policy) {
   return h === 0 ? Infinity : h * 3600_000;
 }
 
-export function evaluateAlerts(state, { approachFraction = 0.8, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
+// Issue #165: configurable cap_approaching warning fractions per agent/team.
+// Default [0.8]; [] turns cap_approaching off; 1-5 unique numbers 0 < f < 1.
+export const DEFAULT_WARN_FRACTIONS = Object.freeze([0.8]);
+export const MAX_WARN_FRACTIONS = 5;
+
+// Returns an error message, or null when v is a valid warnFractions array.
+export function warnFractionsError(v) {
+  if (!Array.isArray(v)) return "warnFractions must be an array of fractions between 0 and 1";
+  if (v.length > MAX_WARN_FRACTIONS) return `warnFractions takes at most ${MAX_WARN_FRACTIONS} values`;
+  if (v.some((f) => typeof f !== "number" || !Number.isFinite(f) || f <= 0 || f >= 1)) return "warnFractions values must be numbers between 0 and 1 (exclusive)";
+  if (new Set(v).size !== v.length) return "warnFractions values must be unique";
+  return null;
+}
+
+export const sortWarnFractions = (v) => [...v].sort((a, b) => a - b);
+
+// The 0.8 key stays the legacy key so existing records keep deduping.
+export function approachKey(id, scope, fraction) {
+  const base = `cap_approaching:${id}:${scope}`;
+  return fraction === 0.8 ? base : `${base}:p${Number((fraction * 100).toFixed(4))}`;
+}
+
+// Highest crossed fraction for one scope, or null. `explicit` adds `fraction`
+// to the payload; the legacy default leaves the payload unchanged.
+function approaching(id, scope, cap, spent, fractions, explicit, extra) {
+  let hit = null;
+  for (const f of fractions) if (spent >= cap * f && (hit === null || f > hit)) hit = f;
+  if (hit === null) return null;
+  return { kind: "cap_approaching", ...extra, key: explicit ? approachKey(id, scope, hit) : `cap_approaching:${id}:${scope}`, cap, spent, ...(explicit ? { fraction: hit } : {}) };
+}
+
+function fractionsFrom(warnFractions, approachFraction) {
+  if (Array.isArray(warnFractions)) return { fractions: warnFractions, explicit: true };
+  return { fractions: [approachFraction], explicit: false };
+}
+
+// UTC cap period for a scope: YYYY-MM-DD (day) or YYYY-MM (month).
+export function capPeriod(scope, nowMs) {
+  const iso = new Date(nowMs).toISOString();
+  return scope === "month" ? iso.slice(0, 7) : iso.slice(0, 10);
+}
+
+// Once-per-period gate for explicit fractions. arm[id:scope] = { period, fired }.
+// A new period clears it. A fraction re-arms only when its threshold at the
+// current cap sits above current spend (e.g. the cap was raised mid-period).
+export function armWarnings(arm, { id, scope, cap, spent, nowMs }) {
+  const period = capPeriod(scope, nowMs);
+  const k = `${id}:${scope}`;
+  if (!arm[k] || arm[k].period !== period) arm[k] = { period, fired: [] };
+  const st = arm[k];
+  if (typeof cap === "number" && Number.isFinite(cap) && typeof spent === "number" && Number.isFinite(spent)) st.fired = st.fired.filter((f) => spent >= f * cap);
+  return st;
+}
+
+// Should this explicit-fraction alert be sent? Marks it and every lower
+// fraction as fired, so a skipped lower fraction never sends later.
+export function claimWarning(st, alert, fractions) {
+  if (st.fired.some((f) => f >= alert.fraction)) return false;
+  st.fired = [...new Set([...st.fired, ...fractions.filter((f) => f <= alert.fraction)])];
+  return true;
+}
+
+export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
   const out = [];
+  const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
   for (const scope of ["run", "day", "month"]) {
     const cap = state.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
     const spent = state.spend?.[scope] ?? 0;
     if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
     if (spent >= cap) out.push({ kind: "cap_hit", scope, key: `cap_hit:${state.agentId}:${scope}`, cap, spent });
-    else if (spent >= cap * approachFraction) out.push({ kind: "cap_approaching", scope, key: `cap_approaching:${state.agentId}:${scope}`, cap, spent });
+    else {
+      const warn = approaching(state.agentId, scope, cap, spent, fractions, explicit, { scope });
+      if (warn) out.push(warn);
+    }
   }
   const monthCap = state.caps?.month;
   if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month")) {
@@ -91,10 +157,11 @@ export function auditEntry({ orgId, actor, action, target, detail = {}, now = ne
 // receipts blocked with scope team:<name>:<scope> in the last hour.
 // Unknown cost (accounting_unavailable) or non-finite spend raises no cap
 // alert: unknown cost never counts as $0.
-export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { approachFraction = 0.8 } = {}) {
+export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { approachFraction = 0.8, warnFractions } = {}) {
   if (!verdict || verdict.spend?.unknown_count !== 0 || verdict.verdict === "accounting_unavailable") return [];
   const out = [];
   const id = `team:${orgId}:${verdict.name}`;
+  const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
   for (const scope of ["day", "month"]) {
     const cap = verdict.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
@@ -102,7 +169,10 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [] }, { app
     if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
     const base = { team: verdict.name, scope, cap, spent };
     if (spent >= cap || blockedScopes.includes(scope)) out.push({ kind: "cap_hit", key: `cap_hit:${id}:${scope}`, ...base });
-    else if (spent >= cap * approachFraction) out.push({ kind: "cap_approaching", key: `cap_approaching:${id}:${scope}`, ...base });
+    else {
+      const warn = approaching(id, scope, cap, spent, fractions, explicit, {});
+      if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, ...(explicit ? { fraction: warn.fraction } : {}) });
+    }
   }
   return out;
 }

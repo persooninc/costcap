@@ -6,7 +6,7 @@ import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { evaluateAlerts, evaluateTeamAlerts, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -548,7 +548,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const input = parseTeamInput(body, { orgId: u.orgId, orgAgents: Object.values(s.agents).filter((a) => !a.revoked), teams: Object.values(s.teams) });
           const key = teamKey(u.orgId, input.name);
           const current = s.teams[key] ?? null;
-          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, month: t.month ?? null } : null);
+          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, month: t.month ?? null, ...(Array.isArray(t.warnFractions) ? { warnFractions: [...t.warnFractions] } : {}) } : null);
           if (input.remove) {
             if (!current) fail(404, "Team not found");
             delete s.teams[key];
@@ -556,7 +556,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             return { removed: true, name: input.name };
           }
           const { name, agents, day, month } = input;
-          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}) };
+          const warnFractions = input.warnFractions === undefined ? current?.warnFractions : input.warnFractions;
+          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}) };
           audit(s, u.orgId, u.id, "team.change", name, { previous: strip(current), next: strip(s.teams[key]) });
           return verdictOf(s, s.teams[key]);
         });
@@ -619,7 +620,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const silentAfterHours = body.silentAfterHours === undefined ? a.policy.silentAfterHours : body.silentAfterHours;
           // models (issue #153): omitted keeps the allowlist, null clears it.
           const models = body.models === undefined ? a.policy.models : body.models;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}) };
+          // warnFractions (issue #165): omitted keeps, null resets to the [0.8] default, [] turns cap_approaching off.
+          const rawWarn = body.warnFractions === undefined ? a.policy.warnFractions : body.warnFractions;
+          const warnFractions = Array.isArray(rawWarn) && rawWarn.every((f) => typeof f === "number") ? sortWarnFractions(rawWarn) : rawWarn;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null };
@@ -698,6 +702,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       fail(404, "Route not found");
     } catch (err) { if (!res.headersSent) await json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
   });
+  // Issue #165: explicit warning fractions fire at most once per UTC cap period.
+  // Legacy policies (no warnFractions) keep the plain key dedupe.
+  function gateWarnings(s, id, caps, spend, fractions) {
+    if (!Array.isArray(fractions)) return () => true;
+    s.warnArm ??= {};
+    const states = {};
+    for (const scope of ["day", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now() });
+    return (alert) => alert.kind !== "cap_approaching" || alert.fraction === undefined || !states[alert.scope] || claimWarning(states[alert.scope], alert, fractions);
+  }
+  const warnExtra = (alert) => (alert.fraction !== undefined ? { period: capPeriod(alert.scope, now()) } : {});
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {
       const out = [];
@@ -713,14 +727,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (r.reason === "budget_exceeded" && ["run", "day", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
-        const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy) });
+        const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions });
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
+        const warnOk = gateWarnings(s, a.id, a.policy.caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
-          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id }, { nowMs: now(), id: randomUUID() }) });
+          if (!prior && !warnOk(alert)) continue;
+          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
           else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
         }
       }
@@ -731,10 +747,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const blockedScopes = t.agents.flatMap((id) => agentReceipts(s, id))
           .filter((r) => Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith(prefix))
           .map((r) => r.scope.slice(prefix.length));
-        for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict: verdictOf(s, t), blockedScopes })) {
+        const verdict = verdictOf(s, t);
+        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, t.warnFractions);
+        for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes }, { warnFractions: t.warnFractions })) {
           teamKeys.add(alert.key);
           const prior = activeOccurrence(s.alerts, alert.key);
-          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null }, { nowMs: now(), id: randomUUID() }) });
+          if (!prior && !warnOk(alert)) continue;
+          if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
           else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
         }
       }

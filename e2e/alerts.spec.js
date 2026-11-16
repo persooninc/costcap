@@ -76,3 +76,63 @@ test("cap_hit alert shows fired time, can be acknowledged, then resolves on cloc
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #165: per-agent "Warn at (%)" fractions, shown on the card and in the alert list.
+test("Warn at 50, 95 on an agent card fires cap_approaching 50% then 95% once each", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const delivered = [];
+  const clock = Date.parse("2026-11-15T10:00:00.000Z");
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-warn-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("warn-owner@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    await page.locator("#enroll input[name=day]").fill("10");
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const agentToken = await page.evaluate(async (credential) => {
+      const e = await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "researcher" }) });
+      return (await e.json()).token;
+    }, token);
+    await page.locator("#refresh").click();
+    const card = page.locator("#agents .agent", { hasText: "researcher" });
+    await expect(card).toContainText("warn at 80% (default)");
+    await card.locator("input[name=warnAt]").fill("50, 95");
+    await card.getByRole("button", { name: "Save caps" }).click();
+    await expect(page.locator("#agents .agent", { hasText: "researcher" })).toContainText("warn at 50%, 95%");
+    const sync = (id, cost) => page.evaluate(async ({ agentToken, id, cost, ts }) => (await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agentToken}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id, ts, cost_usd: cost, model: "m" }] }) })).status, { agentToken, id, cost, ts: new Date(clock).toISOString() });
+    expect(await sync("r1", 6)).toBe(200);
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_approaching 50% · day" })).toBeVisible();
+    expect(await sync("r2", 3.6)).toBe(200);
+    await service.evaluateFleetAlerts();
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_approaching 95% · day" })).toBeVisible();
+    expect(delivered.filter((a) => a.kind === "cap_approaching").map((a) => a.fraction)).toEqual([0.5, 0.95]);
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});
