@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
+import { budgetRemaining } from "./agent-budget.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
@@ -624,6 +625,19 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
               message: `CostCap preflight estimate: worst case $${pf.estimate_usd} does not fit the remaining ${pf.scope} budget ($${pf.remaining_usd[pf.scope]}). This is an estimate. The upstream call was not made.`,
               scope: pf.scope, estimate_usd: pf.estimate_usd, remaining_usd: pf.remaining_usd } });
+            // #193: the estimate must also fit the agent/team remainder and every matching tag cap.
+            if (preflightEst) {
+              const est = preflightEst.estimate_usd;
+              const left = agentBudgets?.limitsFor ? budgetRemaining(agentBudgets, who) : null;
+              const agentScope = left && ["run", "hour", "day", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
+              if (agentScope) {
+                const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
+                return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
+                  message: `CostCap preflight estimate: worst case $${est} does not fit this agent's remaining ${agentScope} budget ($${detail.remaining_usd}). This is an estimate. The upstream call was not made.` });
+              }
+              const tagPf = tagCaps?.preflight?.(reqTags, est);
+              if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));
+            }
           }
           const vhit = velocity?.check();
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });

@@ -126,6 +126,18 @@ export function createTagCaps({ rules = [], history = [], now = () => new Date()
       }
       return null;
     },
+    /** #193: remaining USD of every rule for this request's merged tags. */
+    remaining(tags) {
+      return rules.map((rule) => {
+        const value = valueOf(tags, rule.key);
+        return { tag_key: rule.key, tag_value: value, scope: rule.scope, cap_usd: rule.cap, remaining_usd: round(Math.max(rule.cap - spendOf(rule.key, value, rule.scope), 0)) };
+      });
+    },
+    /** #193: first rule whose remainder cannot fit a preflight worst-case estimate, else null. */
+    preflight(tags, estimateUsd) {
+      const r = engine.remaining(tags).find((x) => estimateUsd > x.remaining_usd);
+      return r ? { reason: "preflight_estimate", estimate: true, estimate_usd: estimateUsd, ...r } : null;
+    },
     /** Every (rule, value) at or over its cap in the current window, sorted. */
     over() {
       const out = [];
@@ -145,6 +157,10 @@ export function createTagCaps({ rules = [], history = [], now = () => new Date()
 }
 
 export function tagBudgetExceededBody(hit) {
+  if (hit.reason === "preflight_estimate") {
+    return { error: "tag_budget_exceeded", ...hit,
+      message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit ${hit.tag_key}=${hit.tag_value}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.` };
+  }
   return { error: "tag_budget_exceeded", ...hit,
     message: `CostCap: ${hit.tag_key}=${hit.tag_value} reached its ${hit.scope} cap of $${hit.cap_usd} ($${hit.spend_usd} spent). The upstream call was not made.` };
 }

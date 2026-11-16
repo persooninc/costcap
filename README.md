@@ -225,6 +225,8 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
 - `--preflight` (or `COSTCAP_PREFLIGHT=1`, off by default) refuses a call whose
   **estimated** worst case cannot fit the remaining run/day/month budget, before
   any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
+  It also covers `--policy` agent and team budgets (the tighter remainder) and
+  every matching `--tag-cap` (`tag_budget_exceeded`).
   It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
   tokens = `max_tokens` (or `max_completion_tokens`, Gemini
   `generationConfig.maxOutputTokens`), else a conservative provider default,
@@ -605,6 +607,9 @@ invalid key, the `run` scope, a cap that is not `> 0` or a duplicate `KEY:SCOPE`
 anything is spawned. `costcap check --tag-cap customer:day=5` exits 1 when any value is at or over
 its cap and lists them in `tag_caps: [{key, value, scope, spend_usd, cap_usd, verdict}]` (Action
 input `tag-caps`, output `tag-caps`). Fleet/hosted tag caps are not supported yet.
+With `--preflight`, a call whose estimated worst case exceeds a matching value's remaining budget
+(including `(untagged)`) is refused the same way, with `reason: "preflight_estimate"`, `estimate: true`,
+`estimate_usd` and `remaining_usd`, before any upstream call.
 
 With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
 `run_id` is `ID`; output adds `run_id`, `scope: "run"` and separate
