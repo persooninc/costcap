@@ -1,5 +1,5 @@
 {
-  "checkedAt": "2026-11-16T17:42:27.623Z",
+  "checkedAt": "2026-11-16T17:52:14.027Z",
   "command": "npm run acceptance:runaway",
   "provider": "local fake OpenAI",
   "paidCalls": 0,
@@ -18,9 +18,9 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "9f7d9505-3078-4782-9d17-edf6eb439aab",
-          "ts": "2026-11-16T17:42:26.004Z",
-          "run_id": "e5ba071a-bf1b-4b66-a0e6-b30b7e857577",
+          "id": "6aeec79d-18c4-4808-9a6a-3dda16abed2a",
+          "ts": "2026-11-16T17:52:12.127Z",
+          "run_id": "3dd55c2f-674a-4334-b113-95ce77a52fa5",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -39,9 +39,9 @@
           "cost_source": "table"
         },
         {
-          "id": "00655813-9970-49f1-ada2-0600a7a744cb",
-          "ts": "2026-11-16T17:42:26.014Z",
-          "run_id": "e5ba071a-bf1b-4b66-a0e6-b30b7e857577",
+          "id": "e9d87eb0-0490-41b2-a466-6fa6b55f425d",
+          "ts": "2026-11-16T17:52:12.135Z",
+          "run_id": "3dd55c2f-674a-4334-b113-95ce77a52fa5",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -54,19 +54,19 @@
       ],
       "warnings": [
         {
-          "ts": "2026-11-16T17:42:26.009Z",
+          "ts": "2026-11-16T17:52:12.129Z",
           "event": "cap_warning",
           "scope": "run",
           "fraction": 0.8,
           "cap": 0.1,
           "spent_usd": 0.15,
-          "period": "e5ba071a-bf1b-4b66-a0e6-b30b7e857577",
-          "run_id": "e5ba071a-bf1b-4b66-a0e6-b30b7e857577",
+          "period": "3dd55c2f-674a-4334-b113-95ce77a52fa5",
+          "run_id": "3dd55c2f-674a-4334-b113-95ce77a52fa5",
           "agent_id": null,
           "lower_bound": false
         }
       ],
-      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run e5ba071a-bf1b-4b66-a0e6-b30b7e857577)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run e5ba071a-bf1b-4b66-a0e6-b30b7e857577 calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
+      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run 3dd55c2f-674a-4334-b113-95ce77a52fa5)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run 3dd55c2f-674a-4334-b113-95ce77a52fa5 calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
     },
     {
       "scenario": "retry-spiral",
@@ -86,9 +86,9 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "cd41cb68-d20f-4d5d-a60f-42d26894d244",
-          "ts": "2026-11-16T17:42:26.166Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "ea5a87b7-c718-4229-9d01-34852f9a86b9",
+          "ts": "2026-11-16T17:52:12.297Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -107,9 +107,9 @@
           "cost_source": "table"
         },
         {
-          "id": "9c76e542-2b86-4adc-b46e-a03294af8751",
-          "ts": "2026-11-16T17:42:26.173Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "bbb943ff-2efe-4ad9-8b6d-ff1d27845aa0",
+          "ts": "2026-11-16T17:52:12.313Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -128,9 +128,9 @@
           "cost_source": "table"
         },
         {
-          "id": "0d705279-d82e-4095-8429-92a846da6c98",
-          "ts": "2026-11-16T17:42:26.177Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "2ad7fef9-0ca7-41a2-bb9c-dd9f7a089bbb",
+          "ts": "2026-11-16T17:52:12.320Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -149,9 +149,9 @@
           "cost_source": "table"
         },
         {
-          "id": "894f4367-b849-4a0c-aadb-e13af35c5b78",
-          "ts": "2026-11-16T17:42:26.183Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "478e37bc-9465-417e-897d-936c53993f0b",
+          "ts": "2026-11-16T17:52:12.325Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -170,9 +170,9 @@
           "cost_source": "table"
         },
         {
-          "id": "48b47735-7232-457d-bb67-f5de73fe9b21",
-          "ts": "2026-11-16T17:42:26.190Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "6289f095-b821-4879-922d-f3b501b93b09",
+          "ts": "2026-11-16T17:52:12.331Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -191,9 +191,9 @@
           "cost_source": "table"
         },
         {
-          "id": "912bd981-6bc7-4d8b-8f14-c8dd272cf771",
-          "ts": "2026-11-16T17:42:26.196Z",
-          "run_id": "1b053c98-97b2-4113-a01e-112735f58f6a",
+          "id": "d7086a71-acf4-484d-a5df-c525d906c3a6",
+          "ts": "2026-11-16T17:52:12.333Z",
+          "run_id": "907ffaca-e11d-4b36-9615-2e8376de1176",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -205,7 +205,7 @@
         }
       ],
       "warnings": [],
-      "stderr": "costcap: run spend $0.7500\ncostcap: run 1b053c98-97b2-4113-a01e-112735f58f6a calls=5 rejected=0 refused=1 models=1 cost=$0.7500\n"
+      "stderr": "costcap: run spend $0.7500\ncostcap: run 907ffaca-e11d-4b36-9615-2e8376de1176 calls=5 rejected=0 refused=1 models=1 cost=$0.7500\n"
     },
     {
       "scenario": "steps",
@@ -223,9 +223,9 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "7d2525d8-7427-42d0-97d8-0950ba750090",
-          "ts": "2026-11-16T17:42:26.330Z",
-          "run_id": "39913a28-cfac-4c03-8232-58e0c51b42e9",
+          "id": "29552966-d43e-4175-af78-37e14930e17a",
+          "ts": "2026-11-16T17:52:12.503Z",
+          "run_id": "dcecee1c-dadc-4519-86fc-2d1f8c29e006",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -244,9 +244,9 @@
           "cost_source": "table"
         },
         {
-          "id": "2149d414-f989-4a35-baef-44b50c6681d6",
-          "ts": "2026-11-16T17:42:26.337Z",
-          "run_id": "39913a28-cfac-4c03-8232-58e0c51b42e9",
+          "id": "4c03e501-1b97-4f06-bf3a-d8cf8e6e9258",
+          "ts": "2026-11-16T17:52:12.515Z",
+          "run_id": "dcecee1c-dadc-4519-86fc-2d1f8c29e006",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -265,9 +265,9 @@
           "cost_source": "table"
         },
         {
-          "id": "3670e432-d216-4fe7-950e-fe8d2cd21bbf",
-          "ts": "2026-11-16T17:42:26.340Z",
-          "run_id": "39913a28-cfac-4c03-8232-58e0c51b42e9",
+          "id": "0504cea2-a393-4f43-b42e-c93dcf84f47c",
+          "ts": "2026-11-16T17:52:12.519Z",
+          "run_id": "dcecee1c-dadc-4519-86fc-2d1f8c29e006",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -286,9 +286,9 @@
           "cost_source": "table"
         },
         {
-          "id": "565f7a55-56ee-4e4a-9f04-015e04ca24ea",
-          "ts": "2026-11-16T17:42:26.347Z",
-          "run_id": "39913a28-cfac-4c03-8232-58e0c51b42e9",
+          "id": "45378834-a9e1-42be-a0d9-906f14b59694",
+          "ts": "2026-11-16T17:52:12.524Z",
+          "run_id": "dcecee1c-dadc-4519-86fc-2d1f8c29e006",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -299,7 +299,7 @@
         }
       ],
       "warnings": [],
-      "stderr": "costcap: run spend $0.4500\ncostcap: run 39913a28-cfac-4c03-8232-58e0c51b42e9 calls=3 rejected=0 refused=1 models=1 cost=$0.4500 stopped_by=breaker_open\n"
+      "stderr": "costcap: run spend $0.4500\ncostcap: run dcecee1c-dadc-4519-86fc-2d1f8c29e006 calls=3 rejected=0 refused=1 models=1 cost=$0.4500 stopped_by=breaker_open\n"
     },
     {
       "scenario": "day-cap",
@@ -315,14 +315,14 @@
       "receipts": [
         {
           "id": "seed-day",
-          "ts": "2026-11-16T17:42:26.375Z",
+          "ts": "2026-11-16T17:52:12.575Z",
           "cost_usd": 1,
           "model": "gpt-4o-mini"
         },
         {
-          "id": "2363526e-4e53-403e-8bf3-7793a0e9469d",
-          "ts": "2026-11-16T17:42:26.480Z",
-          "run_id": "9842aef9-6e38-4784-9867-9bf1f96f0626",
+          "id": "31f4f75e-86b6-4d07-9718-196d56481a0a",
+          "ts": "2026-11-16T17:52:12.693Z",
+          "run_id": "275c175a-dc25-4102-9539-0b27b7e62c16",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -335,19 +335,19 @@
       ],
       "warnings": [
         {
-          "ts": "2026-11-16T17:42:26.436Z",
+          "ts": "2026-11-16T17:52:12.643Z",
           "event": "cap_warning",
           "scope": "day",
           "fraction": 0.8,
           "cap": 0.5,
           "spent_usd": 1,
           "period": "2026-11-16",
-          "run_id": "9842aef9-6e38-4784-9867-9bf1f96f0626",
+          "run_id": "275c175a-dc25-4102-9539-0b27b7e62c16",
           "agent_id": null,
           "lower_bound": false
         }
       ],
-      "stderr": "costcap: warning: day spend $1.0000 is 80% of $0.5 cap (2026-11-16 UTC)\ncostcap: run spend $0.0000\ncostcap: run 9842aef9-6e38-4784-9867-9bf1f96f0626 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:day\n"
+      "stderr": "costcap: warning: day spend $1.0000 is 80% of $0.5 cap (2026-11-16 UTC)\ncostcap: run spend $0.0000\ncostcap: run 275c175a-dc25-4102-9539-0b27b7e62c16 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:day\n"
     },
     {
       "scenario": "month-cap",
@@ -368,9 +368,9 @@
           "model": "gpt-4o-mini"
         },
         {
-          "id": "3e96b7bb-c2a2-4e04-b4fc-2876d2018952",
-          "ts": "2026-11-16T17:42:26.611Z",
-          "run_id": "5e95c850-c2a0-4da9-a7bd-67f013412bf5",
+          "id": "9dbf9822-9f17-4584-9166-9b2f21c85113",
+          "ts": "2026-11-16T17:52:12.890Z",
+          "run_id": "89e66bc1-0520-46f5-a2bb-c7eb8f563bf2",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -383,19 +383,19 @@
       ],
       "warnings": [
         {
-          "ts": "2026-11-16T17:42:26.559Z",
+          "ts": "2026-11-16T17:52:12.835Z",
           "event": "cap_warning",
           "scope": "month",
           "fraction": 0.8,
           "cap": 0.5,
           "spent_usd": 1,
           "period": "2026-11",
-          "run_id": "5e95c850-c2a0-4da9-a7bd-67f013412bf5",
+          "run_id": "89e66bc1-0520-46f5-a2bb-c7eb8f563bf2",
           "agent_id": null,
           "lower_bound": false
         }
       ],
-      "stderr": "costcap: warning: month spend $1.0000 is 80% of $0.5 cap (2026-11 UTC)\ncostcap: run spend $0.0000\ncostcap: run 5e95c850-c2a0-4da9-a7bd-67f013412bf5 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:month\n"
+      "stderr": "costcap: warning: month spend $1.0000 is 80% of $0.5 cap (2026-11 UTC)\ncostcap: run spend $0.0000\ncostcap: run 89e66bc1-0520-46f5-a2bb-c7eb8f563bf2 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:month\n"
     },
     {
       "scenario": "unknown-cost",
@@ -411,15 +411,15 @@
       "receipts": [
         {
           "id": "seed-unknown",
-          "ts": "2026-11-16T17:42:26.375Z",
+          "ts": "2026-11-16T17:52:12.575Z",
           "cost_usd": null,
           "model": "gpt-4o-mini",
           "reason": "usage_unavailable"
         },
         {
-          "id": "8ac5d8ea-83f2-4419-8646-2bbc4a6a8bc5",
-          "ts": "2026-11-16T17:42:26.743Z",
-          "run_id": "6c5630bb-2caa-476a-ab4c-a4153953293a",
+          "id": "8ceb387d-d71c-4e33-b3e6-304ff3b66180",
+          "ts": "2026-11-16T17:52:13.072Z",
+          "run_id": "bb42c423-a603-4633-94af-f616d2f86b3c",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -431,7 +431,7 @@
         }
       ],
       "warnings": [],
-      "stderr": "costcap: run spend $0.0000 of $5 cap\ncostcap: run 6c5630bb-2caa-476a-ab4c-a4153953293a calls=0 rejected=0 refused=1 models=0 cost=$0.0000\n"
+      "stderr": "costcap: run spend $0.0000 of $5 cap\ncostcap: run bb42c423-a603-4633-94af-f616d2f86b3c calls=0 rejected=0 refused=1 models=0 cost=$0.0000\n"
     },
     {
       "scenario": "kill-file",
@@ -446,21 +446,21 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "106c1ce4-ac30-4afa-a4fe-bfb7f43ffd55",
-          "ts": "2026-11-16T17:42:27.609Z",
-          "run_id": "30cb8d5f-da9f-470b-a7a9-e4299810ca31",
+          "id": "6374dca4-ab79-4af5-bc64-e2dff7748135",
+          "ts": "2026-11-16T17:52:14.002Z",
+          "run_id": "a0d234d0-69f9-4877-9fb3-5d0c237b9f0a",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
           "reason": "killed",
           "cost_usd": 0,
           "kill_scope": "project",
-          "kill_file": "/var/folders/c0/k16w9wkj7nnc9q2mlnk31tf40000gn/T/cc-runaway-vf5efa/KILL",
+          "kill_file": "/var/folders/c0/k16w9wkj7nnc9q2mlnk31tf40000gn/T/cc-runaway-IFOZ6V/KILL",
           "note": "synthetic frozen"
         }
       ],
       "warnings": [],
-      "stderr": "costcap: run spend $0.0000\ncostcap: run 30cb8d5f-da9f-470b-a7a9-e4299810ca31 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=killed:project\n"
+      "stderr": "costcap: run spend $0.0000\ncostcap: run a0d234d0-69f9-4877-9fb3-5d0c237b9f0a calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=killed:project\n"
     },
     {
       "scenario": "stream-cap",
@@ -476,9 +476,9 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "0997694d-0986-4c75-8393-df913814f174",
-          "ts": "2026-11-16T17:42:27.472Z",
-          "run_id": "201dfa0f-499d-4686-b322-bfcb59873fa7",
+          "id": "c375eceb-10ab-4750-8a3f-8dec66f306d9",
+          "ts": "2026-11-16T17:52:13.841Z",
+          "run_id": "808aed80-625b-4d92-8ab9-815b523f63fb",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -497,9 +497,9 @@
           "cost_source": "table"
         },
         {
-          "id": "7c8caac0-f047-4d58-ba9c-9259f22e3588",
-          "ts": "2026-11-16T17:42:27.475Z",
-          "run_id": "201dfa0f-499d-4686-b322-bfcb59873fa7",
+          "id": "d8bf2c69-649a-4f1f-a94e-d9a350bb7546",
+          "ts": "2026-11-16T17:52:13.846Z",
+          "run_id": "808aed80-625b-4d92-8ab9-815b523f63fb",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -512,19 +512,19 @@
       ],
       "warnings": [
         {
-          "ts": "2026-11-16T17:42:27.473Z",
+          "ts": "2026-11-16T17:52:13.843Z",
           "event": "cap_warning",
           "scope": "run",
           "fraction": 0.8,
           "cap": 0.1,
           "spent_usd": 0.15,
-          "period": "201dfa0f-499d-4686-b322-bfcb59873fa7",
-          "run_id": "201dfa0f-499d-4686-b322-bfcb59873fa7",
+          "period": "808aed80-625b-4d92-8ab9-815b523f63fb",
+          "run_id": "808aed80-625b-4d92-8ab9-815b523f63fb",
           "agent_id": null,
           "lower_bound": false
         }
       ],
-      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run 201dfa0f-499d-4686-b322-bfcb59873fa7)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run 201dfa0f-499d-4686-b322-bfcb59873fa7 calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
+      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run 808aed80-625b-4d92-8ab9-815b523f63fb)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run 808aed80-625b-4d92-8ab9-815b523f63fb calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
     }
   ]
 }

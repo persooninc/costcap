@@ -550,7 +550,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/spend" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          const query = parseSpendQuery(new URL(req.url, origin).searchParams);
+          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { budgetPeriod: orgPeriod(s, u.orgId), now: now() });
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
           return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
         }));
@@ -559,7 +559,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/spend.csv" && req.method === "GET") {
         const csv = store.read((s) => {
           const u = member(s, req);
-          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { csv: true });
+          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { csv: true, budgetPeriod: orgPeriod(s, u.orgId), now: now() });
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
           return spendCsv(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
         });

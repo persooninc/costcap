@@ -247,3 +247,59 @@ test("#213 GET /v1/spend?group_by=team and /v1/spend.csv: auth, viewer + viewer 
   assert.equal((await f.request("/v1/spend?group_by=team", undefined, null, key)).status, 200);
   for (const q of ["group_by=nope", "period=week", "since=bad", "until=2026-13-40"]) assert.equal((await f.request(`/v1/spend.csv?${q}`, undefined, owner)).status, 400, q);
 });
+
+// Issue #215: date-only since/until and range= follow the org budget period.
+const LA = { timezone: "America/Los_Angeles", monthStartDay: 15 };
+const LA_NOW = Date.parse("2026-11-20T12:00:00-08:00");
+test("#215 parseSpendQuery: range=current_month|7d|30d and date-only since/until are local to the budget period (DST-safe)", () => {
+  const q = (s, bp = LA, now = LA_NOW) => parseSpendQuery(new URLSearchParams(s), { budgetPeriod: bp, now });
+  assert.equal(q("range=current_month").since, Date.parse("2026-11-15T00:00:00-08:00"));
+  assert.equal(q("range=current_month").range, "current_month");
+  // 7d: Nov 14..20 local; 30d: Oct 22 (PDT) .. Nov 20, spanning the Nov 1 fall-back.
+  assert.equal(q("range=7d").since, Date.parse("2026-11-14T00:00:00-08:00"));
+  assert.equal(q("range=30d").since, Date.parse("2026-10-22T00:00:00-07:00"));
+  assert.equal(q("range=7d", null, Date.parse("2026-11-03T12:00:00-08:00")).since, Date.parse("2026-10-28T00:00:00Z"));
+  assert.equal(q("range=7d", { timezone: "America/Los_Angeles" }, Date.parse("2026-11-03T12:00:00-08:00")).since, Date.parse("2026-10-28T00:00:00-07:00"));
+  const d = q("since=2026-11-01&until=2026-11-01");
+  assert.equal(d.since, Date.parse("2026-11-01T00:00:00-07:00"));
+  assert.equal(d.until, Date.parse("2026-11-02T00:00:00-08:00")); // 25-hour fall-back day
+  assert.equal(d.untilExclusive, true);
+  // No budget period: identical to the old UTC behaviour.
+  assert.deepEqual(q("since=2026-11-01&until=2026-11-01", null), parseSpendQuery(new URLSearchParams("since=2026-11-01&until=2026-11-01")));
+  assert.equal(q("since=2026-11-01", null).since, Date.parse("2026-11-01T00:00:00Z"));
+  // Previous behaviour with monthStartDay 1 at 18:00 PDT Oct 31: still October locally.
+  assert.equal(q("range=current_month", { timezone: "America/Los_Angeles" }, Date.parse("2026-10-31T18:00:00-07:00")).since, Date.parse("2026-10-01T00:00:00-07:00"));
+  for (const bad of ["range=week", "range=7d&since=2026-11-01"]) assert.throws(() => q(bad), (e) => e.status === 400, bad);
+});
+
+test("#215 /v1/spend and /v1/spend.csv with range=current_month under an LA/15th budget period", async (t) => {
+  const f = await serve(t);
+  f.setNow(LA_NOW);
+  const owner = await f.login("range-owner@example.invalid");
+  const a = await f.agent(owner, "solo");
+  const receipts = [
+    { id: "old", ts: "2026-11-10T12:00:00-08:00", cost_usd: 5, model: "gpt-4.1" },
+    { id: "edge", ts: "2026-11-15T00:30:00-08:00", cost_usd: 1, model: "gpt-4.1" },
+    { id: "late", ts: "2026-11-19T09:00:00-08:00", cost_usd: 2, model: "gpt-4.1" },
+  ];
+  assert.equal((await f.request("/v1/receipts", { receipts }, null, a.token)).status, 200);
+  const utc = (await f.request("/v1/spend?since=2026-11-01", undefined, owner)).body;
+  assert.equal(utc.since, "2026-11-01T00:00:00.000Z");
+  assert.equal(utc.since_local, "2026-11-01");
+  assert.equal(utc.range, undefined);
+  assert.equal((await f.request("/v1/budget-period", LA, owner)).status, 200);
+  const r = (await f.request("/v1/spend?range=current_month", undefined, owner)).body;
+  assert.equal(r.range, "current_month");
+  assert.equal(r.since, new Date(Date.parse("2026-11-15T00:00:00-08:00")).toISOString());
+  assert.equal(r.since_local, "2026-11-15");
+  assert.equal(r.total.usd_known, 3);
+  assert.equal(r.total.calls, 2);
+  const local = (await f.request("/v1/spend?since=2026-11-01", undefined, owner)).body;
+  assert.equal(local.since, "2026-11-01T07:00:00.000Z");
+  const csv = await f.request("/v1/spend.csv?group_by=team&period=month&range=current_month", undefined, owner);
+  assert.equal(csv.status, 200);
+  const rows = csv.text.split("\n").filter((l) => /^\d{4}-/.test(l));
+  assert.deepEqual(rows, ["2026-11,team,(no team),(no team),3,2,0,true,0"]);
+  assert.equal((await f.request("/v1/spend?range=bogus", undefined, owner)).status, 400);
+  assert.equal((await f.request("/v1/spend.csv?range=7d&since=2026-11-01", undefined, owner)).status, 400);
+});

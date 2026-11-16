@@ -3,7 +3,7 @@
 // unknown cost counts at its settled value in its original bucket.
 
 import { TAG_KEY } from "../tags.js";
-import { normalizeBudgetPeriod, periodKey } from "../period.js";
+import { normalizeBudgetPeriod, periodKey, periodBounds, localParts, zonedMidnight } from "../period.js";
 import { cell } from "./receipts-csv.js";
 
 export const SPEND_GROUPS = ["day", "model", "agent", "tag", "team"];
@@ -12,13 +12,25 @@ export const UNTAGGED = "(untagged)";
 export const NO_TEAM = "(no team)";
 export const CSV_PERIODS = ["day", "month"];
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
-const DAY_MS = 86_400_000;
 const round6 = (n) => Math.round(n * 1e6) / 1e6;
 
 const bad = (message) => { const err = new Error(message); err.status = 400; return err; };
 
-// since/until are ISO instants or YYYY-MM-DD (UTC). A date-only until covers that whole day.
-export function parseSpendQuery(params, { csv = false } = {}) {
+export const SPEND_RANGES = ["current_month", "7d", "30d"];
+
+// #215: start (UTC ms) of a named range in the org budget period: the current
+// budget-month start, or local midnight N-1 days before today (DST-safe).
+export function rangeStart(range, nowMs, budgetPeriod) {
+  const bp = normalizeBudgetPeriod(budgetPeriod);
+  if (range === "current_month") return periodBounds("month", nowMs, bp).start;
+  const { year, month, day } = localParts(nowMs, bp.timezone);
+  return zonedMidnight(year, month, day - (range === "30d" ? 29 : 6), bp.timezone);
+}
+
+// since/until are ISO instants or YYYY-MM-DD. A date-only value is local
+// midnight in the org budget-period timezone (#215; UTC when unset), and a
+// date-only until covers that whole local day. range= replaces since.
+export function parseSpendQuery(params, { csv = false, budgetPeriod = null, now = Date.now() } = {}) {
   const groupBy = params.get("group_by") ?? "day";
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   const out = { groupBy };
@@ -27,13 +39,26 @@ export function parseSpendQuery(params, { csv = false } = {}) {
     if (!tagKey || !TAG_KEY.test(tagKey)) throw bad("tag_key is required with group_by=tag and must match [a-z0-9_.-]{1,32}");
     out.tagKey = tagKey;
   }
+  const tz = normalizeBudgetPeriod(budgetPeriod).timezone;
+  const range = params.get("range");
+  if (range !== null) {
+    if (!SPEND_RANGES.includes(range)) throw bad(`range must be one of ${SPEND_RANGES.join("|")}`);
+    if (params.get("since") !== null) throw bad("use either range or since, not both");
+    out.range = range;
+    out.since = rangeStart(range, now, budgetPeriod);
+  }
   for (const key of ["since", "until"]) {
     const v = params.get(key);
     if (v === null) continue;
-    const ms = Date.parse(DATE_ONLY.test(v) ? `${v}T00:00:00Z` : v);
+    const dateOnly = DATE_ONLY.test(v);
+    let ms = Date.parse(dateOnly ? `${v}T00:00:00Z` : v);
     if (!v || !Number.isFinite(ms) || !/^\d{4}-\d{2}-\d{2}/.test(v)) throw bad(`${key} must be an ISO date`);
-    out[key] = key === "until" && DATE_ONLY.test(v) ? ms + DAY_MS : ms;
-    if (key === "until") out.untilExclusive = DATE_ONLY.test(v);
+    if (dateOnly) {
+      const [y, m, d] = v.split("-").map(Number);
+      ms = zonedMidnight(y, m, d + (key === "until" ? 1 : 0), tz);
+    }
+    out[key] = ms;
+    if (key === "until") out.untilExclusive = dateOnly;
   }
   if (out.since !== undefined && out.until !== undefined && out.since > out.until) throw bad("since must be before until");
   if (csv) {
@@ -46,7 +71,7 @@ export function parseSpendQuery(params, { csv = false } = {}) {
 
 // items: [{ agentId, receipt, settlement? }]. names: { agentId: label }.
 // teams (group_by=team): [{ name, agents }] of the caller's org only.
-export function spendBreakdown(items, { groupBy = "day", since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [] } = {}) {
+export function spendBreakdown(items, { groupBy = "day", range = null, since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [] } = {}) {
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   if (groupBy === "tag" && (!tagKey || !TAG_KEY.test(tagKey))) throw bad("tag_key is required with group_by=tag");
   let from = since, clamped = false;
@@ -99,7 +124,10 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
     ...(groupBy === "tag" ? { tag_key: tagKey } : {}),
     ...(groupBy === "team" ? { team_membership: "current" } : {}),
     budget_period: { ...normalizeBudgetPeriod(budgetPeriod) },
+    ...(range ? { range } : {}),
     since: from === undefined ? null : new Date(from).toISOString(),
+    // #215: the local start date in the budget-period timezone, for "Total since".
+    since_local: from === undefined ? null : periodKey("day", from, budgetPeriod),
     until: until === undefined ? null : new Date(until).toISOString(),
     retention_clamped: clamped,
     total: { ...total, usd_known: round6(total.usd_known), saved_usd: round6(total.saved_usd), user_priced_usd: round6(total.user_priced_usd) },

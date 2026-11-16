@@ -15,4 +15,4 @@ The run uses the CLI wrapper, a local fake OpenAI server, and no credentials. Pa
 | kill-file | 0 | killed |  | 1 | 0 |
 | stream-cap | 1 | budget_exceeded | run | 2 | 0 |
 
-Checked at 2026-11-16T17:42:27.623Z. Node v24.16.0.
+Checked at 2026-11-16T17:52:14.027Z. Node v24.16.0.

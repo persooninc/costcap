@@ -58,6 +58,16 @@ test("Budget period card: timezone moves a receipt to its local day in the Spend
     await expect(local.locator(".incomplete")).toContainText("1 unknown");
     await expect(page.locator(`#spendDays [data-key="${utcDay}"]`)).toHaveCount(0);
     await expect(page.locator("#spendTotal")).toContainText("America/Los_Angeles");
+    // #215: the period select asks the server for range=, never a browser-computed UTC since.
+    const spendUrls = [];
+    page.on("request", (r) => { if (r.url().includes("/v1/spend")) spendUrls.push(r.url()); });
+    const monthReq = page.waitForResponse((r) => r.url().includes("/v1/spend?group_by=day") && r.url().includes("range=current_month"));
+    await page.locator("#spendPeriodSelect").selectOption("month");
+    const month = await (await monthReq).json();
+    expect(month.range).toBe("current_month");
+    await expect(page.locator("#spendTotal")).toContainText(`Total since ${month.since_local}`);
+    expect(spendUrls.every((u) => u.includes("range=") && !u.includes("since="))).toBe(true);
+    await expect(page.locator("#spendCsv")).toHaveAttribute("href", /range=current_month/);
 
     const ctx = await browser.newContext();
     await ctx.addCookies([{ name: "costcap_session", value: viewer.split("=")[1], url: origin }]);
