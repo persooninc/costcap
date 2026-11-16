@@ -30,7 +30,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      actions: write # upload the Playwright trace only after a failure
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -39,11 +38,18 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
+      # persooninc/infra/actions/ci-artifacts is not resolvable from this repo
+      # ("Unable to resolve action persooninc/infra, not found"), which failed the
+      # job at setup. The runner IS dev-home-01, so copy the trace locally instead.
       - name: playwright-trace (failure only -> dev-home-01)
         if: failure()
-        uses: persooninc/infra/actions/ci-artifacts@e203328c0762512f8e80465d69b72cb88bbb708d # ci-artifacts-v1.3
-        with:
-          name: playwright-trace
-          path: |
-            test-results/
-            playwright-report/
+        env:
+          RUN_DIR: costcap/${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          dest="/srv/ci-artifacts/$RUN_DIR"
+          if mkdir -p "$dest" 2>/dev/null; then
+            cp -r test-results playwright-report "$dest"/ 2>/dev/null || true
+            echo "playwright trace saved to $dest"
+          else
+            echo "::warning::/srv/ci-artifacts not writable; trace left in workspace"
+          fi
