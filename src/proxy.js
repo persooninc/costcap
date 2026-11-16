@@ -58,7 +58,11 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   }
   // #188: read by Claude Code (CLAUDE_CODE_USE_BEDROCK / _VERTEX) and the Anthropic Bedrock/Vertex SDKs.
   if (providers.includes("bedrock")) lines.push(`ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:${port}/bedrock`);
-  if (providers.includes("vertex")) lines.push(`ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:${port}/vertex/v1`);
+  if (providers.includes("vertex")) {
+    lines.push(`ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:${port}/vertex/v1`);
+    // #217: Google's genai SDKs read GOOGLE_VERTEX_BASE_URL in Vertex mode (Gemini on Vertex).
+    lines.push(`GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:${port}/vertex`);
+  }
   return lines;
 }
 
@@ -581,7 +585,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const cloudRoute = cloud ? classifyCloudRoute(provider, req.method, cloudPath) : null;
     if (cloud && !cloudRoute) {
       req.resume();
-      send(404, { error: "cloud_route_unsupported", message: `CostCap meters only Claude Messages routes on ${provider}. The upstream call was not made.` });
+      send(404, { error: "cloud_route_unsupported", message: `CostCap meters only Claude Messages${provider === "vertex" ? " and Gemini generateContent / streamGenerateContent / countTokens" : " and Converse"} routes on ${provider}. The upstream call was not made.` });
       return;
     }
     // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
@@ -758,7 +762,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
             const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor), onFit)
-              : preflightCheck(cap, provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
+              : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -844,7 +848,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             delete headers.host; // fetch derives Host from the URL; it matches the signed value
           }
         }
-        const meterAs = cloud ? "anthropic" : provider;
+        const meterAs = cloudRoute?.gemini ? "gemini" : cloud ? "anthropic" : provider;
         try {
           const abort = new AbortController();
           let timer;

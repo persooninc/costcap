@@ -184,7 +184,7 @@ providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `
   --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
   `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
 
-## Claude on Bedrock / Vertex
+## Claude on Bedrock / Vertex, Gemini on Vertex
 
 `costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and
 `ANTHROPIC_VERTEX_BASE_URL`, so boto3 / AWS SDK v3 Bedrock callers, Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
@@ -202,6 +202,16 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   it alone and warns once. Non-Anthropic Converse models (Nova, Llama, …) are unpriced.
   Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
   `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
+- **Gemini on Vertex.** wrap also sets `GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex`
+  (read by Google's genai SDKs with `vertexai=True`; for SDKs that don't read it, pass
+  `http_options.base_url` with that value). `…/publishers/google/models/{id}:generateContent`,
+  `:streamGenerateContent` (`?alt=sse` or the default JSON-array stream) and `:countTokens`
+  (free) are metered from `usageMetadata` exactly like `/gemini` calls, with caps, kill switch,
+  allowlist and preflight (`generationConfig.maxOutputTokens`). Receipts have provider `vertex`.
+  `@version` / `-NNN` suffixes price as the base id; only Gemini models listed under
+  `vertex_gemini` in the pricing table are priced, any other id is unknown (never $0).
+  Batch prediction, `cachedContents`, tuning, Imagen, Veo, embeddings and Live stay
+  `404 cloud_route_unsupported`.
 - **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes
   through unchanged; the region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`. A SigV4
   request is signed by the child for the local proxy, so CostCap verifies it with the static

@@ -123,6 +123,12 @@ export function regionalMultiplier(model) {
   return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
 }
 
+// #217: Gemini models with a published Vertex AI rate (same per-token rates as the table entry).
+export function vertexGeminiModels() {
+  const list = table.vertex_gemini?.models;
+  return Array.isArray(list) ? list.filter((id) => Object.hasOwn(table.models, id)) : [];
+}
+
 // Every numeric rate (including the long-context set) times m; thresholds unchanged.
 export function scalePrice(price, m) {
   const out = scaleRates(price, m);

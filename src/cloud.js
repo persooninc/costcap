@@ -2,7 +2,7 @@
 // host derivation, path-model mapping and a real-time AWS eventstream decoder.
 // The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
 // Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
-import { resolveModelId } from "./pricing.js";
+import { resolveModelId, vertexGeminiModels } from "./pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
 export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
@@ -12,7 +12,8 @@ export const BEDROCK_UPSTREAM = "aws:bedrock-runtime";
 export const VERTEX_UPSTREAM = "gcp:aiplatform";
 
 const BEDROCK_ROUTE = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens|converse|converse-stream)$/;
-const VERTEX_ROUTE = /^\/v1(?:beta1)?\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):(rawPredict|streamRawPredict)$/;
+const VERTEX_ROUTE = /^\/v1(?:beta1)?\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):(rawPredict|streamRawPredict|generateContent|streamGenerateContent|countTokens)$/;
+const GEMINI_VERBS = new Set(["generateContent", "streamGenerateContent", "countTokens"]);
 const REGION = /^[a-z]+-[a-z]+\d+$/; // GCP regions: us-east5, europe-west1
 
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return null; } };
@@ -38,6 +39,14 @@ export function classifyCloudRoute(provider, method, pathname) {
     if (!m) return null;
     const location = m[2];
     if (location !== "global" && !REGION.test(location)) return null; // multi-region hosts are out of scope
+    if (GEMINI_VERBS.has(m[5])) {
+      // #217: Gemini on Vertex (publisher google only); the model id is in the path.
+      if (m[3] !== "google") return null;
+      const modelId = safeDecode(m[4]);
+      if (!modelId) return null;
+      return { modelId: `google/${modelId}`, publisher: "google", gemini: true, stream: m[5] === "streamGenerateContent",
+        countTokens: m[5] === "countTokens", scope: location === "global" ? "global" : "regional", location };
+    }
     const countTokens = m[4] === "count-tokens";
     if (countTokens && m[5] !== "rawPredict") return null;
     return { modelId: countTokens ? null : `${m[3] === "anthropic" ? "" : `${m[3]}/`}${m[4]}`, publisher: m[3], stream: m[5] === "streamRawPredict",
@@ -83,11 +92,25 @@ export function mapCloudModel(provider, rawId) {
     if (!id.startsWith("anthropic.")) return null;
     id = id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, "");
   } else if (provider === "vertex") {
+    if (id.startsWith("google/")) return mapVertexGemini(id.slice("google/".length));
     if (id.includes("/")) return null; // non-Anthropic publisher
     id = id.replace(/@(?:\d{8}|latest)$/, "");
   } else return null;
   if (!id.startsWith("claude-")) return null;
   return resolveModelId(id);
+}
+
+/**
+ * #217: a Vertex Gemini model id (gemini-2.5-pro, gemini-2.5-flash@001, gemini-2.0-flash-001)
+ * mapped to its pricing-table id, only when the table lists a Vertex rate for it. Else null.
+ */
+export function mapVertexGemini(rawId) {
+  if (typeof rawId !== "string" || !rawId.startsWith("gemini-")) return null;
+  const listed = vertexGeminiModels();
+  for (const id of [rawId, rawId.replace(/@[A-Za-z0-9._-]+$/, ""), rawId.replace(/@[A-Za-z0-9._-]+$/, "").replace(/-\d{3}$/, "")]) {
+    if (listed.includes(id)) return id;
+  }
+  return null;
 }
 
 // ---- AWS eventstream (application/vnd.amazon.eventstream) ----

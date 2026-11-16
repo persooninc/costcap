@@ -102,7 +102,8 @@ test("model mapping: geo/anthropic prefixes and version suffix stripped; non-Ant
   assert.equal(mapCloudModel("bedrock", "anthropic.titan-v1"), null);
   assert.equal(mapCloudModel("vertex", "claude-opus-4-5@20251101"), "claude-opus-4-5");
   assert.equal(mapCloudModel("vertex", "claude-sonnet-4-5@latest"), "claude-sonnet-4-5");
-  assert.equal(mapCloudModel("vertex", "google/gemini-2.5-pro"), null);
+  assert.equal(mapCloudModel("vertex", "google/gemini-2.5-pro"), "gemini-2.5-pro"); // #217
+  assert.equal(mapCloudModel("vertex", "meta/llama-4"), null);
   assert.equal(mapCloudModel("other", "claude-opus-4-5"), null);
   assert.equal(mapCloudModel("vertex", ""), null);
   assert.equal(resolveModelId(42), null);
