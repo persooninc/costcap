@@ -54,9 +54,13 @@ export function loadEvents(path) {
   return loadLines(path).filter((r) => r.event);
 }
 
-// caps: { run, day, month } in USD; any may be undefined.
+export const CAP_SCOPES = Object.freeze(["run", "hour", "day", "month"]);
+export const HOUR_MS = 60 * 60 * 1000;
+
+// caps: { run, hour, day, month } in USD; any may be undefined.
+// hour (#172) is a rolling window: spend with now - 60min < ts <= now. It never latches.
 export function createCapEngine({ caps = {}, history = [], now = () => new Date() } = {}) {
-  for (const scope of ["run", "day", "month"]) {
+  for (const scope of CAP_SCOPES) {
     if (caps[scope] != null && (!Number.isFinite(caps[scope]) || caps[scope] <= 0)) throw new Error(`Invalid ${scope} cap`);
   }
   for (const r of history) {
@@ -71,39 +75,76 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
   const byDay = new Map();
   const byMonth = new Map();
+  // Rolling hour window: time-ordered [ms, cost] entries, evicted from the front,
+  // so check() stays amortised O(1). Entries stamped after now (clock skew) count
+  // right away, which only errs toward stopping; out-of-order inserts (settlements)
+  // use binary search.
+  const win = [];
+  let head = 0;
+  let hourSum = 0;
+  const addWindow = (ms, cost) => {
+    if (cost <= 0) return;
+    hourSum += cost;
+    let lo = head, hi = win.length;
+    if (hi > lo && win[hi - 1][0] > ms) {
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (win[mid][0] <= ms) lo = mid + 1; else hi = mid; }
+      win.splice(lo, 0, [ms, cost]);
+    } else win.push([ms, cost]);
+  };
   const add = (ts, cost) => {
-    const key = new Date(ts).toISOString();
+    const d = new Date(ts);
+    const key = d.toISOString();
     byDay.set(key.slice(0, 10), (byDay.get(key.slice(0, 10)) ?? 0) + cost);
     byMonth.set(key.slice(0, 7), (byMonth.get(key.slice(0, 7)) ?? 0) + cost);
+    addWindow(d.getTime(), cost);
   };
   for (const r of history) if (r.cost_usd !== null) add(r.ts, r.cost_usd);
+  // Entries with ts <= now - 60min are evicted; entries with ts > now are not counted yet.
+  function hourSpend(nowMs) {
+    while (head < win.length && win[head][0] <= nowMs - HOUR_MS) { hourSum -= win[head][1]; head += 1; }
+    if (head > 1024 && head * 2 > win.length) { win.splice(0, head); head = 0; }
+    if (head === win.length || hourSum < 0) hourSum = Math.max(0, head === win.length ? 0 : hourSum);
+    return hourSum;
+  }
 
   function spend() {
-    const n = now().toISOString();
-    return { run, day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown };
+    const d = now();
+    const n = d.toISOString();
+    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown };
+  }
+
+  // Seconds until hour spend falls below cap (spend ages out from the oldest entry).
+  function retryAfter(cap, nowMs) {
+    let left = hourSpend(nowMs);
+    for (let i = head; i < win.length; i++) {
+      left -= win[i][1];
+      if (left < cap - 1e-9) return Math.max(1, Math.ceil((win[i][0] + HOUR_MS - nowMs) / 1000));
+    }
+    return Math.ceil(HOUR_MS / 1000);
   }
 
   return {
     spend,
     limits: () => ({ ...caps }),
     updateCaps(next) {
-      for (const scope of ["run", "day", "month"]) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
+      for (const scope of CAP_SCOPES) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
       caps = { ...next };
     },
     // Remaining USD per capped scope (uncapped scopes omitted). Used by preflight (CC-9).
     remaining() {
       const s = spend();
       const out = {};
-      for (const scope of ["run", "day", "month"]) if (caps[scope] != null) out[scope] = Number(Math.max(0, caps[scope] - s[scope]).toFixed(6));
+      for (const scope of CAP_SCOPES) if (caps[scope] != null) out[scope] = Number(Math.max(0, caps[scope] - s[scope]).toFixed(6));
       return out;
     },
     // Returns null if the call may proceed, else a budget-exceeded descriptor.
     check() {
       if (unknown > 0) return { scope: "accounting", cap: 0, spent: 0, reason: "unreconciled_receipt" };
       const s = spend();
-      for (const scope of ["run", "day", "month"]) {
+      for (const scope of CAP_SCOPES) {
         const cap = caps[scope];
         if (cap != null && s[scope] >= cap) {
+          if (scope === "hour") return { scope, cap, spent: Number(s.hour.toFixed(6)), retry_after_s: retryAfter(cap, now().getTime()) };
           return { scope, cap, spent: Number(s[scope].toFixed(6)) };
         }
       }
@@ -136,6 +177,7 @@ export function budgetExceededBody(hit) {
       scope: hit.scope,
       cap_usd: hit.cap,
       spent_usd: hit.spent,
+      ...(hit.retry_after_s != null ? { retry_after_s: hit.retry_after_s } : {}),
     },
   };
 }

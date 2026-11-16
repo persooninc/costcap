@@ -3,7 +3,7 @@
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id"]);
+export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id"]);
 
 const usd = (n) => (n == null ? "" : String(Number(Number(n).toFixed(6))));
 
@@ -16,6 +16,7 @@ export function checkOutputs(result, caps = {}) {
     verdict,
     "spent-usd": unknown ? "" : usd(result.total_usd),
     "cap-usd": usd(caps.run),
+    "hour-spent-usd": ledgerUnknown ? "" : usd(result.spend?.hour),
     "day-spent-usd": ledgerUnknown ? "" : usd(result.spend?.day),
     "month-spent-usd": ledgerUnknown ? "" : usd(result.spend?.month),
     "unknown-receipts": String(result.unknown_cost_count),

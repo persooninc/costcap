@@ -417,7 +417,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const url = new URL(req.url, "http://localhost");
     const [, provider, ...rest] = url.pathname.split("/");
     const upstream = upstreams[provider];
-    const send = (status, body) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body)); };
+    const send = (status, body, headers = {}) => { if (!res.writableEnded && !res.destroyed) res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body)); };
     if (!upstream || !rest.length) { send(404, { error: "unknown provider path" }); return; }
     // #169: x-costcap-tag is CostCap's, never the provider's. Wrapper tags win on a clash.
     let reqTags = null, tagError = null;
@@ -455,7 +455,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const storedPath = receiptPath(`/${rest.join("/")}`, url.search);
         const block = (reason, detail, response) => {
           emit({ provider, path: storedPath, blocked: true, reason, cost_usd: 0, ...detail });
-          send(429, response);
+          // #172: an hour-cap refusal says when enough spend ages out of the window.
+          send(429, response, detail?.retry_after_s != null ? { "retry-after": String(detail.retry_after_s) } : {});
           return "blocked";
         };
         let requestedModel, parsedBody;

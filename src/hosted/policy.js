@@ -26,7 +26,7 @@ export function verifyToken(token, storedHash) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-const CAP_KEYS = ["run", "day", "month"];
+const CAP_KEYS = ["run", "hour", "day", "month"];
 
 export function validatePolicy(p) {
   const errors = [];

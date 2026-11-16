@@ -60,7 +60,7 @@ test("regression: bucketed spend keeps day and month boundaries exact (stress fi
   assert.equal(cap.check().scope, "day");
   n = new Date("2026-12-01T00:00:00Z");
   assert.equal(cap.check(), null);
-  assert.deepEqual(cap.spend(), { run: 2, day: 0, month: 0, unknown: 0 });
+  assert.deepEqual(cap.spend(), { run: 2, hour: 0, day: 0, month: 0, unknown: 0 });
   cap.record({ cost_usd: 3 });
   assert.equal(cap.check().scope, "day");
 });

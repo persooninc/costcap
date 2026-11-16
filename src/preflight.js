@@ -94,14 +94,14 @@ function estimateOne(provider, req, text, path, forcedModel) {
   return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
 }
 
-// Compares the estimate with the remaining run/day/month budget.
+// Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
 export function preflightCheck(cap, provider, body, path, onFit) {
   const est = estimateWorstCase(provider, body, path);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = cap?.remaining?.() ?? {};
-  for (const scope of ["run", "day", "month"]) {
+  for (const scope of ["run", "hour", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
       return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,
         input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier };

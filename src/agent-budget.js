@@ -5,7 +5,8 @@ import { isPendingBatch } from "./cap.js";
 // using the shared ledger's rows for that agent.
 
 export const UNKNOWN_AGENT = "unknown";
-export const SCOPES = Object.freeze(["run", "day", "month"]);
+export const SCOPES = Object.freeze(["run", "hour", "day", "month"]);
+const HOUR_MS = 60 * 60 * 1000;
 
 const round6 = (n) => Number(n.toFixed(6));
 
@@ -69,7 +70,7 @@ export function assertAgentPolicy(policy) {
 }
 
 // policy: { default?: Limits, agents?: { [agentId]: Limits } }
-// Limits: { run?, day?, month? (USD), maxSteps? (upstream calls per run), models? (allowlist, #153) }
+// Limits: { run?, hour? (rolling 60 min, #172), day?, month? (USD), maxSteps? (upstream calls per run), models? (allowlist, #153) }
 // An agent with no entry and no default has no budget, which is a refusal.
 export function createAgentBudgets({ policy = {}, history = [], now = () => new Date() } = {}) {
   assertAgentPolicy(policy);
@@ -94,14 +95,18 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
   };
 
   function spend({ agent_id: agentId = UNKNOWN_AGENT, run_id: runId = null } = {}, agentIds = [agentId]) {
-    const today = now().toISOString();
-    const out = { run: 0, day: 0, month: 0, steps: 0, unknown: 0 };
+    const nowDate = now();
+    const today = nowDate.toISOString();
+    const nowMs = nowDate.getTime();
+    const out = { run: 0, hour: 0, day: 0, month: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
       if (r.cost_usd === null && !isPendingBatch(r)) out.unknown += 1;
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
-      const ts = new Date(r.ts).toISOString();
+      const tsMs = Date.parse(r.ts);
+      const ts = new Date(tsMs).toISOString();
+      if (tsMs > nowMs - HOUR_MS) out.hour += cost;
       if (ts.slice(0, 10) === today.slice(0, 10)) out.day += cost;
       if (ts.slice(0, 7) === today.slice(0, 7)) out.month += cost;
       if (r.run_id === runId) { out.run += cost; out.steps += 1; }
@@ -173,5 +178,7 @@ export function budgetRemaining(budgets, who) {
     return shared == null ? own : Math.min(own, shared);
   };
   const models = budgets.modelsFor?.(who.agent_id) ?? null;
-  return { run_usd: tight("run"), day_usd: tight("day"), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
+  const hour = tight("hour");
+  // hour_usd (#172) appears only when an hour cap applies, so existing consumers see no new null field.
+  return { run_usd: tight("run"), ...(hour != null ? { hour_usd: hour } : {}), day_usd: tight("day"), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
 }
