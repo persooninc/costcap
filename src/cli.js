@@ -140,6 +140,7 @@ export async function wrap(argv) {
   cap = createCapEngine({ caps, history });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
+  let proxySettle = () => {}; // #171: bound once the proxy is listening
   let fleetPolicy;
   let fleetModels = models ?? null;
   const setPolicy = (p) => {
@@ -150,7 +151,7 @@ export async function wrap(argv) {
     fleetModels = resolved.models;
   };
   if (enrollmentPath) {
-    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => cap.settle(r) });
+    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => { cap.settle(r); proxySettle(r); } });
     setPolicy(fleet.policy());
     const result = await fleet.sync();
     if (!result.online) console.error("costcap: fleet offline; cached policy enforced");
@@ -169,6 +170,7 @@ export async function wrap(argv) {
   const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
+  proxySettle = (r) => server.settle(r);
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

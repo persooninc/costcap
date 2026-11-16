@@ -192,6 +192,11 @@ traffic bypasses CostCap.
   Such receipts have `cost_usd: null`. Reconcile them before starting again;
   existing unknown-cost receipts block restart. Never replace unknown cost with
   zero without evidence from the provider.
+  An enrolled wrapper that is still running resumes without a restart once every
+  unknown receipt it produced is settled from the dashboard (picked up on the next
+  fleet poll). A local `costcap reconcile --apply` while a wrap runs is not tailed:
+  restart the wrap after reconciling. An uncertain upstream outcome or an
+  unavailable ledger always needs a restart.
 - A provider 4xx rejection (400, 401, 403, 404, 409, 413, 422, 429) whose body is a
   provider error object is recorded at `cost_usd: 0` with `reason: "upstream_rejected"`
   and does not pause the run; GET/HEAD metadata calls such as `GET /v1/models` are

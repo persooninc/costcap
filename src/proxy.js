@@ -350,7 +350,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
-  let accountingFailure = null;
+  // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
+  // of that receipt clears it. Failures with no receipt (ledger/persistence) never clear.
+  const failures = new Map();
+  let hardFailure = null;
+  const accountingFailureNow = () => hardFailure ?? (failures.size ? failures.values().next().value : null);
   // Shared ledger (CC-5): decide and append inside the cross-process critical section.
   // Reentrant: emit() inside an already-guarded decision reuses the held section.
   let held = false;
@@ -408,7 +412,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       try { onWarning(warningLine(done)); } catch { /* stderr is best effort */ }
     }
   };
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     const [, provider, ...rest] = url.pathname.split("/");
     const upstream = upstreams[provider];
@@ -430,6 +434,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       }
       const body = Buffer.concat(chunks);
       const run = async () => {
+        let failMsg = null;
         if (res.destroyed) return;
         const path = `/${rest.join("/")}${url.search}`;
         const storedPath = receiptPath(`/${rest.join("/")}`, url.search);
@@ -458,6 +463,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const verdict = guarded(() => {
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
+          const accountingFailure = accountingFailureNow();
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const generates = !["GET", "HEAD"].includes(req.method);
           const allow = generates ? allowedModels?.() ?? null : null;
@@ -584,15 +590,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);
-            if (receipt.reason === "tool_use_unpriced") accountingFailure = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
-            else if (receipt.reason === "modality_unpriced") accountingFailure = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
-            else if (receipt.reason === "service_tier_unpriced") accountingFailure = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
-            else if (receipt.cost_usd === null) accountingFailure = "A cache write has no published rate for this model. Restart only after reconciling this request.";
+            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;
+            else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
+            else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";
             else velocity?.record(receipt.cost_usd);
           } else if (streamCut || sseIncomplete) {
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
-            accountingFailure = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
+            failMsg = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
           } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
@@ -629,7 +635,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               } else {
                 // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.
                 Object.assign(receipt, { cost_usd: null, reason: "batch_unpriced" });
-                accountingFailure = "Batch results could not be priced. Restart only after reconciling this batch.";
+                failMsg = "Batch results could not be priced. Restart only after reconciling this batch.";
               }
             }
           } else if (raw && (["GET", "HEAD"].includes(req.method) ||
@@ -640,23 +646,30 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "usage_unavailable" });
-            accountingFailure = "Provider returned no usable token usage. Restart only after reconciling this request.";
+            failMsg = "Provider returned no usable token usage. Restart only after reconciling this request.";
           }
-          emit(receipt);
+          const emitted = emit(receipt);
+          // #171: the unknown counts on the running cap engine so a settle lands exactly once.
+          if (failMsg) { failures.set(emitted.id, failMsg); if (!metered) recordSpend(emitted); failMsg = null; }
           flushWarnings();
           if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw); }
           else if (streamCut) res.destroy();
           else if (!res.destroyed) res.end();
         } catch {
           // A failed fetch may already have billed upstream. Do not assume zero.
-          accountingFailure = "Upstream outcome or receipt persistence is uncertain. Reconcile before restarting.";
+          hardFailure = "Upstream outcome or receipt persistence is uncertain. Reconcile before restarting.";
           try { emit({ provider, path: storedPath, blocked: false, cost_usd: null, reason: "upstream_outcome_unknown" }); } catch { /* stop on broken ledger */ }
           send(502, { error: "upstream_outcome_unknown" });
         }
       };
-      queue = queue.then(run).catch(() => { accountingFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); });
+      queue = queue.then(run).catch(() => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); });
     });
   });
+  // #171: a settlement (hosted poll or reconciliation) of a receipt that caused an
+  // accounting failure clears that failure; the block lifts once all are settled.
+  server.settle = (r) => failures.delete(r?.receipt_id ?? r?.id);
+  server.accountingFailure = accountingFailureNow;
+  return server;
 }
 
 export function startMeteringProxy(opts = {}, port = 0) {
