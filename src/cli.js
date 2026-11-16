@@ -21,9 +21,10 @@ import { readFileSync } from "node:fs";
 import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run-summary.js";
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
+import { writeGithubOutputs } from "./github-output.js";
 
 const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
-  "       costcap check [--cap USD] [--receipts FILE]\n" +
+  "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--receipts FILE] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
@@ -47,6 +48,7 @@ export function parseWrapArgs(argv) {
     const f = flags[i];
     if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
     if (f === "--preflight") { opts.preflight = true; continue; }
+    if (f === "--github-output") { opts.githubOutput = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -174,6 +176,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       if (cmd === "mcp") serveMcp(options);
       else {
         const result = checkBudget(options);
+        if (parsed.githubOutput) writeGithubOutputs(result, parsed.caps);
         console.log(JSON.stringify(result));
         process.exitCode = result.ok ? 0 : 1;
       }

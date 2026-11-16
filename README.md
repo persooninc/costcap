@@ -213,6 +213,23 @@ branding included); no Marketplace listing or public release has been made yet. 
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
 protocol tests do not substitute for verification in every MCP client.
 
+With `--github-output`, `check` also appends step outputs to `$GITHUB_OUTPUT`
+(delimiter syntax, so values cannot break the file) and a Markdown table to
+`$GITHUB_STEP_SUMMARY`, before it exits. The Action does this automatically and
+exposes the outputs `verdict` (`ok`, `budget_exceeded`, `accounting_unavailable`),
+`spent-usd` (empty, never `0`, when any cost is unknown), `cap-usd`,
+`day-spent-usd`, `month-spent-usd`, `unknown-receipts` and `receipts-count`:
+
+```yaml
+- id: budget
+  uses: persooninc/costcap@<sha>
+  with: { receipts: .costcap/receipts.jsonl, cap: '5' }
+- if: always()
+  run: echo "verdict=${{ steps.budget.outputs.verdict }} spent=${{ steps.budget.outputs.spent-usd }}"
+```
+
+The job summary says that totals are estimates and whether any cost is unknown.
+
 <!-- generated-by: workspace-admin/iac-independence -->
 
 ## Setup

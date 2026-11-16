@@ -17,13 +17,36 @@ inputs:
   month-cap:
     description: Optional UTC month cap in estimated USD
     required: false
+outputs:
+  verdict:
+    description: ok, budget_exceeded or accounting_unavailable
+    value: ${{ steps.check.outputs.verdict }}
+  spent-usd:
+    description: Estimated USD across the receipt file; empty when any cost is unknown
+    value: ${{ steps.check.outputs.spent-usd }}
+  cap-usd:
+    description: The cap input in USD
+    value: ${{ steps.check.outputs.cap-usd }}
+  day-spent-usd:
+    description: Estimated USD for the current UTC day; empty when any cost is unknown
+    value: ${{ steps.check.outputs.day-spent-usd }}
+  month-spent-usd:
+    description: Estimated USD for the current UTC month; empty when any cost is unknown
+    value: ${{ steps.check.outputs.month-spent-usd }}
+  unknown-receipts:
+    description: Number of receipts with unknown (null) cost
+    value: ${{ steps.check.outputs.unknown-receipts }}
+  receipts-count:
+    description: Number of receipts read
+    value: ${{ steps.check.outputs.receipts-count }}
 runs:
   using: composite
   steps:
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: '22'
-    - shell: bash
+    - id: check
+      shell: bash
       env:
         COSTCAP_RECEIPTS: ${{ inputs.receipts }}
         COSTCAP_CAP: ${{ inputs.cap }}
@@ -31,7 +54,7 @@ runs:
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
         COSTCAP_ACTION_PATH: ${{ github.action_path }}
       run: |
-        args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP")
+        args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP" --github-output)
         if [ -n "$COSTCAP_DAY_CAP" ]; then args+=(--day-cap "$COSTCAP_DAY_CAP"); fi
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
         node "$COSTCAP_ACTION_PATH/src/cli.js" "${args[@]}"
