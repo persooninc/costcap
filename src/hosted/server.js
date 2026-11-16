@@ -271,6 +271,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             const invite = Object.values(s.invitations).filter((item) => item.email === challenge.email && item.expires > now()).sort((a, b) => b.expires - a.expires)[0];
             const id = randomUUID();
             if (invite && ["admin", "viewer"].includes(invite.role) && s.orgs[invite.orgId]) {
+              // Re-check at acceptance: the plan may have lapsed since the invite was issued.
+              // Count current members only, so the invite being redeemed never counts against itself.
+              // A refusal throws, rolling back the whole transaction: no user, no fallback org, invite kept.
+              try {
+                requireLimit(entitlements(s, invite.orgId), "seats", planUsage(s, invite.orgId, now(), { pending: false }).seats, 1, upgradeUrl);
+              } catch (err) {
+                err.message = "This workspace is at its people limit. Ask the owner to upgrade or remove someone, then sign in again to accept the invite.";
+                throw err;
+              }
               user = { id, email: challenge.email, orgId: invite.orgId, role: invite.role, verified: true };
               s.users[id] = user;
               delete s.invitations[invite.id];

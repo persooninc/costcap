@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
@@ -30,7 +30,8 @@ async function fixture(t, { now, extra = {} } = {}) {
     assert.equal(r.status, 200);
     return r;
   };
-  return { request, login, service: () => service, delivery, invites: () => invites, setFail: (v) => { failDelivery = v; }, setDeliveryResult: (v) => { deliveryResult = v; }, setInviteFail: (v) => { failInvite = v; }, setCodeFail: (v) => { failCode = v; }, storePath, restart: async () => { service.server.closeAllConnections(); await new Promise((r) => service.server.close(r)); await start(); } };
+  const rawVerify = (challengeId) => request("/auth/verify", { challengeId, code });
+  return { request, login, rawVerify, service: () => service, delivery, invites: () => invites, setFail: (v) => { failDelivery = v; }, setDeliveryResult: (v) => { deliveryResult = v; }, setInviteFail: (v) => { failInvite = v; }, setCodeFail: (v) => { failCode = v; }, storePath, restart: async () => { service.server.closeAllConnections(); await new Promise((r) => service.server.close(r)); await start(); } };
 }
 
 test("verified org-first login, tenant isolation, enrollment, receipt sync and restart", async (t) => {
@@ -1158,4 +1159,52 @@ test("#153 hosted models allowlist: validation, versioning, keep/clear, audited 
   await f.request("/v1/receipts", { receipts: [{ id: "bm1", ts: new Date().toISOString(), cost_usd: 0, blocked: true, reason: "model_not_allowed", outcome: "blocked_model", model: "gpt-4o" }] }, null, agent.token);
   const ev = (await f.request("/v1/evidence.json", undefined, owner.cookie)).body;
   assert.equal(ev.receipts.find((x) => x.receipt_id === "bm1").outcome, "blocked_model");
+});
+
+// Issue #161: seats are re-checked when an invite is accepted, not only when it is issued.
+test("#161 accepting an invite after a downgrade to free is refused with 402 seats; removing a member lets it accept", async (t) => {
+  const f = await fixture(t, { extra: { enforceEntitlements: true, billingFactory: async () => ({ status: async () => ({ status: "free_beta" }), checkout: async () => ({}), portal: async () => ({}), webhook: async () => ({ received: true }) }) } });
+  const owner = await f.login("owner@down.invalid");
+  const setPlan = async (billing) => {
+    const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+    raw.orgs[owner.body.orgId].billing = billing;
+    writeFileSync(f.storePath, JSON.stringify(raw));
+    await f.restart();
+  };
+  await setPlan({ status: "active", plan: "team" });
+  for (const e of ["m1", "m2", "late"]) assert.equal((await f.request("/v1/invitations", { email: `${e}@down.invalid`, role: "viewer" }, owner.cookie)).status, 201);
+  await f.login("m1@down.invalid");
+  await f.login("m2@down.invalid");
+  await setPlan(null);
+  const fleet = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.equal((await fleet()).plan.limits.seats, 3);
+  const challenge = await f.request("/auth/request", { email: "late@down.invalid", turnstileToken: "test-pass" });
+  const refused = await f.rawVerify(challenge.body.challengeId);
+  assert.equal(refused.status, 402);
+  assert.equal(refused.body.code, "plan_limit");
+  assert.equal(refused.body.feature, "seats");
+  assert.match(refused.body.error ?? JSON.stringify(refused.body), /people limit|upgrade/i);
+  assert.equal(refused.cookie, undefined);
+  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+  assert.equal(Object.keys(raw.orgs).length, 1, "no fallback org created");
+  assert.equal(Object.values(raw.users).some((u) => u.email === "late@down.invalid"), false);
+  const before = await fleet();
+  assert.equal(before.members.length, 3);
+  assert.ok(before.invitations.some((i) => i.email === "late@down.invalid"), "invite kept");
+  // Under the limit again: the same invite accepts and is audited.
+  const m1 = before.members.find((m) => m.email === "m1@down.invalid");
+  assert.equal((await f.request(`/v1/members/${m1.id}/remove`, {}, owner.cookie)).status, 200);
+  const accepted = await f.login("late@down.invalid");
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.body.orgId, owner.body.orgId);
+  const after = await fleet();
+  assert.equal(after.members.length, 3);
+  assert.ok(after.audit.some((e) => e.action === "invitation.accept"));
+});
+
+test("#161 without enforced entitlements an invite still accepts past the free seat count", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("owner@beta.invalid");
+  for (let i = 1; i <= 4; i++) assert.equal((await f.request("/v1/invitations", { email: `b${i}@beta.invalid`, role: "viewer" }, owner.cookie)).status, 201);
+  for (let i = 1; i <= 4; i++) { const r = await f.login(`b${i}@beta.invalid`); assert.equal(r.status, 200); assert.equal(r.body.orgId, owner.body.orgId); }
 });
