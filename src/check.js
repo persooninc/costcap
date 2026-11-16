@@ -46,6 +46,9 @@ function checkRunBudget({ history, caps, now, runId, warnAt }) {
   if (runUnknown > 0) hit = { scope: "run", cap: caps.run ?? null, spent: null, reason: "accounting_unavailable" };
   else if (caps.run != null && runTotal >= caps.run) hit = { scope: "run", cap: caps.run, spent: Number(runTotal.toFixed(6)) };
   if (!hit && ledgerCaps) hit = cap.check();
+  // #185: a pending batch in any run makes ledger-wide spend unknown, so hour/day/month never pass on it.
+  const ledgerPendingBatches = history.filter(isPendingBatch).length;
+  if (!hit && ledgerCaps && ledgerPendingBatches > 0) hit = { scope: "accounting", cap: 0, spent: 0, reason: "batch_pending" };
   const ledgerUnknown = history.filter((r) => r.cost_usd === null).length;
   const warnings = currentWarnings({ caps, spend: { run: runTotal, day: s.day, month: s.month }, fractions: warnAt,
     lowerBound: { run: runUnknown > 0, day: ledgerUnknown > 0, month: ledgerUnknown > 0 } });
@@ -55,7 +58,7 @@ function checkRunBudget({ history, caps, now, runId, warnAt }) {
     hour: { spent_usd: Number(s.hour.toFixed(6)), cap: caps.hour ?? null, scope: "whole ledger, last 60 minutes" },
     day: { spent_usd: Number(s.day.toFixed(6)), cap: caps.day ?? null, scope: "whole ledger, current UTC day" },
     month: { spent_usd: Number(s.month.toFixed(6)), cap: caps.month ?? null, scope: "whole ledger, current UTC month" },
-    ledger_unknown_cost_count: ledgerUnknown, spend: s, hit, warnings, estimate_only: true };
+    ledger_unknown_cost_count: ledgerUnknown, ledger_pending_batch_count: ledgerPendingBatches, spend: s, hit, warnings, estimate_only: true };
 }
 
 // The budget verdict one agent or a reviewer can read. A missing ledger is no

@@ -465,7 +465,10 @@ With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
 `run_id` is `ID`; output adds `run_id`, `scope: "run"` and separate
 `run`/`day`/`month` totals, while day/month caps still cover the whole ledger.
 Unknown cost inside the run exits 1 (`accounting_unavailable`); unknown cost in
-another run only affects day/month caps. A run id with no receipts exits 2.
+another run only affects day/month caps. A pending batch (`batch_pending`) in
+any run makes hour/day/month caps fail with `batch_pending` until it settles
+(`ledger_pending_batch_count` reports it); a run-only `--cap` gate is
+unaffected by another run's batch. A run id with no receipts exits 2.
 List run ids with `costcap runs`.
 List and export local receipts with `costcap receipts [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE] [--json] [--export csv] [--receipts FILE]`
 (oldest first; kill/resume/reconciliation lines skipped; unknown cost prints `unknown`, settled receipts show `settled_cost_usd`;
