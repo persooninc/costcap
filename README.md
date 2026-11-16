@@ -566,11 +566,25 @@ was generated. A missing, negative, non-finite or non-numeric OpenRouter
 `usage.cost` falls back to table/fallback pricing, never $0, and `usage.cost`
 without the token counters is still `usage_unavailable`.
 
-Provider-side tools are never silently free. Anthropic `server_tool_use`
-requests (for example `web_search_requests`) and OpenAI Responses
-`web_search_call` / `file_search_call` items are billed per call at rates the
-pricing table does not carry, so the call is recorded as `cost_usd: null`,
-`reason: "tool_use_unpriced"`, and the run pauses until you reconcile it. Gemini
+Provider-side tools are priced per call, never silently free (#214). The
+pricing table's `tools` section carries the published rates: Anthropic
+`server_tool_use.web_search_requests` at $10 per 1,000 searches, OpenAI
+Responses `web_search_call` at $10 per 1,000 (`web_search` tool, and
+`web_search_preview` on gpt-5 / o-series) or $25 per 1,000
+(`web_search_preview` on gpt-4o / gpt-4.1), and `file_search_call` at $2.50 per
+1,000. The receipt adds `tool_calls` (for example `{"web_search": 3}`) and
+`tool_cost_usd`, and `cost_usd` is tokens plus tools, so search spend counts
+toward every cap. In batches the 50% discount applies to tokens only; tool
+calls bill at the full rate. With `--preflight`, an Anthropic web search tool
+that sets `max_uses` adds `max_uses × rate` to the worst case. Override a rate
+with a top-level `tools` map in the `--prices` / `--upstream-prices` file, for
+example `{"tools": {"web_search": 0.008}}` (keys `web_search`,
+`web_search_preview`, `file_search`; USD per call, > 0); such receipts are
+marked `cost_source: "user_prices"`. Any other per-call counter (for example
+`web_fetch_requests`), a model family the table does not list, or a tool on a
+route without a rate (OpenRouter, Bedrock, Vertex, custom upstreams) is still
+recorded as `cost_usd: null`, `reason: "tool_use_unpriced"`, and the run pauses
+until you reconcile it. Gemini
 `toolUsePromptTokenCount` is counted as input tokens. The free token-count
 endpoints (`POST /anthropic/v1/messages/count_tokens`, Gemini
 `models/<model>:countTokens`, `POST /openai/v1/responses/input_tokens`) record a

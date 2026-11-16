@@ -269,14 +269,14 @@ test("#138 wrap: a text-format transcription (no usage) pauses the run, check ex
   assert.equal(after.status, 0, after.stdout + after.stderr);
 });
 
-test("#142 wrap: count-tokens then a normal call both succeed; an Anthropic web-search call pauses the run (check exits 1)", async (t) => {
+test("#142 wrap: count-tokens then a normal call both succeed; an unpriced Anthropic server tool (web_fetch) pauses the run (check exits 1)", async (t) => {
   const seen = [];
   const up = await new Promise((r) => {
     const s = http.createServer((q, res) => {
       seen.push(q.url); q.resume();
       const body = q.url.endsWith("/count_tokens") ? { input_tokens: 42 }
         : seen.length === 2 ? { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5 } }
-        : { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_search_requests: 2 } } };
+        : { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_fetch_requests: 2 } } };
       res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
     });
     s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));

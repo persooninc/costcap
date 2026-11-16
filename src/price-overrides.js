@@ -3,7 +3,7 @@
 // or a discount ({discount: d}, 0 < d < 1) scaling every table component by 1-d.
 // Never $0 and never silently lower: built-in rates must be > 0, a discount never touches a
 // fallback-priced model, and an absolute entry prices only the standard text components it lists.
-import { costForUsage, isPricedModel, lookupPrice, promptTokens, premiumTier } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, promptTokens, premiumTier, toolCallCost, requestWebSearchType } from "./pricing.js";
 
 export const OVERRIDE_PROVIDERS = Object.freeze(["openai", "anthropic", "gemini", "openrouter"]);
 const RATE_KEYS = ["input", "output", "cached_input", "cache_write", "cache_write_1h"];
@@ -105,4 +105,31 @@ export function effectivePrice(prices, provider, model) {
   const m = 1 - o.discount;
   const scale = (r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v && typeof v === "object" && !Array.isArray(v) ? scale(v) : v]));
   return { ...scale(lookupPrice(model)), user_prices: true, discount: o.discount };
+}
+
+/**
+ * #214: adds per-call provider tool spend (metered.toolCalls) to a priced receipt.
+ * Tokens keep their own pricing (batch discount included); tools always bill at the full
+ * per-call rate. An unpriced tool / model family makes the receipt tool_use_unpriced, never $0.
+ * A `tools` entry in --prices overrides the table rate and pins the receipt as user_prices.
+ */
+export function withToolCost(c, prices, provider, metered, req) {
+  const toolCalls = metered?.toolCalls;
+  if (!toolCalls || !Object.keys(toolCalls).length) return c;
+  if (c.cost_usd === null || c.cost_usd === undefined) return { ...c, tool_calls: toolCalls };
+  const t = toolCallCost(provider, metered.model, toolCalls, { webSearchType: requestWebSearchType(req), userTools: prices?.tools });
+  if (t.unpriced) return { ...c, cost_usd: null, reason: "tool_use_unpriced", tool_calls: toolCalls };
+  return { ...c, cost_usd: Number((c.cost_usd + t.tool_cost_usd).toFixed(6)), tool_calls: toolCalls, tool_cost_usd: t.tool_cost_usd,
+    ...(t.user_prices && pin(prices)) };
+}
+
+export const TOOL_OVERRIDE_KEYS = Object.freeze(["web_search", "web_search_preview", "file_search"]);
+
+/** Validates the optional top-level `tools` map of a prices file: {tool: usd_per_call > 0}. */
+export function validateToolPrices(path, tools) {
+  if (!tools || typeof tools !== "object" || Array.isArray(tools)) throw new Error(`--upstream-prices ${path}: tools must be an object of {tool: USD per call}`);
+  for (const [k, v] of Object.entries(tools)) {
+    if (!TOOL_OVERRIDE_KEYS.includes(k)) throw new Error(`--upstream-prices ${path}: tools: unknown tool "${k}" (allowed: ${TOOL_OVERRIDE_KEYS.join(", ")})`);
+    if (!positive(v)) throw new Error(`--upstream-prices ${path}: tools.${k} must be a finite USD per call > 0 (never $0)`);
+  }
 }

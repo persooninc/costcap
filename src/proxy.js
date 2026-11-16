@@ -23,7 +23,7 @@ import { loadLedgerLines, isSettlement } from "./cap.js";
 import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
-import { costWithOverrides, effectivePrice, isPricedWithOverrides } from "./price-overrides.js";
+import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
@@ -60,7 +60,8 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
   return lines;
 }
 
-const UNPRICED_RESPONSES_ITEMS = new Set(["web_search_call", "file_search_call"]);
+// #214: Responses output items billed per call, mapped to their pricing-table tool key.
+const RESPONSES_TOOL_ITEMS = { web_search_call: "web_search", file_search_call: "file_search" };
 
 // Free token-count endpoints (exact paths only). Checked against the raw request
 // path so dot segments or percent-encoding can never reach the allowlist.
@@ -147,17 +148,27 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   let geminiStream = false, geminiFinished = false;
   // Provider-side tools billed per request/call have no published rate in the table: never priced as $0.
   let toolUseUnpriced = false;
+  // #214: per-call tool counts priced from the table's `tools` section (Responses items by id; Anthropic counters).
+  const responsesTools = new Map();
+  let anthropicTools = {};
   // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
   // Absent/invalid values are ignored so pricing falls back to the table; it is never trusted on other routes.
   let providerCost;
   const noteResponsesItems = (items) => {
-    if (Array.isArray(items) && items.some((it) => it && UNPRICED_RESPONSES_ITEMS.has(it.type))) toolUseUnpriced = true;
+    if (!Array.isArray(items)) return;
+    items.forEach((it, i) => {
+      const tool = it && Object.hasOwn(RESPONSES_TOOL_ITEMS, it.type) ? RESPONSES_TOOL_ITEMS[it.type] : null;
+      if (!tool) return;
+      // A failed tool call is not billed; items are de-duplicated by id across stream events.
+      if (it.status === "failed") return;
+      responsesTools.set(typeof it.id === "string" && it.id ? it.id : `#${items.length}:${i}`, tool);
+    });
   };
   const add = (chunk) => {
     if (!chunk || typeof chunk !== "object") return;
     if (provider !== "anthropic" && provider !== "gemini") {
       noteResponsesItems(chunk.output);
-      if (chunk.item) noteResponsesItems([chunk.item]);
+      if (chunk.item && typeof chunk.item.id === "string") noteResponsesItems([chunk.item]);
     }
     if (provider !== "anthropic" && provider !== "gemini" && typeof chunk.type === "string" && chunk.type.startsWith("response.")) {
       responsesStream = true;
@@ -210,7 +221,16 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       const u = chunk.usage ?? chunk.message?.usage;
       if (u) {
         const stu = u.server_tool_use;
-        if (stu && typeof stu === "object" && Object.entries(stu).some(([k, v]) => k.endsWith("_requests") && typeof v === "number" && v > 0)) toolUseUnpriced = true;
+        if (stu && typeof stu === "object") {
+          // Counters are cumulative per message (message_delta repeats them); the latest wins.
+          const next = {};
+          for (const [k, v] of Object.entries(stu)) {
+            if (!k.endsWith("_requests") || typeof v !== "number" || !(v > 0)) continue;
+            if (k === "web_search_requests" && Number.isInteger(v)) next.web_search = v;
+            else toolUseUnpriced = true; // an unknown per-call tool (or a non-integer count) is never $0
+          }
+          anthropicTools = next;
+        }
         if (u.input_tokens != null) usage.input_tokens = u.input_tokens;
         if (u.cache_creation_input_tokens != null) {
           // Without the 5m/1h breakdown every write is priced at the 5-minute rate.
@@ -258,7 +278,9 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
-    return { model, usage: { ...usage, ...signal }, ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
+    const toolCalls = provider === "anthropic" ? { ...anthropicTools } : {};
+    for (const tool of responsesTools.values()) toolCalls[tool] = (toolCalls[tool] ?? 0) + 1;
+    return { model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A stream that never reached its provider's terminal event (or errored first) is incomplete.
   return { add, result, get incomplete() {
@@ -894,7 +916,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             resolvedBackground.add(bgRead.id);
             let c = null;
             if (metered && !metered.toolUseUnpriced) {
-              c = costWithOverrides(userPrices, provider, metered.model, metered.usage);
+              c = withToolCost(costWithOverrides(userPrices, provider, metered.model, metered.usage), userPrices, provider, metered, parsedBody);
               if (c.cost_usd === null || c.reason) c = null;
             }
             receipt.response_id = bgRead.id;
@@ -955,9 +977,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage));
             rateLimit?.record(usageTokens(metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
-            if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
+            if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
+            else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
             recordSpend(receipt);
-            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
+            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate for this tool or model. Restart only after reconciling this request.";
             else if (receipt.reason === "upstream_model_unpriced") failMsg = `Model ${receipt.model} on custom upstream ${provider} has no rate in --upstream-prices. Restart only after reconciling this request.`;
             else if (receipt.reason === "user_price_unpriced") failMsg = `Model ${receipt.model} was billed for a component (cache write, long context, premium tier or non-text tokens) your --upstream-prices entry does not price. Restart only after reconciling this request.`;
             else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;

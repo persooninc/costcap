@@ -272,12 +272,16 @@ test("#142 Gemini toolUsePromptTokenCount is billed as input", () => {
   assert.ok(costForUsage("gemini-2.5-flash", m.usage).cost_usd > costForUsage("gemini-2.5-flash", { input_tokens: 100, output_tokens: 10 }).cost_usd);
 });
 
-test("#142 tool-use detection: Anthropic server_tool_use and Responses search items", () => {
-  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 2 } } })).toolUseUnpriced, true);
-  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 0 } } })).toolUseUnpriced, undefined);
-  for (const type of ["web_search_call", "file_search_call"])
-    assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type }, { type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolUseUnpriced, true);
-  assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolUseUnpriced, undefined);
+test("#142/#214 tool-use detection: known per-call tools are counted, unknown counters stay unpriced", () => {
+  const a = extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 2 } } }));
+  assert.deepEqual([a.toolCalls, a.toolUseUnpriced], [{ web_search: 2 }, undefined]);
+  const zero = extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 0 } } }));
+  assert.deepEqual([zero.toolCalls, zero.toolUseUnpriced], [undefined, undefined]);
+  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_fetch_requests: 1 } } })).toolUseUnpriced, true);
+  for (const [type, tool] of [["web_search_call", "web_search"], ["file_search_call", "file_search"]])
+    assert.deepEqual(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type }, { type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolCalls, { [tool]: 1 });
+  assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type: "web_search_call", status: "failed" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolCalls, undefined);
+  assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolCalls, undefined);
 });
 
 test("#142 isCountTokensPath allows only exact, normalized paths", () => {
@@ -297,10 +301,10 @@ async function multi(t, handler) {
   return { post, receipts };
 }
 
-test("#142 Anthropic web search and Responses web_search_call → tool_use_unpriced and the next call is paused", async (t) => {
+test("#142/#214 unknown tools or model families → tool_use_unpriced and the next call is paused", async (t) => {
   for (const [path, body] of [
-    ["/anthropic/v1/messages", { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_search_requests: 2 } } }],
-    ["/openai/v1/responses", { model: "gpt-4o-mini", output: [{ type: "web_search_call", status: "completed" }], usage: { input_tokens: 10, output_tokens: 5 } }],
+    ["/anthropic/v1/messages", { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_fetch_requests: 2 } } }],
+    ["/openai/v1/responses", { model: "gpt-3.5-turbo", output: [{ type: "web_search_call", status: "completed" }], usage: { input_tokens: 10, output_tokens: 5 } }],
   ]) {
     let hits = 0;
     const { post, receipts } = await multi(t, (req, res) => { hits++; req.resume(); res.end(JSON.stringify(body)); });
@@ -310,6 +314,27 @@ test("#142 Anthropic web search and Responses web_search_call → tool_use_unpri
     assert.equal(next.status, 429);
     assert.equal((await next.json()).error, "accounting_unavailable");
     assert.equal(hits, 1);
+  }
+});
+
+test("#214 AC1/AC2: Anthropic web search and Responses search calls are priced and the next call is forwarded", async (t) => {
+  const anth = { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_search_requests: 3 } } };
+  const oai = { model: "gpt-4o-mini", output: [{ id: "a", type: "web_search_call", status: "completed" }, { id: "b", type: "web_search_call", status: "completed" }, { id: "c", type: "file_search_call" }, { type: "message" }],
+    usage: { input_tokens: 10, output_tokens: 5 } };
+  for (const [path, body, req, tools] of [
+    ["/anthropic/v1/messages", anth, { model: "claude-sonnet-4-6" }, 0.03],
+    ["/openai/v1/responses", oai, { model: "gpt-4o-mini", tools: [{ type: "web_search" }, { type: "file_search" }] }, 0.0225],
+    ["/openai/v1/responses", oai, { model: "gpt-4o-mini", tools: [{ type: "web_search_preview" }, { type: "file_search" }] }, 0.0525],
+  ]) {
+    let hits = 0;
+    const { post, receipts } = await multi(t, (q, res) => { hits++; q.resume(); res.end(JSON.stringify(body)); });
+    assert.equal((await post(path, req)).status, 200);
+    const tokens = costForUsage(body.model, { input_tokens: 10, output_tokens: 5 }).cost_usd;
+    assert.equal(receipts[0].reason, undefined);
+    assert.equal(receipts[0].tool_cost_usd, tools);
+    assert.equal(receipts[0].cost_usd, Number((tokens + tools).toFixed(6)));
+    assert.equal((await post(path, req)).status, 200);
+    assert.equal(hits, 2);
   }
 });
 

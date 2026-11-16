@@ -4,7 +4,7 @@
 // rate. Rates come only from --upstream-prices FILE; anything else is unknown (cost_usd null).
 import { readFileSync } from "node:fs";
 import { tableDigest } from "./pricing-digest.js";
-import { OVERRIDE_PROVIDERS, validateBuiltinPrices } from "./price-overrides.js";
+import { OVERRIDE_PROVIDERS, validateBuiltinPrices, validateToolPrices } from "./price-overrides.js";
 
 export const BUILTIN_PROVIDERS = Object.freeze(["openai", "anthropic", "openrouter", "gemini", "bedrock", "vertex"]);
 export const BUILTIN_ENV_VARS = Object.freeze(["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "OPENROUTER_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"]);
@@ -75,6 +75,8 @@ const rateOk = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 export function loadUpstreamPrices(path, names) {
   let doc;
   try { doc = JSON.parse(readFileSync(path, "utf8")); } catch (e) { throw new Error(`--upstream-prices ${path}: ${e.code ?? "invalid JSON"}`); }
+  // #214: a file may carry only a top-level `tools` map (per-call tool rates); upstreams then defaults to {}.
+  if (doc && typeof doc === "object" && !Array.isArray(doc) && doc.tools !== undefined && doc.upstreams === undefined) doc = { ...doc, upstreams: {} };
   if (!doc || typeof doc !== "object" || Array.isArray(doc) || !doc.upstreams || typeof doc.upstreams !== "object" || Array.isArray(doc.upstreams)) {
     throw new Error(`--upstream-prices ${path}: expected {version, upstreams: {NAME: {MODEL: {input, output, cached_input?}}}}`);
   }
@@ -89,7 +91,8 @@ export function loadUpstreamPrices(path, names) {
       }
     }
   }
-  return { version: doc.version ?? null, sha256: tableDigest(doc), upstreams: doc.upstreams };
+  if (doc.tools !== undefined) validateToolPrices(path, doc.tools);
+  return { version: doc.version ?? null, sha256: tableDigest(doc), upstreams: doc.upstreams, ...(doc.tools !== undefined && { tools: doc.tools }) };
 }
 
 const SNAPSHOT_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/;

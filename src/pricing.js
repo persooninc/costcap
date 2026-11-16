@@ -210,3 +210,55 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     cost_source: price.fallback ? "fallback" : "table",
   };
 }
+
+// #214: provider-side tools billed per call (Anthropic server_tool_use web_search_requests,
+// OpenAI Responses web_search_call / file_search_call), from the table's `tools` section.
+// A tool, tool variant or model family the table does not list is unpriced, never $0.
+// toolCalls: { web_search?: n, file_search?: n, <other>?: n }. For OpenAI, web_search is
+// priced by the request's tool type (webSearchType "web_search" | "web_search_preview");
+// when that is unknown (e.g. a batch line) the higher of the two rates is used.
+// userTools ({tool: usd_per_call}) overrides the table rate for that tool key.
+export function toolRate(provider, tool, model) {
+  const row = table.tools?.[provider]?.[tool];
+  if (!row || typeof row !== "object") return null;
+  const ok = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null);
+  if (row.families && typeof row.families === "object") {
+    const id = (resolveModelId(model) ?? (typeof model === "string" ? model.replace(SNAPSHOT_SUFFIX, "") : "")).replace(FIRST_PARTY_PREFIX, "");
+    let best = null;
+    for (const fam of Object.keys(row.families)) {
+      if ((id === fam || id.startsWith(`${fam}-`) || id.startsWith(`${fam}.`)) && (!best || fam.length > best.length)) best = fam;
+    }
+    return best === null ? null : ok(row.families[best]);
+  }
+  return ok(row.usd_per_call);
+}
+
+export function toolCallCost(provider, model, toolCalls, { webSearchType, userTools } = {}) {
+  assertTableIntegrity();
+  let usd = 0, user = false;
+  const rateFor = (key) => {
+    const u = userTools?.[key];
+    if (typeof u === "number" && Number.isFinite(u) && u > 0) { user = true; return u; }
+    return toolRate(provider, key, model);
+  };
+  for (const [tool, n] of Object.entries(toolCalls ?? {})) {
+    if (!(n > 0)) continue;
+    let rate;
+    if (provider === "openai" && tool === "web_search") {
+      const keys = webSearchType ? [webSearchType] : ["web_search", "web_search_preview"];
+      const rates = keys.map(rateFor);
+      rate = rates.some((r) => r === null) ? null : Math.max(...rates);
+    } else rate = rateFor(tool);
+    if (rate === null) return { unpriced: true, tool };
+    usd += n * rate;
+  }
+  return { unpriced: false, tool_cost_usd: Number(usd.toFixed(6)), user_prices: user };
+}
+
+// The OpenAI web search tool type a Responses request declares, or undefined.
+export function requestWebSearchType(req) {
+  const tools = Array.isArray(req?.tools) ? req.tools : [];
+  const types = tools.map((t) => t?.type).filter((t) => typeof t === "string" && t.startsWith("web_search"));
+  if (!types.length) return undefined;
+  return types.some((t) => t.startsWith("web_search_preview")) ? (types.every((t) => t.startsWith("web_search_preview")) ? "web_search_preview" : undefined) : "web_search";
+}

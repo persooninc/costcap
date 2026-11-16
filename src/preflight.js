@@ -5,7 +5,18 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
-import { lookupPrice, selectRates, batchMultiplier, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+import { lookupPrice, selectRates, batchMultiplier, toolRate, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+
+// #214: Anthropic web search with max_uses caps billed searches per request; the worst case adds
+// max_uses x the per-search rate. Without max_uses the search count is unbounded and not added.
+export function toolWorstCase(provider, req, model) {
+  if (provider !== "anthropic" || !Array.isArray(req?.tools)) return { ok: true, usd: 0, calls: 0 };
+  let calls = 0;
+  for (const t of req.tools) if (typeof t?.type === "string" && t.type.startsWith("web_search_") && Number.isInteger(t.max_uses) && t.max_uses > 0) calls += t.max_uses;
+  if (!calls) return { ok: true, usd: 0, calls: 0 };
+  const rate = toolRate("anthropic", "web_search", model);
+  return rate === null ? { ok: false } : { ok: true, usd: calls * rate, calls };
+}
 
 // Conservative default output ceilings when the request sets no limit.
 export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, bedrock: 64_000, vertex: 64_000, gemini: 65_536 };
@@ -93,9 +104,11 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   const signal = { ...(typeof req.speed === "string" && { speed: req.speed }), ...(typeof req.service_tier === "string" && { service_tier: req.service_tier }) };
   const { pricing_tier, rates } = selectRates(price, input_tokens, signal);
   if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
-  const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
+  const tools = toolWorstCase(provider, req, model);
+  if (!tools.ok) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
+  const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000 + tools.usd).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, ...(price.user_prices || (priceFor && !price.table_version) ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, ...(tools.calls && { tool_calls_max: tools.calls, tool_usd_max: Number(tools.usd.toFixed(6)) }), estimate_usd, pricing_tier, ...(price.user_prices || (priceFor && !price.table_version) ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
 }
 
 // Compares the estimate with the remaining run/hour/day/month budget.

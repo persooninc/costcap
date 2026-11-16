@@ -213,7 +213,7 @@ test("AC3: provider errors, usage_unavailable, tool_use_unpriced and batch_pendi
     assert.equal(readdirSync(p.cache.dir).length, 0);
   }
   // usage_unavailable latches the accounting failure, so the repeat is refused, not served.
-  const tool = JSON.stringify({ model: "gpt-4o-mini", output: [{ type: "web_search_call" }], usage: { input_tokens: 10, output_tokens: 5 } });
+  const tool = JSON.stringify({ model: "gpt-3.5-turbo", output: [{ type: "web_search_call" }], usage: { input_tokens: 10, output_tokens: 5 } });
   const up = await upstream(t, () => [200, "application/json", tool]);
   const p = await proxy(t, up);
   await p.call("/openai/v1/responses", JSON.stringify({ model: "gpt-4o-mini", temperature: 0, input: "x" }));

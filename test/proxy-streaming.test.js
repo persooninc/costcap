@@ -183,9 +183,9 @@ test("#138 a streamed final chunk with usage: {} is unknown (usage_unavailable),
 });
 
 // #142: tool billing in streams.
-test("#142 Anthropic stream with server_tool_use in message_delta → tool_use_unpriced, next call paused", async (t) => {
+test("#142/#214 Anthropic stream with an unknown server_tool_use counter in message_delta → tool_use_unpriced, next call paused", async (t) => {
   const events = [ANTHROPIC_EVENTS[0], ANTHROPIC_EVENTS[1],
-    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"web_search_requests":1}}}\n\n', ANTHROPIC_EVENTS[3]];
+    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"web_fetch_requests":1}}}\n\n', ANTHROPIC_EVENTS[3]];
   const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
   const { res } = await streamCall(proxy, "/anthropic/v1/messages");
   assert.equal(res.status, 200);
@@ -196,23 +196,26 @@ test("#142 Anthropic stream with server_tool_use in message_delta → tool_use_u
   assert.equal((await next.json()).error, "accounting_unavailable");
 });
 
-test("#142 Responses stream with a web_search_call item → tool_use_unpriced; parser sees item events and completed output", () => {
+test("#142/#214 Responses stream: parser counts web_search_call / file_search_call from item events and completed output (deduped by id)", () => {
   const usage = '"usage":{"input_tokens":10,"output_tokens":5}';
   const viaItem = createSseUsageParser("openai");
-  viaItem.push('data: {"type":"response.output_item.done","item":{"type":"web_search_call"}}\n\n');
-  viaItem.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini",${usage}}}\n\n`);
-  assert.equal(viaItem.end().toolUseUnpriced, true);
+  viaItem.push('data: {"type":"response.output_item.added","item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}\n\n');
+  viaItem.push('data: {"type":"response.output_item.done","item":{"id":"ws_1","type":"web_search_call","status":"completed"}}\n\n');
+  viaItem.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini","output":[{"id":"ws_1","type":"web_search_call"}],${usage}}}\n\n`);
+  const r = viaItem.end();
+  assert.deepEqual(r.toolCalls, { web_search: 1 });
+  assert.equal(r.toolUseUnpriced, undefined);
   const viaCompleted = createSseUsageParser("openai");
   viaCompleted.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini","output":[{"type":"file_search_call"}],${usage}}}\n\n`);
-  assert.equal(viaCompleted.end().toolUseUnpriced, true);
+  assert.deepEqual(viaCompleted.end().toolCalls, { file_search: 1 });
   const plain = createSseUsageParser("openai");
   plain.push(`data: {"type":"response.completed","response":{"model":"gpt-4o-mini","output":[{"type":"message"}],${usage}}}\n\n`);
-  assert.equal(plain.end().toolUseUnpriced, undefined);
+  assert.equal(plain.end().toolCalls, undefined);
 });
 
-test("#142 Responses stream through the proxy with web_search_call pauses the run", async (t) => {
-  const events = ['data: {"type":"response.output_item.added","item":{"type":"web_search_call"}}\n\n',
-    'data: {"type":"response.completed","response":{"model":"gpt-4o-mini","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'];
+test("#142/#214 Responses stream through the proxy with web_search_call on an unlisted model family pauses the run", async (t) => {
+  const events = ['data: {"type":"response.output_item.added","item":{"id":"ws_1","type":"web_search_call"}}\n\n',
+    'data: {"type":"response.completed","response":{"model":"gpt-3.5-turbo","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'];
   const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
   await streamCall(proxy, "/openai/v1/responses");
   await tick();
@@ -322,4 +325,29 @@ test("#184 with a cache, a temperature-0 stream bypasses the cache and passes th
   assert.equal(calls, 2);
   assert.ok(receipts.every((r) => r.cache === "bypass" && r.cost_usd > 0));
   assert.equal(cache.stats.hits + cache.stats.misses, 0);
+});
+
+// #214 E2E: an Anthropic SSE stream with server_tool_use.web_search_requests is priced
+// (token cost + searches x $0.01) and a cap trips on search spend alone.
+test("#214 Anthropic SSE stream with web_search_requests is priced and the cap trips on search spend alone", async (t) => {
+  const events = [
+    'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1,"server_tool_use":{"web_search_requests":0}}}}\n\n',
+    ANTHROPIC_EVENTS[1],
+    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":5,"server_tool_use":{"web_search_requests":3}}}\n\n',
+    ANTHROPIC_EVENTS[3]];
+  // Tokens alone cost well under $0.001; three searches cost $0.03, over the $0.025 cap.
+  const { proxy, receipts } = await setup(t, events, { gapMs: 5 }, { cap: createCapEngine({ caps: { run: 0.025 } }) });
+  const first = await streamCall(proxy, "/anthropic/v1/messages");
+  assert.equal(first.res.status, 200);
+  await tick();
+  const tokens = costForUsage("claude-haiku-4-5", { input_tokens: 10, output_tokens: 5 }).cost_usd;
+  assert.ok(tokens < 0.025);
+  assert.equal(receipts[0].reason, undefined);
+  assert.deepEqual(receipts[0].tool_calls, { web_search: 3 });
+  assert.equal(receipts[0].tool_cost_usd, 0.03);
+  assert.equal(receipts[0].cost_usd, Number((tokens + 0.03).toFixed(6)));
+  const next = await fetch(`http://127.0.0.1:${proxy}/anthropic/v1/messages`, { method: "POST", body: "{}" });
+  assert.equal(next.status, 429);
+  await tick();
+  assert.equal(receipts.at(-1).reason, "budget_exceeded");
 });
