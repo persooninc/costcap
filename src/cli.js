@@ -10,6 +10,7 @@ import { serveMcp } from "./mcp.js";
 import { parseTagList } from "./tags.js";
 import { createTagCaps, parseTagCaps, withFleetTagCaps } from "./tag-cap.js";
 import { createModelCaps, parseModelCaps, mergeModelCapRules } from "./model-cap.js";
+import { fleetModelRules, withFleetModelCaps } from "./hosted/model-caps.js";
 import { enroll, createFleetClient, requestRaise } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
@@ -196,7 +197,7 @@ export async function wrap(argv) {
   // #170: every receipt carries run_id, with or without --agent.
   const who = { ...(agentId ? { agent_id: agentId } : {}), run_id: runId ?? randomUUID() };
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
-  let cap, agentBudgets, tagCaps = null, modelCaps = null;
+  let cap, agentBudgets, tagCaps = null, modelCaps = null, hostedModelCaps = null;
   let proxySettle = () => {}; // #171: bound once the proxy is listening
   // #176: fleet and shared-ledger settlements share one helper (batch_pending aware).
   // #178: settlements of this run's receipts also feed the run summary.
@@ -222,6 +223,9 @@ export async function wrap(argv) {
   if (tagCapRules?.length) tagCaps = createTagCaps({ rules: tagCapRules, history });
   // #238: always built when enrolled, so fleet modelCaps can arrive on any sync.
   if (modelCapRules?.length || enrollmentPath) modelCaps = createModelCaps({ rules: modelCapRules ?? [], history });
+  // #244: hosted day/month rules are enforced fleet-wide from agent_spend.models; this
+  // engine only covers them (UTC, local ledger) until the server sends that snapshot.
+  if (enrollmentPath) hostedModelCaps = createModelCaps({ rules: [], history });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -249,11 +253,15 @@ export async function wrap(argv) {
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
     fleetRate = { rpm: p.rpm, tpm: p.tpm };
-    modelCaps?.setRules(mergeModelCapRules(p.modelCaps ?? [], modelCapRules ?? []));
+    // #244: hosted hour rules stay local; hosted day/month rules go fleet-wide.
+    const hosted = p.modelCaps ?? [];
+    modelCaps?.setRules(mergeModelCapRules(hosted.filter((r) => r.scope === "hour"), modelCapRules ?? []));
+    hostedModelCaps?.setRules(fleetModelRules(hosted).map((r) => ({ model: r.model, scope: r.scope, cap: r.usd })));
     applyRate();
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => settleReceipt(r) });
+    modelCaps = withFleetModelCaps(modelCaps, hostedModelCaps, fleet);
     setPolicy(fleet.policy());
     const result = await fleet.sync();
     if (!result.online) console.error("costcap: fleet offline; cached policy enforced");

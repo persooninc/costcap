@@ -84,7 +84,7 @@ test("signed webhook: one POST per alert kind with documented fields and a verif
     assert.equal(options.redirect, "error");
     assert.ok(options.signal);
     const body = JSON.parse(options.body);
-    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "org", "tag", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "projected_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
+    assert.deepEqual(Object.keys(body), ["id", "kind", "org_id", "agent_id", "agent_name", "team", "org", "tag", "model", "run_id", "scope", "period", "fraction", "spent_usd", "cap_usd", "projected_usd", "unknown_count", "today_usd", "baseline_usd", "multiplier", "top_models", "lower_bound", "fired_at", "dashboard_url"]);
     assert.equal(body.id, alerts[i].id);
     assert.equal(body.spent_usd, alerts[i].spent ?? null);
     assert.equal(body.cap_usd, alerts[i].cap ?? null);
@@ -143,4 +143,18 @@ test("org router sends org A's alert to org A's webhook only", async () => {
   await route({ kind: "cap_hit", orgId: "A" }, { emails: [], slackWebhook: null, webhook: { url: "https://a.example.com/h", secret } });
   await route({ kind: "cap_hit", orgId: "B" }, { emails: [], slackWebhook: null, webhook: null });
   assert.deepEqual(calls, ["https://a.example.com/h"]);
+});
+
+test("#244: model alert text and webhook payload name the model", async () => {
+  const calls = [];
+  const send = createAlertDelivery({ emailKey: "test-key", emailFrom: "test@example.invalid", emailTo: ["admin@example.invalid"], slackWebhook: "https://hooks.slack.com/services/test/test/test",
+    webhook: { url: "https://hooks.example.com/costcap", secret: "whsec_test" }, lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    fetchImpl: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({}) }; } });
+  await send({ kind: "cap_approaching", agentId: "A", agentName: "mixer", model: "claude-opus-4-8", scope: "day", spent: 4.1, cap: 5, fraction: 0.8 });
+  const slack = JSON.parse(calls.find((c) => String(c.url).includes("hooks.slack.com")).options.body);
+  assert.match(slack.text, /agent mixer, model claude-opus-4-8, day \(spent \$4\.1 of \$5 cap\)/);
+  const email = JSON.parse(calls.find((c) => !String(c.url).includes("hooks.")).options.body);
+  assert.match(JSON.stringify(email), /model claude-opus-4-8/);
+  const hook = JSON.parse(calls.find((c) => c.url === "https://hooks.example.com/costcap").options.body);
+  assert.equal(hook.model, "claude-opus-4-8");
 });

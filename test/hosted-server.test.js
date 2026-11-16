@@ -1573,3 +1573,50 @@ test("#240 /v1/org-budget: validation, viewer 403 (session and key), audit, rest
   clock += 86_400_000;
   await f.service().evaluateFleetAlerts();
 });
+
+// Issue #244: hosted modelCaps — per-model agent_spend, alert fire/dedupe/resolve, org isolation.
+test("#244 model caps: agent_spend.models, cap_approaching/cap_hit per model, resolve on rollover and revoke, cross-org", async (t) => {
+  let clock = Date.parse("2026-11-16T15:00:00Z");
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("mc-owner@example.invalid");
+  const other = await f.login("mc-other@example.invalid");
+  const enroll = async (cookie, name) => (await f.request("/v1/enroll", { name }, null, (await f.request("/v1/enrollment-tokens", { caps: { day: 100 } }, cookie)).body.token)).body;
+  const a = await enroll(owner.cookie, "opus-agent");
+  const x = await enroll(other.cookie, "other-org");
+  const set = await f.request(`/v1/agents/${a.agentId}/policy`, { caps: { day: 100 }, warnFractions: [0.5, 0.8], modelCaps: [{ model: "claude-opus-4-8", scope: "day", usd: 5 }, { model: "claude-haiku-4-5", scope: "day", usd: 1 }] }, owner.cookie);
+  assert.equal(set.status, 200);
+  const ts = () => new Date(clock - 60_000).toISOString();
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "o1", ts: ts(), cost_usd: 4.1, model: "anthropic/claude-opus-4.8" }, { id: "h1", ts: ts(), cost_usd: null, model: "claude-haiku-4-5", reason: "usage_unavailable" }] }, null, a.token)).status, 200);
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "x1", ts: ts(), cost_usd: 50, model: "claude-opus-4-8" }] }, null, x.token)).status, 200);
+  const pol = (await f.request("/v1/policy", undefined, null, a.token)).body;
+  assert.deepEqual(pol.agent_spend.models, { "claude-opus-4-8": { day: 4.1, month: 4.1, unknown: 0 }, "claude-haiku-4-5": { day: 0, month: 0, unknown: 1 } });
+  assert.equal((await f.request("/v1/policy", undefined, null, x.token)).body.agent_spend.models, undefined);
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  assert.deepEqual(fleet.agents[0].modelCapSpend[0], { model: "claude-opus-4-8", scope: "day", usd: 5, spent: 4.1, unknown: 0 });
+  const modelAlerts = () => f.delivery.filter((d) => d.model);
+  await f.service().evaluateFleetAlerts();
+  assert.deepEqual(modelAlerts().map((d) => [d.kind, d.model, d.fraction]), [["cap_approaching", "claude-opus-4-8", 0.8]]);
+  assert.match(modelAlerts()[0].key, /:model:claude-opus-4-8:day/);
+  assert.equal(modelAlerts()[0].agentName, "opus-agent");
+  await f.service().evaluateFleetAlerts();
+  assert.equal(modelAlerts().length, 1, "not re-sent");
+  // A synced block fires cap_hit.
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "b1", ts: ts(), cost_usd: 0, blocked: true, reason: "model_budget_exceeded", model: "claude-opus-4-8", scope: "day" }] }, null, a.token)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.deepEqual(modelAlerts().map((d) => d.kind), ["cap_approaching", "cap_hit"]);
+  let list = (await f.request("/v1/alerts?status=active", undefined, owner.cookie)).body.alerts;
+  assert.deepEqual(list.filter((al) => al.model).map((al) => al.kind), ["cap_hit"]); // cap_hit supersedes the warning
+  assert.equal((await f.request("/v1/alerts?status=active", undefined, other.cookie)).body.alerts.filter((al) => al.model).length, 0);
+  // Next org day: both resolve.
+  clock += 10 * 3600_000; // 01:00 UTC next day
+  await f.service().evaluateFleetAlerts();
+  list = (await f.request("/v1/alerts?status=active", undefined, owner.cookie)).body.alerts;
+  assert.equal(list.filter((al) => al.model).length, 0);
+  // Over again today, then revoke resolves.
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "o2", ts: ts(), cost_usd: 6, model: "claude-opus-4-8" }] }, null, a.token)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await f.request("/v1/alerts?status=active", undefined, owner.cookie)).body.alerts.filter((al) => al.model && al.kind === "cap_hit").length, 1);
+  assert.equal((await f.request(`/v1/agents/${a.agentId}/revoke`, {}, owner.cookie)).status, 200);
+  await f.service().evaluateFleetAlerts();
+  assert.equal((await f.request("/v1/alerts?status=active", undefined, owner.cookie)).body.alerts.filter((al) => al.model).length, 0);
+});

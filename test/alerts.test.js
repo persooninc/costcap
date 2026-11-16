@@ -213,3 +213,26 @@ test("evaluateOrgAlerts: org keys, warn fractions, cap_hit, cap_projected, unkno
   assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 3, { month: 10 }), nowMs }).length, 0);
   assert.equal(evaluateOrgAlerts({ orgId: "o", verdict: v(0, 6, { month: 10 }), nowMs: Date.parse("2026-11-01T06:00:00Z") }).length, 0);
 });
+
+// Issue #244: per-model hosted modelCaps alerts.
+import { evaluateModelAlerts } from "../src/hosted/alerts.js";
+
+test("#244 AC4: evaluateModelAlerts approaching, hit, block and unknown", () => {
+  const rules = [{ model: "claude-opus-4-8", scope: "day", usd: 5 }];
+  const spend = { "claude-opus-4-8": { day: 4.1, month: 4.1, unknown: 0 } };
+  const warn = evaluateModelAlerts({ agentId: "A", rules, spend }, { warnFractions: [0.5, 0.8] });
+  assert.equal(warn.length, 1);
+  assert.equal(warn[0].kind, "cap_approaching");
+  assert.equal(warn[0].fraction, 0.8);
+  assert.match(warn[0].key, /^cap_approaching:A:model:claude-opus-4-8:day/);
+  assert.equal(warn[0].model, "claude-opus-4-8");
+  const hit = evaluateModelAlerts({ agentId: "A", rules, spend: { "claude-opus-4-8": { day: 5, month: 5, unknown: 0 } } });
+  assert.deepEqual(hit.map((a) => [a.kind, a.key]), [["cap_hit", "cap_hit:A:model:claude-opus-4-8:day"]]);
+  const blocked = evaluateModelAlerts({ agentId: "A", rules: [...rules, { model: "claude-opus-4-8", scope: "hour", usd: 1 }], spend, blockedHits: [{ model: "claude-opus-4-8", scope: "hour" }] }, { warnFractions: [0.5, 0.8] });
+  assert.deepEqual(blocked.map((a) => a.kind).sort(), ["cap_approaching", "cap_hit"]);
+  assert.equal(blocked.find((a) => a.kind === "cap_hit").scope, "hour");
+  assert.deepEqual(evaluateModelAlerts({ agentId: "A", rules, spend: { "claude-opus-4-8": { day: 9, month: 9, unknown: 1 } } }), [], "unknown cost: no spend alert");
+  assert.deepEqual(evaluateModelAlerts({ agentId: "A", rules, spend: {} }), []);
+  assert.deepEqual(evaluateModelAlerts({ agentId: "A", rules: [...rules, ...rules], spend: { "claude-opus-4-8": { day: 5, month: 5, unknown: 0 } } }).length, 1, "duplicate rule fires once");
+  assert.deepEqual(evaluateModelAlerts({ agentId: "A" }), []);
+});

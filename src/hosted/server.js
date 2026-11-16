@@ -9,7 +9,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -26,6 +26,8 @@ import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWeb
 import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
+import { modelSpendPolicy, modelCapStatus } from "./model-caps.js";
+import { normalizeModel } from "../model-cap.js";
 import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
 import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
 import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy } from "./org-budget.js";
@@ -481,7 +483,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -607,7 +609,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)), outcomes: agentOutcomes(s, u.orgId, a.id) })),
+          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)), ...(a.policy?.modelCaps?.length ? { modelCapSpend: modelCapStatus(orgAgentReceipts(s, u.orgId, a.id), a.policy.modelCaps, now(), orgPeriod(s, u.orgId)) } : {}), outcomes: agentOutcomes(s, u.orgId, a.id) })),
             budget_period: { ...orgPeriod(s, u.orgId) },
             receipts: visibleReceipts(s, u.orgId),
             audit: labelAudit(s, u.orgId, s.audit), alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
@@ -1194,6 +1196,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // Issue #223: spend anomaly vs the agent's own 14-day median (no cap needed).
         const anomaly = evaluateAnomaly({ id: a.id, receipts, nowMs: now(), budgetPeriod: bp, settings: resolveAnomaly(s.orgs?.[a.orgId]?.anomaly, a.policy.anomaly) });
         if (anomaly) alerts.push(anomaly);
+        // Issue #244: hosted modelCaps alerts per model, from this org's receipts on every host.
+        const modelRules = a.policy.modelCaps ?? [];
+        const modelSpend = modelRules.length ? modelSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), modelRules, now(), bp) ?? {} : {};
+        // #245: day/month blocks count only in the current period; hour blocks in the last hour.
+        const modelHits = modelRules.length ? [...blocksInCurrentPeriod(receipts, { reason: "model_budget_exceeded", nowMs: now(), budgetPeriod: bp }), ...recent.filter((r) => r.reason === "model_budget_exceeded" && r.scope === "hour")].filter((r) => typeof r.model === "string") : [];
+        const modelAlerts = evaluateModelAlerts({ agentId: a.id, rules: modelRules, spend: modelSpend, blockedHits: modelHits, normalize: normalizeModel }, { warnFractions: a.policy.warnFractions });
+        alerts.push(...modelAlerts);
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
@@ -1202,6 +1211,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
+          if (alert.model !== undefined) {
+            // #244: per-model arm state; a new org period is a new firing.
+            if (prior && prior[1].period && prior[1].period !== capPeriod(alert.scope, now(), bp)) resolveAlert(prior[1], now());
+            else if (prior) { queueRetry(prior, out); continue; }
+            const e = modelSpend[alert.model] ?? { day: 0, month: 0 };
+            const ok = alert.scope === "hour" || gateWarnings(s, `${a.id}:model:${alert.model}`, { [alert.scope]: alert.cap }, { day: e.day, month: e.month }, Array.isArray(a.policy.warnFractions) ? a.policy.warnFractions : [0.8], bp)(alert);
+            if (ok) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...(alert.scope === "hour" ? {} : { period: capPeriod(alert.scope, now(), bp) }) }, { nowMs: now(), id: randomUUID() })) });
+            continue;
+          }
           if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
           if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert, bp) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
@@ -1299,7 +1317,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
         const target = a.agentId ?? (a.org ? `org:${a.orgId}` : a.tag ? `tag:${a.tag.key}=${a.tag.value}` : `team:${a.team}`);
-        const extra = a.team ? { team: a.team, scope: a.scope } : a.org ? { org: true, scope: a.scope } : a.tag ? { tag: a.tag, scope: a.scope } : {};
+        const extra = a.team ? { team: a.team, scope: a.scope } : a.org ? { org: true, scope: a.scope } : a.tag ? { tag: a.tag, scope: a.scope } : a.model ? { model: a.model, scope: a.scope } : {};
         const rec = s.alerts[a.id];
         if (rec) delete rec.delivery_claimed_at;
         const gaveUp = rec ? applyDeliveryResult(rec, result, requested, now()) : [];

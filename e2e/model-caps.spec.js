@@ -67,3 +67,47 @@ test("model caps: owner sets modelCaps by API, card shows them, policy sync ship
     service.server.close();
   }
 });
+
+// Issue #244: synced Opus spend pages cap_approaching per model; the card shows fleet spend / cap.
+test("model caps: synced spend fires a per-model cap_approaching alert and the card shows spend / cap", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-modelcaps244-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key",
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert: async () => [{ status: "accepted" }],
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("modelcaps244@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    const post = (path, data, headers = { origin }) => page.request.post(`${origin}${path}`, { data, headers });
+    const tok = await (await post("/v1/enrollment-tokens", { caps: { day: 100 } })).json();
+    const agent = await (await post("/v1/enroll", { name: "opus-fleet" }, { authorization: `Bearer ${tok.token}` })).json();
+    expect((await post(`/v1/agents/${agent.agentId}/policy`, { caps: { day: 100 }, warnFractions: [0.5, 0.8], modelCaps: [{ model: "claude-opus-4-8", scope: "day", usd: 5 }] })).status()).toBe(200);
+    const ts = new Date(Date.now() - 60_000).toISOString();
+    const sync = await fetch(`${origin}/v1/receipts`, { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "h1", ts, cost_usd: 3, model: "claude-opus-4-8" }, { id: "h2", ts, cost_usd: 1.1, model: "anthropic/claude-opus-4.8" }] }) });
+    expect(sync.status).toBe(200);
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#agents .agent", { hasText: "opus-fleet" })).toContainText("claude-opus-4-8 day $4.10 / $5");
+    await expect(page.locator("#alerts")).toContainText("cap_approaching 80%");
+    await expect(page.locator("#alerts")).toContainText("model claude-opus-4-8 day");
+  } finally {
+    service.server.closeAllConnections();
+    service.server.close();
+  }
+});

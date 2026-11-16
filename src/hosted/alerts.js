@@ -353,3 +353,30 @@ export function filterAlerts(list, { status = "all", since, until } = {}) {
     return true;
   }).sort((x, y) => Number(!x.active) - Number(!y.active) || String(y.fired_at ?? "").localeCompare(String(x.fired_at ?? "")));
 }
+
+// Issue #244: hosted modelCaps alerts per agent and rule. spend: modelSpendPolicy(...)
+// ({<norm>: {day, month, unknown}}); blockedHits: [{model, scope}] from
+// model_budget_exceeded blocks synced in the last hour (hour scope included).
+// Key `<kind>:<agentId>:model:<normalized>:<scope>`. A model with unknown-cost
+// receipts this period raises no spend alert (never $0).
+export function evaluateModelAlerts({ agentId, rules = [], spend = {}, blockedHits = [], normalize = (m) => m }, { warnFractions } = {}) {
+  const out = [];
+  const fractions = Array.isArray(warnFractions) ? warnFractions : DEFAULT_WARN_FRACTIONS;
+  const seen = new Set();
+  for (const rule of rules) {
+    const model = normalize(rule.model);
+    const id = `${agentId}:model:${model}`;
+    const key = `${id}:${rule.scope}`;
+    if (!model || seen.has(key)) continue;
+    seen.add(key);
+    const e = spend?.[model];
+    const blocked = blockedHits.some((h) => normalize(h?.model) === model && h?.scope === rule.scope);
+    const spent = rule.scope === "hour" ? null : e && e.unknown === 0 ? e[rule.scope] : null;
+    const base = { model, scope: rule.scope, cap: rule.usd, spent };
+    if (blocked || (spent !== null && spent >= rule.usd)) { out.push({ kind: "cap_hit", key: `cap_hit:${key}`, ...base }); continue; }
+    if (spent === null) continue;
+    const warn = approaching(id, rule.scope, rule.usd, spent, fractions, true, {});
+    if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, fraction: warn.fraction });
+  }
+  return out;
+}

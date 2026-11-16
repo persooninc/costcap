@@ -9,6 +9,7 @@ import { createAgentBudgets } from "../agent-budget.js";
 import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 import { anomalyError } from "./anomaly.js";
+import { modelSpendPolicy, validModelSpend } from "./model-caps.js";
 
 export const TEAM_SCOPES = Object.freeze(["day", "month"]);
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
@@ -150,7 +151,8 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 
 // Issue #127: the agent's own fleet-wide synced spend (all hosts/runners using
 // this identity), from settled-aware stored receipts. Pure.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null) {
+// #244: modelCaps adds `models`, the same totals split per capped model.
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null) {
   const now = new Date(nowMs).toISOString();
   const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const spent = { day: 0, month: 0 };
@@ -165,12 +167,14 @@ export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null) {
     spent.month += r.cost_usd;
     if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
   }
-  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
+  const models = modelSpendPolicy(receipts, modelCaps, nowMs, budgetPeriod);
+  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, ...(models ? { models } : {}), as_of: now };
 }
 
 export function validAgentSpend(a) {
   if (a === null || a === undefined) return true;
   if (typeof a !== "object" || !Number.isFinite(Date.parse(a.as_of)) || !Number.isInteger(a.unknown) || a.unknown < 0) return false;
+  if (!validModelSpend(a.models)) return false;
   return TEAM_SCOPES.every((s) => typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0);
 }
 

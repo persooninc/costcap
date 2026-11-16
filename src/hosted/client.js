@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
+import { cachedFleetModelVerdict } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
 import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
@@ -176,6 +177,13 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         teamName: data.team?.name ?? null,
         org: data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null,
       };
+    },
+    // #244: hosted day/month modelCaps against the agent's fleet-wide per-model
+    // synced spend plus this host's unsynced receipts. No agent_spend.models: no-op.
+    modelCheck(models, nowMs = Date.now()) {
+      if (!data.agentSpend?.models) return null;
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedFleetModelVerdict(data.agentSpend, policy(nowMs).modelCaps ?? [], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,

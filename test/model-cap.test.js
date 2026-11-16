@@ -379,3 +379,104 @@ test("check --model-cap and hosted modelCaps agree on a dotted-id ledger (#241 A
   const engine = createModelCaps({ rules: mergeModelCapRules(hosted, []), history: rows });
   assert.deepEqual(engine.over(), cli);
 });
+
+// Issue #244: fleet model verdict (snapshot + pending, unknown, OpenRouter id, org period).
+import { cachedFleetModelVerdict, modelSpendPolicy, validModelSpend, cappedModels, withFleetModelCaps, modelCapStatus } from "../src/hosted/model-caps.js";
+
+test("#244 AC1: synced snapshot plus unsynced local spend refuses that model only (fleet: true)", () => {
+  const nowMs = Date.parse("2026-11-16T15:00:00Z");
+  const rules = [{ model: "claude-opus-4-8", scope: "day", usd: 5 }];
+  const spend = { as_of: "2026-11-16T14:59:00Z", models: { "claude-opus-4-8": { day: 3, month: 3, unknown: 0 } } };
+  const pending = [{ id: "p", ts: "2026-11-16T14:59:30Z", model: "claude-opus-4-8", cost_usd: 2.1 }];
+  const hit = cachedFleetModelVerdict(spend, rules, ["claude-opus-4-8"], pending, nowMs);
+  assert.deepEqual({ ...hit }, { model: "claude-opus-4-8", rule_model: "claude-opus-4-8", scope: "day", spend_usd: 5.1, cap_usd: 5, fleet: true });
+  assert.equal(cachedFleetModelVerdict(spend, rules, ["claude-haiku-4-5"], pending, nowMs), null);
+  assert.equal(cachedFleetModelVerdict(spend, rules, ["claude-opus-4-8"], [], nowMs), null);
+  assert.equal(cachedFleetModelVerdict({ as_of: spend.as_of }, rules, ["claude-opus-4-8"], pending, nowMs), null, "no models snapshot: no-op");
+  assert.equal(cachedFleetModelVerdict(spend, [{ model: "claude-opus-4-8", scope: "hour", usd: 1 }], ["claude-opus-4-8"], pending, nowMs), null, "hour stays local");
+  // A stale snapshot from yesterday counts 0 for today.
+  assert.equal(cachedFleetModelVerdict({ ...spend, as_of: "2026-11-15T10:00:00Z" }, rules, ["claude-opus-4-8"], pending, nowMs), null);
+});
+
+test("#244 AC2: unknown cost refuses that model only; OpenRouter dotted id shares the bucket", () => {
+  const nowMs = Date.parse("2026-11-16T15:00:00Z");
+  const rules = [{ model: "claude-opus-4-8", scope: "day", usd: 5 }];
+  const receipts = [
+    { id: "a", ts: "2026-11-16T10:00:00Z", model: "anthropic/claude-opus-4.8", cost_usd: 1 },
+    { id: "b", ts: "2026-11-16T11:00:00Z", model: "claude-opus-4-8", cost_usd: null },
+    { id: "c", ts: "2026-11-16T11:00:00Z", model: "claude-haiku-4-5", cost_usd: 9 },
+    { id: "d", ts: "2026-11-16T11:00:00Z", model: "claude-opus-4-8", cost_usd: 4, blocked: true },
+    { id: "e", ts: "2026-11-16T11:00:00Z", model: "claude-opus-4-8", cost_usd: null, reason: "batch_pending" },
+  ];
+  const models = modelSpendPolicy(receipts, rules, nowMs);
+  assert.deepEqual(models, { "claude-opus-4-8": { day: 1, month: 1, unknown: 1 } });
+  const spend = { as_of: new Date(nowMs).toISOString(), models };
+  const v = cachedFleetModelVerdict(spend, rules, ["anthropic/claude-opus-4.8"], [], nowMs);
+  assert.equal(v.verdict, "accounting_unavailable");
+  assert.equal(v.fleet, true);
+  assert.equal(cachedFleetModelVerdict(spend, rules, ["claude-haiku-4-5"], [], nowMs), null);
+  // Settled: the unknown is gone and the spend is under the cap.
+  const settled = modelSpendPolicy([receipts[0], { ...receipts[1], cost_usd: 0.5 }], rules, nowMs);
+  assert.equal(cachedFleetModelVerdict({ as_of: spend.as_of, models: settled }, rules, ["claude-opus-4-8"], [], nowMs), null);
+  // Pending unknown also refuses.
+  assert.equal(cachedFleetModelVerdict({ as_of: spend.as_of, models: settled }, rules, ["claude-opus-4-8"], [{ id: "x", ts: spend.as_of, model: "claude-opus-4-8", cost_usd: null }], nowMs).verdict, "accounting_unavailable");
+});
+
+test("#244 AC3: org period America/Los_Angeles puts 07:00 UTC in the prior org day", () => {
+  const bp = { timezone: "America/Los_Angeles", monthStartDay: 1 };
+  const nowMs = Date.parse("2026-11-16T20:00:00Z"); // 12:00 PST on the 16th
+  const rules = [{ model: "claude-opus-4-8", scope: "day", usd: 5 }];
+  const receipts = [{ id: "a", ts: "2026-11-16T07:00:00Z", model: "claude-opus-4-8", cost_usd: 4 }, { id: "b", ts: "2026-11-16T09:00:00Z", model: "claude-opus-4-8", cost_usd: 1 }];
+  const models = modelSpendPolicy(receipts, rules, nowMs, bp);
+  assert.equal(models["claude-opus-4-8"].day, 1);
+  assert.equal(models["claude-opus-4-8"].month, 5);
+  assert.equal(cachedFleetModelVerdict({ as_of: new Date(nowMs).toISOString(), models }, rules, ["claude-opus-4-8"], [], nowMs, bp), null);
+  // Under UTC both count today and the cap trips.
+  const utc = modelSpendPolicy(receipts, rules, nowMs);
+  assert.equal(cachedFleetModelVerdict({ as_of: new Date(nowMs).toISOString(), models: utc }, rules, ["claude-opus-4-8"], [], nowMs).spend_usd, 5);
+  // The snapshot resets at org midnight (08:00 UTC on the 17th), not UTC midnight.
+  const snap = { as_of: new Date(nowMs).toISOString(), models: { "claude-opus-4-8": { day: 5, month: 5, unknown: 0 } } };
+  assert.ok(cachedFleetModelVerdict(snap, rules, ["claude-opus-4-8"], [], Date.parse("2026-11-17T01:00:00Z"), bp));
+  assert.equal(cachedFleetModelVerdict(snap, rules, ["claude-opus-4-8"], [], Date.parse("2026-11-17T08:30:00Z"), bp), null);
+});
+
+test("#244: validModelSpend, cappedModels, modelCapStatus", () => {
+  assert.equal(validModelSpend(undefined), true);
+  assert.equal(validModelSpend({ m: { day: 1, month: 1, unknown: 0 } }), true);
+  assert.equal(validModelSpend({ m: { day: -1, month: 1, unknown: 0 } }), false);
+  assert.equal(validModelSpend({ m: { day: 1, month: 1, unknown: 0.5 } }), false);
+  assert.equal(validModelSpend([]), false);
+  assert.equal(validModelSpend(Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`m${i}`, { day: 0, month: 0, unknown: 0 }]))), false);
+  assert.deepEqual(cappedModels([{ model: "claude-opus-4-8" }, { model: "anthropic/claude-opus-4.8" }]), ["claude-opus-4-8"]);
+  assert.deepEqual(cappedModels(null), []);
+  assert.equal(modelSpendPolicy([], [], 0), null);
+  const nowMs = Date.parse("2026-11-16T15:00:00Z");
+  const rows = modelCapStatus([{ id: "a", ts: "2026-11-16T10:00:00Z", model: "claude-opus-4-8", cost_usd: 4.1 }], [{ model: "claude-opus-4-8", scope: "day", usd: 5 }, { model: "claude-opus-4-8", scope: "hour", usd: 1 }], nowMs);
+  assert.deepEqual(rows, [{ model: "claude-opus-4-8", scope: "day", usd: 5, spent: 4.1, unknown: 0 }, { model: "claude-opus-4-8", scope: "hour", usd: 1, spent: null, unknown: 0 }]);
+});
+
+test("#244: withFleetModelCaps uses the local engine first, fleet with a snapshot, fallback without", () => {
+  const local = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "hour", cap: 1 }] });
+  const fallback = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "day", cap: 2 }] });
+  let snap = null;
+  const fleet = { agentSpend: () => snap, modelCheck: () => ({ model: "claude-opus-4-8", scope: "day", fleet: true }) };
+  const w = withFleetModelCaps(local, fallback, fleet);
+  assert.equal(w.check(["claude-opus-4-8"]), null);
+  w.record({ id: "r1", ts: new Date().toISOString(), model: "claude-opus-4-8", cost_usd: 0.5 });
+  w.record({ id: "r2", ts: new Date(Date.now() - 2 * 3600_000).toISOString(), model: "claude-opus-4-8", cost_usd: 1.6 });
+  assert.equal(w.check(["claude-opus-4-8"]).scope, "day", "fallback enforces before a snapshot");
+  assert.equal(w.remaining(["claude-opus-4-8"]).length, 2);
+  assert.equal(w.over().length, 1);
+  assert.ok(w.preflight(["claude-opus-4-8"], 1));
+  snap = { models: {} };
+  assert.equal(w.check(["claude-opus-4-8"]).fleet, true);
+  assert.equal(w.remaining(["claude-opus-4-8"]).length, 1);
+  assert.equal(w.over().length, 0);
+  assert.equal(w.preflight(["claude-opus-4-8"], 0.1), null);
+  assert.equal(w.rules().length, 2);
+  w.setRules([]);
+  assert.equal(local.rules().length, 0);
+  assert.equal(w.settle("missing", 1), false);
+  w.record({ id: "u1", ts: new Date().toISOString(), model: "claude-opus-4-8", cost_usd: null });
+  assert.equal(w.settle("u1", 0.1), true);
+});

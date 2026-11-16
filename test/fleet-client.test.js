@@ -316,3 +316,37 @@ test("#240 orgCheck: cached org budget plus unsynced receipts, offline; null lif
   assert.equal((await cold.sync()).online, true);
   assert.equal(cold.orgCheck(), null);
 });
+
+// Issue #244: agent_spend.models is validated, cached and enforced offline per model.
+test("#244 modelCheck: cached agent_spend.models plus unsynced receipts; invalid models refused", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-models-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  const asOf = new Date().toISOString();
+  let models = { "claude-opus-4-8": { day: 3, month: 3, unknown: 0 } };
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: {}, killed: false } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version: 2, caps: {}, killed: false, modelCaps: [{ model: "claude-opus-4-8", scope: "day", usd: 5 }], agent_spend: { spent: { day: 3, month: 3 }, unknown: 0, pending_batches: 0, ...(models ? { models } : {}), as_of: asOf } }));
+    else res.end(JSON.stringify({ acceptedIds: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "e", name: "x", path });
+  const client = createFleetClient({ path, receiptsPath });
+  assert.equal(client.modelCheck(["claude-opus-4-8"]), null); // nothing cached
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.modelCheck(["claude-opus-4-8"]), null);
+  appendFileSync(receiptsPath, JSON.stringify({ id: "local", ts: new Date().toISOString(), model: "claude-opus-4-8", cost_usd: 2.1 }) + "\n");
+  const cold = createFleetClient({ path, receiptsPath }); // offline restart
+  const hit = cold.modelCheck(["claude-opus-4-8"]);
+  assert.equal(hit.fleet, true);
+  assert.equal(hit.spend_usd, 5.1);
+  assert.equal(cold.modelCheck(["claude-haiku-4-5"]), null);
+  models = { "claude-opus-4-8": { day: -1, month: 3, unknown: 0 } };
+  assert.equal((await client.sync()).online, false, "invalid models map is refused");
+  assert.equal(client.agentSpend().models["claude-opus-4-8"].day, 3, "cache kept");
+  models = null;
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.modelCheck(["claude-opus-4-8"]), null, "older server: no models, no fleet verdict");
+});
