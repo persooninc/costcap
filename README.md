@@ -276,7 +276,9 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   Which endpoints are estimated (#205): chat, responses, messages, embeddings
   and other generating POSTs use the maths above. An Anthropic Message Batches
   create is estimated as the **sum** of every `requests[].params` worst case
-  times the batch rate (0.5x); any unpriced entry refuses with
+  times the batch rate (0.5x); the batch preflight discounts tokens only, and
+  each entry's tool worst case (`max_uses` x rate) is added at 100%
+  (`tool_calls_max` / `tool_usd_max` are summed across entries, #218); any unpriced entry refuses with
   `preflight_unpriced` naming it. These pass through preflight unestimated
   (still subject to caps, allowlists and rpm; the receipt has
   `preflight_estimate: false`): `GET`/`HEAD` (background polls, batch and file

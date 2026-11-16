@@ -137,6 +137,39 @@ test("estimateBatch: sums entries at the batch multiplier; rejects unusable bodi
   assert.equal(checkEstimate(undefined, one), null);
 });
 
+// #218: batch preflight discounts tokens only; web search max_uses bills at 100%.
+const searchBatch = (n) => j({ requests: Array.from({ length: n }, (_, i) => ({ custom_id: `s${i}`,
+  params: { model: "claude-sonnet-4-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }], tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 10 }] } })) });
+
+test("estimateBatch #218: tools at full rate, tokens at batch rate, sums tool fields", () => {
+  const e = estimateBatch("anthropic", searchBatch(100));
+  assert.equal(e.ok, true);
+  assert.equal(e.tool_calls_max, 1000);
+  assert.equal(e.tool_usd_max, 10);
+  assert.ok(e.estimate_usd >= 10.0, `estimate ${e.estimate_usd}`);
+  const plain = estimateBatch("anthropic", anthropicBatch(3));
+  assert.equal(plain.tool_calls_max, undefined);
+  assert.equal(plain.tool_usd_max, undefined);
+});
+
+test("estimateBatch #218 regression: tool-free batch keeps the old token-only estimate", () => {
+  const body = anthropicBatch(4);
+  const reqs = JSON.parse(body).requests;
+  const e = estimateBatch("anthropic", body);
+  const single = reqs.reduce((a, r) => a + estimateBatch("other", j({ requests: [r] })).estimate_usd, 0);
+  assert.ok(Math.abs(e.estimate_usd - single * 0.5) < 1e-5);
+});
+
+test("checkEstimate #218: $7 left refuses the search batch over cap; $11 left forwards it", () => {
+  const est = estimateBatch("anthropic", searchBatch(100));
+  const r7 = checkEstimate({ remaining: () => ({ run: 7 }) }, est);
+  assert.equal(r7.reason, "preflight_estimate");
+  assert.equal(r7.scope, "run");
+  let fit;
+  assert.equal(checkEstimate({ remaining: () => ({ run: 11 }) }, est, (x) => { fit = x; }), null);
+  assert.equal(fit, est);
+});
+
 test("stress: 200 mixed preflight routes, none mis-refused", async () => {
   const h = await harness();
   // Waves of 40 concurrent requests: 200 simultaneous connects overflow the

@@ -128,15 +128,18 @@ export function estimateBatch(provider, body, priceFor) {
   try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
   if (!Array.isArray(reqs) || !reqs.length) return { ok: false, reason: "preflight_unpriced", model: "unknown" };
   const mult = batchMultiplier(provider) ?? 1;
-  let usd = 0, input_tokens = 0, output_tokens = 0, model;
+  // #218: the batch discount covers tokens only; tool calls (web search) bill at 100%.
+  let usd = 0, toolUsd = 0, toolCalls = 0, input_tokens = 0, output_tokens = 0, model;
   for (const r of reqs) {
     const params = r?.params && typeof r.params === "object" ? r.params : {};
     const e = estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
     if (!e.ok) return e;
-    usd += e.estimate_usd; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
+    const t = e.tool_usd_max ?? 0;
+    usd += e.estimate_usd - t; toolUsd += t; toolCalls += e.tool_calls_max ?? 0; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
   }
   return { ok: true, model, input_tokens, output_tokens, output_multiplier: 1, batch_entries: reqs.length, batch_multiplier: mult,
-    estimate_usd: Number((usd * mult).toFixed(6)) };
+    ...(toolCalls && { tool_calls_max: toolCalls, tool_usd_max: Number(toolUsd.toFixed(6)) }),
+    estimate_usd: Number((usd * mult + toolUsd).toFixed(6)) };
 }
 
 // Compares a precomputed estimate (estimateWorstCase / estimateBatch) with the remaining budget.
