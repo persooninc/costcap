@@ -751,8 +751,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const runCap = a.policy.caps?.run;
         const hasRunCap = typeof runCap === "number" && Number.isFinite(runCap);
         const activeRuns = hasRunCap || blockedRunIds.length
-          ? summarizeRuns(receipts.filter((r) => typeof r.run_id === "string" && r.run_id)).filter((run) => Date.parse(run.last_ts) > now() - 3600_000).slice(0, 20)
+          ? summarizeRuns(receipts.filter((r) => typeof r.run_id === "string" && r.run_id)).filter((run) => Date.parse(run.last_ts) > now() - 3600_000)
           : [];
+        // Issue #180: every active run is evaluated (no top-N slice), so a
+        // blocked or over-cap run past the 20 most recent still pages and its
+        // alert is not flap-resolved when newer runs sync.
         const runAlerts = evaluateRunAlerts({ agentId: a.id, cap: hasRunCap ? runCap : null, runs: activeRuns, blockedRunIds }, { warnFractions: a.policy.warnFractions });
         alerts.push(...runAlerts);
         // A configured global alert channel is not an org recipient grant.

@@ -110,3 +110,25 @@ test("hosted sweep: explicit fractions, unknown cost, no cap, no run_id", async 
   await f.sync(c, [{ run_id: "q", cost_usd: 50 }]); await f.sweep();
   assert.equal(f.delivery.filter((d) => d.agentId === c.agentId).length, 0);
 });
+
+// Issue #180: more than 20 concurrent active runs.
+test("hosted sweep: blocked oldest of 25 runs pages; run alerts survive 21 newer runs", async (t) => {
+  const clock = { ms: Date.parse("2026-11-16T10:00:00Z") };
+  const f = await fixture(t, clock);
+  const a = await f.enroll({ caps: { run: 1 } });
+  const id = a.agentId;
+  await f.sync(a, [{ run_id: "old", cost_usd: 0, blocked: true, reason: "budget_exceeded", scope: "run" }]);
+  await f.sync(a, [{ run_id: "warm", cost_usd: 0.85 }]);
+  for (let i = 0; i < 23; i++) { clock.ms += 1000; await f.sync(a, [{ run_id: `n${i}`, cost_usd: 0.1 }]); }
+  await f.sweep();
+  const keys = f.delivery.map((d) => d.key);
+  assert.ok(keys.includes(`cap_hit:${id}:run:old`));
+  assert.ok(keys.includes(`cap_approaching:${id}:run:warm`));
+  assert.equal(keys.length, 2);
+  for (let i = 0; i < 21; i++) { clock.ms += 1000; await f.sync(a, [{ run_id: `m${i}`, cost_usd: 0.1 }]); }
+  await f.sweep();
+  assert.equal(f.delivery.length, 2);
+  const doc = (await f.request("/v1/evidence.json", undefined, f.cookie)).body;
+  const active = doc.alerts.filter((x) => x.active && x.run_id).map((x) => x.run_id).sort();
+  assert.deepEqual(active, ["old", "warm"]);
+});
