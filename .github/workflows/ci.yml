@@ -39,11 +39,11 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - name: playwright-trace (failure only -> dev-home-01)
         if: failure()
+        uses: persooninc/infra/actions/ci-artifacts@ci-artifacts-v1.1
         with:
           name: playwright-trace
           path: |
             test-results/
             playwright-report/
-          if-no-files-found: ignore
