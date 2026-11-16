@@ -20,6 +20,8 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   const by_model = {};
   let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, total = 0;
   let stopped_by = killed ? "killed" : null, stopped_scope = killed ? (kill?.kill_scope ?? null) : null;
+  // #184: response cache counters, present only when some receipt carries a cache field.
+  let cache = null;
   let killInfo = killed && kill?.kill_scope ? { kill_scope: kill.kill_scope, kill_file: kill.kill_file } : null;
   for (const r of applySettlements(receipts.filter(Boolean))) {
     if (r.blocked) {
@@ -30,6 +32,11 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
       continue;
     }
     calls++;
+    if (r.cache) {
+      cache ??= { hits: 0, misses: 0, saved_usd: 0 };
+      if (r.cache === "hit") { cache.hits++; if (typeof r.saved_usd === "number" && Number.isFinite(r.saved_usd)) cache.saved_usd = r6(cache.saved_usd + r.saved_usd); }
+      else if (r.cache === "miss") cache.misses++;
+    }
     if (r.reason === "upstream_rejected") rejected_calls++;
     const m = r.model ?? "unknown";
     const b = (by_model[m] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 });
@@ -50,16 +57,17 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   return {
     schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
     total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls,
-    caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
+    caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(cache ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
   };
 }
 
 export function rollupLine(s) {
+  const saved = s.cache?.hits > 0 ? ` · cache: ${s.cache.hits} hit${s.cache.hits === 1 ? "" : "s"}, saved $${s.cache.saved_usd.toFixed(4)}` : "";
   const cost = s.total_cost_usd === null
     ? `unknown (${s.unknown_cost_calls} unpriced call${s.unknown_cost_calls === 1 ? "" : "s"})`
     : `$${s.total_cost_usd.toFixed(4)}`;
   const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
-  return `costcap: run ${s.run_id} calls=${s.calls} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}`;
+  return `costcap: run ${s.run_id} calls=${s.calls} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}`;
 }
 
 export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");

@@ -530,3 +530,17 @@ test("#163 AC2: gpt-image-1 images/generations priced from the table", async (t)
   assert.equal(rec.cost_usd, Number(((50 * 5 + 4160 * 40) / 1e6).toFixed(6)));
   assert.equal(rec.cost_source, "table");
 });
+
+// #184 regression: with no --cache every receipt keeps its exact shape (no cache fields, no header).
+test("#184 no --cache: receipt key set and response headers are unchanged", async (t) => {
+  const receipts = [];
+  const seen = [];
+  const call = await fixture(t, (req, res) => {
+    seen.push(req.headers["x-costcap-cache"]);
+    res.writeHead(200, { "content-type": "application/json" }).end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":10,"completion_tokens":5}}');
+  }, { onReceipt: (r) => receipts.push(r) });
+  const r = await call(); await r.text();
+  assert.equal(r.headers.get("x-costcap-cache"), null);
+  assert.deepEqual(Object.keys(receipts[0]).sort(), ["blocked", "cache_write_1h_input_tokens", "cache_write_input_tokens", "cached_input_tokens", "cost_source", "cost_usd", "fallback", "id", "input_tokens", "model", "output_tokens", "path", "pricing_tier", "provider", "status", "table_sha256", "table_version", "ts"].sort());
+  assert.deepEqual(seen, [undefined]);
+});

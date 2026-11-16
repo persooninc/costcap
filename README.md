@@ -438,6 +438,24 @@ node src/cli.js runs --json --receipts .costcap/receipts.jsonl
 
 Corrupt summary files are reported and skipped. No account is needed.
 
+## Response cache
+
+`costcap wrap --cache TTL` (`30s`, `10m`, `24h`, up to `7d`) answers repeated identical deterministic requests from a local disk cache. It is off by default.
+
+```sh
+costcap wrap --cache 24h [--cache-dir DIR] [--cache-max-mb 256] -- npm run evals
+```
+
+- **Cached:** `POST` non-streaming generations whose body sets `temperature` (Gemini: `generationConfig.temperature`) to exactly `0`, and OpenAI embeddings. Only a `2xx` response with a known, numeric cost is stored.
+- **Never cached** (response header `x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), `n > 1`, any other temperature, batch create/read, Files, count-tokens and GET/HEAD. Provider errors, rejected calls, unknown or unpriced cost and pending batches are never stored.
+- **Key:** provider, upstream base URL, method, path and query, the exact request body bytes, the `anthropic-version`, `anthropic-beta`, `openai-organization` and `openai-project` headers, and a hash of the API key headers and `?key=`. Different keys never share entries.
+- **On disk:** `--cache-dir` defaults to `<ledger-dir>/cache` (mode `0700`); entries are `0600` and hold only the response, model, original cost, source receipt id and a timestamp: never request bodies, headers or keys. `--cache-max-mb` (default 256) evicts least recently used entries; a response over a tenth of the cap is not stored. Delete the directory to purge it.
+- **Enforcement:** the lookup runs after every refusal check (kill file, accounting failure, model allowlist, caps, preflight, breaker, spiral), so a hit never bypasses a refusal. Hits count toward `--max-steps` and policy `maxSteps`, never toward velocity spend or caps.
+- **Hit:** the stored status, content-type and body are replayed with `x-costcap-cache: hit` and no upstream call. The receipt is `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`. A miss is forwarded and metered as today, with `cache: "miss"` on the receipt.
+- Send `x-costcap-cache: bypass` on a request to skip the cache for that call. CostCap strips the header before forwarding.
+- The run summary gains `cache: {hits, misses, saved_usd}` and the roll-up line ends with ` · cache: N hits, saved $X`. Hosted `/v1/spend` returns `cache_hits` and `saved_usd` per bucket and in the total, and the dashboard Spend card shows "Saved $X on N cached calls". `saved_usd` never counts toward caps, alerts or billing.
+- **Staleness:** a cached answer can be up to the TTL old. Use a short TTL, or `bypass`, when the provider's answer may change.
+
 ## CI check and local MCP
 
 ```sh

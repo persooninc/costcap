@@ -397,3 +397,30 @@ test("#163: wrap meters Gemini audio at the audio rate, check --cap trips on it,
   const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gemini-2.5-flash"], { encoding: "utf8" });
   assert.match(show.stdout, /gemini-2\.5-flash \(audio\): input \$1, cached_input \$0\.1/);
 });
+
+// #184: --cache TTL / --cache-dir / --cache-max-mb parsing; a bad TTL exits 2.
+test("#184 parseWrapArgs reads --cache, --cache-dir and --cache-max-mb", async () => {
+  const o = parseWrapArgs(["--cache", "24h", "--cache-dir", "/tmp/c", "--cache-max-mb", "64", "--", "node"]);
+  assert.equal(o.cacheTtlMs, 86_400_000);
+  assert.equal(o.cacheDir, "/tmp/c");
+  assert.equal(o.cacheMaxMb, 64);
+  assert.equal(parseWrapArgs(["--", "node"]).cacheTtlMs, undefined);
+  assert.throws(() => parseWrapArgs(["--cache", "8d", "--", "x"]), /at most 7d/);
+  assert.throws(() => parseWrapArgs(["--cache", "soon", "--", "x"]), /TTL/);
+  assert.throws(() => parseWrapArgs(["--cache", "1h", "--cache-max-mb", "0", "--", "x"]), /positive number/);
+  assert.throws(() => parseWrapArgs(["--cache-dir", "/tmp/c", "--", "x"]), /need --cache/);
+  const { responseCacheFor } = await import("../src/cli.js");
+  assert.equal(responseCacheFor({ receiptsPath: "x/receipts.jsonl" }), null);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-cli-cache-"));
+  const c = responseCacheFor({ cacheTtlMs: 1000, receiptsPath: path.join(dir, "receipts.jsonl") });
+  assert.equal(c.dir, path.join(dir, "cache"));
+  assert.equal(c.maxBytes, 256 * 1024 * 1024);
+  assert.equal(responseCacheFor({ cacheTtlMs: 1000, cacheMaxMb: 1, cacheDir: path.join(dir, "x"), receiptsPath: "r" }).maxBytes, 1024 * 1024);
+});
+
+test("#184 costcap wrap --cache with a bad TTL exits 2 before spawning", () => {
+  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--cache", "forever", "--", process.execPath, "-e", "console.log('ran')"], { encoding: "utf8" });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--cache must be a TTL/);
+  assert.doesNotMatch(r.stdout, /ran/);
+});

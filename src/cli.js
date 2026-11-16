@@ -27,8 +27,10 @@ import { writeGithubOutputs } from "./github-output.js";
 import { assertTableIntegrity } from "./pricing.js";
 import { pricingCommand } from "./pricing-cli.js";
 import { receiptsCommand } from "./receipts-cli.js";
+import { createResponseCache, parseTtl, DEFAULT_CACHE_MAX_MB } from "./response-cache.js";
+import { dirname, join } from "node:path";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] -- <command...>\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
@@ -89,11 +91,22 @@ export function parseWrapArgs(argv) {
     else if (f === "--run-id") opts.runId = v;
     else if (f === "--tag") opts.tagPairs = [...(opts.tagPairs ?? []), v];
     else if (f === "--policy") opts.policyPath = v;
+    else if (f === "--cache") opts.cacheTtlMs = parseTtl(v);
+    else if (f === "--cache-dir") opts.cacheDir = v;
+    else if (f === "--cache-max-mb") opts.cacheMaxMb = positiveNumber(f, v);
     else throw new Error(`unknown flag ${f}`);
   }
   // #169: validated here so a bad --tag exits 2 before anything is spawned.
   if (opts.tagPairs) { opts.tags = parseTagList(opts.tagPairs); delete opts.tagPairs; }
+  // #184: --cache-dir / --cache-max-mb only mean something with --cache.
+  if (opts.cacheTtlMs === undefined && (opts.cacheDir !== undefined || opts.cacheMaxMb !== undefined)) throw new Error("--cache-dir and --cache-max-mb need --cache TTL");
   return opts;
+}
+
+/** #184: the response cache for `wrap --cache`, or null when caching is off. */
+export function responseCacheFor({ cacheTtlMs, cacheDir, cacheMaxMb, receiptsPath }) {
+  if (cacheTtlMs === undefined) return null;
+  return createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, maxBytes: Math.round((cacheMaxMb ?? DEFAULT_CACHE_MAX_MB) * 1024 * 1024) });
 }
 
 function positiveNumber(name, v) {
@@ -126,7 +139,8 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags } = parseWrapArgs(argv);
+  const parsedWrap = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags } = parsedWrap;
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
@@ -189,7 +203,7 @@ export async function wrap(argv) {
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
   capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits,
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits, cache: responseCacheFor(parsedWrap),
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);

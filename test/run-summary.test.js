@@ -194,3 +194,22 @@ test("#160 a pending batch keeps the run total unknown until its batch_results s
   const settled = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending, { event: "reconciliation", receipt_id: "p1", cost_usd: 0.25, source: "batch_results" }] });
   assert.deepEqual([settled.total_cost_usd, settled.unknown_cost_calls], [0.35, 0]);
 });
+
+// #184: response cache block in the run summary and the roll-up line.
+test("#184 run summary reports cache hits, misses and saved spend; roll-up shows the saving", () => {
+  const s = buildRunSummary({ run_id: "rc", started_at: "a", ended_at: "b", receipts: [
+    priced("m1", 0.25, { cache: "miss", id: "x" }),
+    priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.25, cache_source_receipt: "x" }),
+    priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.25, cache_source_receipt: "x" }),
+    priced("m1", 0.1, { cache: "bypass" }),
+  ] });
+  assert.deepEqual(s.cache, { hits: 2, misses: 1, saved_usd: 0.5 });
+  assert.equal(s.total_cost_usd, 0.35);
+  assert.match(rollupLine(s), / · cache: 2 hits, saved \$0\.5000$/);
+  const none = buildRunSummary({ run_id: "rn", started_at: "a", ended_at: "b", receipts: [priced("m1", 0.1)] });
+  assert.equal("cache" in none, false);
+  assert.doesNotMatch(rollupLine(none), /cache:/);
+  const misses = buildRunSummary({ run_id: "rm", started_at: "a", ended_at: "b", receipts: [priced("m1", 0.1, { cache: "miss" })] });
+  assert.deepEqual(misses.cache, { hits: 0, misses: 1, saved_usd: 0 });
+  assert.doesNotMatch(rollupLine(misses), /cache:/);
+});

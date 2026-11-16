@@ -356,6 +356,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
+            // #184: saved_usd only on a $0 cache_hit receipt, as a finite number >= 0.
+            if (r.saved_usd !== undefined && (r.reason !== "cache_hit" || r.cost_usd !== 0 || typeof r.saved_usd !== "number" || !Number.isFinite(r.saved_usd) || r.saved_usd < 0)) fail(400, "Invalid receipt: saved_usd");
             const key = `${a.id}:${r.id}`;
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");
             s.receipts[key] ??= { orgId: a.orgId, agentId: a.id, receipt: r };

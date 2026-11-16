@@ -95,3 +95,38 @@ test("Spend card: day, model and agent rows, incomplete badge, period switch, vi
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// #184: a synced cache_hit receipt shows "Saved $… on 1 cached calls" on the Spend card.
+test("Spend card shows saved spend from response-cache hits", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-spend-cache-e2e-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const email = "spend-cache-e2e@example.invalid";
+    const c = await post("/auth/request", { email, turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes[email] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", {}, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "cached" }) }).then((r) => r.json());
+    const ts = new Date().toISOString();
+    const synced = await fetch(origin + "/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [
+      { id: "miss1", ts, cost_usd: 0.25, model: "gpt-4o-mini", cache: "miss" },
+      { id: "hit1", ts, cost_usd: 0, model: "gpt-4o-mini", reason: "cache_hit", cache: "hit", saved_usd: 0.25, cache_source_receipt: "miss1" },
+    ] }) });
+    expect(synced.status).toBe(200);
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    await expect(page.locator("#spendTotal")).toContainText("$0.25");
+    await expect(page.locator("#spendTotal")).toContainText("Saved $0.25 on 1 cached calls");
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});

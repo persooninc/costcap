@@ -1208,3 +1208,32 @@ test("#161 without enforced entitlements an invite still accepts past the free s
   for (let i = 1; i <= 4; i++) assert.equal((await f.request("/v1/invitations", { email: `b${i}@beta.invalid`, role: "viewer" }, owner.cookie)).status, 201);
   for (let i = 1; i <= 4; i++) { const r = await f.login(`b${i}@beta.invalid`); assert.equal(r.status, 200); assert.equal(r.body.orgId, owner.body.orgId); }
 });
+
+// #184: ingest accepts saved_usd only on a $0 cache_hit receipt; /v1/spend reports it.
+test("#184 receipt ingest validates saved_usd and /v1/spend returns cache_hits and saved_usd", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("cache-owner@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", {}, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "cached" }, null, enrollment.body.token)).body;
+  const ts = new Date().toISOString();
+  const base = { ts, model: "gpt-4o-mini" };
+  for (const bad of [
+    { id: "b1", ...base, cost_usd: 0, reason: "cache_hit", saved_usd: -1 },
+    { id: "b2", ...base, cost_usd: 0, reason: "cache_hit", saved_usd: "x" },
+    { id: "b3", ...base, cost_usd: 0.2, saved_usd: 0.2 },
+    { id: "b4", ...base, cost_usd: 0.1, reason: "cache_hit", saved_usd: 0.2 },
+  ]) assert.equal((await f.request("/v1/receipts", { receipts: [bad] }, null, agent.token)).status, 400, bad.id);
+  const ok = await f.request("/v1/receipts", { receipts: [
+    { id: "m1", ...base, cost_usd: 0.2, cache: "miss" },
+    { id: "h1", ...base, cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: 0.2, cache_source_receipt: "m1" },
+  ] }, null, agent.token);
+  assert.equal(ok.status, 200);
+  for (const g of ["day", "model", "agent"]) {
+    const s = await f.request(`/v1/spend?group_by=${g}`, undefined, owner.cookie);
+    assert.equal(s.status, 200);
+    assert.equal(s.body.total.cache_hits, 1, g);
+    assert.equal(s.body.total.saved_usd, 0.2, g);
+    assert.equal(s.body.total.usd_known, 0.2, g);
+    assert.equal(s.body.buckets[0].cache_hits, 1, g);
+  }
+});

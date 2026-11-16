@@ -124,3 +124,26 @@ test("GET /v1/spend clamps to plan receipt retention when entitlements are enfor
   assert.equal(r.since, new Date(NOW - 30 * DAY).toISOString());
   assert.equal(r.total.usd_known, 1);
 });
+
+// #184: cache_hits and saved_usd per bucket and in the total, for every group_by; usd_known unchanged.
+test("#184 spendBreakdown counts cache_hits and saved_usd without touching usd_known", () => {
+  const items = [
+    { agentId: "a1", receipt: { id: "m", ts: "2026-11-16T01:00:00Z", model: "gpt-4o-mini", cost_usd: 0.3, cache: "miss", tags: { env: "ci" } } },
+    { agentId: "a1", receipt: { id: "h1", ts: "2026-11-16T02:00:00Z", model: "gpt-4o-mini", cost_usd: 0, reason: "cache_hit", saved_usd: 0.3, tags: { env: "ci" } } },
+    { agentId: "a2", receipt: { id: "h2", ts: "2026-11-15T02:00:00Z", model: "o3", cost_usd: 0, reason: "cache_hit", saved_usd: 0.1 } },
+  ];
+  const withoutHits = spendBreakdown(items.slice(0, 1), { groupBy: "day" });
+  for (const groupBy of ["day", "model", "agent", "tag"]) {
+    const d = spendBreakdown(items, { groupBy, tagKey: "env" });
+    assert.equal(d.total.cache_hits, 2, groupBy);
+    assert.equal(d.total.saved_usd, 0.4, groupBy);
+    assert.equal(d.total.usd_known, 0.3, groupBy);
+    assert.equal(d.buckets.reduce((n, b) => n + b.cache_hits, 0), 2, groupBy);
+    assert.equal(Number(d.buckets.reduce((n, b) => n + b.saved_usd, 0).toFixed(6)), 0.4, groupBy);
+    for (const b of d.buckets) assert.ok("cache_hits" in b && "saved_usd" in b);
+  }
+  const model = spendBreakdown(items, { groupBy: "model" });
+  assert.deepEqual(model.buckets.map((b) => [b.key, b.cache_hits, b.saved_usd]), [["gpt-4o-mini", 1, 0.3], ["o3", 1, 0.1]]);
+  assert.equal(withoutHits.total.usd_known, 0.3);
+  assert.equal(withoutHits.total.cache_hits, 0);
+});

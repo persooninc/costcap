@@ -299,3 +299,30 @@ test("#166 Gemini stream: cumulative usageMetadata without finishReason is incom
   bare.push(`data: {${usage}}\n\n`);
   assert.equal(bare.incomplete, false);
 });
+
+// #184: with --cache on, temperature-0 streams bypass the cache and pass through unchanged.
+import { createResponseCache } from "../src/response-cache.js";
+import { mkdtempSync as mkdtemp184, readdirSync as readdir184 } from "node:fs";
+import { tmpdir as tmpdir184 } from "node:os";
+import { join as join184 } from "node:path";
+
+for (const [name, path, body] of [
+  ["OpenAI", "/openai/v1/chat/completions", '{"stream":true,"temperature":0,"stream_options":{"include_usage":true}}'],
+  ["Anthropic", "/anthropic/v1/messages", '{"stream":true,"temperature":0}'],
+]) {
+  test(`#184 ${name}: a stream with --cache is a bypass, streamed byte-identical and never stored`, async (t) => {
+    const dir = join184(mkdtemp184(join184(tmpdir184(), "cc-cache-sse-")), "cache");
+    const events = name === "OpenAI" ? OPENAI_EVENTS : ANTHROPIC_EVENTS;
+    const { up, proxy, receipts } = await setup(t, events, { gapMs: 20 }, { cache: createResponseCache({ dir, ttlMs: 3_600_000 }) });
+    for (let i = 0; i < 2; i++) {
+      const { res, body: text } = await streamCall(proxy, path, body);
+      assert.equal(res.headers.get("x-costcap-cache"), "bypass");
+      assert.equal(text, events.join(""));
+    }
+    await tick();
+    assert.equal(receipts.length, 2);
+    assert.ok(receipts.every((r) => r.cache === "bypass" && r.cost_usd > 0));
+    assert.equal(readdir184(dir).length, 0);
+    assert.ok(up.state.sent.length >= events.length * 2);
+  });
+}

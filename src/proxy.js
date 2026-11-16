@@ -14,6 +14,7 @@ import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
+import { CACHE_HEADER, cacheKey, isCacheable } from "./response-cache.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -348,7 +349,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -424,6 +425,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     let reqTags = null, tagError = null;
     try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) { tagError = e.message; }
     delete req.headers[TAG_HEADER];
+    // #184: x-costcap-cache is CostCap's too: `bypass` skips lookup and store. Never forwarded.
+    const cacheBypass = String(req.headers[CACHE_HEADER] ?? "").trim().toLowerCase() === "bypass";
+    delete req.headers[CACHE_HEADER];
     const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt);
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
@@ -524,6 +528,29 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           return null;
         });
         if (verdict === "blocked") return;
+        // #184: the cache is consulted only after the full verdict, so a hit never bypasses a refusal.
+        let cacheState = null, cacheId = null;
+        if (cache) {
+          const eligible = !cacheBypass && isCacheable(provider, req.method, req.url, parsedBody, {
+            embeddings: isEmbeddingsPath(req.url), countTokens: isCountTokensPath(req.url),
+            files: isNonBillableFilesRequest(req.method, req.url), batch: Boolean(batchCreate) || Boolean(batchReadPath(req.method, req.url)) });
+          cacheState = eligible ? "miss" : "bypass";
+          if (eligible) {
+            cacheId = cacheKey({ provider, upstream, method: req.method, path, body, headers: req.headers });
+            let entry = null;
+            try { entry = cache.get(cacheId); } catch { /* a broken cache is a miss */ }
+            if (entry) {
+              emit({ provider, path: storedPath, status: entry.status, blocked: false, model: entry.model ?? requestedModel ?? "unknown",
+                cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id });
+              // A hit is a step (max-steps) but adds no velocity spend.
+              velocity?.record(0);
+              flushWarnings();
+              if (!res.destroyed) res.writeHead(entry.status, { "content-type": entry.content_type, [CACHE_HEADER]: "hit" }).end(entry.body);
+              return;
+            }
+          }
+        }
+        const cacheHeaders = cacheState ? { [CACHE_HEADER]: cacheState } : {};
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
@@ -552,7 +579,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, streamCut = false, sseIncomplete = false;
-          if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
+          const sse = /^text\/event-stream/i.test(contentType) && upstreamRes.body;
+          if (cacheState) { if (sse) { cacheState = "bypass"; cacheHeaders[CACHE_HEADER] = "bypass"; } receipt.cache = cacheState; }
+          if (sse) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             const parser = createSseUsageParser(provider, requestedModel);
             const decoder = new TextDecoder();
@@ -566,7 +595,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
             };
             if (!res.destroyed) {
-              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache" });
+              res.writeHead(upstreamRes.status, { "content-type": contentType, "cache-control": "no-cache", ...cacheHeaders });
               res.flushHeaders();
             }
             const reader = upstreamRes.body.getReader();
@@ -673,7 +702,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           // #171: the unknown counts on the running cap engine so a settle lands exactly once.
           if (failMsg) { failures.set(emitted.id, failMsg); if (!metered) recordSpend(emitted); failMsg = null; }
           flushWarnings();
-          if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw); }
+          // #184: only a 2xx with a known numeric cost and no special reason is stored.
+          if (cacheState === "miss" && raw && upstreamRes.status >= 200 && upstreamRes.status < 300 && metered
+            && typeof emitted.cost_usd === "number" && Number.isFinite(emitted.cost_usd) && !emitted.reason) {
+            try { cache.put(cacheId, { status: upstreamRes.status, contentType, body: raw, model: emitted.model, cost_usd: emitted.cost_usd, receipt_id: emitted.id }); } catch { /* cache write is best effort */ }
+          }
+          if (raw) { if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType, ...cacheHeaders }).end(raw); }
           else if (streamCut) res.destroy();
           else if (!res.destroyed) res.end();
         } catch {
