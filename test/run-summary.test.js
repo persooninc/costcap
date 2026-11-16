@@ -21,7 +21,7 @@ test("builder sums tokens, cache tokens and cost per model", () => {
   assert.equal(s.unknown_cost_calls, 0);
   assert.deepEqual(s.caps, { run: { limit_usd: 1, spent_usd: 0.35 } });
   assert.equal(s.stopped_by, null);
-  assert.match(rollupLine(s), /calls=3 refused=0 models=2 cost=\$0\.3500$/);
+  assert.match(rollupLine(s), /calls=3 rejected=0 refused=0 models=2 cost=\$0\.3500$/);
 });
 
 test("null cost makes total unknown, never $0", () => {
@@ -105,7 +105,7 @@ test("wrap: 3 priced calls over 2 models; by_model equals receipt sums; runs --j
   const rp = path.join(dir, "r.jsonl");
   const first = await runWrap(up, ["--receipts", rp], callLoop(3));
   assert.equal(first.code, 0);
-  assert.match(first.err, /costcap: run \S+ calls=3 refused=0 models=2 cost=\$/);
+  assert.match(first.err, /costcap: run \S+ calls=3 rejected=0 refused=0 models=2 cost=\$/);
   const [s] = readSummaries(dir);
   const receipts = readFileSync(rp, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.equal(receipts.length, 3);

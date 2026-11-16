@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractUsage, startMeteringProxy } from "../src/proxy.js";
+import { extractUsage, isProviderError, startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 
 async function fixture(t, handler, options = {}) {
@@ -70,4 +70,110 @@ test("oversized body is refused without provider call", async (t) => {
   const call = await fixture(t, () => { hits++; }, { maxBodyBytes: 1 });
   assert.equal((await call()).status, 413);
   assert.equal(hits, 0);
+});
+
+// #135: provider 4xx rejections and metadata GETs are not billed and must not freeze the run.
+async function scripted(t, provider, statuses) {
+  let hits = 0;
+  const up = http.createServer((req, res) => {
+    const status = statuses[Math.min(hits++, statuses.length - 1)];
+    const body = status === 200
+      ? (provider === "gemini" ? { modelVersion: "gemini-2.0-flash", usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 } }
+        : provider === "anthropic" ? { model: "claude-3-5-haiku-20241022", usage: { input_tokens: 10, output_tokens: 5 } }
+          : { model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } })
+      : status === "ok-nousage" ? {} : { error: { code: status, message: "rejected", type: "rate_limit_error" } };
+    res.writeHead(status === "ok-nousage" ? 200 : status, { "content-type": "application/json" }).end(JSON.stringify(body));
+  });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { [provider]: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const paths = { openai: "/openai/v1/chat/completions", anthropic: "/anthropic/v1/messages", gemini: "/gemini/v1beta/models/gemini-2.0-flash:generateContent" };
+  const call = (i = 0, method = "POST", path = paths[provider]) => fetch(`http://127.0.0.1:${p.port}${path}`,
+    { method, body: method === "GET" ? undefined : JSON.stringify({ model: provider === "gemini" ? undefined : "m", i }) });
+  return { call, receipts, hits: () => hits };
+}
+
+for (const provider of ["openai", "anthropic", "gemini"]) {
+  for (const status of [429, 400, 401]) {
+    test(`#135 ${provider} ${status} with error body is zero-cost upstream_rejected and does not pause`, async (t) => {
+      const f = await scripted(t, provider, [status, 200]);
+      const r1 = await f.call(1);
+      assert.equal(r1.status, status);
+      assert.equal((await r1.json()).error.message, "rejected");
+      assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason, f.receipts[0].status], [0, "upstream_rejected", status]);
+      const r2 = await f.call(2);
+      assert.equal(r2.status, 200);
+      assert.equal(f.hits(), 2);
+      assert.ok(f.receipts[1].cost_usd > 0);
+    });
+  }
+  for (const status of [500, 502, 503]) {
+    test(`#135 regression: ${provider} ${status} without usage stays unknown and pauses`, async (t) => {
+      const f = await scripted(t, provider, [status, 200]);
+      assert.equal((await f.call(1)).status, status);
+      assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [null, "usage_unavailable"]);
+      const r2 = await f.call(2);
+      assert.equal(r2.status, 429);
+      assert.equal((await r2.json()).error, "accounting_unavailable");
+      assert.equal(f.hits(), 1);
+    });
+  }
+  test(`#135 regression: ${provider} 200 POST without usage still pauses`, async (t) => {
+    const f = await scripted(t, provider, ["ok-nousage", 200]);
+    assert.equal((await f.call(1)).status, 200);
+    assert.equal(f.receipts[0].reason, "usage_unavailable");
+    assert.equal((await f.call(2)).status, 429);
+    assert.equal(f.hits(), 1);
+  });
+}
+
+test("#135 GET /openai/v1/models is non_billable_request and does not pause", async (t) => {
+  const f = await scripted(t, "openai", ["ok-nousage", 200]);
+  const r = await f.call(0, "GET", "/openai/v1/models");
+  assert.equal(r.status, 200);
+  assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [0, "non_billable_request"]);
+  assert.equal((await f.call(1)).status, 200);
+  assert.equal(f.hits(), 2);
+});
+
+test("#135 a 4xx without a provider error body stays unknown and pauses", async (t) => {
+  let hits = 0;
+  const up = http.createServer((q, res) => { hits++; res.writeHead(429, { "content-type": "text/html" }).end("<html>slow down</html>"); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const u = `http://127.0.0.1:${p.port}/openai/v1/chat/completions`;
+  await fetch(u, { method: "POST", body: "{}" });
+  assert.equal(receipts[0].reason, "usage_unavailable");
+  assert.equal((await (await fetch(u, { method: "POST", body: "{}" })).json()).error, "accounting_unavailable");
+  assert.equal(hits, 1);
+});
+
+test("#135 isProviderError recognises error objects, Gemini arrays, and rejects usage/non-JSON", () => {
+  assert.equal(isProviderError(Buffer.from('{"error":{"message":"x"}}')), true);
+  assert.equal(isProviderError(Buffer.from('[{"error":{"code":429}}]')), true);
+  assert.equal(isProviderError(Buffer.from('{"error":{"m":1},"usage":{"prompt_tokens":1}}')), false);
+  assert.equal(isProviderError(Buffer.from('{"error":"str"}')), false);
+  assert.equal(isProviderError(Buffer.from('null')), false);
+  assert.equal(isProviderError(Buffer.from('nope')), false);
+});
+
+test("#135 repeated identical requests that keep getting 429 still trip the spiral breaker", async (t) => {
+  const { createSpiralDetector } = await import("../src/spiral.js");
+  let hits = 0;
+  const up = http.createServer((q, res) => { hits++; res.writeHead(429, { "content-type": "application/json" }).end('{"error":{"type":"rate_limit_error"}}'); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, spiral: createSpiralDetector({ threshold: 2 }), onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const statuses = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await fetch(`http://127.0.0.1:${p.port}/openai/v1/chat/completions`, { method: "POST", body: '{"model":"gpt-4o-mini"}' });
+    statuses.push(r.status); if (i === 2) assert.equal((await r.json()).error, "spiral_detected"); else await r.arrayBuffer();
+  }
+  assert.deepEqual(statuses, [429, 429, 429]);
+  assert.equal(hits, 2);
+  assert.equal(receipts.at(-1).reason, "spiral_detected");
 });

@@ -161,3 +161,35 @@ test("regression #130: wrap blocks a Gemini ?key= call by cap and no file under 
   for (const f of files) assert.doesNotMatch(readFileSync(f, "utf8"), /SECRET123/, f);
   assert.match(readFileSync(path.join(dir, "r.jsonl"), "utf8"), /key=REDACTED/);
 });
+
+test("#135 wrap: first call 429 (provider rejected), second 200 with usage; both complete and check reports known spend", async (t) => {
+  let n = 0;
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => (n++ === 0
+      ? res.writeHead(429, { "content-type": "application/json" }).end('{"error":{"type":"rate_limit_error","message":"slow down"}}')
+      : res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1000, completion_tokens: 100 } }))));
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `
+    const u = process.env.OPENAI_BASE_URL + "/chat/completions";
+    const a = await fetch(u,{method:"POST",body:JSON.stringify({model:"gpt-4o-mini",n:1})});
+    const b = await fetch(u,{method:"POST",body:JSON.stringify({model:"gpt-4o-mini",n:2})});
+    console.log(a.status, b.status);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "429 200");
+  assert.match(res.err, /calls=2 rejected=1 refused=0 .*cost=\$0\.\d+/);
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
+  assert.deepEqual(lines.map((r) => r.reason ?? "metered"), ["upstream_rejected", "metered"]);
+  const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(check.status, 0, check.stdout + check.stderr);
+  assert.match(check.stdout + check.stderr, /unknown[^0-9]*0|"unknown_cost_count":\s*0/i);
+});

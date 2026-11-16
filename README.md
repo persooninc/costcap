@@ -135,6 +135,11 @@ CostCap. The local proxy binds to 127.0.0.1.
   Such receipts have `cost_usd: null`. Reconcile them before starting again;
   existing unknown-cost receipts block restart. Never replace unknown cost with
   zero without evidence from the provider.
+- A provider 4xx rejection (400, 401, 403, 404, 409, 413, 422, 429) whose body is a
+  provider error object is recorded at `cost_usd: 0` with `reason: "upstream_rejected"`
+  and does not pause the run; GET/HEAD metadata calls such as `GET /v1/models` are
+  `reason: "non_billable_request"`. 5xx, 2xx without usage and cut streams stay unknown
+  and still pause. Repeated identical 429s still trip the retry-spiral breaker.
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   The receipt is written when the stream ends, so a cap hit by a streamed call

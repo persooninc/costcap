@@ -129,6 +129,18 @@ export function createSseUsageParser(provider, requestedModel) {
   };
 }
 
+const REJECTED_STATUSES = new Set([400, 401, 403, 404, 409, 413, 422, 429]);
+
+/** True when a body is a provider error object ({error:{...}}, Gemini may wrap it in an array) with no usage. */
+export function isProviderError(raw) {
+  let body;
+  try { body = JSON.parse(raw.toString("utf8")); } catch { return false; }
+  if (Array.isArray(body) && body.length === 1) body = body[0];
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  if (body.usage || body.usageMetadata) return false;
+  return Boolean(body.error) && typeof body.error === "object";
+}
+
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
   spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
@@ -255,6 +267,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // Stream cut (upstream error, client abort or timeout) before usage arrived.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "stream_incomplete" });
             accountingFailure = "A streamed response was cut before usage arrived. Restart only after reconciling this request.";
+          } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
+            // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
+          } else if (raw && ["GET", "HEAD"].includes(req.method)) {
+            // Metadata reads (models list/retrieve) never generate tokens.
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });
           } else {
             // Unknown spend is never silently free. Stop subsequent calls.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "usage_unavailable" });

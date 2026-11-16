@@ -18,7 +18,7 @@ export function stopReason(reason) {
 // Build a summary from this run's receipt lines (event lines are ignored).
 export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false }) {
   const by_model = {};
-  let calls = 0, blocked_calls = 0, unknown_cost_calls = 0, total = 0;
+  let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, total = 0;
   let stopped_by = killed ? "killed" : null, stopped_scope = null;
   for (const r of applySettlements(receipts.filter(Boolean))) {
     if (r.blocked) {
@@ -28,6 +28,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
       continue;
     }
     calls++;
+    if (r.reason === "upstream_rejected") rejected_calls++;
     const m = r.model ?? "unknown";
     const b = (by_model[m] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 });
     b.calls++;
@@ -43,7 +44,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     if (caps[scope] != null) capsOut[scope] = { limit_usd: caps[scope], spent_usd: r6(spend[scope] ?? 0) };
   }
   return {
-    schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, by_model,
+    schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
     total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls,
     caps: capsOut, stopped_by, ...(stopped_scope ? { stopped_scope } : {}),
   };
@@ -54,7 +55,7 @@ export function rollupLine(s) {
     ? `unknown (${s.unknown_cost_calls} unpriced call${s.unknown_cost_calls === 1 ? "" : "s"})`
     : `$${s.total_cost_usd.toFixed(4)}`;
   const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
-  return `costcap: run ${s.run_id} calls=${s.calls} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}`;
+  return `costcap: run ${s.run_id} calls=${s.calls} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}`;
 }
 
 export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");
