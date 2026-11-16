@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.3",
+  "version": "2026-11-16.4",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -11,8 +11,11 @@
     "https://ai.google.dev/gemini-api/docs/pricing",
     "https://openrouter.ai/models",
     "https://platform.openai.com/docs/pricing (gpt-5*, gpt-4.1*, o1*, o3, o4-mini; retrieved 2026-11-16)",
-    "https://docs.anthropic.com/en/docs/about-claude/models (Anthropic -YYYYMMDD snapshot ids; retrieved 2026-11-16)"
+    "https://docs.anthropic.com/en/docs/about-claude/models (Anthropic -YYYYMMDD snapshot ids; retrieved 2026-11-16)",
+    "https://platform.claude.com/docs/en/build-with-claude/batch-processing (Message Batches: 50% of standard on every token component; retrieved 2026-11-16)",
+    "https://developers.openai.com/api/docs/guides/batch (Batch API: 50% cost discount; retrieved 2026-11-16)"
   ],
+  "batch": { "openai": 0.5, "anthropic": 0.5 },
   "currency": "usd_per_1m_tokens",
   "fallback": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "cache_write": 3.125, "cache_write_1h": 5.00 },
   "models": {

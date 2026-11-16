@@ -61,8 +61,17 @@ test("#158 non-2xx files replies keep today's handling", async (t) => {
   assert.equal((await b.call("POST", "/anthropic/v1/messages", "{}")).status, 429);
 });
 
+test("#158/#160 batch creates are batch_pending and do not pause", async (t) => {
+  for (const path of ["/anthropic/v1/messages/batches", "/openai/v1/batches"]) {
+    const { call, receipts } = await setup(t, (req, res) => { req.resume(); res.end(req.url.endsWith("batches") ? '{"id":"b"}' : USAGE); });
+    await call("POST", path, "{}");
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason, receipts[0].batch_id], [null, "batch_pending", "b"], path);
+    assert.equal((await call("POST", "/anthropic/v1/messages", "{}")).status, 200, path);
+  }
+});
+
 test("#158 non-files 2xx POSTs without usage still pause", async (t) => {
-  for (const path of ["/anthropic/v1/messages/batches", "/openai/v1/batches", "/openai/v1/files/x/extra", "/anthropic/v1/files%2F.."]) {
+  for (const path of ["/openai/v1/files/x/extra", "/anthropic/v1/files%2F.."]) {
     const { call, receipts } = await setup(t, (req, res) => { req.resume(); res.end('{"id":"b"}'); });
     await call("POST", path, "{}");
     assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"], path);

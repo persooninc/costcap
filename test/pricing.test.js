@@ -95,3 +95,21 @@ test("#145 embeddings rates are input-only at published prices", () => {
   assert.equal(costForUsage("text-embedding-3-small", { input_tokens: 1_000_000 }).cost_usd, 0.02);
   assert.ok(table.sources.some((u) => u.includes("openai.com/api/pricing")));
 });
+
+test("#160 batch multiplier is 0.5 per provider and stacks with caching and long_context", async () => {
+  const { batchMultiplier } = await import("../src/pricing.js");
+  assert.equal(batchMultiplier("openai"), 0.5);
+  assert.equal(batchMultiplier("anthropic"), 0.5);
+  assert.equal(batchMultiplier("gemini"), null);
+  const usage = { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 4000, cache_write_input_tokens: 300, cache_write_1h_input_tokens: 200 };
+  const std = costForUsage("claude-sonnet-4-6", usage);
+  const b = costForUsage("claude-sonnet-4-6", usage, { batch: "anthropic" });
+  assert.equal(b.batch_multiplier, 0.5);
+  assert.ok(Math.abs(b.cost_usd - std.cost_usd * 0.5) < 1e-6);
+  const big = { ...usage, input_tokens: 250000 };
+  const lc = costForUsage("claude-sonnet-4-6", big, { batch: "anthropic" });
+  assert.equal(lc.pricing_tier, "long_context");
+  assert.ok(Math.abs(lc.cost_usd - costForUsage("claude-sonnet-4-6", big).cost_usd * 0.5) < 1e-6);
+  assert.equal(costForUsage("gpt-4o", { input_tokens: 10 }).batch_multiplier, undefined);
+  assert.throws(() => costForUsage("gemini-2.5-pro", { input_tokens: 1 }, { batch: "gemini" }), /no batch rate/);
+});

@@ -188,9 +188,28 @@ traffic bypasses CostCap.
   `reason: "non_billable_request"`. Files API upload/delete (`POST /v1/files`,
   `DELETE /v1/files/{id}` on Anthropic and OpenAI) 2xx replies are also
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
-  content is billed as input tokens when used in a Messages call. Batch APIs
-  (`/v1/messages/batches`, `/v1/batches`) are still unknown cost. 5xx, 2xx without usage and cut streams stay unknown
+  content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
+- Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
+  OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
+  (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
+  run, but the run total stays unknown and `costcap check` fails until the batch
+  settles. Reading the results through the proxy settles it: Anthropic
+  `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
+  links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
+  Succeeded lines are priced at the published 50% batch rate (pricing table
+  `batch`, applied to every component including cache reads/writes and on top of
+  long_context); errored, canceled, expired and non-2xx lines cost $0. One
+  `{"event":"reconciliation","source":"batch_results"}` line is appended (once,
+  however often results are read) and counts at the batch's original `ts`. An
+  unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
+  read is recorded as `reason: "batch_unpriced"` and the run pauses. Every
+  Anthropic `requests[].params.model` is checked against `--models` and
+  `--unknown-models refuse`; an OpenAI batch names its models only inside the
+  input file, so an OpenAI batch create is refused whenever an allowlist is set.
+  Not covered: pre-flight reservation for batches, Gemini batch mode and
+  OpenRouter batches, and polling the provider (costcap only sees results you
+  fetch through it).
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when

@@ -28,6 +28,10 @@ export function isSettlement(e) {
     typeof e.cost_usd === "number" && Number.isFinite(e.cost_usd) && e.cost_usd >= 0;
 }
 
+export function isPendingBatch(r) {
+  return !!r && r.reason === "batch_pending" && r.cost_usd === null;
+}
+
 export function applySettlements(lines) {
   const settle = new Map();
   for (const e of lines) if (isSettlement(e) && !settle.has(e.receipt_id)) settle.set(e.receipt_id, e);
@@ -59,7 +63,9 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     if (!Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) throw new Error("Invalid receipt history; reconcile before running");
   }
   let run = 0;
-  let unknown = history.filter((r) => r.cost_usd === null).length;
+  // A pending batch (#160) is unknown until its results settle it, but it does not
+  // stop synchronous calls: its cost arrives through a batch_results settlement.
+  let unknown = history.filter((r) => r.cost_usd === null && !isPendingBatch(r)).length;
   // Null cost is unknown. It is omitted from sums so it is not treated as $0.
   // Spend is bucketed by UTC day and month key once, at record time, so check()
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
@@ -106,6 +112,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     // external: a receipt another wrapper sharing this ledger wrote. It counts
     // toward day/month (and unknown) but not toward this wrapper's run cap.
     record(receipt, { external = false } = {}) {
+      if (isPendingBatch(receipt)) return;
       if (receipt.cost_usd === null) { unknown += 1; return; }
       if (!external) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);

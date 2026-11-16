@@ -1,5 +1,5 @@
 // Read-only CI guard: rejects unknown cost rather than treating it as free.
-import { loadSettledReceipts as loadReceipts, createCapEngine } from "./cap.js";
+import { loadSettledReceipts as loadReceipts, createCapEngine, isPendingBatch } from "./cap.js";
 import { budgetRemaining, createAgentBudgets, intersectModels } from "./agent-budget.js";
 import { createKillCheck } from "./kill.js";
 import { createFleetClient } from "./hosted/client.js";
@@ -12,6 +12,8 @@ export function checkBudget({ receiptsPath, caps = {}, now, runId }) {
   const unknown_cost_count = history.filter((r) => r.cost_usd === null).length;
   const total = history.reduce((sum, r) => sum + (typeof r.cost_usd === "number" ? r.cost_usd : 0), 0);
   let hit = cap.check();
+  // #160: a pending batch does not stop the proxy, but a check never passes on unknown cost.
+  if (!hit && history.some(isPendingBatch)) hit = { scope: "accounting", cap: 0, spent: 0, reason: "batch_pending" };
   if (!hit && caps.run != null) {
     if (!Number.isFinite(caps.run) || caps.run <= 0) throw new Error("Invalid run cap");
     if (total >= caps.run) hit = { scope: "run", cap: caps.run, spent: total };

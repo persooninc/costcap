@@ -10,6 +10,8 @@ import { costForUsage, isPricedModel } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck } from "./preflight.js";
+import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
+import { loadLedgerLines, isSettlement } from "./cap.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -270,6 +272,10 @@ export function createUsageChunkFilter() {
   };
 }
 
+function batchIdOf(raw) {
+  try { const b = JSON.parse(raw.toString("utf8")); return typeof b?.id === "string" && /^[A-Za-z0-9_-]+$/.test(b.id) ? b.id : null; } catch { return null; }
+}
+
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
   spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
@@ -286,6 +292,29 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
+    if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
+    try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
+    return complete;
+  });
+  // Batch state (#160): pending batch_id -> receipt, OpenAI output_file_id -> batch_id.
+  const pendingBatches = new Map();
+  const batchFiles = new Map();
+  const resolvedBatches = new Set();
+  const findPending = (batchId) => {
+    if (pendingBatches.has(batchId)) return pendingBatches.get(batchId);
+    if (!receiptsPath) return null;
+    // After a restart, the pending receipt (and any settlement) is read back from the ledger.
+    let lines;
+    try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
+    const r = lines.find((l) => !l.event && l.reason === "batch_pending" && l.batch_id === batchId && l.cost_usd === null);
+    if (!r) return null;
+    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId };
+    pendingBatches.set(batchId, entry);
+    if (lines.some((l) => isSettlement(l) && l.receipt_id === r.id)) resolvedBatches.add(batchId);
+    return entry;
+  };
+  const emitEvent = (event) => guarded(() => {
+    const complete = { ts: new Date().toISOString(), ...event };
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
@@ -324,6 +353,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        const batchCreate = batchCreateProvider(req.method, req.url);
+        // #160: an Anthropic batch names its models per request; every one is checked.
+        const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
+        if (batchModels && !requestedModel) requestedModel = batchModels.find(Boolean);
         // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
         const modelRefusal = (status, error, message) => {
           emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
@@ -337,12 +370,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const generates = !["GET", "HEAD"].includes(req.method);
           const allow = generates ? allowedModels?.() ?? null : null;
-          if (allow && (!requestedModel || !allow.includes(requestedModel))) {
+          const checkModels = batchModels ?? [requestedModel];
+          // Index of the first missing or refused model (-1: every model passes).
+          const offending = (ok) => checkModels.findIndex((m) => !m || !ok(m));
+          const refuse = (i) => { requestedModel = checkModels[i] ?? undefined; };
+          if (allow && offending((m) => allow.includes(m)) !== -1) {
+            refuse(offending((m) => allow.includes(m)));
             return modelRefusal(403, "model_not_allowed", allow.length
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
           }
-          if (generates && unknownModels === "refuse" && !isPricedModel(requestedModel)) {
+          if (generates && unknownModels === "refuse" && offending(isPricedModel) !== -1) {
+            refuse(offending(isPricedModel));
             return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
           }
           const agentHit = agentBudgets?.check(who);
@@ -460,6 +499,41 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (raw && REJECTED_STATUSES.has(upstreamRes.status) && isProviderError(raw)) {
             // Provider rejected the request before generation (rate limit, auth, bad request): not billed.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "upstream_rejected" });
+          } else if (raw && batchCreate && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchIdOf(raw)) {
+            // #160: a batch is billed when it runs. Pending, unknown (never $0), and the run continues.
+            const batch_id = batchIdOf(raw);
+            Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: null, reason: "batch_pending", batch_id,
+              ...(batchModels && { request_count: batchModels.length }) });
+            const done = emit(receipt);
+            pendingBatches.set(batch_id, { id: done.id, ts: done.ts, provider: batchCreate, batch_id });
+            if (!res.destroyed) res.writeHead(upstreamRes.status, { "content-type": contentType }).end(raw);
+            return;
+          } else if (raw && req.method === "GET" && upstreamRes.status >= 200 && upstreamRes.status < 300 && batchReadPath(req.method, req.url)) {
+            Object.assign(receipt, { model: "unknown", cost_usd: 0, reason: "non_billable_request" });
+            const read = batchReadPath(req.method, req.url);
+            let batchId = null;
+            if (read.kind === "openai_batch") {
+              try {
+                const b = JSON.parse(raw.toString("utf8"));
+                if (typeof b?.output_file_id === "string" && /^[A-Za-z0-9_-]+$/.test(b.output_file_id) && findPending(read.id)?.provider === "openai") batchFiles.set(b.output_file_id, read.id);
+              } catch { /* not a batch object: nothing to link */ }
+            } else if (read.kind === "anthropic_results") batchId = read.id;
+            else batchId = batchFiles.get(read.id) ?? null;
+            const pending = batchId ? findPending(batchId) : null;
+            if (pending && !resolvedBatches.has(batchId) && pending.provider === provider) {
+              resolvedBatches.add(batchId);
+              const folded = foldBatchResults(provider, raw.toString("utf8"));
+              receipt.batch_id = batchId;
+              if (folded.ok) {
+                emitEvent({ event: "reconciliation", receipt_id: pending.id, cost_usd: folded.cost_usd, source: "batch_results", batch_id: batchId,
+                  succeeded: folded.succeeded, not_billed: folded.free });
+                cap?.record({ cost_usd: folded.cost_usd, ts: pending.ts });
+              } else {
+                // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.
+                Object.assign(receipt, { cost_usd: null, reason: "batch_unpriced" });
+                accountingFailure = "Batch results could not be priced. Restart only after reconciling this batch.";
+              }
+            }
           } else if (raw && (["GET", "HEAD"].includes(req.method) ||
             (upstreamRes.status >= 200 && upstreamRes.status < 300 &&
               ((req.method === "POST" && isCountTokensPath(req.url)) || isNonBillableFilesRequest(req.method, req.url))))) {

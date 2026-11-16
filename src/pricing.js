@@ -101,10 +101,23 @@ export function selectRates(price, prompt_tokens, signal = {}) {
   return { pricing_tier: premium, rates };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}) {
+// Batch APIs (#160): a provider-level multiplier applied to every rate component,
+// on top of the long_context tier. null when the provider publishes no batch rate.
+export function batchMultiplier(provider) {
+  const m = table.batch?.[provider];
+  return typeof m === "number" && Number.isFinite(m) && m > 0 ? m : null;
+}
+
+const scaleRates = (rates, m) => Object.fromEntries(Object.entries(rates).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v]));
+
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}, { batch } = {}) {
   const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
-  const { pricing_tier, rates: selected } = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
+  const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
+  const multiplier = batch ? batchMultiplier(batch) : null;
+  if (batch && multiplier === null) throw new Error(`no batch rate for provider ${batch}`);
+  const pricing_tier = tiered.pricing_tier;
+  const selected = tiered.rates && multiplier !== null ? scaleRates(tiered.rates, multiplier) : tiered.rates;
   const premium = pricing_tier === "fast" || pricing_tier === "priority";
   const rates = selected ?? {};
   // A premium tier, or a cache component of it, with no published rate is unpriced: never standard.
@@ -128,6 +141,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     cache_write_input_tokens,
     cache_write_1h_input_tokens,
     pricing_tier,
+    ...(multiplier !== null && { batch_multiplier: multiplier }),
     ...(signal.speed !== undefined && { speed: signal.speed }),
     ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
     table_version: price.table_version,

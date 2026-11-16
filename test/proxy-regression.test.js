@@ -406,3 +406,78 @@ test("#155 standard receipts unchanged: no speed/service_tier keys, pricing_tier
   assert.ok(!("speed" in r) && !("service_tier" in r) && !("reason" in r));
   assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100 }), { ...costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100, speed: undefined }) });
 });
+
+// #160 e2e: `costcap wrap` against local mock OpenAI and Anthropic upstreams serving JSONL fixtures.
+import { spawn as spawnBatch, spawnSync as spawnSyncBatch } from "node:child_process";
+import { ANTHROPIC_EXPECTED, OPENAI_EXPECTED, mockUpstream } from "./support/batch.js";
+
+async function wrapBatch(t, script, args = []) {
+  const up = http.createServer(mockUpstream());
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => { up.closeAllConnections(); up.close(); });
+  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
+  const receipts = join(dir, "receipts.jsonl");
+  const base = `http://127.0.0.1:${up.address().port}`;
+  const res = await new Promise((resolve) => {
+    const c = spawnBatch(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, ...args, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: base, COSTCAP_TEST_ANTHROPIC_UPSTREAM: base } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
+  });
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const cli = (...a) => spawnSyncBatch(process.execPath, ["src/cli.js", ...a, "--receipts", receipts], { encoding: "utf8" });
+  return { ...res, lines, cli };
+}
+
+test("#160 e2e Anthropic batch: wrap is not frozen after create; results settle once at 0.5x; check passes under a cap the full rate would exceed", async (t) => {
+  const script = `const A = process.env.ANTHROPIC_BASE_URL;
+    const p = { model: "claude-sonnet-4-6", max_tokens: 10, messages: [] };
+    const out = [];
+    out.push((await fetch(A + "/v1/messages/batches", { method: "POST", body: JSON.stringify({ requests: [1, 2, 3].map((i) => ({ custom_id: "c" + i, params: p })) }) })).status);
+    out.push((await fetch(A + "/v1/messages", { method: "POST", body: JSON.stringify(p) })).status);
+    if (process.env.FETCH !== "0") for (let i = 0; i < 2; i++) out.push((await fetch(A + "/v1/messages/batches/msgbatch_01/results")).status);
+    console.log(out.join(","));`;
+  const r = await wrapBatch(t, script);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.out.trim(), "200,200,200,200");
+  const pend = r.lines.find((l) => l.reason === "batch_pending");
+  assert.deepEqual([pend.cost_usd, pend.batch_id, pend.request_count], [null, "msgbatch_01", 3]);
+  assert.equal(r.lines.some((l) => l.reason === "accounting_unavailable"), false);
+  const settles = r.lines.filter((l) => l.event === "reconciliation");
+  assert.deepEqual(settles.map((e) => [e.receipt_id, e.cost_usd, e.source]), [[pend.id, ANTHROPIC_EXPECTED, "batch_results"]]);
+  const runs = JSON.parse(r.cli("runs", "--json").stdout);
+  assert.notEqual(runs[0].total_cost_usd, null);
+  const sync = r.lines.find((l) => l.path === "/v1/messages").cost_usd;
+  const cap = String(Number((ANTHROPIC_EXPECTED * 1.5 + sync).toFixed(6)));
+  assert.equal(r.cli("check", "--cap", cap).status, 0);
+  assert.notEqual(r.cli("check", "--cap", String(Number((ANTHROPIC_EXPECTED + sync).toFixed(6)))).status, 0);
+});
+
+test("#160 e2e: a batch whose results are never fetched leaves the run unknown and check incomplete", async (t) => {
+  const script = `const A = process.env.ANTHROPIC_BASE_URL;
+    await fetch(A + "/v1/messages/batches", { method: "POST", body: JSON.stringify({ requests: [{ custom_id: "a", params: { model: "claude-sonnet-4-6" } }] }) });
+    console.log((await fetch(A + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-6" }) })).status);`;
+  const r = await wrapBatch(t, script);
+  assert.equal(r.out.trim(), "200");
+  assert.equal(JSON.parse(r.cli("runs", "--json").stdout)[0].total_cost_usd, null);
+  assert.notEqual(r.cli("check").status, 0);
+  assert.equal(r.lines.some((l) => l.event), false);
+});
+
+test("#160 e2e OpenAI batch: create, retrieve, file content settle at 0.5x; unrelated file content stays $0", async (t) => {
+  const script = `const O = process.env.OPENAI_BASE_URL;
+    const out = [];
+    out.push((await fetch(O + "/batches", { method: "POST", body: JSON.stringify({ input_file_id: "file-in", endpoint: "/v1/chat/completions", completion_window: "24h" }) })).status);
+    out.push((await fetch(O + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) })).status);
+    out.push((await fetch(O + "/files/file-unrelated/content")).status);
+    out.push((await fetch(O + "/batches/batch_01")).status);
+    out.push((await fetch(O + "/files/file-out/content")).status);
+    console.log(out.join(","));`;
+  const r = await wrapBatch(t, script);
+  assert.equal(r.out.trim(), "200,200,200,200,200", r.err);
+  const pend = r.lines.find((l) => l.reason === "batch_pending");
+  assert.deepEqual(r.lines.filter((l) => l.event === "reconciliation").map((e) => [e.receipt_id, e.cost_usd]), [[pend.id, OPENAI_EXPECTED]]);
+  const unrelated = r.lines.find((l) => l.path === "/v1/files/file-unrelated/content");
+  assert.deepEqual([unrelated.cost_usd, unrelated.reason], [0, "non_billable_request"]);
+  assert.equal(r.cli("check").status, 0);
+});

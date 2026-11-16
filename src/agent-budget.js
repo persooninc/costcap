@@ -1,3 +1,4 @@
+import { isPendingBatch } from "./cap.js";
 // Per-agent spend and step budgets. Follows the contract of the skills-library
 // ai-cost-tracking skill (references/agent-budget.mjs). Pure module, no I/O.
 // Separate from the wrapper's own caps: this answers "may this agent spend",
@@ -97,7 +98,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     const out = { run: 0, day: 0, month: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
-      if (r.cost_usd === null) out.unknown += 1;
+      if (r.cost_usd === null && !isPendingBatch(r)) out.unknown += 1;
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
       const ts = new Date(r.ts).toISOString();

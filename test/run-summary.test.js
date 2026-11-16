@@ -186,3 +186,11 @@ test("wrap: unwritable runs dir warns but does not fail the run", async (t) => {
   assert.equal(res.code, 0);
   if (process.getuid?.() !== 0) assert.match(res.err, /run summary not written/);
 });
+
+test("#160 a pending batch keeps the run total unknown until its batch_results settlement", () => {
+  const pending = { id: "p1", provider: "anthropic", blocked: false, model: "claude-sonnet-4-6", cost_usd: null, reason: "batch_pending", batch_id: "b1", request_count: 3 };
+  const open = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending] });
+  assert.deepEqual([open.total_cost_usd, open.unknown_cost_calls], [null, 1]);
+  const settled = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending, { event: "reconciliation", receipt_id: "p1", cost_usd: 0.25, source: "batch_results" }] });
+  assert.deepEqual([settled.total_cost_usd, settled.unknown_cost_calls], [0.35, 0]);
+});
