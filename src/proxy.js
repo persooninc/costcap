@@ -8,7 +8,7 @@ import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
 import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
-import { budgetExceededBody } from "./cap.js";
+import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
@@ -434,7 +434,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     cap.record(receipt, opts);
     if (!capWarner) return;
     const after = cap.spend();
-    pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: after.unknown > 0 }));
+    pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: isLowerBound(after) }));
   };
   const flushWarnings = () => {
     const evs = pendingWarnings;
@@ -778,6 +778,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                   succeeded: folded.succeeded, not_billed: folded.free });
                 // #182: another run's (or wrapper's) batch counts toward day/month only, like src/settle.js.
                 const external = !(who.run_id != null && pending.run_id === who.run_id);
+                cap?.resolvePending?.(pending.id);
                 recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts }, { external });
                 // #179: --policy agent/team budgets count the batch at its original ts, no restart needed.
                 agentBudgets?.settle({ receipt_id: pending.id, cost_usd: folded.cost_usd });
@@ -830,7 +831,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   server.checkWarnings = () => {
     if (!cap || !capWarner) return;
     const spend = cap.spend();
-    pendingWarnings.push(...capWarner.reached({ caps: cap.limits(), spend, lowerBound: spend.unknown > 0 }));
+    pendingWarnings.push(...capWarner.reached({ caps: cap.limits(), spend, lowerBound: isLowerBound(spend) }));
     flushWarnings();
   };
   server.settle = (r) => {

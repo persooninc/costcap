@@ -212,6 +212,8 @@ export async function wrap(argv) {
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);
   checkWarnings = () => server.checkWarnings();
+  // #187: fractions already reached at startup (incl. a cached fleet cap) warn once, deduped by the ledger.
+  checkWarnings();
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

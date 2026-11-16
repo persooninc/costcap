@@ -14,6 +14,7 @@ export function createSettler({ cap, agentBudgets, proxySettle, onSettled = () =
     const r = cap();
     // Fleet passes the receipt with its settled cost already merged, so test reason only.
     // #178: a settled batch of this wrapper's own run also counts toward run.
+    if (receipt?.reason === "batch_pending") r?.resolvePending?.(id);
     if (receipt?.reason === "batch_pending") r?.record({ ts: receipt.ts, cost_usd: cost }, { external: !(r.runId != null && receipt.run_id === r.runId) });
     else r?.settle({ ...receipt, cost_usd: cost });
     agentBudgets()?.settle?.({ receipt_id: id, cost_usd: cost });

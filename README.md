@@ -498,7 +498,8 @@ costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
 - `--warn-at F[,F...]` takes fractions with 0 < F < 1. The default is `0.8`, and `--warn-at off` disables warnings. A bad value exits `2`.
 - The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`.
 - Warnings never block a call and are never spend. Receipts, runs and check totals ignore `cap_warning` lines.
-- When a scope has an unknown-cost receipt, its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
+- `wrap` also checks once at startup: a fraction already reached (including from a cached fleet cap) warns once if this period has no matching `cap_warning` yet.
+- When a scope has an unknown-cost receipt (a pending batch included), its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
 - `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
 
 ## Response cache

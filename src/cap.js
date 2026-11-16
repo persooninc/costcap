@@ -73,6 +73,11 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   // A pending batch (#160) is unknown until its results settle it, but it does not
   // stop synchronous calls: its cost arrives through a batch_results settlement.
   let unknown = history.filter((r) => r.cost_usd === null && !isPendingBatch(r)).length;
+  // #187: pending batches do not stop calls, but while any is open spend is a lower bound.
+  const pendingBatches = new Set();
+  let anonPending = 0;
+  const notePending = (r) => { if (typeof r.id === "string" && r.id) pendingBatches.add(r.id); else anonPending += 1; };
+  for (const r of history) if (isPendingBatch(r)) notePending(r);
   // Null cost is unknown. It is omitted from sums so it is not treated as $0.
   // Spend is bucketed by UTC day and month key once, at record time, so check()
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
@@ -113,7 +118,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   function spend() {
     const d = now();
     const n = d.toISOString();
-    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown };
+    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown, pending_batches: pendingBatches.size + anonPending };
   }
 
   // Seconds until hour spend falls below cap (spend ages out from the oldest entry).
@@ -162,10 +167,12 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       add(receipt.ts ?? now(), receipt.cost_usd);
       return true;
     },
+    // #187: a pending batch's results were priced (or settled); spend is exact again for it.
+    resolvePending(id) { return pendingBatches.delete(id); },
     // external: a receipt another wrapper sharing this ledger wrote. It counts
     // toward day/month (and unknown) but not toward this wrapper's run cap.
     record(receipt, { external = false } = {}) {
-      if (isPendingBatch(receipt)) return;
+      if (isPendingBatch(receipt)) { notePending(receipt); return; }
       if (receipt.cost_usd === null) { unknown += 1; return; }
       if (!external) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);
@@ -195,4 +202,9 @@ export function budgetExceededBody(hit) {
       ...(hit.retry_after_s != null ? { retry_after_s: hit.retry_after_s } : {}),
     },
   };
+}
+
+// #187: spend is a lower bound while any receipt has unknown cost, a pending batch included.
+export function isLowerBound(spend) {
+  return (spend?.unknown ?? 0) > 0 || (spend?.pending_batches ?? 0) > 0;
 }
