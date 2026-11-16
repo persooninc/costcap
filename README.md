@@ -813,8 +813,24 @@ function verifyCostCap(secret, rawBody, header, toleranceSec = 300) {
 }
 ```
 
+### Org API keys
+
+Scripts, CI, incident tooling and BI can call the hosted API with a revocable org key instead of a browser session. An owner or admin creates one in the dashboard's "API keys" card or with `POST /v1/api-keys` (session only, body `{ "name": "...", "role": "viewer" | "admin", "expires_at"?: "<ISO date>" }`). The response carries the full `cck_…` value once; CostCap stores only its SHA-256 hash. `GET /v1/api-keys` lists keys masked (`cck_…` + last 4) with status and `last_used_at`, and `POST /v1/api-keys/:id/revoke` revokes one. Create and revoke write `api_key.create` / `api_key.revoke` audit entries.
+
+Send it as `Authorization: Bearer cck_…` (no `Origin` header is needed):
+
+- **viewer**: `GET /v1/spend`, `/v1/receipts.csv`, `/v1/audit.csv`, `/v1/evidence.json`, `/v1/fleet`, `/v1/alerts`, `/v1/agents/:id/budget` and `/v1/agents/:id/runs`.
+- **admin**: also `POST /v1/fleet/freeze|resume`, `/v1/agents/:id/policy|revoke`, `/v1/alerts/:id/ack` and `/v1/receipts/:id/settle`. Actions are audited with the key id as actor and `api_key:<name>` as its label.
+
+A key can't create or revoke keys, issue enrollment tokens, or reach billing, members, invitations, roles or alert settings. A revoked, expired or unknown key gets `401`, a key only ever sees its own org, and a `cck_` key is never accepted as an agent token. Example, freezing the fleet from a CostCap alert webhook handler:
+
+```sh
+curl -X POST https://app.costcap.dev/v1/fleet/freeze -H "Authorization: Bearer $COSTCAP_API_KEY" \
+  -H 'content-type: application/json' -d '{"reason":"cap_hit webhook"}'
+```
+
 ### Fleet freeze (kill switch)
 
-`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
+`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin [API key](#org-api-keys), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
 
 `GET /v1/spend?since=&until=&group_by=day|model|agent` (any session role, including viewer) returns the org's synced receipt spend in buckets. Each bucket has `usd_known`, `calls`, `unknown_count`, `blocked_count` and `cost_complete`, plus a `total`. Days are UTC. `since`/`until` take an ISO instant or `YYYY-MM-DD`; a date-only `until` covers that whole day. A `cost_usd: null` receipt adds to `unknown_count` and marks the bucket incomplete; it never adds $0. Once settled it counts at the settled value in its original bucket. With entitlements enforced, the period is clamped to the plan's receipt retention, and the response reports the clamped `since` with `retention_clamped: true`. An invalid `group_by`, `since` or `until` returns `400`. The dashboard's Spend card reads it with a 7-day, 30-day or this-month period.
