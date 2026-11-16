@@ -161,7 +161,7 @@ finite number >= 0, one `{"event":"reconciliation","receipt_id",...,"provider_sh
 line is appended; the original receipt line is never edited. The settled cost
 counts toward the original receipt's run/day/month. A missing, null or negative
 charge never settles (it is not $0): the command exits 1 and lists the ids still
-unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.jsonl`.
+unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.json`.
 
 ## Enrollment client (service not yet deployed)
 
