@@ -136,3 +136,55 @@ test("Warn at 50, 95 on an agent card fires cap_approaching 50% then 95% once ea
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #168: a hosted per-run cap raises cap_approaching per run_id, shown in the alert list.
+test("run cap: receipts for one run past 80% show cap_approaching 80% · run <id>", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const delivered = [];
+  const clock = Date.parse("2026-11-16T10:00:00.000Z");
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-runcap-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("runcap-owner@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    await page.locator("#enroll input[name=run]").fill("5");
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const ts = new Date(clock).toISOString();
+    const synced = await page.evaluate(async ({ credential, ts }) => {
+      const e = await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "runner" }) });
+      const agent = await e.json();
+      const r = await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "a1", ts, run_id: "job-7", cost_usd: 2, model: "m" }, { id: "a2", ts, run_id: "job-7", cost_usd: 2.1, model: "m" }] }) });
+      return r.status;
+    }, { credential: token, ts });
+    expect(synced).toBe(200);
+    await service.evaluateFleetAlerts();
+    expect(delivered.filter((a) => a.run_id === "job-7")).toHaveLength(1);
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_approaching 80% · run job-7" })).toBeVisible();
+    const doc = await page.evaluate(async () => (await fetch("/v1/evidence.json")).json());
+    expect(doc.alerts.some((a) => a.run_id === "job-7")).toBe(true);
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

@@ -6,7 +6,7 @@ import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy } from "./policy.js";
 import { buildEvidence } from "./evidence.js";
-import { evaluateAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -711,7 +711,21 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     for (const scope of ["day", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now() });
     return (alert) => alert.kind !== "cap_approaching" || alert.fraction === undefined || !states[alert.scope] || claimWarning(states[alert.scope], alert, fractions);
   }
-  const warnExtra = (alert) => (alert.fraction !== undefined ? { period: capPeriod(alert.scope, now()) } : {});
+  // Issue #168: run warnings fire at most once per run (period = run id).
+  // Arm state for runs that left the active window is dropped.
+  function gateRunWarnings(s, id, cap, runs, warnFractions) {
+    s.warnArm ??= {};
+    const fractions = Array.isArray(warnFractions) ? warnFractions : [0.8];
+    const live = new Set(runs.map((r) => `${id}:run:${r.run_id}`));
+    for (const k of Object.keys(s.warnArm)) if (k.startsWith(`${id}:run:`) && !live.has(k)) delete s.warnArm[k];
+    const spentOf = Object.fromEntries(runs.map((r) => [r.run_id, r.usd_known]));
+    return (alert) => {
+      if (alert.kind !== "cap_approaching") return true;
+      const st = armWarnings(s.warnArm, { id, scope: `run:${alert.run_id}`, cap, spent: spentOf[alert.run_id], nowMs: now() });
+      return claimWarning(st, alert, fractions);
+    };
+  }
+  const warnExtra = (alert) => (alert.fraction !== undefined && alert.run_id === undefined ? { period: capPeriod(alert.scope, now()) } : {});
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {
       const out = [];
@@ -724,18 +738,30 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const spent = spendSummary(receipts, now());
         const recent = receipts.filter((r) => Date.parse(r.ts) > now() - 3600_000);
         const blockedReasons = recent.flatMap((r) => {
+          // Issue #168: a run block with a run_id pages through the per-run key.
+          if (r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id) return [];
           if (r.reason === "budget_exceeded" && ["run", "day", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
         const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions });
+        // Issue #168: per-run alerts from synced receipts (active runs only).
+        const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
+        const runCap = a.policy.caps?.run;
+        const hasRunCap = typeof runCap === "number" && Number.isFinite(runCap);
+        const activeRuns = hasRunCap || blockedRunIds.length
+          ? summarizeRuns(receipts.filter((r) => typeof r.run_id === "string" && r.run_id)).filter((run) => Date.parse(run.last_ts) > now() - 3600_000).slice(0, 20)
+          : [];
+        const runAlerts = evaluateRunAlerts({ agentId: a.id, cap: hasRunCap ? runCap : null, runs: activeRuns, blockedRunIds }, { warnFractions: a.policy.warnFractions });
+        alerts.push(...runAlerts);
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
         const warnOk = gateWarnings(s, a.id, a.policy.caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions);
+        const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
-          if (!prior && !warnOk(alert)) continue;
+          if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
           if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
           else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
         }

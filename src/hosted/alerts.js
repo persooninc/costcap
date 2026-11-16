@@ -69,6 +69,8 @@ function fractionsFrom(warnFractions, approachFraction) {
 
 // UTC cap period for a scope: YYYY-MM-DD (day) or YYYY-MM (month).
 export function capPeriod(scope, nowMs) {
+  // Issue #168: a run-scope period is the run itself ("run:<runId>").
+  if (typeof scope === "string" && scope.startsWith("run:")) return scope;
   const iso = new Date(nowMs).toISOString();
   return scope === "month" ? iso.slice(0, 7) : iso.slice(0, 10);
 }
@@ -135,6 +137,35 @@ export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, s
   }
   if (Number.isFinite(silentAfterMs) && state.lastSeenMs != null && state.nowMs - state.lastSeenMs > silentAfterMs) {
     out.push({ kind: "agent_silent", key: `agent_silent:${state.agentId}`, silentMs: state.nowMs - state.lastSeenMs });
+  }
+  return out;
+}
+
+// Issue #168: hosted run-scope alerts. Pure. runs: summarizeRuns() rows that
+// are already filtered to the active window. cap: the policy caps.run (or
+// null when the server has no run cap). blockedRunIds: run_ids with a recent
+// budget_exceeded/run block. Keys carry the run_id, so each run pages on its
+// own. Unknown cost is never $0: a run with only unknown-cost receipts raises
+// no spend alert, and a partial one carries lower_bound: true.
+export function evaluateRunAlerts({ agentId, cap, runs = [], blockedRunIds = [] }, { approachFraction = 0.8, warnFractions } = {}) {
+  const out = [];
+  const hasCap = typeof cap === "number" && Number.isFinite(cap);
+  const blocked = new Set(blockedRunIds);
+  const fractions = Array.isArray(warnFractions) ? warnFractions : [approachFraction];
+  for (const run of runs) {
+    const runId = run?.run_id;
+    if (typeof runId !== "string" || !runId || runId === "(none)") continue;
+    const spent = run.usd_known;
+    const unknown = run.unknown_count ?? 0;
+    const allUnknown = unknown > 0 && unknown >= (run.calls ?? unknown);
+    const base = { scope: "run", run_id: runId, cap: hasCap ? cap : null, spent, unknown_count: unknown, lower_bound: unknown > 0 };
+    const hitKey = `cap_hit:${agentId}:run:${runId}`;
+    if (hasCap && !allUnknown && Number.isFinite(spent) && spent >= cap) { out.push({ kind: "cap_hit", key: hitKey, ...base }); continue; }
+    if (blocked.has(runId)) { out.push({ kind: "cap_hit", key: hitKey, ...base }); continue; }
+    if (!hasCap || allUnknown || !Number.isFinite(spent)) continue;
+    let hit = null;
+    for (const f of fractions) if (spent >= cap * f && (hit === null || f > hit)) hit = f;
+    if (hit !== null) out.push({ kind: "cap_approaching", key: approachKey(agentId, `run:${runId}`, hit), ...base, fraction: hit });
   }
   return out;
 }
