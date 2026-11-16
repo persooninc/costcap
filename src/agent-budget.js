@@ -155,6 +155,18 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       }
       return null;
     },
+    // #173: a settlement (hosted or provider) of an unknown-cost receipt. Accepts a
+    // reconciliation { receipt_id, settled_cost_usd | cost_usd } or the settled receipt
+    // { id, cost_usd }. Idempotent: only a row still at null cost is updated.
+    settle(s) {
+      const id = s?.receipt_id ?? s?.id;
+      const cost = s?.settled_cost_usd ?? s?.cost_usd;
+      if (typeof id !== "string" || typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return false;
+      const row = rows.find((r) => r.id === id);
+      if (!row || row.cost_usd !== null) return false;
+      row.cost_usd = cost;
+      return true;
+    },
     record(receipt) {
       assertReceipt(receipt);
       add(receipt);

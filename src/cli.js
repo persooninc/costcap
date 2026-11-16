@@ -156,7 +156,7 @@ export async function wrap(argv) {
     fleetModels = resolved.models;
   };
   if (enrollmentPath) {
-    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => { cap.settle(r); proxySettle(r); } });
+    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => { cap.settle(r); agentBudgets?.settle(r); proxySettle(r); } });
     setPolicy(fleet.policy());
     const result = await fleet.sync();
     if (!result.online) console.error("costcap: fleet offline; cached policy enforced");
@@ -184,7 +184,7 @@ export async function wrap(argv) {
   const child = spawn(command[0], command.slice(1), { env, stdio: "inherit" });
   // Kill switch also stops the wrapped child: SIGTERM, then SIGKILL after 5s.
   const killCheck = combinedKill;
-  const syncTimer = fleet ? setInterval(() => fleet.sync(), 60_000) : null;
+  const syncTimer = fleet ? setInterval(() => fleet.sync(), Number(process.env.COSTCAP_SYNC_MS) || 60_000) : null; // COSTCAP_SYNC_MS: test hook
   let killedByCostcap = false, killInfo = null;
   const watcher = setInterval(() => {
     if (killedByCostcap) return;
