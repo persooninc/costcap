@@ -35,7 +35,8 @@ async function fixture(t, { now, extra = {} } = {}) {
 }
 
 test("verified org-first login, tenant isolation, enrollment, receipt sync and restart", async (t) => {
-  const f = await fixture(t);
+  let skew = 0;
+  const f = await fixture(t, { now: () => Date.now() + skew });
   assert.equal((await f.request("/v1/fleet")).status, 401);
   assert.equal((await f.request("/auth/request", { email: "a@example.invalid", turnstileToken: "bad" })).status, 403);
   assert.equal((await f.request("/auth/request", { email: "a@example.invalid", turnstileToken: "test-pass" }, null, null, "https://evil.invalid")).status, 403);
@@ -64,6 +65,7 @@ test("verified org-first login, tenant isolation, enrollment, receipt sync and r
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.length, 1);
   f.setFail(false);
+  skew += 61_000;
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.length, 2);
   await f.service().evaluateFleetAlerts();
@@ -252,7 +254,8 @@ test("a step-budget receipt pages once, ages out, and re-arms", async (t) => {
 });
 
 test("an unconfigured channel does not retry an accepted or empty delivery", async (t) => {
-  const f = await fixture(t);
+  let skew = 0;
+  const f = await fixture(t, { now: () => Date.now() + skew });
   const owner = await f.login("channels@example.invalid");
   const token = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie)).body.token;
   const agent = (await f.request("/v1/enroll", { name: "channels" }, null, token)).body;
@@ -289,6 +292,9 @@ test("an unconfigured channel does not retry an accepted or empty delivery", asy
   ] }, null, agentC.token)).status, 200);
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.length, 3);
+  await f.service().evaluateFleetAlerts();
+  assert.equal(f.delivery.length, 3, "issue #206: backoff, not every sweep");
+  skew += 61_000;
   await f.service().evaluateFleetAlerts();
   assert.equal(f.delivery.length, 4);
   fleet = await f.request("/v1/fleet", undefined, owner.cookie);
@@ -1237,7 +1243,8 @@ test("signed webhook: roles, isolation, SSRF, masking, rotation, audit, delivery
   let receiverStatus = 200;
   const resolveHost = async (host) => (host.startsWith("private.") ? [{ address: "10.0.0.8", family: 4 }] : [{ address: "93.184.216.34", family: 4 }]);
   const router = routerFor199({ lookup: resolveHost, dashboardUrl: "https://app.costcap.dev", fetchImpl: async (url, o) => { posts.push({ url, body: o.body, sig: o.headers["x-costcap-signature"] }); return { ok: receiverStatus < 300, status: receiverStatus }; } });
-  const f = await fixture(t, { extra: { resolveHost, deliverAlert: router } });
+  let skew = 0;
+  const f = await fixture(t, { now: () => Date.now() + skew, extra: { resolveHost, deliverAlert: router } });
   const owner = await f.login("owner@w.invalid");
   const other = await f.login("owner@x.invalid");
   assert.equal((await f.request("/v1/invitations", { email: "viewer@w.invalid", role: "viewer" }, owner.cookie)).status, 201);
@@ -1285,6 +1292,7 @@ test("signed webhook: roles, isolation, SSRF, masking, rotation, audit, delivery
   assert.equal(alerts[0].delivery, "failed");
   // Retry on the next sweep, same occurrence id; then 2xx is not resent.
   receiverStatus = 200;
+  skew += 61_000;
   await f.service().evaluateFleetAlerts();
   assert.equal(posts.length, 2);
   assert.equal(JSON.parse(posts[1].body).id, firstId);
@@ -1367,4 +1375,70 @@ test("#204: PUT /v1/tag-caps validates, enforces roles, audits, and ships tag_ca
   assert.equal(policy.tag_caps.spend.customer["(untagged)"].month, 0.1);
   assert.equal((await put({ tagCaps: [] }, owner.cookie)).status, 200);
   assert.equal((await f.request("/v1/policy", undefined, null, agent.token)).body.tag_caps, null);
+});
+
+// Issue #206: per-channel retry, backoff and attempt cap.
+test("issue #206: only failed channels retry, with backoff and a give-up cap; a new occurrence resends all", async (t) => {
+  let clock = Date.now();
+  const calls = { email: 0, slack: 0, webhook: 0 };
+  const status = { email: "accepted", slack: "accepted", webhook: "failed" };
+  const deliverAlert = async (_a, _settings, opts) => {
+    const want = opts?.channels ?? ["email", "slack", "webhook"];
+    return want.map((channel) => { calls[channel]++; return { channel, status: status[channel] }; });
+  };
+  const f = await fixture(t, { now: () => clock, extra: { deliverAlert } });
+  const owner = await f.login("perchannel@example.invalid");
+  const token = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "perchannel" }, null, token)).body;
+  const ts = () => new Date(clock).toISOString();
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-1", ts: ts(), cost_usd: 2, model: "test" }] }, null, agent.token)).status, 200);
+  const sweep = () => f.service().evaluateFleetAlerts();
+  const activeCapHit = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.find((a) => a.agentId === agent.agentId && a.kind === "cap_hit" && a.status !== "resolved");
+  // AC1: webhook 500, email ok. Over 5 sweeps (each a due retry), email once.
+  await sweep();
+  assert.deepEqual(calls, { email: 1, slack: 1, webhook: 1 });
+  await sweep(); // not due yet (1 min backoff)
+  assert.equal(calls.webhook, 1);
+  for (let i = 0; i < 3; i++) { clock += 31 * 60_000; await sweep(); }
+  assert.deepEqual(calls, { email: 1, slack: 1, webhook: 4 });
+  let alert = await activeCapHit();
+  assert.equal(alert.delivery, "failed");
+  // AC2: webhook recovers: called once more, then never again.
+  status.webhook = "accepted";
+  clock += 31 * 60_000; await sweep();
+  clock += 31 * 60_000; await sweep();
+  assert.deepEqual(calls, { email: 1, slack: 1, webhook: 5 });
+  alert = await activeCapHit();
+  assert.equal(alert.delivery, "accepted");
+});
+
+test("issue #206: email failing retries only email; cap writes one gave_up row; re-fire resends all", async (t) => {
+  let clock = Date.now();
+  const calls = { email: 0, slack: 0, webhook: 0 };
+  const status = { email: "failed", slack: "accepted", webhook: "accepted" };
+  const deliverAlert = async (_a, _settings, opts) => (opts?.channels ?? ["email", "slack", "webhook"]).map((channel) => { calls[channel]++; return { channel, status: status[channel] }; });
+  const f = await fixture(t, { now: () => clock, extra: { deliverAlert } });
+  const owner = await f.login("emailfail@example.invalid");
+  const token = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "emailfail" }, null, token)).body;
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-1", ts: new Date(clock).toISOString(), cost_usd: 2, model: "test" }] }, null, agent.token)).status, 200);
+  const sweep = () => f.service().evaluateFleetAlerts();
+  for (let i = 0; i < 15; i++) { await sweep(); clock += 31 * 60_000; if (i === 10) assert.equal((await f.request("/v1/receipts", { receipts: [{ id: `keep-${i}`, ts: new Date(clock).toISOString(), cost_usd: 0.01, model: "test" }] }, null, agent.token)).status, 200); }
+  // AC3 + AC4: only email retried, stops at the cap, one gave_up row.
+  assert.equal(calls.slack, 1);
+  assert.equal(calls.webhook, 1);
+  assert.equal(calls.email, 10);
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  const gaveUp = fleet.audit.filter((e) => e.action === "alert.delivery_gave_up");
+  assert.equal(gaveUp.length, 1);
+  assert.equal(gaveUp[0].detail.channel, "email");
+  assert.equal(gaveUp[0].detail.attempts, 10);
+  // AC5: a new occurrence after the alert resolves delivers everywhere again.
+  clock += 2 * 86_400_000;
+  await sweep(); // day rolled over: cap_hit resolves
+  const before = { ...calls };
+  status.email = "accepted";
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-2", ts: new Date(clock).toISOString(), cost_usd: 2, model: "test" }] }, null, agent.token)).status, 200);
+  await sweep();
+  assert.deepEqual(calls, { email: before.email + 1, slack: before.slack + 1, webhook: before.webhook + 1 });
 });

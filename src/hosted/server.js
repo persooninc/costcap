@@ -124,13 +124,47 @@ export function agentSettlementInput(body) {
 }
 const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(auditEntry({ orgId, actor, action, target, detail }));
 
-// A missing channel is not a failed send. Retry only when a configured
-// channel failed. Accepted, or nothing configured, does not send again
-// until the alert clears and re-arms.
-export function alertDeliveryState(result) {
-  const configured = (Array.isArray(result) ? result : []).filter((row) => row?.status !== "unconfigured");
-  if (!configured.length) return "unconfigured";
-  return configured.every((row) => row.status === "accepted") ? "accepted" : "failed";
+// Issue #206: per-channel retry. Each occurrence keeps `deliveryChannels`
+// ({ email: "accepted", webhook: "failed", ... }) and `deliveryRetry`
+// ({ webhook: { attempts, next_at } }). Only failed channels are re-sent, with
+// backoff 1, 2, 4 ... minutes capped at 30, and at most ALERT_MAX_ATTEMPTS
+// sends per channel per occurrence; then the channel is `gave_up`.
+export const ALERT_MAX_ATTEMPTS = 10;
+export const alertBackoffMs = (attempts) => Math.min(2 ** Math.max(0, attempts - 1), 30) * 60_000;
+/** Channels due for a retry now, `null` for a legacy/untagged full resend, or [] when nothing is due. */
+export function dueRetryChannels(record, nowMs) {
+  if (record.delivery !== "failed") return [];
+  const chans = record.deliveryChannels;
+  if (!chans) return null;
+  const due = Object.entries(chans).filter(([ch, st]) => st === "failed" && (record.deliveryRetry?.[ch]?.next_at ?? 0) <= nowMs).map(([ch]) => ch);
+  if (due.includes("all")) return null;
+  return due;
+}
+/** Merges one send's results into the occurrence. Returns channels that just gave up. */
+export function applyDeliveryResult(record, result, requested, nowMs) {
+  record.deliveryChannels ??= {};
+  record.deliveryRetry ??= {};
+  const rows = Array.isArray(result) ? result : [];
+  const tagged = rows.filter((r) => typeof r?.channel === "string");
+  const untagged = rows.find((r) => typeof r?.channel !== "string" && r?.status !== "unconfigured");
+  const untaggedFailed = untagged?.status === "failed";
+  const updates = tagged.map((r) => [r.channel, r.status]);
+  // An untagged row (the send threw, or a legacy adapter) covers every
+  // requested channel, or "all" when the channels are unknown.
+  if (untagged) for (const ch of requested ?? ["all"]) if (!tagged.some((r) => r.channel === ch)) updates.push([ch, untagged.status === "accepted" ? "accepted" : "failed"]);
+  if (requested == null && tagged.length) delete record.deliveryChannels.all;
+  const gaveUp = [];
+  for (const [ch, status] of updates) {
+    if (status === "unconfigured") { record.deliveryChannels[ch] = "unconfigured"; continue; }
+    const attempts = (record.deliveryRetry[ch]?.attempts ?? 0) + 1;
+    if (status === "accepted") { record.deliveryChannels[ch] = "accepted"; record.deliveryRetry[ch] = { attempts, next_at: null }; continue; }
+    if (attempts >= ALERT_MAX_ATTEMPTS) { record.deliveryChannels[ch] = "gave_up"; record.deliveryRetry[ch] = { attempts, next_at: null }; gaveUp.push(ch); continue; }
+    record.deliveryChannels[ch] = "failed";
+    record.deliveryRetry[ch] = { attempts, next_at: nowMs + alertBackoffMs(attempts) };
+  }
+  const states = Object.values(record.deliveryChannels).filter((st) => st !== "unconfigured");
+  record.delivery = !states.length ? (untaggedFailed ? "failed" : "unconfigured") : states.every((st) => st === "accepted") ? "accepted" : "failed";
+  return gaveUp;
 }
 
 // Estimated receipt spend for the dashboard. Null cost is unknown, never zero.
@@ -846,7 +880,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
           if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
-          else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
+          else { const ch = dueRetryChannels(prior[1], now()); if (ch === null || ch.length) out.push({ ...prior[1], id: prior[0], retryChannels: ch }); }
         }
       }
       // Issue #139: team day/month caps alert too, keyed per org and team.
@@ -863,13 +897,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
           if (!prior) out.push({ ...fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() }) });
-          else if (prior[1].delivery === "failed") out.push({ ...prior[1], id: prior[0] });
+          else { const ch = dueRetryChannels(prior[1], now()); if (ch === null || ch.length) out.push({ ...prior[1], id: prior[0], retryChannels: ch }); }
         }
       }
       for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && !teamKeys.has(x.key))) resolveAlert(prior, now());
       return out;
     });
-    for (const a of queued) {
+    for (const queuedAlert of queued) {
+      const { retryChannels, deliveryChannels: _c, deliveryRetry: _r, ...a } = queuedAlert;
+      const requested = retryChannels ?? null;
       let result;
       try { // Only addresses that are still verified members of the org receive the alert.
         const settings = store.read((s) => {
@@ -879,11 +915,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null };
         });
         const agentName = a.agentId ? store.read((s) => s.agents[a.agentId]?.name ?? null) : null;
-        result = deliverAlert ? await deliverAlert({ ...a, agentName }, settings) : [{ status: "unconfigured" }]; }
+        result = deliverAlert ? await deliverAlert({ ...a, agentName }, settings, requested ? { channels: requested } : undefined) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {
-        if (s.alerts[a.id]) s.alerts[a.id].delivery = alertDeliveryState(result);
-        audit(s, a.orgId, "alert-worker", "alert.delivery", a.agentId ?? `team:${a.team}`, { kind: a.kind, ...(a.team ? { team: a.team, scope: a.scope } : {}), result });
+        const target = a.agentId ?? `team:${a.team}`;
+        const extra = a.team ? { team: a.team, scope: a.scope } : {};
+        const gaveUp = s.alerts[a.id] ? applyDeliveryResult(s.alerts[a.id], result, requested, now()) : [];
+        audit(s, a.orgId, "alert-worker", "alert.delivery", target, { kind: a.kind, ...extra, alert_id: a.id, ...(requested ? { channels: requested } : {}), result });
+        for (const channel of gaveUp) audit(s, a.orgId, "alert-worker", "alert.delivery_gave_up", target, { kind: a.kind, ...extra, alert_id: a.id, channel, attempts: ALERT_MAX_ATTEMPTS });
       });
     }
     return queued.length;

@@ -13,20 +13,26 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
     const response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(5000) });
     if (!response.ok) throw new Error(`delivery HTTP ${response.status}`);
   };
-  return async (alert) => {
+  // Issue #206: `channels` limits a retry to the channels that failed; omitted
+  // channels are not sent and not reported.
+  return async (alert, { channels } = {}) => {
+    const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
     const text = `CostCap ${alert.kind}: ${alert.team ? `team ${alert.team}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.team ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
-    if (emailKey && emailFrom && emailTo?.length) {
+    if (!want("email")) { /* already settled for this occurrence */ }
+    else if (emailKey && emailFrom && emailTo?.length) {
       try {
         await createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to: emailTo, subject: `CostCap: ${alert.kind}`, text });
         results.push({ channel: "email", status: "accepted" });
       } catch (err) { results.push({ channel: "email", status: "failed", error: err.message }); }
     } else results.push({ channel: "email", status: "unconfigured" });
-    if (slackWebhook) {
+    if (!want("slack")) { /* skip */ }
+    else if (slackWebhook) {
       try { await post(slackWebhook, {}, { text }); results.push({ channel: "slack", status: "accepted" }); }
       catch (err) { results.push({ channel: "slack", status: "failed", error: err.message }); }
     } else results.push({ channel: "slack", status: "unconfigured" });
-    if (webhook?.url && webhook?.secret) {
+    if (!want("webhook")) { /* skip */ }
+    else if (webhook?.url && webhook?.secret) {
       try {
         await assertWebhookTarget(webhook.url, lookup); // Re-checked at send time: DNS can change after save.
         const body = JSON.stringify(webhookPayload(alert, { dashboardUrl }));
@@ -135,10 +141,10 @@ export async function assertWebhookTarget(value, lookup = dnsLookup) {
 // while it has no saved settings. Any other org with no settings stays unconfigured.
 export function createOrgAlertRouter({ emailKey, emailFrom, fetchImpl = fetch, fallback, dashboardUrl, lookup = dnsLookup, nowMs } = {}) {
   const fallbackDelivery = fallback?.orgId ? createAlertDelivery({ emailKey, emailFrom, emailTo: fallback.emailTo, slackWebhook: fallback.slackWebhook, fetchImpl }) : null;
-  return async (alert, settings) => {
+  return async (alert, settings, opts) => {
     const has = settings && (settings.emails?.length || settings.slackWebhook || settings.webhook?.url);
-    if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, dashboardUrl, lookup, fetchImpl, nowMs })(alert);
-    if (fallbackDelivery && alert.orgId === fallback.orgId) return fallbackDelivery(alert);
+    if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
+    if (fallbackDelivery && alert.orgId === fallback.orgId) return fallbackDelivery(alert, opts);
     return [{ status: "unconfigured" }];
   };
 }
