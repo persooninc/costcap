@@ -554,7 +554,27 @@ receipt; the call is not forwarded and later calls are not blocked. Every receip
 request carries `tags`. Filter with `costcap receipts --tag customer=acme`; both CSV exports have
 a `tags` column (`k=v;k=v`, sorted). Hosted: `GET /v1/spend?group_by=tag&tag_key=customer`
 returns one bucket per value plus `(untagged)`, and the dashboard Spend card has a "By tag" field.
-Tags are attribution only; there are no per-tag caps.
+
+#### Per-tag spend caps
+
+`--tag-cap KEY:SCOPE=USD` (repeatable; `SCOPE` is `hour` (rolling 60 min), `day` or `month`, UTC)
+gives every value of `KEY` its own cap. One runaway end customer is stopped while the rest keep working:
+
+```bash
+# SaaS: each customer (x-costcap-tag: customer=acme) gets $5 a UTC day and $50 a month.
+costcap wrap --tag-cap customer:day=5 --tag-cap customer:month=50 -- node server.js
+```
+
+Requests without `KEY` share the `(untagged)` bucket, which has the same cap, so a missing header
+never bypasses it. Caps use the merged tags (wrapper `--tag` wins). Once a value's spend (ledger
+history, live receipts, settlements and `--shared-ledger` siblings) reaches its cap, the call is not
+forwarded: `429 {"error":"tag_budget_exceeded", tag_key, tag_value, scope, spend_usd, cap_usd}`
+(plus `retry_after_s` and `Retry-After` for `hour`) and a $0 blocked receipt with the tags. The
+refusal never latches: other values, and this value once its window rolls over, keep going. An
+invalid key, the `run` scope, a cap that is not `> 0` or a duplicate `KEY:SCOPE` exits 2 before
+anything is spawned. `costcap check --tag-cap customer:day=5` exits 1 when any value is at or over
+its cap and lists them in `tag_caps: [{key, value, scope, spend_usd, cap_usd, verdict}]` (Action
+input `tag-caps`, output `tag-caps`). Fleet/hosted tag caps are not supported yet.
 
 With `--run-id ID` (Action input `run-id`), `--cap` counts only receipts whose
 `run_id` is `ID`; output adds `run_id`, `scope: "run"` and separate

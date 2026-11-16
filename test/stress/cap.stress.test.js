@@ -41,3 +41,20 @@ test("ledger lock: 1000 acquire/release cycles stay exclusive and under 5000 ms"
   const elapsed = ms(() => { for (let i = 0; i < 1000; i++) { const release = lockLedger(path); assert.throws(() => lockLedger(path), /locked/); release(); } });
   assert.ok(elapsed < 5000, `took ${elapsed.toFixed(0)} ms`);
 });
+
+test("#191 tag caps: 10k distinct tag values, 10k check+record cycles stay O(1) (under 2000 ms)", async () => {
+  const { createTagCaps } = await import("../../src/tag-cap.js");
+  const hist = Array.from({ length: 10_000 }, (_, i) => ({ id: `h${i}`, ts: new Date(NOW - (i % 3600) * 1000).toISOString(), cost_usd: 0.001, tags: { customer: `c${i}` } }));
+  const tc = createTagCaps({ rules: [{ key: "customer", scope: "hour", cap: 1 }, { key: "customer", scope: "day", cap: 1 }, { key: "customer", scope: "month", cap: 5 }], history: hist, now: () => NOW });
+  const t = ms(() => {
+    for (let i = 0; i < 10_000; i++) {
+      const tags = { customer: `c${i}` };
+      assert.equal(tc.check(tags), null);
+      tc.record({ id: `n${i}`, ts: NOW.toISOString(), cost_usd: 0.001, tags });
+    }
+  });
+  assert.ok(t < 2000, `${t} ms`);
+  for (let i = 0; i < 1000; i++) tc.record({ id: `x${i}`, ts: NOW.toISOString(), cost_usd: 0.001, tags: { customer: "hot" } });
+  assert.equal(tc.check({ customer: "hot" }).tag_value, "hot");
+  assert.equal(tc.check({ customer: "c1" }), null);
+});

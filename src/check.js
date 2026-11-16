@@ -4,10 +4,21 @@ import { budgetRemaining, createAgentBudgets, intersectModels } from "./agent-bu
 import { createKillCheck } from "./kill.js";
 import { DEFAULT_WARN_AT, currentWarnings } from "./cap-warn.js";
 import { createFleetClient } from "./hosted/client.js";
-export function checkBudget({ receiptsPath, caps = {}, now, runId, warnAt = DEFAULT_WARN_AT }) {
-  const history = loadReceipts(receiptsPath);
+import { createTagCaps } from "./tag-cap.js";
+
+// #191: --tag-cap lists every tag value at or over its cap; any one fails the check.
+export function checkBudget({ tagCaps, ...options }) {
+  const history = loadReceipts(options.receiptsPath);
   if (!history.length) throw new Error("No receipts found; a budget check needs evidence");
-  if (runId != null) return checkRunBudget({ history, caps, now, runId, warnAt });
+  const base = options.runId != null ? checkRunBudget({ ...options, history, warnAt: options.warnAt ?? DEFAULT_WARN_AT }) : checkLedgerBudget({ ...options, history });
+  if (!tagCaps?.length) return base;
+  const over = createTagCaps({ rules: tagCaps, history, now: options.now }).over();
+  const first = over[0];
+  const hit = base.hit ?? (first ? { scope: first.scope, reason: "tag_budget_exceeded", tag_key: first.key, tag_value: first.value, cap: first.cap_usd, spent: first.spend_usd } : null);
+  return { ...base, ok: base.ok && !over.length, hit, tag_caps: over };
+}
+
+function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }) {
   const cap = createCapEngine({ caps: { hour: caps.hour, day: caps.day, month: caps.month }, history, now });
   const s = cap.spend();
   const unknown_cost_count = history.filter((r) => r.cost_usd === null).length;
@@ -31,7 +42,7 @@ export function checkBudget({ receiptsPath, caps = {}, now, runId, warnAt = DEFA
 
 // Run-scoped check: the run cap counts only receipts with this run_id, while
 // day/month caps (and their unknown-cost rule) still cover the whole ledger.
-function checkRunBudget({ history, caps, now, runId, warnAt }) {
+function checkRunBudget({ history, caps = {}, now, runId, warnAt }) {
   if (typeof runId !== "string" || !runId) throw new Error("--run-id needs a non-empty value");
   const runRecs = history.filter((r) => r.run_id === runId);
   if (!runRecs.length) throw new Error(`No receipts for run_id ${JSON.stringify(runId)}; a budget check needs evidence (list runs with: costcap runs)`);

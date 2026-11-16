@@ -9,6 +9,7 @@ import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
 import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
+import { tagBudgetExceededBody } from "./tag-cap.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, openRouterModels } from "./preflight.js";
@@ -390,7 +391,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -408,6 +409,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   const emitBase = (receipt) => guarded(() => {
     const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
+    tagCaps?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     sharedLedger?.track?.(complete);
@@ -603,6 +605,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (teamHit) return block(teamHit.reason, teamHit, { error: teamHit.verdict, ...teamHit });
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
+          // #191: per-tag caps refuse one tag value without latching the run.
+          const tagHit = tagCaps?.check(reqTags);
+          if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
           if (preflight) {
             // #188: cloud preflight prices the mapped path model, with the regional premium.
             const cloudPrice = cloud ? () => {
@@ -802,6 +807,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 recordSpend({ cost_usd: folded.cost_usd, ts: pending.ts }, { external });
                 // #179: --policy agent/team budgets count the batch at its original ts, no restart needed.
                 agentBudgets?.settle({ receipt_id: pending.id, cost_usd: folded.cost_usd });
+                tagCaps?.settle(pending.id, folded.cost_usd);
                 flushWarnings();
               } else {
                 // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.

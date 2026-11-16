@@ -23,9 +23,12 @@ inputs:
   run-id:
     description: Optional run_id; the cap then counts only that run's receipts (day/month caps still cover the whole ledger). List ids with `costcap runs`
     required: false
+  tag-caps:
+    description: Optional per-tag caps, space separated KEY:SCOPE=USD rules (e.g. "customer:day=5 customer:month=50"); each tag value gets its own cap
+    required: false
 outputs:
   verdict:
-    description: ok, budget_exceeded or accounting_unavailable
+    description: ok, budget_exceeded, tag_budget_exceeded or accounting_unavailable
     value: ${{ steps.check.outputs.verdict }}
   spent-usd:
     description: Estimated USD across the receipt file; empty when any cost is unknown
@@ -54,6 +57,9 @@ outputs:
   run-id:
     description: The run_id the cap was scoped to; empty for a whole-ledger check
     value: ${{ steps.check.outputs.run-id }}
+  tag-caps:
+    description: Tag values at or over a tag-caps rule, as key=value:scope:spent/cap pairs; empty if none
+    value: ${{ steps.check.outputs.tag-caps }}
 runs:
   using: composite
   steps:
@@ -69,6 +75,7 @@ runs:
         COSTCAP_DAY_CAP: ${{ inputs.day-cap }}
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
         COSTCAP_RUN_ID: ${{ inputs.run-id }}
+        COSTCAP_TAG_CAPS: ${{ inputs.tag-caps }}
         COSTCAP_ACTION_PATH: ${{ github.action_path }}
       run: |
         args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP" --github-output)
@@ -76,4 +83,5 @@ runs:
         if [ -n "$COSTCAP_DAY_CAP" ]; then args+=(--day-cap "$COSTCAP_DAY_CAP"); fi
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
         if [ -n "$COSTCAP_RUN_ID" ]; then args+=(--run-id "$COSTCAP_RUN_ID"); fi
+        for rule in $COSTCAP_TAG_CAPS; do args+=(--tag-cap "$rule"); done
         node "$COSTCAP_ACTION_PATH/src/cli.js" "${args[@]}"
