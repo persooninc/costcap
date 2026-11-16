@@ -277,3 +277,14 @@ test("#188 path model overrides the body model; cloud providers default to 64k o
   const cap = createCapEngine({ caps: { run: 0.0001 } });
   assert.equal(preflightCheck(cap, "bedrock", "{}", "/x", undefined, undefined, "claude-haiku-4-5").reason, "preflight_estimate");
 });
+
+test("#200 AC6 Gemini embed paths preflight input-only; unpriced embedding models are refused", () => {
+  const body = JSON.stringify({ content: { parts: [{ text: "x".repeat(400) }] } });
+  for (const path of ["/v1beta/models/gemini-embedding-001:embedContent", "/v1/models/gemini-embedding-2:batchEmbedContents"]) {
+    const est = estimateWorstCase("gemini", body, path);
+    assert.equal(est.ok, true, path);
+    assert.equal(est.output_tokens, 0);
+  }
+  assert.notEqual(estimateWorstCase("gemini", body, "/v1beta/models/gemini-2.5-flash:generateContent").output_tokens, 0);
+  assert.equal(estimateWorstCase("gemini", body, "/v1beta/models/gemini-embedding-999:embedContent").reason, "preflight_unpriced");
+});

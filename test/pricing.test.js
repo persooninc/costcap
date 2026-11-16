@@ -128,3 +128,8 @@ test("#163: text-only costs are unchanged by the modality breakdown", () => {
     assert.equal(costForUsage(model, { ...u, modality_tokens: text }).cost_usd, costForUsage(model, u).cost_usd, model);
   }
 });
+
+test("#200 gemini-embedding rows are in the table", () => {
+  assert.equal(lookupPrice("gemini-embedding-001").input, 0.15);
+  assert.equal(lookupPrice("gemini-embedding-2").modalities.video.input, 12);
+});

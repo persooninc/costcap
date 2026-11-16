@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.8",
+  "version": "2026-11-16.9",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -9,6 +9,7 @@
     "https://developers.openai.com/api/docs/pricing",
     "https://platform.openai.com/docs/guides/priority-processing",
     "https://ai.google.dev/gemini-api/docs/pricing",
+    "https://aistudio.google.com/docs/pricing",
     "https://openrouter.ai/models",
     "https://platform.openai.com/docs/pricing (gpt-5*, gpt-4.1*, o1*, o3, o4-mini; retrieved 2026-11-16)",
     "https://docs.anthropic.com/en/docs/about-claude/models (Anthropic -YYYYMMDD snapshot ids; retrieved 2026-11-16)",
@@ -52,6 +53,8 @@
     "claude-opus-5-5": { "input": 4.00, "cached_input": 0.20, "output": 20.00, "cache_write": 5.00, "cache_write_1h": 8.00, "fast": { "input": 8.00, "cached_input": 0.40, "output": 40.00, "cache_write": 10.00, "cache_write_1h": 16.00 } },
     "claude-sonnet-5-5": { "input": 2.00, "cached_input": 0.10, "output": 10.00, "cache_write": 2.50, "cache_write_1h": 4.00 },
     "claude-haiku-4-5": { "input": 1.00, "cached_input": 0.10, "output": 5.00, "cache_write": 1.25, "cache_write_1h": 2.00 },
+    "gemini-embedding-001": { "input": 0.15, "cached_input": 0.15, "output": 0, "input_only": true, "uniform_modalities": true },
+    "gemini-embedding-2": { "input": 0.20, "cached_input": 0.20, "output": 0, "input_only": true, "modalities": { "image": { "input": 0.45, "cached_input": 0.45 }, "audio": { "input": 6.50, "cached_input": 6.50 }, "video": { "input": 12.00, "cached_input": 12.00 } } },
     "gemini-2.5-flash": { "input": 0.30, "cached_input": 0.03, "output": 2.50, "text_rate_modalities": ["image", "video"], "modalities": { "audio": { "input": 1.00, "cached_input": 0.10 } } },
     "gemini-2.5-flash-lite": { "input": 0.10, "cached_input": 0.01, "output": 0.40, "text_rate_modalities": ["image", "video"], "modalities": { "audio": { "input": 0.30, "cached_input": 0.03 } } },
     "gemini-2.5-pro": { "input": 1.25, "cached_input": 0.125, "output": 10.00, "long_context": { "threshold_input_tokens": 200000, "input": 2.50, "cached_input": 0.25, "output": 15.00 }, "uniform_modalities": true },

@@ -586,3 +586,60 @@ test("#196 a GET whose body carries usage is $0 non_billable_request and never p
   assert.equal(r.status, 200);
   assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [0, "non_billable_request"]);
 });
+
+// #200: Gemini embeddings are metered input-only from usageMetadata.promptTokenCount.
+test("#200 extractUsage: Gemini embed/batch usage, invalid shapes stay unknown, generateContent unchanged", () => {
+  const e = { embeddings: true };
+  assert.deepEqual(extractUsage("gemini", '{"embedding":{"values":[0.1]},"usageMetadata":{"promptTokenCount":12}}', "gemini-embedding-001", e),
+    { model: "gemini-embedding-001", usage: { input_tokens: 12, output_tokens: 0, cached_input_tokens: 0 } });
+  assert.deepEqual(extractUsage("gemini", '{"embeddings":[{"values":[1]},{"values":[2]}],"usageMetadata":{"promptTokenCount":40}}', "gemini-embedding-001", e).usage,
+    { input_tokens: 40, output_tokens: 0, cached_input_tokens: 0 });
+  for (const bad of ['{"embedding":{}}', '{"usageMetadata":{}}', '{"usageMetadata":{"promptTokenCount":-1}}', '{"usageMetadata":{"promptTokenCount":"5"}}', '{"usageMetadata":null}'])
+    assert.equal(extractUsage("gemini", bad, "gemini-embedding-001", e), null, bad);
+  const mm = extractUsage("gemini", JSON.stringify({ usageMetadata: { promptTokenCount: 300, promptTokenDetails: [{ modality: "TEXT", tokenCount: 100 }, { modality: "IMAGE", tokenCount: 200 }] } }), "gemini-embedding-2", e);
+  assert.deepEqual(mm.usage.modality_tokens.input, { text: 100, image: 200, audio: 0, video: 0 });
+  assert.equal(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":12}}', "gemini-2.5-flash"), null);
+});
+
+test("#200 isEmbeddingsPath: exact Gemini embed paths only", () => {
+  for (const ok of ["/gemini/v1beta/models/gemini-embedding-001:embedContent", "/gemini/v1/models/gemini-embedding-2:batchEmbedContents",
+    "/gemini/v1alpha/models/gemini-embedding-001:embedContent?key=x"]) assert.equal(isEmbeddingsPath(ok), true, ok);
+  for (const bad of ["/gemini/v1beta/models/gemini-embedding-001:generateContent", "/gemini/v1beta/models/gemini-embedding-001:asyncBatchEmbedContent",
+    "/gemini/v1beta/models/gemini-embedding-001%3AembedContent", "/gemini/v1beta/models/../models/x:embedContent", "/gemini//v1beta/models/x:embedContent",
+    "/gemini/v2/models/x:embedContent", "/gemini/v1beta/models/x:embedContent/", "/vertex/v1beta/models/x:embedContent"]) assert.equal(isEmbeddingsPath(bad), false, bad);
+});
+
+async function geminiEmbedProxy(t, responder) {
+  const up = http.createServer((req, res) => { req.resume(); const [status, body] = responder(req); res.writeHead(status, { "content-type": "application/json" }).end(body); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { gemini: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const call = (path = "/gemini/v1beta/models/gemini-embedding-001:embedContent") => fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: JSON.stringify({ content: { parts: [{ text: "hi" }] } }) });
+  return { call, receipts };
+}
+
+test("#200 AC1/AC2 Gemini embedContent and batchEmbedContents are metered and the next call is forwarded", async (t) => {
+  for (const path of ["/gemini/v1beta/models/gemini-embedding-001:embedContent", "/gemini/v1beta/models/gemini-embedding-001:batchEmbedContents"]) {
+    const { call, receipts } = await geminiEmbedProxy(t, () => [200, '{"embedding":{"values":[0.1]},"usageMetadata":{"promptTokenCount":1000}}']);
+    assert.equal((await call(path)).status, 200);
+    assert.equal(receipts[0].cost_usd, Number((1000 * 0.15 / 1e6).toFixed(6)), path);
+    assert.deepEqual([receipts[0].output_tokens, receipts[0].fallback], [0, false]);
+    assert.match(receipts[0].table_sha256, /^[0-9a-f]{64}$/);
+    assert.equal((await call(path)).status, 200);
+  }
+});
+
+test("#200 AC3 a Gemini embed response without usage pauses the run", async (t) => {
+  const { call, receipts } = await geminiEmbedProxy(t, () => [200, '{"embedding":{"values":[0.1]}}']);
+  assert.equal((await call()).status, 200);
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"]);
+  assert.equal((await (await call()).json()).error, "accounting_unavailable");
+});
+
+test("#200 AC4 gemini-embedding-2 prices each modality; a modality with no rate is unknown", () => {
+  const mt = (input) => ({ input, cached_input: null, output: null });
+  const r = costForUsage("gemini-embedding-2", { input_tokens: 4_000_000, modality_tokens: mt({ text: 1_000_000, image: 1_000_000, audio: 1_000_000, video: 1_000_000 }) });
+  assert.equal(r.cost_usd, Number((0.20 + 0.45 + 6.50 + 12.00).toFixed(6)));
+  assert.equal(costForUsage("gemini-embedding-001", { input_tokens: 1_000_000 }).cost_usd, 0.15);
+});

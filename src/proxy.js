@@ -94,8 +94,10 @@ export function isEmbeddingsPath(rawUrl) {
   if (typeof rawUrl !== "string") return false;
   const pathname = rawUrl.split(/[?#]/, 1)[0];
   if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
-  return /^\/openai\/v1\/embeddings$/.test(pathname);
+  return /^\/openai\/v1\/embeddings$/.test(pathname) || GEMINI_EMBED_PATH.test(pathname);
 }
+// Gemini embeddings (#200): :embedContent / :batchEmbedContents, billed on input only.
+const GEMINI_EMBED_PATH = /^\/gemini\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*:(?:embedContent|batchEmbedContents)$/;
 
 const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
 
@@ -173,6 +175,16 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
       if (chunk.candidates.some((c) => c && typeof c.finishReason === "string")) geminiFinished = true;
     }
     if (provider === "gemini" && chunk.promptFeedback?.blockReason) geminiFinished = true;
+    if (provider === "gemini" && embeddings) {
+      // #200: embed responses carry only promptTokenCount (+ promptTokenDetails); anything else is unknown.
+      const u = chunk.usageMetadata;
+      if (!u || !isCount(u.promptTokenCount)) { usage = { unpriceable: NaN }; return; }
+      usage = { input_tokens: u.promptTokenCount, output_tokens: 0, cached_input_tokens: 0 };
+      const input = geminiModalitySlice(u.promptTokenDetails ?? u.promptTokensDetails);
+      const mt = modalityTokens({ input, cached_input: null, output: null });
+      if (mt) usage.modality_tokens = mt;
+      return;
+    }
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
       // Known only with both required counters; {} or partial shapes are unpriceable (never $0).
