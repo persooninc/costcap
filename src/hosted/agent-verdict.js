@@ -3,6 +3,7 @@
 // drift. An unknown cost (cost_usd: null) is never treated as $0.
 import { createAgentBudgets, budgetRemaining } from "../agent-budget.js";
 import { effectiveCaps } from "./policy.js";
+import { periodKey } from "../period.js";
 
 const HOSTED_SCOPES = ["day", "month"];
 
@@ -11,9 +12,9 @@ const HOSTED_SCOPES = ["day", "month"];
 // runId (optional): count steps for that run against policy.maxSteps (issue #114).
 // team (optional, issue #123): the teamVerdict() of the agent's team. The agent's own
 // cap applies first, then the team's shared spend.
-export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team = null }) {
+export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team = null, budgetPeriod = null }) {
   const nowDate = new Date(nowMs);
-  const month = nowDate.toISOString().slice(0, 7);
+  const month = periodKey("month", nowMs, budgetPeriod);
   const who = { agent_id: agent.id, run_id: runId };
   const limits = {};
   // #208: an active cap raise applies until its expires_at, then the base cap again.
@@ -22,11 +23,11 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   const maxSteps = agent.policy?.maxSteps ?? null;
   if (maxSteps != null && runId) limits.maxSteps = maxSteps;
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};
-  // Only receipts in the widest window (this UTC month) count, unknown ones included.
+  // Only receipts in the widest window (this budget-period month, #209) count, unknown ones included.
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && new Date(r.ts).toISOString().slice(0, 7) === month)
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && periodKey("month", Date.parse(r.ts), budgetPeriod) === month)
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
-  const budgets = createAgentBudgets({ policy, history, now: () => nowDate });
+  const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
   const remaining = budgetRemaining(budgets, who);
   const budget_remaining = remaining && { day_usd: remaining.day_usd, month_usd: remaining.month_usd };
   let hit;

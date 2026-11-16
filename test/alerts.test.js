@@ -142,3 +142,33 @@ test("occurrence lifecycle: fire, resolve, re-fire keeps history; legacy records
   assert.deepEqual(filterAlerts(list, { since: t1 }).map((x) => x.id), ["two"]);
   assert.deepEqual(filterAlerts(list, { until: t0 }).map((x) => x.id), ["one"]);
 });
+
+// Issue #209: cap periods, warning arms and the month projection follow the org budget period.
+import { capPeriod as capPeriod209, armWarnings as arm209 } from "../src/hosted/alerts.js";
+test("#209 capPeriod and warning arm re-open on the configured month start", () => {
+  const bp = { timezone: "America/Los_Angeles", monthStartDay: 15 };
+  assert.equal(capPeriod209("day", Date.parse("2026-11-16T07:30:00Z"), bp), "2026-11-15");
+  assert.equal(capPeriod209("month", Date.parse("2026-11-15T07:59:00Z"), bp), "2026-10");
+  assert.equal(capPeriod209("month", Date.parse("2026-11-15T08:00:00Z"), bp), "2026-11");
+  assert.equal(capPeriod209("run:abc", 0, bp), "run:abc");
+  assert.equal(capPeriod209("month", Date.parse("2026-11-15T08:00:00Z")), "2026-11");
+  const arm = {};
+  const st = arm209(arm, { id: "a", scope: "month", cap: 10, spent: 9, nowMs: Date.parse("2026-11-14T12:00:00Z"), budgetPeriod: bp });
+  st.fired.push(0.8);
+  assert.equal(arm209(arm, { id: "a", scope: "month", cap: 10, spent: 9, nowMs: Date.parse("2026-11-15T07:00:00Z"), budgetPeriod: bp }).fired.length, 1);
+  // New period: the fraction can fire again even though spend did not drop.
+  assert.equal(arm209(arm, { id: "a", scope: "month", cap: 10, spent: 9, nowMs: Date.parse("2026-11-15T09:00:00Z"), budgetPeriod: bp }).fired.length, 0);
+});
+
+test("#209 cap_projected uses the elapsed share of the configured month period", () => {
+  const bp = { monthStartDay: 15 };
+  // 5 days into a 31-day Oct 15 - Nov 15 period ... use Nov 15 - Dec 15 (30 days).
+  const now = Date.parse("2026-11-20T00:00:00Z");
+  assert.equal(projectMonthSpend(5, now, { budgetPeriod: bp }), 30);
+  // UTC month: 19 of 30 days elapsed.
+  assert.equal(Number(projectMonthSpend(19, now).toFixed(6)), 30);
+  assert.equal(projectMonthSpend(5, Date.parse("2026-11-15T12:00:00Z"), { budgetPeriod: bp }), null); // < 24h into the period
+  const fired = evaluateAlerts({ agentId: "a", caps: { month: 20 }, spend: { month: 5 }, nowMs: now }, { budgetPeriod: bp });
+  assert.ok(fired.some((x) => x.kind === "cap_projected"));
+  assert.ok(!evaluateAlerts({ agentId: "a", caps: { month: 20 }, spend: { month: 5 }, nowMs: now }).some((x) => x.kind === "cap_projected"));
+});

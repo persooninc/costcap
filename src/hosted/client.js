@@ -1,3 +1,4 @@
+import { budgetPeriodError } from "../period.js";
 // Enrolled-agent transport. Credentials/cache stay local, mode 0600.
 // This client needs a real authenticated service; it does not create one.
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
@@ -126,7 +127,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     teamCheck(nowMs = Date.now()) {
       if (!data.team) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedTeamVerdict(data.team, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedTeamVerdict(data.team, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     agentSpend: () => data.agentSpend ?? null,
     // Per-agent fleet caps (#127) against the agent's fleet-wide synced spend plus
@@ -134,7 +135,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     agentCheck(nowMs = Date.now()) {
       if (!data.agentSpend) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedAgentVerdict(data.agentSpend, policy(nowMs).caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedAgentVerdict(data.agentSpend, policy(nowMs).caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     // #195: fleet agent / hosted team remainders for --preflight.
     preflightRemaining(nowMs = Date.now()) {
@@ -142,18 +143,19 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       const synced = new Set(data.syncedIds ?? []);
       const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
       return {
-        agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs) : null,
-        team: data.team ? cachedTeamRemaining(data.team, pending, nowMs) : null,
+        agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs, data.budgetPeriod) : null,
+        team: data.team ? cachedTeamRemaining(data.team, pending, nowMs, data.budgetPeriod) : null,
         teamName: data.team?.name ?? null,
       };
     },
     tagCaps: () => data.tagCaps ?? null,
+    budgetPeriod: () => data.budgetPeriod ?? null,
     // #204: fleet tag caps against the org's synced per-value spend plus this host's
     // unsynced receipts; local --tag-cap rules tighten a matching fleet rule.
     tagCheck(tags, localRules = [], nowMs = Date.now()) {
       if (!data.tagCaps) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetTagVerdict(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedFleetTagVerdict(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     revoked: () => revoked,
     // wait: true (used at exit) waits for an in-flight sync, then runs a fresh one,
@@ -186,13 +188,15 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         }
         await uploadSettlements(synced);
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, ...fetchedPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, budget_period: budgetPeriod = null, ...fetchedPolicy } = fetched ?? {};
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps)) throw new Error("Invalid fleet policy response");
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
         // #204: rules and spend refresh on every poll; a removed rule set (null) lifts enforcement.
         if (JSON.stringify(tagCaps) !== JSON.stringify(data.tagCaps ?? null)) { data.tagCaps = tagCaps; saveEnrollment(path, data); }
+        // #209: the org budget period, so offline windows roll over on the org's clock.
+        if (JSON.stringify(budgetPeriod) !== JSON.stringify(data.budgetPeriod ?? null)) { data.budgetPeriod = budgetPeriod; saveEnrollment(path, data); }
         // Team membership and spend refresh on every poll; removal (null) stops team enforcement.
         if (JSON.stringify(team) !== JSON.stringify(data.team ?? null)) { data.team = team; saveEnrollment(path, data); }
         // Only strictly newer valid versions can replace a cached policy.

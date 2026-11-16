@@ -241,3 +241,38 @@ test("#208: requestRaise files a request with the enrollment token and maps erro
   status = 400; await assert.rejects(requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "b" }), /request rejected/);
   status = 500; await assert.rejects(requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "b" }), /HTTP 500/);
 });
+
+// Issue #209 AC5: the synced budget_period is cached and drives offline rollover.
+test("#209 offline cachedTotals zero synced spend at the configured period rollover, not UTC", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-period-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  let budgetPeriod = { timezone: "America/Los_Angeles", monthStartDay: 1 };
+  const agentSpend = { spent: { day: 3, month: 3 }, unknown: 0, pending_batches: 0, as_of: "2026-11-16T04:00:00.000Z" };
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: { day: 3 }, killed: false } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version: 1, caps: { day: 3 }, killed: false, agent_spend: agentSpend, budget_period: budgetPeriod }));
+    else res.end(JSON.stringify({ acceptedIds: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "e", name: "x", path });
+  const client = createFleetClient({ path, receiptsPath });
+  assert.equal((await client.sync()).online, true);
+  assert.deepEqual(client.budgetPeriod(), budgetPeriod);
+  // Offline after a restart: same LA day blocks, LA midnight (08:00Z) lifts.
+  const cold = createFleetClient({ path, receiptsPath });
+  assert.equal(cold.agentCheck(Date.parse("2026-11-16T07:30:00Z")).verdict, "budget_exceeded");
+  assert.equal(cold.agentCheck(Date.parse("2026-11-16T08:30:00Z")), null);
+  assert.equal(cold.preflightRemaining(Date.parse("2026-11-16T08:30:00Z")).agent.day, 3);
+  // An invalid period is refused and the cache kept.
+  budgetPeriod = { timezone: "Not/AZone" };
+  assert.equal((await client.sync()).online, false);
+  assert.deepEqual(client.budgetPeriod(), { timezone: "America/Los_Angeles", monthStartDay: 1 });
+  // Removing it (older server: null) reverts to UTC windows.
+  budgetPeriod = null;
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.budgetPeriod(), null);
+  assert.equal(client.agentCheck(Date.parse("2026-11-16T08:30:00Z")).verdict, "budget_exceeded");
+});

@@ -1,3 +1,4 @@
+import { periodKey } from "./period.js";
 import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // Per-agent spend and step budgets. Follows the contract of the skills-library
 // ai-cost-tracking skill (references/agent-budget.mjs). Pure module, no I/O.
@@ -74,7 +75,7 @@ export function assertAgentPolicy(policy) {
 // policy: { default?: Limits, agents?: { [agentId]: Limits } }
 // Limits: { run?, hour? (rolling 60 min, #172), day?, month? (USD), maxSteps? (upstream calls per run), models? (allowlist, #153) }
 // An agent with no entry and no default has no budget, which is a refusal.
-export function createAgentBudgets({ policy = {}, history = [], now = () => new Date() } = {}) {
+export function createAgentBudgets({ policy = {}, history = [], now = () => new Date(), budgetPeriod = null } = {}) {
   assertAgentPolicy(policy);
   history.forEach(assertReceipt);
 
@@ -98,8 +99,9 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
 
   function spend({ agent_id: agentId = UNKNOWN_AGENT, run_id: runId = null } = {}, agentIds = [agentId]) {
     const nowDate = now();
-    const today = nowDate.toISOString();
     const nowMs = nowDate.getTime();
+    // #209: day/month windows follow the org budget period (UTC/day 1 by default).
+    const today = { day: periodKey("day", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
     const out = { run: 0, hour: 0, day: 0, month: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
@@ -107,10 +109,9 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
       const tsMs = Date.parse(r.ts);
-      const ts = new Date(tsMs).toISOString();
       if (tsMs > nowMs - HOUR_MS) out.hour += cost;
-      if (ts.slice(0, 10) === today.slice(0, 10)) out.day += cost;
-      if (ts.slice(0, 7) === today.slice(0, 7)) out.month += cost;
+      if (periodKey("day", tsMs, budgetPeriod) === today.day) out.day += cost;
+      if (periodKey("month", tsMs, budgetPeriod) === today.month) out.month += cost;
       if (r.run_id === runId) { out.run += cost; out.steps += 1; }
     }
     return out;

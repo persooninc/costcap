@@ -1,3 +1,4 @@
+import { periodKey, samePeriod } from "../period.js";
 // Hosted team budgets (issue #123, SRM #3017). Pure, no I/O.
 // A team shares one day/month cap across a group of enrolled agents in one org.
 // The verdict reuses the local agent-budget engine (src/agent-budget.js), so the
@@ -55,21 +56,21 @@ export const teamFor = (teams, orgId, agentId) => teams.find((t) => t.orgId === 
 
 // team: { name, agents, day?, month? }
 // receiptsByAgent: { [agentId]: receipt[] } with { id, ts, cost_usd, blocked? }
-export function teamVerdict({ team, receiptsByAgent, nowMs }) {
+export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null }) {
   const nowDate = new Date(nowMs);
-  const month = nowDate.toISOString().slice(0, 7);
+  const month = periodKey("month", nowMs, budgetPeriod);
   const def = { agents: team.agents };
   for (const s of TEAM_SCOPES) if (team[s] != null) def[s] = team[s];
   const history = [];
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
-      if (!Number.isFinite(Date.parse(r?.ts)) || new Date(r.ts).toISOString().slice(0, 7) !== month) continue;
+      if (!Number.isFinite(Date.parse(r?.ts)) || periodKey("month", Date.parse(r.ts), budgetPeriod) !== month) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
   // #183: keep `reason` so a synced pending batch is pending, not unknown, server side too.
   const pendingBatches = history.filter(isPendingBatch).length;
-  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate });
+  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate, budgetPeriod });
   const spend = budgets.spend({ agent_id: team.agents[0] }, team.agents);
   // Any member's view of the team is the same once its own receipts are folded in.
   const hit = team.agents.map((a) => budgets.check({ agent_id: a })).find(Boolean) ?? null;
@@ -105,33 +106,31 @@ export function validTeamPolicy(t) {
   return true;
 }
 
-// Synced spend plus pending local receipts, per UTC window. Shared by team (#123)
-// and per-agent (#127) cached enforcement. Synced spend from an earlier UTC
-// day/month than now no longer counts in that window.
-function cachedTotals(entry, pending, nowMs) {
-  const now = new Date(nowMs).toISOString();
-  const asOf = new Date(entry.as_of).toISOString();
-  const window = { day: 10, month: 7 };
+// Synced spend plus pending local receipts, per budget-period window (#209,
+// UTC by default). Shared by team (#123) and per-agent (#127) cached
+// enforcement. Synced spend from an earlier day/month period than now no
+// longer counts in that window.
+function cachedTotals(entry, pending, nowMs, budgetPeriod) {
+  const asOfMs = Date.parse(entry.as_of);
   const total = {};
   let unknown = entry.unknown;
-  for (const s of TEAM_SCOPES) total[s] = now.slice(0, window[s]) === asOf.slice(0, window[s]) ? entry.spent[s] : 0;
+  for (const s of TEAM_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? entry.spent[s] : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     // #183: a pending batch is not unknown spend (same rule as cap.js); its cost
     // arrives as a settlement, which settled-aware loading has already applied.
     if (isPendingBatch(r)) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-    const ts = new Date(r.ts).toISOString();
-    for (const s of TEAM_SCOPES) if (ts.slice(0, window[s]) === now.slice(0, window[s])) total[s] += r.cost_usd;
+    for (const s of TEAM_SCOPES) if (samePeriod(s, Date.parse(r.ts), nowMs, budgetPeriod)) total[s] += r.cost_usd;
   }
   return { total, unknown };
 }
 
 // Offline enforcement in the wrapper from the cached team policy.
 // pending: this agent's receipts not yet synced (counted on top of `spent`).
-export function cachedTeamVerdict(team, pending, nowMs) {
+export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
   if (!team) return null;
-  const { total, unknown } = cachedTotals(team, pending, nowMs);
+  const { total, unknown } = cachedTotals(team, pending, nowMs, budgetPeriod);
   if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", team: team.name, unknown_receipts: unknown };
   for (const s of TEAM_SCOPES) {
     const cap = team.caps?.[s];
@@ -142,19 +141,20 @@ export function cachedTeamVerdict(team, pending, nowMs) {
 
 // Issue #127: the agent's own fleet-wide synced spend (all hosts/runners using
 // this identity), from settled-aware stored receipts. Pure.
-export function agentSpendPolicy(receipts, nowMs) {
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null) {
   const now = new Date(nowMs).toISOString();
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const spent = { day: 0, month: 0 };
   let unknown = 0;
   let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    const ts = new Date(r.ts).toISOString();
-    if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+    const tsMs = Date.parse(r.ts);
+    if (periodKey("month", tsMs, budgetPeriod) !== month) continue;
     if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     spent.month += r.cost_usd;
-    if (ts.slice(0, 10) === now.slice(0, 10)) spent.day += r.cost_usd;
+    if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
   }
   return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
 }
@@ -167,9 +167,9 @@ export function validAgentSpend(a) {
 
 // Offline per-agent enforcement against the agent's fleet caps (#127).
 // caps: the resolved day/month caps; pending: unsynced local receipts.
-export function cachedAgentVerdict(spend, caps, pending, nowMs) {
+export function cachedAgentVerdict(spend, caps, pending, nowMs, budgetPeriod = null) {
   if (!spend || !TEAM_SCOPES.some((s) => caps?.[s] != null)) return null;
-  const { total, unknown } = cachedTotals(spend, pending, nowMs);
+  const { total, unknown } = cachedTotals(spend, pending, nowMs, budgetPeriod);
   if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", unknown_receipts: unknown };
   for (const s of TEAM_SCOPES) {
     const cap = caps[s];
@@ -181,18 +181,18 @@ export function cachedAgentVerdict(spend, caps, pending, nowMs) {
 // Issue #195: what is left of each capped window for --preflight. Pure.
 // Returns { day, month } (null = no cap on that window), or null when nothing applies.
 // Unknown-cost receipts make the verdict functions refuse already; here they add 0.
-function cachedRemaining(entry, caps, pending, nowMs) {
+function cachedRemaining(entry, caps, pending, nowMs, budgetPeriod = null) {
   if (!entry || !TEAM_SCOPES.some((s) => caps?.[s] != null)) return null;
-  const { total } = cachedTotals(entry, pending, nowMs);
+  const { total } = cachedTotals(entry, pending, nowMs, budgetPeriod);
   const left = {};
   for (const s of TEAM_SCOPES) left[s] = caps[s] == null ? null : round6(Math.max(0, caps[s] - total[s]));
   return left;
 }
 
-export function cachedAgentRemaining(spend, caps, pending, nowMs) {
-  return cachedRemaining(spend, caps, pending, nowMs);
+export function cachedAgentRemaining(spend, caps, pending, nowMs, budgetPeriod = null) {
+  return cachedRemaining(spend, caps, pending, nowMs, budgetPeriod);
 }
 
-export function cachedTeamRemaining(team, pending, nowMs) {
-  return team ? cachedRemaining(team, team.caps, pending, nowMs) : null;
+export function cachedTeamRemaining(team, pending, nowMs, budgetPeriod = null) {
+  return team ? cachedRemaining(team, team.caps, pending, nowMs, budgetPeriod) : null;
 }

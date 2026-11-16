@@ -3,6 +3,7 @@
 // unknown cost counts at its settled value in its original bucket.
 
 import { TAG_KEY } from "../tags.js";
+import { normalizeBudgetPeriod, periodKey } from "../period.js";
 
 export const SPEND_GROUPS = ["day", "model", "agent", "tag"];
 export const UNTAGGED = "(untagged)";
@@ -35,7 +36,7 @@ export function parseSpendQuery(params) {
 }
 
 // items: [{ agentId, receipt, settlement? }]. names: { agentId: label }.
-export function spendBreakdown(items, { groupBy = "day", since, until, untilExclusive = false, cutoff = null, names = {}, tagKey } = {}) {
+export function spendBreakdown(items, { groupBy = "day", since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null } = {}) {
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   if (groupBy === "tag" && (!tagKey || !TAG_KEY.test(tagKey))) throw bad("tag_key is required with group_by=tag");
   let from = since, clamped = false;
@@ -48,7 +49,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
     if (!Number.isFinite(ms)) continue;
     if (from !== undefined && ms < from) continue;
     if (until !== undefined && (untilExclusive ? ms >= until : ms > until)) continue;
-    const key = groupBy === "day" ? new Date(ms).toISOString().slice(0, 10)
+    const key = groupBy === "day" ? periodKey("day", ms, budgetPeriod)
       : groupBy === "model" ? (typeof r.model === "string" && r.model ? r.model : "unknown")
       : groupBy === "tag" ? (typeof r.tags?.[tagKey] === "string" ? r.tags[tagKey] : UNTAGGED)
       : String(item.agentId ?? "unknown");
@@ -76,6 +77,7 @@ export function spendBreakdown(items, { groupBy = "day", since, until, untilExcl
   return {
     group_by: groupBy,
     ...(groupBy === "tag" ? { tag_key: tagKey } : {}),
+    budget_period: { ...normalizeBudgetPeriod(budgetPeriod) },
     since: from === undefined ? null : new Date(from).toISOString(),
     until: until === undefined ? null : new Date(until).toISOString(),
     retention_clamped: clamped,

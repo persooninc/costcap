@@ -1,3 +1,4 @@
+import { periodKey, samePeriod } from "../period.js";
 // Issue #204: fleet-wide per-tag caps. An org sets `tagCaps` rules in the
 // dashboard (GET/PUT /v1/tag-caps); GET /v1/policy ships the rules plus the
 // org's synced per-value spend for this UTC month, and every enrolled wrapper
@@ -36,22 +37,23 @@ export function parseFleetTagCaps(input) {
  * spend[key][value] = {day, month, unknown} for the current UTC month, at most
  * MAX_TAG_VALUES values per key (unknown-cost values first, then highest month).
  */
-export function fleetTagCapsPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES) {
+export function fleetTagCapsPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES, budgetPeriod = null) {
   if (!Array.isArray(rules) || !rules.length) return null;
   const now = new Date(nowMs).toISOString();
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const keys = [...new Set(rules.map((r) => r.key))];
   const acc = Object.fromEntries(keys.map((k) => [k, new Map()]));
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    const ts = new Date(r.ts).toISOString();
-    if (ts.slice(0, 7) !== now.slice(0, 7) || isPendingBatch(r)) continue;
+    const tsMs = Date.parse(r.ts);
+    if (periodKey("month", tsMs, budgetPeriod) !== month || isPendingBatch(r)) continue;
     for (const key of keys) {
       const v = valueOf(r.tags, key);
       const e = acc[key].get(v) ?? { day: 0, month: 0, unknown: 0 };
       acc[key].set(v, e);
       if (r.cost_usd === null || r.cost_usd === undefined) { e.unknown += 1; continue; }
       e.month += r.cost_usd;
-      if (ts.slice(0, 10) === now.slice(0, 10)) e.day += r.cost_usd;
+      if (periodKey("day", tsMs, budgetPeriod) === day) e.day += r.cost_usd;
     }
   }
   let truncated = false;
@@ -101,23 +103,21 @@ function syncedEntry(policy, key, value) {
  * unsynced, settled-aware receipts. Returns null, a tag_budget_exceeded hit
  * (fleet: true) or an accounting_unavailable verdict for that value only.
  */
-export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs) {
+export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs, budgetPeriod = null) {
   if (!policy?.rules?.length) return null;
-  const now = new Date(nowMs).toISOString();
-  const asOf = new Date(policy.as_of).toISOString();
-  const win = { day: 10, month: 7 };
+  const asOfMs = Date.parse(policy.as_of);
   for (const rule of mergeTagCapRules(policy.rules, localRules)) {
     const value = valueOf(tags, rule.key);
     const e = syncedEntry(policy, rule.key, value);
-    const same = (s) => now.slice(0, win[s]) === asOf.slice(0, win[s]);
+    const same = (s) => samePeriod(s, nowMs, asOfMs, budgetPeriod);
     let unknown = same("month") ? e.unknown : 0;
     let total = same(rule.scope) ? e[rule.scope] : 0;
     for (const r of pending) {
       if (r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
-      const ts = new Date(r.ts).toISOString();
-      if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+      const tsMs = Date.parse(r.ts);
+      if (!samePeriod("month", tsMs, nowMs, budgetPeriod)) continue;
       if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-      if (ts.slice(0, win[rule.scope]) === now.slice(0, win[rule.scope])) total += r.cost_usd;
+      if (samePeriod(rule.scope, tsMs, nowMs, budgetPeriod)) total += r.cost_usd;
     }
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", tag_key: rule.key, tag_value: value, unknown_receipts: unknown, fleet: true,
       message: `CostCap: ${rule.key}=${value} has ${unknown} receipt(s) with unknown cost, so its fleet tag cap cannot be enforced. The upstream call was not made.` };

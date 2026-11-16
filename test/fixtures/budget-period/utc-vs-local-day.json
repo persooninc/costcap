@@ -1,0 +1,15 @@
+{
+  "description": "Issue #209 regression: receipts whose UTC day differs from the America/Los_Angeles day, plus a monthStartDay 15 boundary and the 2026-11-01 DST fall-back day.",
+  "budgetPeriod": { "timezone": "America/Los_Angeles", "monthStartDay": 15 },
+  "nowMs": "2026-11-16T09:00:00.000Z",
+  "receipts": [
+    { "id": "late-15th", "ts": "2026-11-16T07:30:00.000Z", "cost_usd": 2, "local_day": "2026-11-15", "utc_day": "2026-11-16" },
+    { "id": "early-16th", "ts": "2026-11-16T08:30:00.000Z", "cost_usd": 3, "local_day": "2026-11-16", "utc_day": "2026-11-16" },
+    { "id": "nov-14", "ts": "2026-11-14T20:00:00.000Z", "cost_usd": 5, "local_day": "2026-11-14", "utc_day": "2026-11-14" },
+    { "id": "unknown-16th", "ts": "2026-11-16T08:45:00.000Z", "cost_usd": null, "local_day": "2026-11-16", "utc_day": "2026-11-16" }
+  ],
+  "expect": {
+    "utc": { "day_usd": 5, "month_usd": 10 },
+    "local": { "day_usd": 3, "month_usd": 5 }
+  }
+}

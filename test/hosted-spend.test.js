@@ -159,3 +159,18 @@ test("#189 spendBreakdown splits user_prices spend; usd_known and cost_complete 
   const byModel = spendBreakdown(items, { groupBy: "model" }).buckets.find((b) => b.key === "gpt-4.1");
   assert.equal(byModel.user_priced_count, 0);
 });
+
+// Issue #209: day buckets follow the org budget period and report it.
+test("#209 spendBreakdown buckets by local date and reports budget_period", () => {
+  const items = [
+    { agentId: "a", receipt: { ts: "2026-11-16T07:30:00Z", cost_usd: 2, model: "m" } },
+    { agentId: "a", receipt: { ts: "2026-11-16T08:30:00Z", cost_usd: null, model: "m" } },
+  ];
+  const utc = spendBreakdown(items, { groupBy: "day" });
+  assert.deepEqual(utc.budget_period, { timezone: "UTC", monthStartDay: 1 });
+  assert.deepEqual(utc.buckets.map((b) => b.key), ["2026-11-16"]);
+  const la = spendBreakdown(items, { groupBy: "day", budgetPeriod: { timezone: "America/Los_Angeles" } });
+  assert.deepEqual(la.budget_period, { timezone: "America/Los_Angeles", monthStartDay: 1 });
+  assert.deepEqual(la.buckets.map((b) => [b.key, b.usd_known, b.unknown_count]), [["2026-11-15", 2, 0], ["2026-11-16", 0, 1]]);
+  assert.equal(la.buckets[1].cost_complete, false); // unknown cost is never $0
+});

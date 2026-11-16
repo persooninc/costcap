@@ -293,3 +293,81 @@ test("regression: a team-scope block in the last hour raises cap_hit even when s
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].active, false);
 });
+
+// Issue #209: hosted agent, team and tag caps follow the org budget period.
+import { readFileSync as readFixture209 } from "node:fs";
+import { agentSpendPolicy as agentSpend209, cachedAgentVerdict as cachedAgent209, cachedTeamRemaining as teamRemaining209 } from "../src/hosted/teams.js";
+import { fleetTagCapsPolicy as tagPolicy209, cachedFleetTagVerdict as tagVerdict209 } from "../src/hosted/tag-caps.js";
+const fx209 = JSON.parse(readFixture209(new URL("./fixtures/budget-period/utc-vs-local-day.json", import.meta.url), "utf8"));
+const NOW209 = Date.parse(fx209.nowMs);
+const rows209 = fx209.receipts.map(({ id, ts, cost_usd }) => ({ id, ts, cost_usd }));
+const known209 = rows209.filter((r) => r.cost_usd !== null);
+
+test("#209 AC1: hosted agent and team verdicts count a 23:30 PST receipt toward the 15th", () => {
+  const LA = { timezone: "America/Los_Angeles" };
+  const now = Date.parse("2026-11-16T09:00:00Z");
+  const receipts = [{ id: "a", ts: "2026-11-16T07:30:00Z", cost_usd: 2 }, { id: "b", ts: "2026-11-16T08:30:00Z", cost_usd: 3 }];
+  const agent = { id: "ag", policy: { caps: { day: 4 } }, revoked: false };
+  // UTC: both receipts are on the 16th -> $5 >= $4.
+  assert.equal(hostedAgentVerdict({ agent, receipts, nowMs: now }).verdict, "budget_exceeded");
+  const la = hostedAgentVerdict({ agent, receipts, nowMs: now, budgetPeriod: LA });
+  assert.equal(la.verdict, "ok");
+  assert.equal(la.budget_remaining.day_usd, 1);
+  const team = { name: "ops", agents: ["ag"], day: 4 };
+  assert.equal(teamVerdict({ team, receiptsByAgent: { ag: receipts }, nowMs: now }).verdict, "budget_exceeded");
+  const tv = teamVerdict({ team, receiptsByAgent: { ag: receipts }, nowMs: now, budgetPeriod: LA });
+  assert.equal(tv.verdict, "ok");
+  assert.equal(tv.spend.day_usd, 3);
+  const rules = [{ key: "customer", scope: "day", usd: 4 }];
+  const tagged = receipts.map((r) => ({ ...r, tags: { customer: "acme" } }));
+  assert.equal(tagPolicy209(rules, tagged, now).spend.customer.acme.day, 5);
+  assert.equal(tagPolicy209(rules, tagged, now, undefined, LA).spend.customer.acme.day, 3);
+});
+
+test("#209 regression fixture: UTC day differs from local day (agent, team, tag)", () => {
+  const bp = fx209.budgetPeriod;
+  const utc = agentSpend209(rows209, NOW209);
+  const local = agentSpend209(rows209, NOW209, bp);
+  assert.deepEqual(utc.spent, { day: fx209.expect.utc.day_usd, month: fx209.expect.utc.month_usd });
+  assert.deepEqual(local.spent, { day: fx209.expect.local.day_usd, month: fx209.expect.local.month_usd });
+  assert.equal(local.unknown, 1); // unknown cost is never $0
+  const tv = teamVerdict({ team: { name: "t", agents: ["x"], month: 100 }, receiptsByAgent: { x: known209 }, nowMs: NOW209, budgetPeriod: bp });
+  assert.deepEqual([tv.spend.day_usd, tv.spend.month_usd], [fx209.expect.local.day_usd, fx209.expect.local.month_usd]);
+  const tp = tagPolicy209([{ key: "k", scope: "month", usd: 9 }], known209.map((r) => ({ ...r, tags: { k: "v" } })), NOW209, undefined, bp);
+  assert.deepEqual(tp.spend.k.v, { day: fx209.expect.local.day_usd, month: fx209.expect.local.month_usd, unknown: 0 });
+});
+
+test("#209 AC5: cached (offline) verdicts roll over at the configured period, not UTC", () => {
+  const LA = { timezone: "America/Los_Angeles" };
+  // Synced at 20:00 PST on the 15th (04:00Z on the 16th): $3 today.
+  const spend = { spent: { day: 3, month: 3 }, unknown: 0, as_of: "2026-11-16T04:00:00.000Z" };
+  const caps = { day: 3 };
+  // 07:30Z: same LA day -> still blocked; UTC would agree (same UTC day too).
+  assert.equal(cachedAgent209(spend, caps, [], Date.parse("2026-11-16T07:30:00Z"), LA).verdict, "budget_exceeded");
+  // 08:30Z: LA midnight passed -> synced day spend zeroed; UTC would still block.
+  assert.equal(cachedAgent209(spend, caps, [], Date.parse("2026-11-16T08:30:00Z"), LA), null);
+  assert.equal(cachedAgent209(spend, caps, [], Date.parse("2026-11-16T08:30:00Z")).verdict, "budget_exceeded");
+  // UTC rollover at 00:00Z on the 17th is not an LA rollover (16:00 PST on the 16th).
+  const spend2 = { ...spend, as_of: "2026-11-16T23:00:00.000Z" };
+  assert.equal(cachedAgent209(spend2, caps, [], Date.parse("2026-11-17T01:00:00Z"), LA).verdict, "budget_exceeded");
+  assert.equal(cachedAgent209(spend2, caps, [], Date.parse("2026-11-17T01:00:00Z")), null);
+  const team = { name: "t", caps: { day: 3 }, spent: { day: 3, month: 3 }, unknown: 0, as_of: spend.as_of };
+  assert.equal(cachedTeamVerdict(team, [], Date.parse("2026-11-16T08:30:00Z"), LA), null);
+  assert.equal(cachedTeamVerdict(team, [{ id: "p", ts: "2026-11-16T08:40:00Z", cost_usd: 3 }], Date.parse("2026-11-16T08:50:00Z"), LA).verdict, "budget_exceeded");
+  assert.deepEqual(teamRemaining209(team, [], Date.parse("2026-11-16T08:30:00Z"), LA), { day: 3, month: null });
+  const tag = { rules: [{ key: "c", scope: "day", usd: 1 }], spend: { c: { a: { day: 1, month: 1, unknown: 0 } } }, truncated: false, as_of: spend.as_of };
+  assert.equal(tagVerdict209(tag, [], { c: "a" }, [], Date.parse("2026-11-16T07:30:00Z"), LA).verdict, "tag_budget_exceeded");
+  assert.equal(tagVerdict209(tag, [], { c: "a" }, [], Date.parse("2026-11-16T08:30:00Z"), LA), null);
+});
+
+test("#209 AC2: monthStartDay 15 opens a new month window for team caps", () => {
+  const bp = { monthStartDay: 15 };
+  const team = { name: "m", agents: ["x"], month: 5 };
+  const receipts = [{ id: "a", ts: "2026-11-14T12:00:00Z", cost_usd: 5 }];
+  assert.equal(teamVerdict({ team, receiptsByAgent: { x: receipts }, nowMs: Date.parse("2026-11-14T13:00:00Z"), budgetPeriod: bp }).verdict, "budget_exceeded");
+  const fresh = teamVerdict({ team, receiptsByAgent: { x: receipts }, nowMs: Date.parse("2026-11-15T00:00:01Z"), budgetPeriod: bp });
+  assert.equal(fresh.verdict, "ok");
+  assert.equal(fresh.spend.month_usd, 0);
+  // UTC (day 1) would keep both in November.
+  assert.equal(teamVerdict({ team, receiptsByAgent: { x: receipts }, nowMs: Date.parse("2026-11-15T00:00:01Z") }).verdict, "budget_exceeded");
+});

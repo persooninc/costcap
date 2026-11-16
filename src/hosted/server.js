@@ -22,6 +22,7 @@ import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
+import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -182,19 +183,17 @@ export function applyDeliveryResult(record, result, requested, nowMs) {
 }
 
 // Estimated receipt spend for the dashboard. Null cost is unknown, never zero.
-// Windows follow the UTC instant, matching the local cap engine. A numeric
-// offset is not a calendar prefix.
-export function spendSummary(receipts, nowMs) {
-  const utc = new Date(nowMs).toISOString();
+// Windows follow the org budget period (#209; UTC instant, day 1 by default),
+// matching the hosted cap engine. A numeric offset is not a calendar prefix.
+export function spendSummary(receipts, nowMs, budgetPeriod = null) {
+  const cur = { day: periodKey("day", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
   const fold = (window) => {
     let usd = 0, unknown = 0;
     for (const item of receipts) {
       const r = costedReceipt(item);
       const instant = new Date(r.ts);
       if (Number.isNaN(instant.getTime())) continue;
-      const iso = instant.toISOString();
-      if (window === "day" && iso.slice(0, 10) !== utc.slice(0, 10)) continue;
-      if (window === "month" && iso.slice(0, 7) !== utc.slice(0, 7)) continue;
+      if (window !== "all" && periodKey(window, instant.getTime(), budgetPeriod) !== cur[window]) continue;
       if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1;
       else if (typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd)) usd += r.cost_usd;
     }
@@ -258,7 +257,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const orgAgentReceipts = (s, orgId, agentId) => Object.values(s.receipts).filter((r) => r.orgId === orgId && r.agentId === agentId).map(costedReceipt);
   // Issue #204: settled-aware org receipts for fleet tag caps.
   const orgReceipts = (s, orgId) => Object.values(s.receipts).filter((r) => r.orgId === orgId).map(costedReceipt);
-  const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
+  // Issue #209: the org budget period (timezone + month start day); UTC/day 1 when unset.
+  const orgPeriod = (s, orgId) => normalizeBudgetPeriod(s.orgs?.[orgId]?.budgetPeriod);
+  const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), budgetPeriod: orgPeriod(s, team.orgId), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
     let logged = false;
@@ -436,7 +437,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now()), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now()) }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -508,7 +509,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/evidence.json" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
+          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now(), orgPeriod(s, u.orgId)),
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
             alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
@@ -521,13 +522,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = member(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams);
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names });
+          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId) });
         }));
       }
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now()) })),
+          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)) })),
+            budget_period: { ...orgPeriod(s, u.orgId) },
             receipts: visibleReceipts(s, u.orgId),
             audit: labelAudit(s, u.orgId, s.audit), alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
             fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active),
@@ -646,6 +648,26 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      // Issue #209: org budget period. Owner/admin write (audited before/after), any member reads.
+      if (path === "/v1/budget-period" && req.method === "GET") {
+        return json(200, store.read((s) => { const u = sessionUser(s, req); return { budgetPeriod: { ...orgPeriod(s, u.orgId) }, canEdit: ["owner", "admin"].includes(u.role) }; }));
+      }
+      if (path === "/v1/budget-period" && (req.method === "POST" || req.method === "PUT")) {
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const input = body?.budgetPeriod ?? body;
+          const err = budgetPeriodError(input);
+          if (err) fail(400, err);
+          const org = s.orgs[u.orgId];
+          if (!org) fail(404, "Organization not found");
+          const before = { ...orgPeriod(s, u.orgId) };
+          const after = { ...before, ...input };
+          org.budgetPeriod = after;
+          audit(s, u.orgId, u.id, "budget_period.change", u.orgId, { before, after });
+          return { budgetPeriod: after, canEdit: true };
+        });
+        return json(200, result);
+      }
       // Issue #204: org-level fleet tag caps. Owner/admin write, any member reads.
       if (path === "/v1/tag-caps" && req.method === "GET") {
         return json(200, store.read((s) => { const u = sessionUser(s, req); return { tagCaps: s.orgs[u.orgId]?.tagCaps ?? [], canEdit: ["owner", "admin"].includes(u.role) }; }));
@@ -721,7 +743,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const receipts = agentReceipts(s, a.id);
           const runId = new URL(req.url, origin).searchParams.get("run_id");
           const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id);
-          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null, team: t ? verdictOf(s, t) : null });
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), budgetPeriod: orgPeriod(s, a.orgId), runId: runId || null, team: t ? verdictOf(s, t) : null });
         }));
       }
       // Issue #208: time-boxed cap raise requests.
@@ -879,11 +901,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   });
   // Issue #165: explicit warning fractions fire at most once per UTC cap period.
   // Legacy policies (no warnFractions) keep the plain key dedupe.
-  function gateWarnings(s, id, caps, spend, fractions) {
+  function gateWarnings(s, id, caps, spend, fractions, budgetPeriod = null) {
     if (!Array.isArray(fractions)) return () => true;
     s.warnArm ??= {};
     const states = {};
-    for (const scope of ["day", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now() });
+    for (const scope of ["day", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now(), budgetPeriod });
     return (alert) => alert.kind !== "cap_approaching" || alert.fraction === undefined || !states[alert.scope] || claimWarning(states[alert.scope], alert, fractions);
   }
   // Issue #168: run warnings fire at most once per run (period = run id).
@@ -900,7 +922,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       return claimWarning(st, alert, fractions);
     };
   }
-  const warnExtra = (alert) => (alert.fraction !== undefined && alert.run_id === undefined ? { period: capPeriod(alert.scope, now()) } : {});
+  const warnExtra = (alert, budgetPeriod = null) => (alert.fraction !== undefined && alert.run_id === undefined ? { period: capPeriod(alert.scope, now(), budgetPeriod) } : {});
   const claim = (record) => { record.delivery_claimed_at = new Date(now()).toISOString(); return record; };
   const queueRetry = ([id, record], out) => {
     const recovered = pendingRecovered(record, now());
@@ -917,7 +939,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           continue;
         }
         const receipts = agentReceipts(s, a.id);
-        const spent = spendSummary(receipts, now());
+        const bp = orgPeriod(s, a.orgId);
+        const spent = spendSummary(receipts, now(), bp);
         const recent = receipts.filter((r) => Date.parse(r.ts) > now() - 3600_000);
         const blockedReasons = recent.flatMap((r) => {
           // Issue #168: a run block with a run_id pages through the per-run key.
@@ -926,7 +949,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return r.reason ? [r.reason] : [];
         });
         const caps = effectiveCaps(a.policy, now());
-        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions });
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
         const runCap = caps.run;
@@ -943,12 +966,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
-        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions);
+        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions, bp);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
-          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() })) });
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert, bp) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }
@@ -960,12 +983,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           .filter((r) => Date.parse(r.ts) > now() - 3600_000 && r.reason === "budget_exceeded" && typeof r.scope === "string" && r.scope.startsWith(prefix))
           .map((r) => r.scope.slice(prefix.length));
         const verdict = verdictOf(s, t);
-        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, t.warnFractions);
+        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, t.warnFractions, orgPeriod(s, t.orgId));
         for (const alert of evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes }, { warnFractions: t.warnFractions })) {
           teamKeys.add(alert.key);
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
-          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert) }, { nowMs: now(), id: randomUUID() })) });
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert, orgPeriod(s, t.orgId)) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }

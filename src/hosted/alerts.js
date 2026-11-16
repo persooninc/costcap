@@ -1,3 +1,4 @@
+import { periodBounds, periodKey } from "../period.js";
 // Alert rules for the hosted dashboard (story #14). Pure logic: given an
 // agent's state, returns the alerts that should fire now. The caller sends
 // them (Brevo email, Slack) and writes the audit log. Dedupe: an alert
@@ -12,11 +13,10 @@ export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agen
 // by the elapsed share of the UTC month. Returns null before minElapsedMs so a
 // first-hour burst does not page. Unknown-cost receipts are not counted as
 // zero; the caller reports them and the projection is then a lower bound.
-export function projectMonthSpend(spent, nowMs, { minElapsedMs = 24 * 3600_000 } = {}) {
+export function projectMonthSpend(spent, nowMs, { minElapsedMs = 24 * 3600_000, budgetPeriod = null } = {}) {
   if (typeof spent !== "number" || !Number.isFinite(spent) || !Number.isFinite(nowMs)) return null;
-  const now = new Date(nowMs);
-  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
-  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  // #209: the elapsed share of the configured month period (UTC, day 1 by default).
+  const { start, end } = periodBounds("month", nowMs, budgetPeriod);
   const elapsed = nowMs - start;
   if (elapsed < minElapsedMs) return null;
   return spent * ((end - start) / elapsed);
@@ -67,19 +67,19 @@ function fractionsFrom(warnFractions, approachFraction) {
   return { fractions: [approachFraction], explicit: false };
 }
 
-// UTC cap period for a scope: YYYY-MM-DD (day) or YYYY-MM (month).
-export function capPeriod(scope, nowMs) {
+// Cap period for a scope: YYYY-MM-DD (day) or YYYY-MM (month), in the org
+// budget period (#209; UTC and day 1 by default).
+export function capPeriod(scope, nowMs, budgetPeriod = null) {
   // Issue #168: a run-scope period is the run itself ("run:<runId>").
   if (typeof scope === "string" && scope.startsWith("run:")) return scope;
-  const iso = new Date(nowMs).toISOString();
-  return scope === "month" ? iso.slice(0, 7) : iso.slice(0, 10);
+  return periodKey(scope === "month" ? "month" : "day", nowMs, budgetPeriod);
 }
 
 // Once-per-period gate for explicit fractions. arm[id:scope] = { period, fired }.
 // A new period clears it. A fraction re-arms only when its threshold at the
 // current cap sits above current spend (e.g. the cap was raised mid-period).
-export function armWarnings(arm, { id, scope, cap, spent, nowMs }) {
-  const period = capPeriod(scope, nowMs);
+export function armWarnings(arm, { id, scope, cap, spent, nowMs, budgetPeriod = null }) {
+  const period = capPeriod(scope, nowMs, budgetPeriod);
   const k = `${id}:${scope}`;
   if (!arm[k] || arm[k].period !== period) arm[k] = { period, fired: [] };
   const st = arm[k];
@@ -95,7 +95,7 @@ export function claimWarning(st, alert, fractions) {
   return true;
 }
 
-export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000 } = {}) {
+export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000, budgetPeriod = null } = {}) {
   const out = [];
   const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
   for (const scope of ["run", "day", "month"]) {
@@ -111,7 +111,7 @@ export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, s
   }
   const monthCap = state.caps?.month;
   if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month")) {
-    const projected = projectMonthSpend(state.spend?.month, state.nowMs, { minElapsedMs: minProjectionMs });
+    const projected = projectMonthSpend(state.spend?.month, state.nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
     if (projected !== null && projected >= monthCap) {
       const unknown = state.unknown?.month ?? 0;
       out.push({ kind: "cap_projected", scope: "month", key: `cap_projected:${state.agentId}:month`, cap: monthCap, spent: state.spend.month, projected: Number(projected.toFixed(6)), lowerBound: unknown > 0 });

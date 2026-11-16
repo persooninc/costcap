@@ -42,7 +42,7 @@ test('same-origin UI assets use CSP and no inline scripts or data HTML injection
   assert.ok(!js.includes('localStorage'));
   assert.ok(!js.includes('sessionStorage'));
   assert.match(js, /textContent/);
-  assert.match(js, /Estimated spend \(UTC\)/);
+  assert.match(js, /Estimated spend \('\+\(b\.budget_period\?b\.budget_period\.timezone:'UTC'\)/); // #209
   assert.equal(uiResponse('/anything'), null);
 });
 test('UI config returns public site key only, JSON-encoded', () => {
@@ -98,7 +98,7 @@ test('#159: agent cards render Recent runs via textContent with run click-throug
 test('#156 Spend card markup, period label and textContent-only rendering', () => {
   const html = uiResponse('/').body;
   assert.match(html, /<section class="card" id="spendCard">/);
-  assert.match(html, /id="spendPeriodSelect"><option value="7d">Last 7 days<\/option><option value="30d">Last 30 days<\/option><option value="month">This month \(UTC\)<\/option>/);
+  assert.match(html, /id="spendPeriodSelect"><option value="7d">Last 7 days<\/option><option value="30d">Last 30 days<\/option><option value="month">This month<\/option>/);
   for (const id of ['spendDays', 'spendModels', 'spendAgents', 'spendTotal', 'costPeriod']) assert.match(html, new RegExp(`id="${id}"`));
   assert.match(html, /Period: every synced receipt/);
   const js = uiResponse('/assets/app.js').body;

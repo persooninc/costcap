@@ -279,7 +279,7 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   settle). Audio (`/v1/audio/*`) is checked against the extracted `model`
   only: a priced model (e.g. `whisper-1`) passes, an unpriced one refuses with
   `preflight_unpriced` naming it.
-- Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
+- Local `wrap`/`check` daily and monthly periods use UTC; hosted caps follow the org budget period (below). Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Unknown models use the declared fallback. On the
   `/openrouter` route only, a finite, non-negative `usage.cost` in the response
@@ -893,4 +893,19 @@ That calls `POST /v1/agents/:id/cap-requests` with `{scope: run|hour|day|month, 
 
 The raise applies only while `now < expires_at`: in the hosted verdict, `cap_hit`/`cap_approaching` alerts, and in wrappers, which revert to the base cap at expiry from their cached policy without contacting the service. A raise never lifts `killed`, a fleet freeze, a local `--cap` (the lowest value still wins), or team and tag caps. Unknown cost is still never counted as $0. Audit events `cap_request.create`, `.approve`, `.deny` and `.expire` carry the actor, before/after caps and the reason, and appear in `/v1/audit.csv` and `/v1/evidence.json` (which also lists `effective_caps` and active `raises` per agent). The dashboard's "Cap raise requests" card shows pending requests with Approve/Deny and active raises with their expiry.
 
-`GET /v1/spend?since=&until=&group_by=day|model|agent` (any session role, including viewer) returns the org's synced receipt spend in buckets. Each bucket has `usd_known`, `calls`, `unknown_count`, `blocked_count` and `cost_complete`, plus a `total`. Days are UTC. `since`/`until` take an ISO instant or `YYYY-MM-DD`; a date-only `until` covers that whole day. A `cost_usd: null` receipt adds to `unknown_count` and marks the bucket incomplete; it never adds $0. Once settled it counts at the settled value in its original bucket. With entitlements enforced, the period is clamped to the plan's receipt retention, and the response reports the clamped `since` with `retention_clamped: true`. An invalid `group_by`, `since` or `until` returns `400`. The dashboard's Spend card reads it with a 7-day, 30-day or this-month period.
+### Budget period (hosted, #209)
+
+By default hosted day and month caps reset at UTC midnight on the 1st. An owner or
+admin can set the org budget period in the dashboard's **Budget period** card or with
+`POST /v1/budget-period {"timezone":"America/Los_Angeles","monthStartDay":15}`
+(`GET` for any member). `timezone` is an IANA zone and `monthStartDay` is 1-28; a bad
+value returns `400`, a viewer gets `403`, and every change is audited as
+`budget_period.change` with `before`/`after`. The period drives hosted agent, team and
+tag caps, `cap_approaching`/`cap_hit` periods, `cap_projected` (elapsed share of the
+configured month), `/v1/spend` day buckets and the agent cards. Enrolled wrappers get
+it as `budget_period` in `/v1/policy`, so offline enforcement rolls synced spend over
+on the same clock. Days follow local midnight across DST (a fall-back day has 25
+hours). Out of scope: local `--day-cap`/`--month-cap` (still UTC), per-agent zones,
+non-midnight resets.
+
+`GET /v1/spend?since=&until=&group_by=day|model|agent` (any session role, including viewer) returns the org's synced receipt spend in buckets. Each bucket has `usd_known`, `calls`, `unknown_count`, `blocked_count` and `cost_complete`, plus a `total`. Days follow the org budget period (UTC unless set, see below) and the response reports `budget_period`. `since`/`until` take an ISO instant or `YYYY-MM-DD`; a date-only `until` covers that whole day. A `cost_usd: null` receipt adds to `unknown_count` and marks the bucket incomplete; it never adds $0. Once settled it counts at the settled value in its original bucket. With entitlements enforced, the period is clamped to the plan's receipt retention, and the response reports the clamped `since` with `retention_clamped: true`. An invalid `group_by`, `since` or `until` returns `400`. The dashboard's Spend card reads it with a 7-day, 30-day or this-month period.
