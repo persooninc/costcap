@@ -1,6 +1,7 @@
 // Stripe Checkout for an optional hosted workspace plan. Never trust a return URL
 // as payment evidence. All amounts/currency/intervals are checked server-side.
 import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
+import { DEFAULT_PLANS, priceCents } from '../billing/plans.js';
 const problem = (status, message) => Object.assign(new Error(message), { status });
 
 // Public probe. Booleans only: never echo a key, webhook secret, account id, or price id.
@@ -40,7 +41,10 @@ export function verifyStripeEvent(raw, signature, secret, now = Date.now(), { li
   return event;
 }
 // Agent Guardrails Team bundle ($79/mo). Resolved by lookup key so test and live share code.
-export const TEAM_BUNDLE_LOOKUP_KEY = 'guardrails_team_month';
+export const TEAM_BUNDLE_LOOKUP_KEY = DEFAULT_PLANS.team.lookupKey;
+// Checkout amounts come from the same catalog the public /pricing page renders.
+const SOLO_CENTS = priceCents('workspace');
+const TEAM_CENTS = priceCents('team');
 /** Throws unless `price` is an active, licensed, monthly USD price for `amount` cents in the expected mode. */
 export function checkMonthlyPrice(price, amount, livemode = true) {
   return Boolean(price?.active && price.livemode === livemode && price.currency === 'usd' && price.unit_amount === amount
@@ -65,14 +69,14 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
   const account = await request('/account');
   if (accountId !== 'acct_1TdlLm0Yt0O6HtVs' || account.id !== accountId || !account.charges_enabled) throw new Error('Persoon.ai Inc live account readback failed');
   const price = await request(`/prices/${encodeURIComponent(priceId)}?expand[]=product`);
-  if (!price.active || price.livemode !== true || price.currency !== 'usd' || price.unit_amount !== 1900 || price.recurring?.interval !== 'month' || price.recurring?.interval_count !== 1 || price.recurring?.usage_type !== 'licensed' || !price.product?.active || price.product.metadata?.app !== 'costcap') throw new Error('CostCap $19/month price readback failed');
+  if (!price.active || price.livemode !== true || price.currency !== 'usd' || price.unit_amount !== SOLO_CENTS || price.recurring?.interval !== 'month' || price.recurring?.interval_count !== 1 || price.recurring?.usage_type !== 'licensed' || !price.product?.active || price.product.metadata?.app !== 'costcap') throw new Error('CostCap $19/month price readback failed');
   // Optional Team: the Guardrails bundle price, looked up by key. No price found = Solo only.
   let teamPriceId = null;
   if (teamLookupKey) {
     const list = await request(`/prices?active=true&lookup_keys[]=${encodeURIComponent(teamLookupKey)}&expand[]=data.product`);
     const team = list?.data?.[0];
     if (team) {
-      if (!checkMonthlyPrice(team, 7900, true) || team.lookup_key !== teamLookupKey || team.id === priceId) throw new Error('Guardrails Team $79/month price readback failed');
+      if (!checkMonthlyPrice(team, TEAM_CENTS, true) || team.lookup_key !== teamLookupKey || team.id === priceId) throw new Error('Guardrails Team $79/month price readback failed');
       teamPriceId = team.id;
     }
   }
@@ -82,7 +86,7 @@ export async function createStripeBilling({ secretKey, webhookSecret, accountId,
     const b = s.orgs[orgId]?.billing;
     const plan = b?.status && !['free_beta', 'canceled', 'unpaid', 'incomplete_expired'].includes(b.status) ? (b.plan ?? 'workspace') : null;
     // The amount is the subscribed plan's price: $79 for a Team (bundle) subscriber, else $19.
-    return { enabled: true, amount: plan === 'team' ? 7900 : 1900, currency: 'usd', interval: 'month', status: b?.status ?? 'free_beta',
+    return { enabled: true, amount: plan === 'team' ? TEAM_CENTS : SOLO_CENTS, currency: 'usd', interval: 'month', status: b?.status ?? 'free_beta',
       plan, plans: Object.keys(prices),
       cancelAtPeriodEnd: b?.cancelAtPeriodEnd ?? false, paidInvoiceCount: b?.paidInvoiceCount ?? 0 };
   };
@@ -243,7 +247,7 @@ export function createTestModeStripeBilling({ secretKey, webhookSecret, priceId,
       .then((list) => {
         const found = (list?.data ?? []).filter((p) => p?.lookup_key === teamLookupKey);
         const team = found.length === 1 ? found[0] : null;
-        if (team && checkMonthlyPrice(team, 7900, false) && team.id !== priceId) prices.team = team.id;
+        if (team && checkMonthlyPrice(team, TEAM_CENTS, false) && team.id !== priceId) prices.team = team.id;
         else { teamMissAt = now(); if (found.length) log("costcap: test-mode Team bundle price readback failed"); }
       }, () => { teamMissAt = now(); })
       .finally(() => { teamLookup = null; });

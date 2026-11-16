@@ -64,7 +64,9 @@ export const DEFAULT_PLANS = Object.freeze({
     hosted: true,
     paid: true,
     priceUsdMonthly: 79,
-    // Live Team is the Agent Guardrails Team bundle price (lookup key guardrails_team_month).
+    // Live Team is the Agent Guardrails Team bundle price. Checkout resolves this lookup key.
+    lookupKey: "guardrails_team_month",
+    bundle: "Agent Guardrails",
     summary: "For a team sharing one agent fleet.",
     limits: Object.freeze({ agents: 50, seats: 15, receiptRetentionDays: 365 }),
     features: Object.freeze([
@@ -76,6 +78,13 @@ export const DEFAULT_PLANS = Object.freeze({
     ]),
   }),
 });
+
+/** Monthly list price in USD cents for a plan id (the amount Checkout reads back). */
+export function priceCents(planId, catalog = DEFAULT_PLANS) {
+  const usd = catalog[planId]?.priceUsdMonthly;
+  if (!Number.isFinite(usd)) throw new Error(`No list price for plan ${planId}`);
+  return Math.round(usd * 100);
+}
 
 /** Plans in display order. */
 export function listPlans(catalog = DEFAULT_PLANS) {
