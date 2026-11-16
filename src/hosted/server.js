@@ -80,6 +80,15 @@ export function settleInput(body) {
   if (body.agent_id !== undefined && typeof body.agent_id !== "string") fail(400, "agent_id must be a string");
   return { cost_usd: cost, source, reason: reason.trim(), agentId: body.agent_id };
 }
+// Issue #129: agent-uploaded local settlement.
+export function agentSettlementInput(body) {
+  const id = body?.receipt_id, cost = body?.cost_usd, sha = body?.provider_sha256 ?? null, ts = body?.ts ?? null;
+  if (typeof id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(id)) fail(400, "Invalid receipt_id");
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) fail(400, "cost_usd must be a finite number >= 0");
+  if (sha !== null && (typeof sha !== "string" || !/^[a-f0-9]{64}$/.test(sha))) fail(400, "provider_sha256 must be 64 hex characters");
+  if (ts !== null && (typeof ts !== "string" || !Number.isFinite(Date.parse(ts)))) fail(400, "Invalid ts");
+  return { receipt_id: id, cost_usd: cost, provider_sha256: sha, ts };
+}
 const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(auditEntry({ orgId, actor, action, target, detail }));
 
 // A missing channel is not a failed send. Retry only when a configured
@@ -495,6 +504,28 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           a.policy = policy;
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });
           return policy;
+        });
+        return json(200, result);
+      }
+      // Issue #129: an enrolled agent uploads its own local reconcile settlement
+      // (costcap reconcile --apply). Same record and audit shape as admin settle (#125).
+      if (path === "/v1/receipts/settlements" && req.method === "POST") {
+        const input = agentSettlementInput(body);
+        const result = store.transaction((s) => {
+          const a = agentUser(s, req);
+          const item = s.receipts[`${a.id}:${input.receipt_id}`];
+          if (!item || item.orgId !== a.orgId || item.agentId !== a.id) fail(404, "Receipt not found");
+          if (item.settlement) {
+            const same = item.settlement.source === "agent_reconcile" && item.settlement.by === a.id && item.settlement.cost_usd === input.cost_usd;
+            if (same) return { receipt_id: input.receipt_id, settled_cost_usd: input.cost_usd, duplicate: true };
+            const e = new Error("Receipt already settled"); e.status = 409; e.body = { code: "already_settled" }; throw e;
+          }
+          if (item.receipt.cost_usd != null) { const e = new Error("Receipt cost is already known"); e.status = 409; e.body = { code: "already_known" }; throw e; }
+          const reason = `local reconcile${input.provider_sha256 ? ` sha256:${input.provider_sha256}` : ""}`;
+          item.settlement = { cost_usd: input.cost_usd, at: new Date(now()).toISOString(), by: a.id, source: "agent_reconcile", reason, provider_sha256: input.provider_sha256, settled_ts: input.ts };
+          a.lastSeen = now();
+          audit(s, a.orgId, a.id, "receipt.settle", input.receipt_id, { event: "reconciliation", agent_id: a.id, before: null, after: input.cost_usd, source: "agent_reconcile", reason, provider_sha256: input.provider_sha256 });
+          return { receipt_id: input.receipt_id, settled_cost_usd: input.cost_usd, duplicate: false };
         });
         return json(200, result);
       }

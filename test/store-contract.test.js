@@ -32,6 +32,13 @@ async function policyOf(store, token) {
   finally { service.server.closeAllConnections(); service.server.close(); }
 }
 
+async function settleOf(store, token, body) {
+  const service = createHostedServer({ store, origin: "http://localhost", secureCookies: false, verifyChallenge: async () => false, sendCode: async () => {} });
+  await new Promise((resolve) => service.server.listen(0, "127.0.0.1", resolve));
+  try { return (await fetch(`http://127.0.0.1:${service.server.address().port}/v1/receipts/settlements`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) })).status; }
+  finally { service.server.closeAllConnections(); service.server.close(); }
+}
+
 async function contract(open, mode) {
   const store = await open();
   assert.equal(store.mode, mode);
@@ -75,6 +82,11 @@ async function contract(open, mode) {
   });
   await reopened.flush();
   assert.deepEqual((await policyOf(reopened, "ag1-token")).agent_spend.spent.day, 0.4);
+  // #129: an agent settlement never reaches a receipt row stored under another org.
+  reopened.transaction((s) => { s.receipts["ag1:foreign-unk"] = { orgId: ORG_B, agentId: "ag1", receipt: { id: "foreign-unk", ts: day, cost_usd: null } }; });
+  await reopened.flush();
+  assert.equal(await settleOf(reopened, "ag1-token", { receipt_id: "foreign-unk", cost_usd: 1 }), 404);
+  assert.equal(reopened.read((s) => s.receipts["ag1:foreign-unk"].settlement), undefined);
   return { store, reopened };
 }
 

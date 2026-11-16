@@ -171,6 +171,14 @@ counts toward the original receipt's run/day/month. A missing, null or negative
 charge never settles (it is not $0): the command exits 1 and lists the ids still
 unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.json`.
 
+On an enrolled wrapper, the fleet team and agent checks use the settled cost too.
+The next sync uploads each settlement once to `POST /v1/receipts/settlements`
+(agent token; only the agent's own synced `cost_usd: null` receipt; duplicate =
+idempotent 200, already known or settled = 409). The hosted receipt keeps
+`cost_usd: null`, gains `settled_cost_usd`, and is audited as `receipt.settle`
+with `source: "agent_reconcile"` and the agent as actor. An older server without
+the route is skipped without failing receipt sync.
+
 ## Enrollment client (service not yet deployed)
 
 ```sh

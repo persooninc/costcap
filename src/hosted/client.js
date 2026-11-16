@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from "
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
-import { loadReceipts } from "../cap.js";
+import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict } from "./teams.js";
 
 export function serviceUrl(value) {
@@ -37,7 +37,12 @@ async function request(url, token, path, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(5000), redirect: "error",
   });
-  if (!response.ok) throw new Error(`Fleet service returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const err = new Error(`Fleet service returned HTTP ${response.status}`);
+    err.status = response.status;
+    err.route = await response.json().then((b) => b?.error === "Route not found", () => true);
+    throw err;
+  }
   return response.json();
 }
 
@@ -55,6 +60,29 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
   let revoked = Boolean(data.revoked);
   let busy = false;
   const policy = () => resolvePolicy({ lastKnown: data.policy });
+  // Issue #129: each local reconcile settlement of a synced null-cost receipt goes up
+  // once. An older server without the endpoint (404) skips it; receipt sync still succeeds.
+  async function uploadSettlements(synced) {
+    const done = new Set(data.syncedSettlementIds ?? []);
+    const nullIds = new Set(loadReceipts(receiptsPath).filter((r) => r.cost_usd === null && typeof r.id === "string").map((r) => r.id));
+    const seen = new Set();
+    for (const e of loadEvents(receiptsPath)) {
+      if (!isSettlement(e) || seen.has(e.receipt_id)) continue;
+      seen.add(e.receipt_id);
+      if (done.has(e.receipt_id) || !synced.has(e.receipt_id) || !nullIds.has(e.receipt_id)) continue;
+      try {
+        await request(data.url, data.token, "/v1/receipts/settlements", { receipt_id: e.receipt_id, cost_usd: e.cost_usd, provider_sha256: e.provider_sha256 ?? null, ts: e.ts ?? null });
+      } catch (err) {
+        // Missing route: older server, skip all. Missing receipt: leave it for a later sync.
+        if (err.status === 404 && err.route) return;
+        if (err.status === 404) continue;
+        if (err.status !== 409) throw err;
+      }
+      done.add(e.receipt_id);
+      data.syncedSettlementIds = [...done];
+      saveEnrollment(path, data);
+    }
+  }
   return {
     policy,
     team: () => data.team ?? null,
@@ -63,7 +91,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
     teamCheck(nowMs = Date.now()) {
       if (!data.team) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedTeamVerdict(data.team, loadReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedTeamVerdict(data.team, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
     },
     agentSpend: () => data.agentSpend ?? null,
     // Per-agent fleet caps (#127) against the agent's fleet-wide synced spend plus
@@ -71,7 +99,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
     agentCheck(nowMs = Date.now()) {
       if (!data.agentSpend) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedAgentVerdict(data.agentSpend, policy().caps, loadReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedAgentVerdict(data.agentSpend, policy().caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
     },
     revoked: () => revoked,
     async sync() {
@@ -89,6 +117,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {} }) {
           data.syncedIds = [...synced];
           saveEnrollment(path, data);
         }
+        await uploadSettlements(synced);
         const fetched = await request(data.url, data.token, "/v1/policy");
         const { team = null, agent_spend: agentSpend = null, ...fetchedPolicy } = fetched ?? {};
         if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend)) throw new Error("Invalid fleet policy response");

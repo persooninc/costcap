@@ -179,3 +179,57 @@ test("settle by id is ambiguous across two agents unless agent_id is given", asy
   assert.equal((await f.request("/v1/receipts/unk/settle", { ...good, agent_id: second.agentId }, owner)).status, 200);
   assert.equal((await f.request("/v1/receipts/unk/settle", { ...good, agent_id: agent.agentId }, owner)).status, 200);
 });
+
+// Issue #129: agent-uploaded local reconcile settlements.
+const SHA = "a".repeat(64);
+test("#129 AC3: agent settlement endpoint validates input, ownership and state", async (t) => {
+  const { f, owner, agent } = await seeded(t);
+  const post = (body, tok = agent.token) => f.request("/v1/receipts/settlements", body, null, tok);
+  for (const bad of [{ receipt_id: "unk", cost_usd: null }, { receipt_id: "unk", cost_usd: -1 }, { receipt_id: "unk", cost_usd: "1" },
+    { receipt_id: "bad id!", cost_usd: 1 }, { receipt_id: "unk", cost_usd: 1, provider_sha256: "xyz" }, { receipt_id: "unk", cost_usd: 1, ts: "nope" }]) {
+    assert.equal((await post(bad)).status, 400, JSON.stringify(bad));
+  }
+  // Another agent in the same org cannot settle this agent's receipt.
+  const token2 = (await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, owner)).body.token;
+  const other = (await f.request("/v1/enroll", { name: "other" }, null, token2)).body;
+  assert.equal((await post({ receipt_id: "unk", cost_usd: 1 }, other.token)).status, 404);
+  // Another org's agent: 404.
+  const owner2 = await f.login("settle-other-org@example.invalid");
+  const token3 = (await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, owner2)).body.token;
+  const foreign = (await f.request("/v1/enroll", { name: "foreign" }, null, token3)).body;
+  assert.equal((await post({ receipt_id: "unk", cost_usd: 1 }, foreign.token)).status, 404);
+  assert.equal((await post({ receipt_id: "missing", cost_usd: 1 })).status, 404);
+  assert.equal((await post({ receipt_id: "unk", cost_usd: 1 }, "not-a-token")).status, 401);
+  // Known cost: 409 already_known.
+  const known = await post({ receipt_id: "known", cost_usd: 1 });
+  assert.deepEqual([known.status, known.body.code], [409, "already_known"]);
+  // Admin-settled: 409 already_settled.
+  assert.equal((await f.request("/v1/receipts/unk/settle", good, owner)).status, 200);
+  const dup = await post({ receipt_id: "unk", cost_usd: 2.5 });
+  assert.deepEqual([dup.status, dup.body.code], [409, "already_settled"]);
+});
+
+test("#129 AC2/4/5: agent settlement is idempotent, audited and unblocks verdicts and evidence", async (t) => {
+  const { f, owner, agent } = await seeded(t);
+  assert.equal((await f.request(`/v1/agents/${agent.agentId}/budget`, undefined, owner)).body.verdict, "accounting_unavailable");
+  const body = { receipt_id: "unk", cost_usd: 0.75, provider_sha256: SHA, ts: new Date().toISOString() };
+  const first = await f.request("/v1/receipts/settlements", body, null, agent.token);
+  assert.deepEqual([first.status, first.body.duplicate, first.body.settled_cost_usd], [200, false, 0.75]);
+  const again = await f.request("/v1/receipts/settlements", body, null, agent.token);
+  assert.deepEqual([again.status, again.body.duplicate], [200, true]);
+  const conflict = await f.request("/v1/receipts/settlements", { ...body, cost_usd: 9 }, null, agent.token);
+  assert.equal(conflict.status, 409);
+  const ev = (await f.request("/v1/evidence.json", undefined, owner)).body;
+  const settles = ev.audit.filter((e) => e.action === "receipt.settle");
+  assert.equal(settles.length, 1);
+  assert.equal(settles[0].actor, agent.agentId);
+  assert.equal(settles[0].detail.source, "agent_reconcile");
+  assert.deepEqual([settles[0].detail.before, settles[0].detail.after], [null, 0.75]);
+  const row = ev.receipts.find((r) => r.receipt_id === "unk");
+  assert.deepEqual([row.cost_usd, row.settled_cost_usd, row.settle_source], [null, 0.75, "agent_reconcile"]);
+  assert.equal(ev.totals.cost_complete, true);
+  assert.notEqual((await f.request(`/v1/agents/${agent.agentId}/budget`, undefined, owner)).body.verdict, "accounting_unavailable");
+  assert.notEqual((await f.request("/v1/teams", undefined, owner)).body.teams[0].verdict, "accounting_unavailable");
+  const policy = (await f.request("/v1/policy", undefined, null, agent.token)).body;
+  assert.equal(policy.agent_spend.unknown, 0);
+});
