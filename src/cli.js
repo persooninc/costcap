@@ -147,7 +147,7 @@ export async function wrap(argv) {
     fleetModels = resolved.models;
   };
   if (enrollmentPath) {
-    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy });
+    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => cap.settle(r) });
     setPolicy(fleet.policy());
     const result = await fleet.sync();
     if (!result.online) console.error("costcap: fleet offline; cached policy enforced");

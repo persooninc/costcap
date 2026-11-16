@@ -94,6 +94,14 @@ export function costedReceipt(item) {
   const settled = item?.settlement?.cost_usd;
   return r && r.cost_usd == null && typeof settled === "number" ? { ...r, cost_usd: settled } : r;
 }
+// Issue #162: hosted settlements of this agent's own unknown-cost receipts, so the
+// wrapper can append them to its local ledger and stop refusing calls.
+export function agentSettlements(s, a) {
+  return Object.values(s.receipts ?? {})
+    .filter((r) => r.orgId === a.orgId && r.agentId === a.id && r.receipt?.cost_usd == null && typeof r.settlement?.cost_usd === "number")
+    .map((r) => ({ receipt_id: r.receipt.id, settled_cost_usd: r.settlement.cost_usd, settle_source: r.settlement.source ?? null, audit_id: r.settlement.audit_id ?? null }));
+}
+
 export function settleInput(body) {
   const cost = body?.cost_usd, source = body?.source, reason = body?.reason;
   if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) fail(400, "cost_usd must be a finite number >= 0");
@@ -336,7 +344,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now()) }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now()), settlements: agentSettlements(s, a) }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -680,8 +688,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const item = matches[0];
           if (item.settlement) { const e = new Error("Receipt already settled"); e.status = 409; e.body = { code: "already_settled" }; throw e; }
           if (item.receipt.cost_usd != null) { const e = new Error("Receipt cost is already known"); e.status = 409; e.body = { code: "already_known" }; throw e; }
-          item.settlement = { cost_usd: input.cost_usd, at: new Date(now()).toISOString(), by: u.id, source: input.source, reason: input.reason };
-          audit(s, u.orgId, u.id, "receipt.settle", receiptId, { event: "reconciliation", agent_id: item.agentId, before: null, after: input.cost_usd, source: input.source, reason: input.reason });
+          const auditId = randomUUID();
+          item.settlement = { cost_usd: input.cost_usd, at: new Date(now()).toISOString(), by: u.id, source: input.source, reason: input.reason, audit_id: auditId };
+          audit(s, u.orgId, u.id, "receipt.settle", receiptId, { event: "reconciliation", agent_id: item.agentId, before: null, after: input.cost_usd, source: input.source, reason: input.reason, audit_id: auditId });
           return { agent_id: item.agentId, receipt_id: receiptId, cost_usd: null, settled_cost_usd: input.cost_usd, settled_at: item.settlement.at, settled_by: u.id, settle_source: input.source, settle_reason: input.reason };
         });
         return json(200, result);

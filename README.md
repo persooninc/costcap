@@ -275,6 +275,8 @@ counts toward the original receipt's run/day/month. A missing, null or negative
 charge never settles (it is not $0): the command exits 1 and lists the ids still
 unknown. Re-running is idempotent. See `docs/fixtures/provider-charges.sample.json`.
 
+Settlements also flow the other way (#162): `GET /v1/policy` returns `settlements` (`receipt_id`, `settled_cost_usd`, `settle_source`, `audit_id` of the `receipt.settle` audit entry) for this agent's settled unknown-cost receipts. On the next poll the wrapper appends one `{"event":"reconciliation","source":"hosted_settle",...}` line per settlement to its local ledger (never editing the original line; repeat polls add nothing), so a dashboard settle unblocks a running or freshly started `costcap wrap` and `costcap agent-status` agrees with `/v1/agents/:id/budget`. Settlements for other agents' receipts, known-cost receipts or receipts already settled locally are ignored.
+
 On an enrolled wrapper, the fleet team and agent checks use the settled cost too.
 The next sync uploads each settlement once to `POST /v1/receipts/settlements`
 (agent token; only the agent's own synced `cost_usd: null` receipt; duplicate =

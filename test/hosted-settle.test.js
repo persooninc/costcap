@@ -150,7 +150,8 @@ test("AC3-6: settlement is audited, unblocks verdicts, completes evidence and su
     assert.ok(row.settled_at && row.settled_by);
     const entry = ev.audit.find((e) => e.action === "receipt.settle");
     assert.equal(entry.target, "unk");
-    assert.deepEqual(entry.detail, { event: "reconciliation", agent_id: agent.agentId, before: null, after: 2.5, source: "provider_invoice", reason: "Invoice INV-1 line 3" });
+    assert.match(entry.detail.audit_id, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(entry.detail, { event: "reconciliation", agent_id: agent.agentId, before: null, after: 2.5, source: "provider_invoice", reason: "Invoice INV-1 line 3", audit_id: entry.detail.audit_id });
     const csv = (await f.request("/v1/receipts.csv", undefined, owner)).body;
     assert.match(csv, /,unk,,m,,,2\.5,provider_invoice,/);
   };

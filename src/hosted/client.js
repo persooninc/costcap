@@ -1,6 +1,6 @@
 // Enrolled-agent transport. Credentials/cache stay local, mode 0600.
 // This client needs a real authenticated service; it does not create one.
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
@@ -58,7 +58,7 @@ export async function enroll({ url, token, name, path }) {
 // Server accepts at most 100 receipts per POST (src/hosted/server.js).
 const SYNC_BATCH = 100;
 
-export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, maxBatches = 500, syncBudgetMs = 30_000 }) {
+export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onSettle = () => {}, maxBatches = 500, syncBudgetMs = 30_000 }) {
   let data = loadEnrollment(path);
   let revoked = Boolean(data.revoked);
   let busy = false, inflight = Promise.resolve();
@@ -85,6 +85,25 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, max
       data.syncedSettlementIds = [...done];
       saveEnrollment(path, data);
     }
+  }
+  // Issue #162: an admin settlement in the dashboard reaches the local ledger as one
+  // append-only reconciliation line. Only this host's own null-cost receipts that are
+  // not settled locally yet; known costs are never overridden; repeat polls are no-ops.
+  function applyHostedSettlements(settlements) {
+    if (!settlements.length || !receiptsPath) return 0;
+    const nullReceipts = new Map(loadReceipts(receiptsPath).filter((r) => r.cost_usd === null && typeof r.id === "string").map((r) => [r.id, r]));
+    const nullIds = new Set(nullReceipts.keys());
+    const settled = new Set(loadEvents(receiptsPath).filter(isSettlement).map((e) => e.receipt_id));
+    let n = 0;
+    for (const x of settlements) {
+      const id = x?.receipt_id, cost = x?.settled_cost_usd;
+      if (typeof id !== "string" || !nullIds.has(id) || settled.has(id) || typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) continue;
+      appendFileSync(receiptsPath, JSON.stringify({ event: "reconciliation", source: "hosted_settle", receipt_id: id, cost_usd: cost, settle_source: typeof x.settle_source === "string" ? x.settle_source : null, audit_id: typeof x.audit_id === "string" ? x.audit_id : null, ts: new Date().toISOString() }) + "\n");
+      settled.add(id);
+      n++;
+      onSettle({ ...nullReceipts.get(id), cost_usd: cost });
+    }
+    return n;
   }
   return {
     policy,
@@ -135,7 +154,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, max
         }
         await uploadSettlements(synced);
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, agent_spend: agentSpend = null, ...fetchedPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], ...fetchedPolicy } = fetched ?? {};
+        if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
+        applyHostedSettlements(settlements);
         if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend)) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
         // Team membership and spend refresh on every poll; removal (null) stops team enforcement.

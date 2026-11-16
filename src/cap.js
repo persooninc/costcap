@@ -109,6 +109,14 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       }
       return null;
     },
+    // Issue #162: a hosted settlement of an unknown-cost receipt this engine already
+    // counted as unknown. The cost lands in the receipt's original day/month.
+    settle(receipt) {
+      if (unknown <= 0 || typeof receipt?.cost_usd !== "number" || !Number.isFinite(receipt.cost_usd) || receipt.cost_usd < 0) return false;
+      unknown -= 1;
+      add(receipt.ts ?? now(), receipt.cost_usd);
+      return true;
+    },
     // external: a receipt another wrapper sharing this ledger wrote. It counts
     // toward day/month (and unknown) but not toward this wrapper's run cap.
     record(receipt, { external = false } = {}) {
