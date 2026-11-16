@@ -427,6 +427,13 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   Lines are priced like interactive Gemini calls (cache, thoughts, modality and
   long-context rules) at `batch.gemini` 0.5; error lines are $0. Cancel
   (`POST …/batches/{id}:cancel`) and `DELETE …/batches/{id}` are $0 and never pause;
+  Batch management calls (#233) are $0 `non_billable_request` receipts that never
+  pause and skip `--models`, `--unknown-models refuse` and `--preflight`: OpenAI
+  `POST /openai/v1/batches/{id}/cancel`, Anthropic `POST /anthropic/v1/messages/batches/{id}/cancel`
+  and `DELETE /anthropic/v1/messages/batches/{id}`, Gemini `POST /gemini/v1beta/batches/{id}:cancel`
+  and `DELETE /gemini/v1beta/batches/{id}`, plus Gemini Files upload
+  (`POST /gemini/upload/v1beta/files`, resumable start and chunks) and
+  `DELETE /gemini/v1beta/files/{name}`. A cancel does not settle a pending batch;
   a failed, cancelled or expired batch with no output stays pending (unknown).
   With `--preflight`, an inline Gemini create is estimated as the sum of each
   request's worst case x 0.5; a file-input create passes unestimated.

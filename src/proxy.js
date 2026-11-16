@@ -86,8 +86,14 @@ export function isCountTokensPath(rawUrl) {
 // Files API management (#158): upload and delete are free on Anthropic and OpenAI
 // (https://platform.claude.com/docs/en/build-with-claude/files#usage-and-billing).
 // Exact paths only, same hardening as count_tokens. GET is covered by the GET/HEAD rule.
-const FILES_UPLOAD_PATHS = [/^\/anthropic\/v1\/files$/, /^\/openai\/v1\/files$/];
-const FILES_DELETE_PATHS = [/^\/anthropic\/v1\/files\/[A-Za-z0-9_-]+$/, /^\/openai\/v1\/files\/[A-Za-z0-9_-]+$/];
+// #233: Gemini Files API upload (incl. resumable chunks) and delete are free too, as are
+// batch cancel/delete on all three providers (management calls that stop spend).
+const FILES_UPLOAD_PATHS = [/^\/anthropic\/v1\/files$/, /^\/openai\/v1\/files$/, /^\/gemini\/upload\/v1(?:beta|alpha)?\/files$/,
+  /^\/openai\/v1\/batches\/[A-Za-z0-9_-]+\/cancel$/, /^\/anthropic\/v1\/messages\/batches\/[A-Za-z0-9_-]+\/cancel$/,
+  /^\/gemini\/v1(?:beta|alpha)?\/batches\/[A-Za-z0-9_-]+:cancel$/];
+const FILES_DELETE_PATHS = [/^\/anthropic\/v1\/files\/[A-Za-z0-9_-]+$/, /^\/openai\/v1\/files\/[A-Za-z0-9_-]+$/,
+  /^\/gemini\/v1(?:beta|alpha)?\/files\/[A-Za-z0-9_-]+$/, /^\/anthropic\/v1\/messages\/batches\/[A-Za-z0-9_-]+$/,
+  /^\/gemini\/v1(?:beta|alpha)?\/batches\/[A-Za-z0-9_-]+$/];
 export function isNonBillableFilesRequest(method, rawUrl) {
   if (typeof rawUrl !== "string") return false;
   const pathname = rawUrl.split(/[?#]/, 1)[0];
@@ -699,7 +705,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (killed) return block("killed", killed, { error: "killed", ...killed });
           const accountingFailure = accountingFailureNow();
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
+          // #233: free management calls (files, batch cancel/delete) skip allowlist, unpriced and preflight checks.
           const generates = !["GET", "HEAD"].includes(req.method);
+          const freeMgmt = generates && isNonBillableFilesRequest(req.method, req.url);
           // #207: decided before the allowlist, unpriced check, preflight and cache key, so all of them see TO.
           if (downgrader && generates) {
             const candidates = routerModels?.length ? routerModels : batchModels ?? [requestedModel];
@@ -716,7 +724,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
             }
           }
-          const allow = generates ? allowedModels?.() ?? null : null;
+          const allow = generates && !freeMgmt ? allowedModels?.() ?? null : null;
           if (generates && routerModels === null) {
             emit({ provider, path: storedPath, blocked: true, reason: "invalid_models", outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
             send(400, { error: "invalid_models", model: requestedModel ?? null, message: "CostCap: `models` must be an array of model id strings. The upstream call was not made." });
@@ -732,7 +740,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
           }
-          if (generates && unknownModels === "refuse" && offending(cloud ? () => cloudModel !== null : priced) !== -1) {
+          if (generates && !freeMgmt && unknownModels === "refuse" && offending(cloud ? () => cloudModel !== null : priced) !== -1) {
             refuse(offending(cloud ? () => cloudModel !== null : priced));
             return modelRefusal(403, "model_unpriced", `CostCap: model "${requestedModel ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made.`);
           }
@@ -750,6 +758,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           // model lists), file uploads and OpenAI batch creates (models live in an
           // uploaded file) pass through; audio checks only that the model is priced.
           const pfMode = !preflight || !generates ? null
+            : freeMgmt ? "pass"
             : batchCreate === "anthropic" && !cloud ? "batch"
             : batchCreate === "gemini" ? (geminiReqs?.length ? "batch" : "pass")
             : batchCreate === "openai" || /^\/v1\/(?:files|uploads)(?:\/|$|\?)/.test(path) ? "pass"
