@@ -134,7 +134,7 @@ export async function wrap(argv) {
   const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
-  cap = createCapEngine({ caps, history });
+  cap = createCapEngine({ caps, history, pendingBatchesBlock: false });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -160,7 +160,7 @@ export async function wrap(argv) {
   const runReceipts = [];
   const summaryRunId = who.run_id ?? randomUUID();
   const startedAt = new Date().toISOString();
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, onSettlement: (e) => { runReceipts.push(e); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   const env = { ...process.env };

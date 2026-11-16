@@ -50,8 +50,13 @@ export function loadEvents(path) {
   return loadLines(path).filter((r) => r.event);
 }
 
+// A submitted batch whose results have not been metered yet (#160): unknown cost, never $0.
+export const isPendingBatch = (r) => !!r && r.cost_usd === null && r.reason === "batch_pending";
+
 // caps: { run, day, month } in USD; any may be undefined.
-export function createCapEngine({ caps = {}, history = [], now = () => new Date() } = {}) {
+// pendingBatchesBlock: false lets `costcap wrap` keep serving synchronous calls while a
+// batch is pending (#160); read-only checks keep the default and report it as unknown.
+export function createCapEngine({ caps = {}, history = [], now = () => new Date(), pendingBatchesBlock = true } = {}) {
   for (const scope of ["run", "day", "month"]) {
     if (caps[scope] != null && (!Number.isFinite(caps[scope]) || caps[scope] <= 0)) throw new Error(`Invalid ${scope} cap`);
   }
@@ -59,7 +64,8 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     if (!Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) throw new Error("Invalid receipt history; reconcile before running");
   }
   let run = 0;
-  let unknown = history.filter((r) => r.cost_usd === null).length;
+  const blocksUnknown = (r) => r.cost_usd === null && (pendingBatchesBlock || !isPendingBatch(r));
+  let unknown = history.filter(blocksUnknown).length;
   // Null cost is unknown. It is omitted from sums so it is not treated as $0.
   // Spend is bucketed by UTC day and month key once, at record time, so check()
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
@@ -106,7 +112,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     // external: a receipt another wrapper sharing this ledger wrote. It counts
     // toward day/month (and unknown) but not toward this wrapper's run cap.
     record(receipt, { external = false } = {}) {
-      if (receipt.cost_usd === null) { unknown += 1; return; }
+      if (receipt.cost_usd === null) { if (blocksUnknown(receipt)) unknown += 1; return; }
       if (!external) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);
     },

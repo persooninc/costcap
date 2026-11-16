@@ -93,3 +93,14 @@ test("AC6: --github-output writes run-id; action.yml wires the input", () => {
   assert.match(yml, /COSTCAP_RUN_ID: \$\{\{ inputs\.run-id \}\}/);
   assert.match(yml, /args\+=\(--run-id "\$COSTCAP_RUN_ID"\)/);
 });
+
+test("#160 --run-id: a pending batch makes the run incomplete until its settlement lands", () => {
+  const { r } = ledger([{ id: "p1", run_id: "batch", reason: "batch_pending", batch_id: "b", cost_usd: null }]);
+  const open = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "batch" });
+  assert.deepEqual([open.ok, open.unknown_cost_count, open.hit.reason], [false, 1, "accounting_unavailable"]);
+  writeFileSync(r, readFileSync(r, "utf8") + JSON.stringify({ event: "reconciliation", source: "batch_results", ts, receipt_id: "p1", cost_usd: 0.5 }) + "\n");
+  const done = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "batch" });
+  assert.deepEqual([done.ok, done.total_usd, done.unknown_cost_count], [true, 0.5, 0]);
+  const over = checkBudget({ receiptsPath: r, caps: { run: 0.4 }, runId: "batch" });
+  assert.equal(over.ok, false);
+});

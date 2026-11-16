@@ -188,9 +188,32 @@ traffic bypasses CostCap.
   `reason: "non_billable_request"`. Files API upload/delete (`POST /v1/files`,
   `DELETE /v1/files/{id}` on Anthropic and OpenAI) 2xx replies are also
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
-  content is billed as input tokens when used in a Messages call. Batch APIs
-  (`/v1/messages/batches`, `/v1/batches`) are still unknown cost. 5xx, 2xx without usage and cut streams stay unknown
+  content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
+- Batch APIs (#160): a 2xx `POST /v1/messages/batches` (Anthropic) or `POST /v1/batches`
+  (OpenAI) writes a `reason: "batch_pending"` receipt (`cost_usd: null`, `batch_id`,
+  `request_count`). It does not pause the run, but it counts as unknown in `costcap runs`
+  and `costcap check` (never $0) until results come back through the proxy:
+  - Anthropic: `GET /v1/messages/batches/{id}/results` is metered line by line.
+    `succeeded` lines are priced at the batch rate; `errored`, `canceled` and `expired`
+    lines are free.
+  - OpenAI: `GET /v1/batches/{id}` links its `output_file_id` to the batch, then
+    `GET /v1/files/{that id}/content` is metered from each line's `response.body.usage`
+    (chat and Responses shapes); lines with a non-2xx `status_code` are free.
+    Other file downloads stay `non_billable_request`.
+  - The batch rate is the table's provider `batch.multiplier` (0.5 for both) on every
+    component, including cache read/write and the long_context tier. The cost is
+    appended as one `{"event":"reconciliation","source":"batch_results"}` settlement
+    that keeps the batch receipt's `ts`; fetching results again settles nothing.
+  - An unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
+    batch stays unknown and the results receipt says `batch_unpriced` or
+    `batch_results_malformed`. A batch whose results are never fetched stays unknown.
+  - Anthropic batch creates check every `requests[].params.model` against `--models`
+    and `--unknown-models refuse`; one refused model refuses the whole batch. OpenAI
+    input files are not inspected, so an OpenAI batch create is refused while an
+    allowlist (or `--unknown-models refuse`) is set. No worst-case preflight reservation
+    is made for batches, Gemini batch mode and OpenRouter are not covered, and costcap
+    never polls the provider.
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when

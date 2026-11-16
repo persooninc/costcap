@@ -101,7 +101,14 @@ export function selectRates(price, prompt_tokens, signal = {}) {
   return { pricing_tier: premium, rates };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}) {
+// Batch discount (#160): provider-level multiplier applied to every component,
+// including cache read/write and on top of the long_context tier. null when unpublished.
+export function batchMultiplier(provider) {
+  const m = table.batch?.[provider]?.multiplier;
+  return typeof m === "number" && Number.isFinite(m) && m > 0 ? m : null;
+}
+
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}, { multiplier = 1 } = {}) {
   const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const { pricing_tier, rates: selected } = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
@@ -117,7 +124,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
       cached_input_tokens * rates.cached_input +
       cache_write_input_tokens * (rates.cache_write ?? 0) +
       cache_write_1h_input_tokens * (rates.cache_write_1h ?? 0) +
-      output_tokens * rates.output) / 1_000_000;
+      output_tokens * rates.output) * multiplier / 1_000_000;
   return {
     model,
     cost_usd: unpriced ? null : Number(cost.toFixed(6)),

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { lookupPrice, costForUsage, TABLE_VERSION } from "../src/pricing.js";
+import { lookupPrice, costForUsage, batchMultiplier, TABLE_VERSION } from "../src/pricing.js";
 
 const table = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
 
@@ -94,4 +94,22 @@ test("#145 embeddings rates are input-only at published prices", () => {
   }
   assert.equal(costForUsage("text-embedding-3-small", { input_tokens: 1_000_000 }).cost_usd, 0.02);
   assert.ok(table.sources.some((u) => u.includes("openai.com/api/pricing")));
+});
+
+test("#160 batch multiplier: 0.5 for openai/anthropic with sources, stacks with caching and long_context", () => {
+  assert.equal(batchMultiplier("openai"), 0.5);
+  assert.equal(batchMultiplier("anthropic"), 0.5);
+  assert.equal(batchMultiplier("gemini"), null);
+  for (const p of ["openai", "anthropic"]) assert.match(table.batch[p].source, /^https:\/\//);
+  const cached = { input_tokens: 1000, cached_input_tokens: 2000, cache_write_input_tokens: 400, cache_write_1h_input_tokens: 100, output_tokens: 500 };
+  const std = costForUsage("claude-sonnet-4-6", cached);
+  const half = costForUsage("claude-sonnet-4-6", cached, { multiplier: 0.5 });
+  assert.equal(half.cost_usd, Number((std.cost_usd / 2).toFixed(6)));
+  assert.equal(half.pricing_tier, "standard");
+  const long = { input_tokens: 250000, cached_input_tokens: 1000, output_tokens: 1000 };
+  const lstd = costForUsage("claude-sonnet-4-6", long);
+  const lhalf = costForUsage("claude-sonnet-4-6", long, { multiplier: 0.5 });
+  assert.equal(lhalf.pricing_tier, "long_context");
+  assert.equal(lhalf.cost_usd, Number((lstd.cost_usd / 2).toFixed(6)));
+  assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 7, output_tokens: 3 }), costForUsage("gpt-4o-mini", { input_tokens: 7, output_tokens: 3 }, {}), "default multiplier leaves receipts unchanged");
 });

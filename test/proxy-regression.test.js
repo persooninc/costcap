@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractUsage, isCountTokensPath, isEmbeddingsPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
@@ -405,4 +406,92 @@ test("#155 standard receipts unchanged: no speed/service_tier keys, pricing_tier
   assert.equal(r.cost_usd, Number(((1000 * 0.15 + 100 * 0.6) / 1e6).toFixed(6)));
   assert.ok(!("speed" in r) && !("service_tier" in r) && !("reason" in r));
   assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100 }), { ...costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100, speed: undefined }) });
+});
+
+// #160 e2e: `costcap wrap` against local mock Anthropic / OpenAI upstreams serving JSONL fixtures.
+const SONNET_BATCH_LINE = (id, usage) => JSON.stringify({ custom_id: id, result: { type: "succeeded", message: { model: "claude-sonnet-4-6", usage } } });
+const BATCH_JSONL = [SONNET_BATCH_LINE("a", { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 2000 }),
+  SONNET_BATCH_LINE("b", { input_tokens: 2000, output_tokens: 1000 }), JSON.stringify({ custom_id: "c", result: { type: "errored", error: {} } })].join("\n");
+const OPENAI_BATCH_JSONL = [
+  JSON.stringify({ custom_id: "1", response: { status_code: 200, body: { model: "gpt-4o-mini", usage: { prompt_tokens: 1000, completion_tokens: 1000 } } } }),
+  JSON.stringify({ custom_id: "2", response: { status_code: 200, body: { object: "response", model: "gpt-4o-mini", usage: { input_tokens: 2000, output_tokens: 500, input_tokens_details: { cached_tokens: 1000 } } } } }),
+  JSON.stringify({ custom_id: "3", response: { status_code: 400, body: { error: {} } } })].join("\n");
+function batchUpstream() {
+  return http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const u = req.url;
+      if (u === "/v1/messages/batches") return res.end('{"id":"msgbatch_e2e","type":"message_batch"}');
+      if (u === "/v1/messages/batches/msgbatch_e2e/results") return res.end(BATCH_JSONL);
+      if (u === "/v1/batches" && req.method === "POST") return res.end('{"id":"batch_e2e","object":"batch","request_counts":{"total":3}}');
+      if (u === "/v1/batches/batch_e2e") return res.end('{"id":"batch_e2e","status":"completed","output_file_id":"file-e2e"}');
+      if (u === "/v1/files/file-e2e/content" || u === "/v1/files/file-other/content") return res.end(OPENAI_BATCH_JSONL);
+      if (u === "/v1/chat/completions") return res.end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":1,"completion_tokens":1}}');
+      res.end('{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1}}');
+    });
+  });
+}
+const cliRun = (args, env = {}) => new Promise((resolve) => {
+  const child = spawn(process.execPath, ["src/cli.js", ...args], { env: { ...process.env, ...env } });
+  let out = "", err = "";
+  child.stdout.on("data", (d) => { out += d; });
+  child.stderr.on("data", (d) => { err += d; });
+  child.on("exit", (code) => resolve({ code, out: out.trim(), err }));
+});
+const agent = (calls) => `for (const [m, base, p, b] of ${JSON.stringify(calls)}) { const r = await fetch(process.env[base] + p, { method: m, body: b }); console.log(r.status); }`;
+
+test("#160 e2e Anthropic batch: wrap is not frozen after create; results settle at 0.5x once; check passes under the cap", async (t) => {
+  const up = batchUpstream();
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
+  const receipts = join(dir, "r.jsonl");
+  const env = { COSTCAP_TEST_ANTHROPIC_UPSTREAM: `http://127.0.0.1:${up.address().port}` };
+  const create = JSON.stringify({ requests: [0, 1, 2].map((i) => ({ custom_id: String(i), params: { model: "claude-sonnet-4-6", max_tokens: 5, messages: [] } })) });
+  const wrap = (calls) => cliRun(["wrap", "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", agent(calls)], env);
+  const w1 = await wrap([["POST", "ANTHROPIC_BASE_URL", "/v1/messages/batches", create], ["POST", "ANTHROPIC_BASE_URL", "/v1/messages", '{"model":"claude-sonnet-4-6"}']]);
+  assert.equal(w1.code, 0, w1.err);
+  assert.deepEqual(w1.out.split("\n").filter((l) => /^\d+$/.test(l)), ["200", "200"]);
+  const ledger = () => readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const pending = ledger().filter((l) => l.reason === "batch_pending");
+  assert.equal(pending.length, 1);
+  assert.deepEqual([pending[0].cost_usd, pending[0].batch_id, pending[0].request_count], [null, "msgbatch_e2e", 3]);
+  const runs = JSON.parse((await cliRun(["runs", "--json", "--receipts", receipts])).out);
+  assert.equal(runs[0].total_cost_usd, null);
+  const pendingCheck = await cliRun(["check", "--receipts", receipts]);
+  assert.notEqual(pendingCheck.code, 0, "pending batch is incomplete, never $0");
+  const results = ["GET", "ANTHROPIC_BASE_URL", "/v1/messages/batches/msgbatch_e2e/results"];
+  const w2 = await wrap([results, results]);
+  assert.equal(w2.code, 0, w2.err);
+  const settlements = ledger().filter((l) => l.event === "reconciliation");
+  assert.equal(settlements.length, 1);
+  const standard = costForUsage("claude-sonnet-4-6", { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 2000 }).cost_usd + costForUsage("claude-sonnet-4-6", { input_tokens: 2000, output_tokens: 1000 }).cost_usd;
+  assert.equal(settlements[0].cost_usd, Number((standard * 0.5).toFixed(6)));
+  assert.equal(settlements[0].receipt_id, pending[0].id);
+  const cap = String(standard * 0.75);
+  const ok = await cliRun(["check", "--cap", cap, "--receipts", receipts]);
+  assert.equal(ok.code, 0, ok.out + ok.err);
+});
+
+test("#160 e2e OpenAI batch: create, retrieve output_file_id, settle from file content; unrelated file stays $0", async (t) => {
+  const up = batchUpstream();
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
+  const receipts = join(dir, "r.jsonl");
+  const w = await cliRun(["wrap", "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", agent([
+    ["POST", "OPENAI_BASE_URL", "/batches", '{"input_file_id":"file-in"}'], ["POST", "OPENAI_BASE_URL", "/chat/completions", '{"model":"gpt-4o-mini"}'],
+    ["GET", "OPENAI_BASE_URL", "/batches/batch_e2e"], ["GET", "OPENAI_BASE_URL", "/files/file-e2e/content"], ["GET", "OPENAI_BASE_URL", "/files/file-other/content"]])],
+  { COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` });
+  assert.equal(w.code, 0, w.err);
+  assert.deepEqual(w.out.split("\n").filter((l) => /^\d+$/.test(l)), ["200", "200", "200", "200", "200"]);
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const settlements = lines.filter((l) => l.event === "reconciliation");
+  assert.equal(settlements.length, 1);
+  const standard = costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 1000 }).cost_usd + costForUsage("gpt-4o-mini", { input_tokens: 1000, cached_input_tokens: 1000, output_tokens: 500 }).cost_usd;
+  assert.equal(settlements[0].cost_usd, Number((standard * 0.5).toFixed(6)));
+  const other = lines.find((l) => l.path?.includes("file-other"));
+  assert.deepEqual([other.cost_usd, other.reason], [0, "non_billable_request"]);
+  const runs = JSON.parse((await cliRun(["runs", "--json", "--receipts", receipts])).out);
+  assert.equal(typeof runs[0].total_cost_usd, "number", "settled within the same run");
 });

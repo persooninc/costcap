@@ -6,8 +6,10 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel } from "./pricing.js";
-import { budgetExceededBody } from "./cap.js";
+import { batchMultiplier, costForUsage, isPricedModel, premiumTier } from "./pricing.js";
+import { budgetExceededBody, loadLedgerLines } from "./cap.js";
+import { anthropicBatchModels, anthropicResultsBatchId, batchCreateProvider, batchSettlement, createBatchIndex,
+  foldBatchResults, openaiBatchGetId, openaiFileContentId, pendingFromCreate } from "./batch.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck } from "./preflight.js";
 
@@ -270,11 +272,15 @@ export function createUsageChunkFilter() {
   };
 }
 
-export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
+export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, onSettlement, cap,
   spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
+  // #160: pending batches and their OpenAI output files, seeded from the ledger so a later run can settle them.
+  let seed = [];
+  try { seed = receiptsPath ? loadLedgerLines(receiptsPath) : []; } catch { seed = []; }
+  const batches = createBatchIndex(seed);
   // Shared ledger (CC-5): decide and append inside the cross-process critical section.
   // Reentrant: emit() inside an already-guarded decision reuses the held section.
   let held = false;
@@ -287,9 +293,29 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
+    batches.observe(complete);
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
+  // Settlement for a pending batch: an append-only reconciliation line (never via onReceipt).
+  const settleBatch = (pendingReceipt, fold) => guarded(() => {
+    const line = batchSettlement(pendingReceipt, fold);
+    if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(line) + "\n", { mode: 0o600 });
+    batches.observe(line);
+    try { onSettlement?.(line); } catch { /* integrations are outside the local ledger */ }
+    cap?.record({ ...pendingReceipt, cost_usd: fold.cost_usd });
+    return line;
+  });
+  // Meters a JSONL results body against its pending batch. Returns receipt fields, or null when untracked.
+  const meterBatchResults = (provider, batchId, text) => {
+    if (!batchId || !batches.isTracked(provider, batchId)) return null;
+    const pendingReceipt = batches.pendingFor(provider, batchId);
+    if (!pendingReceipt) return { batch_id: batchId, cost_usd: 0, reason: "batch_results", already_settled: true };
+    const fold = foldBatchResults(provider, text, { extractUsage, costForUsage, isPricedModel, premiumTier, multiplier: batchMultiplier(provider) });
+    if (fold.cost_usd === null) return { batch_id: batchId, cost_usd: 0, reason: fold.reason, settled_receipt_id: null };
+    settleBatch(pendingReceipt, fold);
+    return { batch_id: batchId, cost_usd: 0, reason: "batch_results", settled_receipt_id: pendingReceipt.id, batch_cost_usd: fold.cost_usd };
+  };
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     const [, provider, ...rest] = url.pathname.split("/");
@@ -324,6 +350,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        const batchCreate = batchCreateProvider(req.method, req.url) === provider ? provider : null;
+        // Anthropic batch create (#160): every requests[].params.model is checked; one refusal refuses the batch.
+        const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
         // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
         const modelRefusal = (status, error, message) => {
           emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
@@ -337,6 +366,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const generates = !["GET", "HEAD"].includes(req.method);
           const allow = generates ? allowedModels?.() ?? null : null;
+          if (batchModels && generates) {
+            // The first offending model drives the refusal below; otherwise any listed model passes both checks.
+            requestedModel = (allow && batchModels.find((m) => !allow.includes(m))) ||
+              (unknownModels === "refuse" && batchModels.find((m) => !isPricedModel(m))) || batchModels[0];
+          }
           if (allow && (!requestedModel || !allow.includes(requestedModel))) {
             return modelRefusal(403, "model_not_allowed", allow.length
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
@@ -391,9 +425,29 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             return;
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
+          const batchResponseFields = (text) => {
+            if (batchCreate) {
+              const p = pendingFromCreate(batchCreate, body, text);
+              return p && { ...p, cost_usd: null, reason: "batch_pending" };
+            }
+            if (provider === "anthropic") {
+              const m = meterBatchResults("anthropic", anthropicResultsBatchId(req.method, req.url), text);
+              return m && { model: "batch", ...m };
+            }
+            if (provider !== "openai") return null;
+            const getId = openaiBatchGetId(req.method, req.url);
+            if (getId && batches.isTracked("openai", getId)) {
+              let b; try { b = JSON.parse(text); } catch { b = null; }
+              const out = typeof b?.output_file_id === "string" && /^[A-Za-z0-9_-]+$/.test(b.output_file_id) ? b.output_file_id : undefined;
+              return { model: "batch", batch_id: getId, ...(out && { output_file_id: out }), cost_usd: 0, reason: "non_billable_request" };
+            }
+            const fileId = openaiFileContentId(req.method, req.url);
+            const m = fileId ? meterBatchResults("openai", batches.batchForFile(fileId), text) : null;
+            return m && { model: "batch", output_file_id: fileId, ...m };
+          };
           const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
-          let metered, raw, streamCut = false, sseIncomplete = false;
+          let metered, raw, streamCut = false, sseIncomplete = false, batchFields = null;
           if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             const parser = createSseUsageParser(provider, requestedModel);
@@ -439,12 +493,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
+            const ok2xx = upstreamRes.status >= 200 && upstreamRes.status < 300;
+            if (ok2xx) batchFields = batchResponseFields(raw.toString("utf8"));
+            if (!batchFields) metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           clearTimeout(timer);
           res.off("close", onClientClose);
-          if (metered) {
+          if (batchFields) {
+            // #160: batch create is pending (unknown, never $0, run not frozen); results settle it.
+            Object.assign(receipt, batchFields);
+            cap?.record(receipt);
+          } else if (metered) {
             Object.assign(receipt, costForUsage(metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
