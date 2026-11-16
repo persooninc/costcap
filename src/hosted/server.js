@@ -20,6 +20,7 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
+import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
 import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
@@ -554,6 +555,22 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
           return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId) });
         }));
+      }
+      // #220: Prometheus scrape endpoint. Viewer/admin cck_ keys or a member session; org-scoped.
+      if (path === "/v1/metrics" && req.method === "GET") {
+        const byParam = new URL(req.url, origin).searchParams.get("by");
+        if (byParam !== null && byParam !== "model") fail(400, "by must be model");
+        const out = store.read((s) => {
+          const u = member(s, req);
+          const bp = orgPeriod(s, u.orgId);
+          return buildMetrics({ nowMs: now(), budgetPeriod: bp, byModel: byParam === "model",
+            cutoff: retentionCutoff(entitlements(s, u.orgId), now()),
+            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId && !a.revoked).map((a) => ({ ...a, caps: effectiveCaps(a.policy, now()) })),
+            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
+            receipts: visibleReceipts(s, u.orgId),
+            alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId) });
+        });
+        return res.writeHead(200, { "content-type": METRICS_CONTENT_TYPE, "cache-control": "no-store", "x-content-type-options": "nosniff" }).end(out.body);
       }
       // #213: finance summary CSV, one row per period and group. Viewers and viewer keys may read it.
       if (path === "/v1/spend.csv" && req.method === "GET") {

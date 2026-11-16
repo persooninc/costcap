@@ -102,7 +102,7 @@ test("AC1-AC6: create once, role matrix, freeze without Origin, revoke/expiry/is
   assert.ok(!store.includes(viewerKey) && !store.includes(adminKey), "store holds only hashes");
 
   // AC2: viewer key reads, never writes.
-  for (const p of ["/v1/spend", "/v1/receipts.csv", "/v1/evidence.json", "/v1/alerts", "/v1/audit.csv", "/v1/fleet", `/v1/agents/${agent.agentId}/budget`, `/v1/agents/${agent.agentId}/runs`]) {
+  for (const p of ["/v1/spend", "/v1/metrics", "/v1/receipts.csv", "/v1/evidence.json", "/v1/alerts", "/v1/audit.csv", "/v1/fleet", `/v1/agents/${agent.agentId}/budget`, `/v1/agents/${agent.agentId}/runs`]) {
     const r = await f.raw(p, { bearer: viewerKey });
     assert.equal(r.status, 200, p);
     assert.ok(!r.text.includes(viewerKey) && !r.text.includes(adminKey), `${p} leaks a key`);

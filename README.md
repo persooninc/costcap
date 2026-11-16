@@ -950,6 +950,22 @@ non-midnight resets.
 
 **Team chargeback (#213).** `GET /v1/spend?group_by=team` returns one bucket per org team plus `(no team)`, each with a `label`, and `team_membership: "current"`: spend is allocated by today's team membership, not membership history. `GET /v1/spend.csv?group_by=team&period=month|day&since=&until=` (any member or viewer API key) downloads a finance summary with columns `period,group_by,key,label,usd_known,calls,unknown_count,cost_complete,blocked_count`, one row per budget period and group. It takes every `/v1/spend` `group_by`. In-band `# retention_clamped`, `# cost_incomplete` and `# team_membership` lines precede the header when they apply. The Spend card shows a By team section and a Download CSV link that follows the selected period.
 
+**Prometheus scrape (#220).** `GET /v1/metrics` returns `text/plain; version=0.0.4` (Prometheus exposition format) for the caller's org. It takes an org API key (`Authorization: Bearer cck_…`, viewer or admin) or a member session; no key, or a revoked or expired key, gives `401`. Series: `costcap_spend_usd{agent,team,window}`, `costcap_spend_complete{agent,window}` (0 when the window has unsettled unknown-cost receipts, so spend is a lower bound), `costcap_unknown_cost_receipts{agent}`, `costcap_cap_usd` and `costcap_cap_remaining_usd{scope="agent|team",name,window}` (omitted when there is no cap), `costcap_alerts_open{kind,scope_name}` (active, unacknowledged; every alert kind), `costcap_agent_frozen{agent}`, `costcap_agent_last_sync_timestamp_seconds{agent}` and `costcap_metrics_truncated`. `window` is `day` or `month` of the org budget period, and receipts past the retention cutoff are excluded as in `/v1/spend`. `?by=model` adds a `model` label to `costcap_spend_usd`; past 5,000 series the per-model series are dropped, `costcap_metrics_truncated` is 1 and the agent totals stay complete. Every value is a **gauge for the current period, not a monotonic counter** (retention deletes old receipts), so use it directly rather than with `rate()`.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: costcap
+    scheme: https
+    metrics_path: /v1/metrics
+    scrape_interval: 60s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/costcap.key   # a viewer cck_ key
+    static_configs:
+      - targets: [app.costcap.dev]
+```
+
 ### Receipt retention (hosted, #211)
 
 By default synced receipts are kept. An owner or admin can turn on deletion in the
