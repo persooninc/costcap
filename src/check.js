@@ -1,6 +1,8 @@
 // Read-only CI guard: rejects unknown cost rather than treating it as free.
 import { loadSettledReceipts as loadReceipts, createCapEngine } from "./cap.js";
 import { budgetRemaining, createAgentBudgets } from "./agent-budget.js";
+import { createKillCheck } from "./kill.js";
+import { createFleetClient } from "./hosted/client.js";
 export function checkBudget({ receiptsPath, caps = {}, now, runId }) {
   const history = loadReceipts(receiptsPath);
   if (!history.length) throw new Error("No receipts found; a budget check needs evidence");
@@ -54,4 +56,49 @@ export function agentBudgetStatus({ receiptsPath, policy, agent_id: agentId, run
   const who = { agent_id: agentId, run_id: runId };
   const hit = budgets.check(who);
   return { ok: !hit, verdict: hit ? hit.verdict : "allow", reason: hit?.reason ?? null, hit, ...who, budget_remaining: budgetRemaining(budgets, who), estimate_only: true };
+}
+
+// Issue #140: the self-check must match what the wrapper enforces on the next
+// call. Same order as the proxy: kill switch (local file or cached fleet kill /
+// revoked credentials), then the agent policy, then the cached fleet per-agent
+// caps and team caps, then min(local, fleet) day/month caps. Read-only: the
+// enrollment cache is read, never synced or rewritten. With neither a kill file
+// present nor an enrollment, the base result is returned unchanged.
+export function fleetGuard({ killFile, enrollmentPath, receiptsPath, now }) {
+  const killed = killFile ? createKillCheck(killFile)() : null;
+  if (killed) return { killed };
+  if (!enrollmentPath) return {};
+  const fleet = createFleetClient({ path: enrollmentPath, receiptsPath });
+  const policy = fleet.policy();
+  if (policy.killed || fleet.revoked()) return { killed: { reason: "killed", note: "fleet policy or revoked credentials", enrollment: enrollmentPath } };
+  const nowMs = now ? now().getTime() : Date.now();
+  return { fleetCaps: policy.caps, fleetHit: fleet.agentCheck(nowMs) ?? fleet.teamCheck(nowMs) };
+}
+
+const killedResult = (killed, extra = {}) => ({ ok: false, verdict: "killed", reason: "killed", kill: killed, hit: { verdict: "killed", ...killed }, ...extra, estimate_only: true });
+const applyFleetHit = (result, hit) => (hit ? { ...result, ok: false, verdict: hit.verdict, reason: hit.reason, hit, ...(hit.scope ? { scope: hit.scope } : {}) } : result);
+
+export function guardedBudgetStatus(options) {
+  const g = fleetGuard(options);
+  if (g.killed) return killedResult(g.killed);
+  if (!options.enrollmentPath) return checkBudget(options);
+  const caps = { ...(options.caps ?? {}) };
+  for (const k of ["day", "month"]) {
+    const vals = [caps[k], g.fleetCaps?.[k]].filter((v) => v != null);
+    if (vals.length) caps[k] = Math.min(...vals);
+  }
+  let base;
+  try { base = checkBudget({ ...options, caps }); }
+  catch (err) { if (!g.fleetHit || !/No receipts/.test(err.message)) throw err; base = { ok: true }; }
+  if (g.fleetHit) return applyFleetHit(base, g.fleetHit);
+  if (!base.ok && base.hit) return { ...base, verdict: base.unknown_cost_count ? "accounting_unavailable" : "budget_exceeded" };
+  return base;
+}
+
+export function guardedAgentStatus(options) {
+  const g = fleetGuard(options);
+  if (g.killed) return killedResult(g.killed, { agent_id: options.agent_id, run_id: options.run_id ?? null });
+  const base = agentBudgetStatus(options);
+  if (!base.ok || !options.enrollmentPath) return base;
+  return applyFleetHit(base, g.fleetHit);
 }

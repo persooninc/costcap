@@ -1,6 +1,6 @@
 // Minimal read-only MCP JSON-RPC over stdio. No remote bind or spend effects.
 import { createInterface } from "node:readline";
-import { agentBudgetStatus, checkBudget } from "./check.js";
+import { guardedAgentStatus as agentBudgetStatus, guardedBudgetStatus as checkBudget } from "./check.js";
 export function handleMcp(message, options) {
   const id = message.id;
   if (message.jsonrpc !== "2.0" || typeof message.method !== "string") return { jsonrpc: "2.0", id: id ?? null, error: { code: -32600, message: "Invalid request" } };

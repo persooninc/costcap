@@ -306,6 +306,18 @@ branding included); no Marketplace listing or public release has been made yet. 
 JSON-RPC stdio. It cannot kill, resume, change caps or spend money. Local MCP
 protocol tests do not substitute for verification in every MCP client.
 
+`mcp` and `agent-status` give the same answer the wrapper will enforce on the
+next call. `--kill-file PATH` (default `.costcap/KILL`, the wrapper's default)
+and `--enrollment PATH` (the cached hosted policy that `wrap --enrollment`
+reads) are honoured in the wrapper's order: a kill file, a cached fleet
+`killed: true` or revoked credentials return `ok: false`, `verdict: "killed"`
+and the kill metadata, ahead of any budget verdict. Then the cached fleet
+per-agent caps and team caps apply (`scope` reads e.g. `team:ops:day`), then
+min(local, fleet) day/month caps. Unsettled fleet or team spend returns
+`accounting_unavailable`, never ok. Both commands only read the enrollment
+cache; they never sync or write it. With no kill file and no enrollment the
+output is unchanged.
+
 With `--github-output`, `check` also appends step outputs to `$GITHUB_OUTPUT`
 (delimiter syntax, so values cannot break the file) and a Markdown table to
 `$GITHUB_STEP_SUMMARY`, before it exits. The Action does this automatically and

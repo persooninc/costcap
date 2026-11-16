@@ -15,7 +15,7 @@ import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadSettledReceipts } from "./cap.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets } from "./agent-budget.js";
-import { agentBudgetStatus } from "./check.js";
+import { guardedAgentStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { buildRunSummary, rollupLine, runsCommand, writeRunSummary } from "./run-summary.js";
@@ -30,8 +30,8 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap check [--cap USD] [--day-cap USD] [--month-cap USD] [--run-id ID] [--receipts FILE] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
-  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
-  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
+  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
+  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
   "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--json] [--export csv]\n" +
   "       costcap pricing verify [--receipts FILE] [--json] | costcap pricing show [model]\n" +
@@ -182,7 +182,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
       const options = { receiptsPath: parsed.receiptsPath, caps: parsed.caps, policy: parsed.policyPath ? loadPolicy(parsed.policyPath) : undefined };
       if (cmd === "check" && parsed.runId !== undefined) options.runId = parsed.runId;
-      if (cmd === "mcp") serveMcp(options);
+      if (cmd === "mcp") serveMcp({ ...options, killFile: parsed.killFile, enrollmentPath: parsed.enrollmentPath });
       else {
         const result = checkBudget(options);
         if (parsed.githubOutput) writeGithubOutputs(result, parsed.caps);
@@ -194,7 +194,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     try {
       const parsed = parseWrapArgs([...rest, "--", "unused"]);
       if (!parsed.policyPath) throw new Error("--policy is required");
-      const result = agentBudgetStatus({ receiptsPath: parsed.receiptsPath, policy: loadPolicy(parsed.policyPath), agent_id: parsed.agentId, run_id: parsed.runId ?? null });
+      const result = guardedAgentStatus({ receiptsPath: parsed.receiptsPath, policy: loadPolicy(parsed.policyPath), agent_id: parsed.agentId, run_id: parsed.runId ?? null, killFile: parsed.killFile, enrollmentPath: parsed.enrollmentPath });
       console.log(JSON.stringify(result));
       process.exitCode = result.ok ? 0 : 1;
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
