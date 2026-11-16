@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.14",
+  "version": "2026-11-16.15",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -26,6 +26,8 @@
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (Gemini 2.5 Pro / Flash / Flash-Lite on Vertex AI: same per-token, cached-input and >200K long-context rates as the Gemini API; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/pricing (Built-in tools: web search $10.00/1k calls; web search preview $10/1k reasoning models, $25/1k other models; file search $2.50/1k tool calls; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/pricing (#232: gpt-6-astra, gpt-6.1-sol/terra, gpt-6-sol/luna, gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4(-mini), gpt-5.2 Standard / Fast / Ultrafast; cache writes 30m 1.25x and 12h 2.5x input; retrieved 2026-11-16)",
+    "https://platform.claude.com/docs/en/about-claude/pricing (#234: claude-fable-5-2 / claude-mythos-5-2 $8/$40, cache hit $0.20, 5m $10, 1h $16; claude-mythos-5-1 $10/$50 hit $0.25; claude-mythos-5 $10/$50 hit $1; claude-opus-4-8 / 4-7 $5/$25 hit $0.50; claude-haiku-5-5 $0.10/$0.50 <=100K prompt tokens, $0.50/$2.50 >100K; fast mode $16/$80 on Fable 5.2 and Mythos 5.2, $10/$50 on Opus 4.8; retrieved 2026-11-16)",
+    "https://platform.claude.com/docs/en/about-claude/model-deprecations (#234: Fable 5.2, Mythos 5.2/5.1/5, Opus 4.8/4.7, Haiku 5.5 Active; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/models/gpt-6-astra (#232: >272K input tokens: 2x input/cache, 1.5x output; Fast is 2x the applicable rates; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
@@ -41,7 +43,7 @@
   },
   "batch": { "openai": 0.5, "anthropic": 0.5, "gemini": 0.5 },
   "vertex_gemini": { "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"] },
-  "regional_endpoint": { "multiplier": 1.1, "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"] },
+  "regional_endpoint": { "multiplier": 1.1, "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-mythos-5-2", "claude-mythos-5-1", "claude-mythos-5", "claude-opus-4-8", "claude-opus-4-7", "claude-haiku-5-5"] },
   "currency": "usd_per_1m_tokens",
   "fallback": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "cache_write": 3.125, "cache_write_1h": 5.00 },
   "models": {
@@ -83,6 +85,13 @@
     "claude-fable-5": { "input": 10.00, "cached_input": 1.00, "output": 50.00, "cache_write": 12.50, "cache_write_1h": 20.00 },
     "claude-opus-5-5": { "input": 4.00, "cached_input": 0.20, "output": 20.00, "cache_write": 5.00, "cache_write_1h": 8.00, "fast": { "input": 8.00, "cached_input": 0.40, "output": 40.00, "cache_write": 10.00, "cache_write_1h": 16.00 } },
     "claude-sonnet-5-5": { "input": 2.00, "cached_input": 0.10, "output": 10.00, "cache_write": 2.50, "cache_write_1h": 4.00 },
+    "claude-fable-5-2": { "input": 8.00, "cached_input": 0.20, "output": 40.00, "cache_write": 10.00, "cache_write_1h": 16.00, "fast": { "input": 16.00, "cached_input": 0.40, "output": 80.00, "cache_write": 20.00, "cache_write_1h": 32.00 } },
+    "claude-mythos-5-2": { "input": 8.00, "cached_input": 0.20, "output": 40.00, "cache_write": 10.00, "cache_write_1h": 16.00, "fast": { "input": 16.00, "cached_input": 0.40, "output": 80.00, "cache_write": 20.00, "cache_write_1h": 32.00 } },
+    "claude-mythos-5-1": { "input": 10.00, "cached_input": 0.25, "output": 50.00, "cache_write": 12.50, "cache_write_1h": 20.00 },
+    "claude-mythos-5": { "input": 10.00, "cached_input": 1.00, "output": 50.00, "cache_write": 12.50, "cache_write_1h": 20.00 },
+    "claude-opus-4-8": { "input": 5.00, "cached_input": 0.50, "output": 25.00, "cache_write": 6.25, "cache_write_1h": 10.00, "fast": { "input": 10.00, "cached_input": 1.00, "output": 50.00, "cache_write": 12.50, "cache_write_1h": 20.00 } },
+    "claude-opus-4-7": { "input": 5.00, "cached_input": 0.50, "output": 25.00, "cache_write": 6.25, "cache_write_1h": 10.00 },
+    "claude-haiku-5-5": { "input": 0.10, "cached_input": 0.01, "output": 0.50, "cache_write": 0.125, "cache_write_1h": 0.20, "long_context": { "threshold_input_tokens": 100000, "input": 0.50, "cached_input": 0.05, "output": 2.50, "cache_write": 0.625, "cache_write_1h": 1.00 } },
     "claude-haiku-4-5": { "input": 1.00, "cached_input": 0.10, "output": 5.00, "cache_write": 1.25, "cache_write_1h": 2.00 },
     "gemini-embedding-001": { "input": 0.15, "cached_input": 0.15, "output": 0, "input_only": true, "uniform_modalities": true },
     "gemini-embedding-2": { "input": 0.20, "cached_input": 0.20, "output": 0, "input_only": true, "modalities": { "image": { "input": 0.45, "cached_input": 0.45 }, "audio": { "input": 6.50, "cached_input": 6.50 }, "video": { "input": 12.00, "cached_input": 12.00 } } },

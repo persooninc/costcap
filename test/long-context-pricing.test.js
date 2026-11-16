@@ -194,3 +194,39 @@ test("#232 AC4: gpt-6.1-sol long context standard and fast", async () => {
     assert.deepEqual([r.cost_usd, r.reason], [null, "service_tier_unpriced"], m);
   }
 });
+
+// #234: Haiku 5.5 >100K prompt tier (prompt counts cache reads/writes); Fable 5.2 cache usage through the proxy.
+test("#234 AC3: claude-haiku-5-5 standard up to 100000 prompt tokens, long_context above", () => {
+  const a = costForUsage("claude-haiku-5-5", { input_tokens: 80_000, output_tokens: 1000 });
+  assert.deepEqual([a.cost_usd, a.pricing_tier], [0.0085, "standard"]);
+  const b = costForUsage("claude-haiku-5-5", { input_tokens: 100_000, output_tokens: 1000 });
+  assert.deepEqual([b.cost_usd, b.pricing_tier], [0.0105, "standard"]);
+  const c = costForUsage("claude-haiku-5-5", { input_tokens: 90_000, cached_input_tokens: 20_000, output_tokens: 1000 });
+  assert.deepEqual([c.cost_usd, c.pricing_tier], [0.0485, "long_context"]);
+  const reg = costForUsage("claude-haiku-5-5", { input_tokens: 90_000, cached_input_tokens: 20_000, output_tokens: 1000 }, { regional: true });
+  assert.deepEqual([reg.cost_usd, reg.pricing_tier, reg.regional_multiplier], [0.05335, "long_context", 1.1]);
+});
+
+test("#234 pricing show prints Haiku 5.5 >100000 and Fable 5.2 fast rows; verify passes", () => {
+  const out = pricingCommand(["show"]).out;
+  assert.match(out, /claude-haiku-5-5 \(>100000 input tokens\): input \$0\.5, cached_input \$0\.05/);
+  assert.match(out, /claude-fable-5-2 \(fast\): input \$16/);
+  assert.equal(pricingCommand(["verify"]).code, 0);
+});
+
+const FABLE_USAGE = { input_tokens: 1000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 20_000, cache_creation: { ephemeral_5m_input_tokens: 10_000, ephemeral_1h_input_tokens: 10_000 }, output_tokens: 2000 };
+test("#234 AC2 proxy: claude-fable-5-2 cache usage costs 0.368 as JSON and SSE, no fallback", async (t) => {
+  const json = await through(t, "anthropic", "/v1/messages", JSON.stringify({ model: "claude-fable-5-2", usage: FABLE_USAGE }));
+  assert.equal(await json.call(), 200);
+  const { output_tokens, ...start } = FABLE_USAGE;
+  const events = [
+    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: "claude-fable-5-2", usage: { ...start, output_tokens: 1 } } })}`,
+    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens } })}`,
+    'event: message_stop\ndata: {"type":"message_stop"}', ""].join("\n\n");
+  const sse = await through(t, "anthropic", "/v1/messages", events, "text/event-stream");
+  assert.equal(await sse.call(), 200);
+  for (const r of [json.receipts[0], sse.receipts[0]]) {
+    assert.equal(r.cost_usd, 0.368);
+    assert.ok(!r.fallback);
+  }
+});

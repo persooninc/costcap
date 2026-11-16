@@ -93,3 +93,19 @@ test("#232 AC1: GPT-6 / GPT-5.6 / gpt-5.2-5.5 rows and dated snapshots are price
   assert.equal(lookupPrice("gpt-5.5").cache_write, undefined);
   assert.equal(costForUsage("gpt-5.5", { cache_write_input_tokens: 10 }).reason, "cache_write_unpriced");
 });
+
+// #234: current Claude models carry published rates (no fallback).
+test("#234 AC1: Fable 5.2, Mythos 5.x, Opus 4.7/4.8, Haiku 5.5 and a dated snapshot are priced", () => {
+  const out = { "claude-fable-5-2": 40, "claude-mythos-5-2": 40, "claude-mythos-5-1": 50, "claude-mythos-5": 50, "claude-opus-4-8": 25, "claude-opus-4-7": 25, "claude-haiku-5-5": 0.5, "claude-opus-4-8-20260528": 25 };
+  for (const [m, usd] of Object.entries(out)) {
+    assert.equal(isPricedModel(m), true, m);
+    assert.equal(lookupPrice(m).fallback, false, m);
+    const r = costForUsage(m, { output_tokens: 1_000_000 });
+    assert.deepEqual([r.cost_usd, r.fallback], [usd, false], m);
+  }
+});
+
+test("#234 AC2: Fable 5.2 cache usage meters every cache component at list price", () => {
+  const r = costForUsage("claude-fable-5-2", { input_tokens: 1000, cached_input_tokens: 100_000, cache_write_input_tokens: 10_000, cache_write_1h_input_tokens: 10_000, output_tokens: 2000 });
+  assert.deepEqual([r.cost_usd, r.fallback], [0.368, false]);
+});

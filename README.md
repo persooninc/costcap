@@ -319,7 +319,7 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   and the next call returns `accounting_unavailable`: never priced as text.
   `costcap pricing show` prints the modality rates. When a model
   publishes a prompt-length split (Gemini 2.5 Pro / 3.1 Pro, Claude Sonnet
-  4.5 / 4.6 above 200K prompt tokens), a call whose whole prompt (input +
+  4.5 / 4.6 above 200K prompt tokens, Claude Haiku 5.5 above 100K), a call whose whole prompt (input +
   cache read + cache writes) exceeds the threshold is priced entirely at the
   `long_context` rates, and the receipt says `pricing_tier: "long_context"`
   (otherwise `"standard"`). Preflight and `costcap pricing show` use the same
@@ -335,8 +335,13 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   A breakdown that doesn't sum, or cached + writes above the prompt total, is unknown
   (`cost_usd: null`), never guessed. Prompts over 272K input tokens use the model's
   `long_context` rates (2x input/cache, 1.5x output). GPT-6 web search is $0.01 per call.
+- Current Claude models (#234): `claude-fable-5-2` and `claude-mythos-5-2` ($8/$40 per M, cache
+  hit $0.20), `claude-mythos-5-1` and `claude-mythos-5` ($10/$50), `claude-opus-4-8` and
+  `claude-opus-4-7` ($5/$25) and `claude-haiku-5-5` ($0.10/$0.50; $0.50/$2.50 when the whole
+  prompt exceeds 100K tokens) are priced from the table, including 5m/1h cache writes, dated
+  snapshots, the 1.1x Bedrock/Vertex regional premium and 0.5x batch.
 - Premium speed tiers: Anthropic fast mode (response `usage.speed: "fast"`,
-  Claude Opus 5.5 at $8/$40 per M, Claude Opus 5 at $10/$50), OpenAI Fast (formerly Priority:
+  Claude Fable 5.2 / Mythos 5.2 at $16/$80 per M, Claude Opus 4.8 at $10/$50, Claude Opus 5.5 at $8/$40 per M, Claude Opus 5 at $10/$50), OpenAI Fast (formerly Priority:
   `service_tier: "fast"` on GPT-6, `"priority"` on GPT-5.6 and earlier; gpt-4o at $4.25/$17,
   gpt-6-astra at $20/$100) and OpenAI Ultrafast (`service_tier: "ultrafast"`, gpt-6-astra and
   gpt-6.1-sol only, 6x standard) are priced at the table's `fast` / `priority` / `ultrafast`

@@ -390,3 +390,18 @@ test("cloud errors ({message}) are upstream_rejected, not a pause; cache always 
   assert.equal(isCloudError(Buffer.from("nope")), false);
   assert.equal(isCloudError(Buffer.from('{"message":"x","usage":{}}')), false);
 });
+
+test("#234 AC5: Bedrock Fable 5.2 (global) and Opus 4.8 (regional) are metered, never cloud_model_unpriced", async (t) => {
+  assert.equal(mapCloudModel("bedrock", "global.anthropic.claude-fable-5-2"), "claude-fable-5-2");
+  const up = await fakeCloud((req, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...message, model: "x" })));
+  const { base, port, receipts } = await proxyFor(t, up, { unknownModels: "refuse" });
+  const body = JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 10, messages: [] });
+  assert.equal((await signedPost(base, port, `/bedrock/model/${enc("global.anthropic.claude-fable-5-2")}/invoke`, body)).status, 200);
+  assert.equal((await signedPost(base, port, `/bedrock/model/${enc("us.anthropic.claude-opus-4-8-v1:0")}/invoke`, body)).status, 200);
+  assert.deepEqual(receipts.map((r) => [r.model, r.endpoint_scope, r.regional_multiplier ?? null, r.reason ?? null]), [
+    ["claude-fable-5-2", "global", null, null], ["claude-opus-4-8", "regional", 1.1, null]]);
+  assert.equal(receipts[0].cost_usd, expected("claude-fable-5-2", 1));
+  assert.equal(receipts[1].cost_usd, expected("claude-opus-4-8", 1.1));
+  const reg = costForUsage("claude-haiku-5-5", { input_tokens: 90_000, cached_input_tokens: 20_000, output_tokens: 1000 }, { regional: true });
+  assert.deepEqual([reg.cost_usd, reg.regional_multiplier], [0.05335, 1.1]);
+});

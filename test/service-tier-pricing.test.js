@@ -224,3 +224,15 @@ test("#232 preflight: ultrafast estimates at premium rates; unrecognised tier re
   const un = estimateWorstCase("openai", JSON.stringify({ model: "gpt-6-astra", service_tier: "turbo" }), "/v1/responses");
   assert.equal(un.reason, "preflight_unpriced");
 });
+
+// #234 AC4: fast mode on Fable 5.2 / Opus 4.8; models without a fast set stay unpriced.
+test("#234 AC4: fast mode on claude-fable-5-2 and claude-opus-4-8; none on opus-4-7 / haiku-5-5", () => {
+  const f = costForUsage("claude-fable-5-2", { input_tokens: 1000, cached_input_tokens: 10_000, output_tokens: 1000, speed: "fast" });
+  assert.deepEqual([f.cost_usd, f.pricing_tier], [0.1, "fast"]);
+  const o = costForUsage("claude-opus-4-8", { output_tokens: 1_000_000, speed: "fast" });
+  assert.deepEqual([o.cost_usd, o.pricing_tier], [50, "fast"]);
+  for (const m of ["claude-opus-4-7", "claude-haiku-5-5"]) {
+    const r = costForUsage(m, { input_tokens: 1000, output_tokens: 1, speed: "fast" });
+    assert.deepEqual([r.cost_usd, r.reason], [null, "service_tier_unpriced"], m);
+  }
+});

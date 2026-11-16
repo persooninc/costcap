@@ -309,3 +309,11 @@ test("#232 AC5: --preflight refuses a gpt-6-astra ultrafast request over a $0.10
     assert.deepEqual([last.reason, last.pricing_tier], ["preflight_estimate", "ultrafast"]);
   } finally { h.close(); }
 });
+
+test("#234 AC6: preflight prices claude-fable-5-2 instead of preflight_unpriced", () => {
+  const req = body({ model: "claude-fable-5-2", max_tokens: 4000, messages: [{ role: "user", content: "hi" }] });
+  const e = estimateWorstCase("anthropic", req);
+  assert.equal(e.estimate_usd, 0.160184);
+  assert.equal(preflightCheck(createCapEngine({ caps: { day: 0.1 } }), "anthropic", req).reason, "preflight_estimate");
+  assert.equal(preflightCheck(createCapEngine({ caps: { day: 1 } }), "anthropic", req), null);
+});

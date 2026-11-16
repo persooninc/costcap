@@ -188,3 +188,9 @@ test("#232 AC1: a gpt-6-astra batch line settles at 0.5x standard; ultrafast sta
   assert.deepEqual([r.ok, r.cost_usd, r.succeeded], [true, 0.03, 1]); // (1000*10 + 1000*50)/1e6 * 0.5
   for (const t of ["fast", "ultrafast", "turbo"]) assert.equal(foldBatchResults("openai", line({ service_tier: t })).ok, false, t);
 });
+
+test("#234 AC3: a claude-haiku-5-5 >100K batch line settles at 0.5x the long-context rate", () => {
+  const line = JSON.stringify({ custom_id: "h", result: { type: "succeeded", message: { model: "claude-haiku-5-5", usage: { input_tokens: 90_000, cache_read_input_tokens: 20_000, output_tokens: 1000 } } } });
+  const r = foldBatchResults("anthropic", line);
+  assert.deepEqual([r.ok, r.cost_usd, r.succeeded], [true, 0.02425, 1]);
+});
