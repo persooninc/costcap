@@ -5,17 +5,27 @@ import { createKillCheck } from "./kill.js";
 import { DEFAULT_WARN_AT, currentWarnings } from "./cap-warn.js";
 import { createFleetClient } from "./hosted/client.js";
 import { createTagCaps } from "./tag-cap.js";
+import { createModelCaps } from "./model-cap.js";
 
 // #191: --tag-cap lists every tag value at or over its cap; any one fails the check.
-export function checkBudget({ tagCaps, ...options }) {
+// #238: --model-cap lists every model rule at or over its cap the same way.
+export function checkBudget({ tagCaps, modelCaps, ...options }) {
   const history = loadReceipts(options.receiptsPath);
   if (!history.length) throw new Error("No receipts found; a budget check needs evidence");
-  const base = options.runId != null ? checkRunBudget({ ...options, history, warnAt: options.warnAt ?? DEFAULT_WARN_AT }) : checkLedgerBudget({ ...options, history });
-  if (!tagCaps?.length) return base;
-  const over = createTagCaps({ rules: tagCaps, history, now: options.now }).over();
-  const first = over[0];
-  const hit = base.hit ?? (first ? { scope: first.scope, reason: "tag_budget_exceeded", tag_key: first.key, tag_value: first.value, cap: first.cap_usd, spent: first.spend_usd } : null);
-  return { ...base, ok: base.ok && !over.length, hit, tag_caps: over };
+  let out = options.runId != null ? checkRunBudget({ ...options, history, warnAt: options.warnAt ?? DEFAULT_WARN_AT }) : checkLedgerBudget({ ...options, history });
+  if (tagCaps?.length) {
+    const over = createTagCaps({ rules: tagCaps, history, now: options.now }).over();
+    const first = over[0];
+    const hit = out.hit ?? (first ? { scope: first.scope, reason: "tag_budget_exceeded", tag_key: first.key, tag_value: first.value, cap: first.cap_usd, spent: first.spend_usd } : null);
+    out = { ...out, ok: out.ok && !over.length, hit, tag_caps: over };
+  }
+  if (modelCaps?.length) {
+    const over = createModelCaps({ rules: modelCaps, history, now: options.now }).over();
+    const first = over[0];
+    const hit = out.hit ?? (first ? { scope: first.scope, reason: "model_budget_exceeded", model: first.model, cap: first.cap_usd, spent: first.spend_usd } : null);
+    out = { ...out, ok: out.ok && !over.length, hit, model_caps: over };
+  }
+  return out;
 }
 
 function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }) {

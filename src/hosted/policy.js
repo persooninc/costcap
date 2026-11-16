@@ -9,6 +9,7 @@
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
 import { anomalyError } from "./anomaly.js";
+import { modelCapsError } from "../model-cap.js";
 import { downgradeError, mergeDowngrade } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
@@ -121,6 +122,11 @@ export function validatePolicy(p) {
     const err = anomalyError(p.anomaly);
     if (err) errors.push(err);
   }
+  // Per-model caps (issue #238): optional [{model, scope, usd}].
+  if (p.modelCaps !== undefined && p.modelCaps !== null) {
+    const err = modelCapsError(p.modelCaps);
+    if (err) errors.push(err);
+  }
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   const raiseErr = raiseError(p.raise);
   if (raiseErr) errors.push(raiseErr);
@@ -160,5 +166,5 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
   // #207: fleet downgrade; local can only add unmapped models and lower `at`.
   const downgrade = mergeDowngrade(server?.downgrade ?? null, local?.downgrade ?? null);
-  return { caps, maxSteps, models, ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+  return { caps, maxSteps, models, ...(server?.modelCaps ? { modelCaps: server.modelCaps } : {}), ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }

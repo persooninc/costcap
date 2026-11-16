@@ -642,6 +642,12 @@ On OpenRouter, every entry of a `models` fallback array is checked too (OpenRout
 
 The same `models: [...]` limit works in a `--policy` file (`default`, `agents.<id>`, `teams.<id>`) and on the hosted per-agent policy (`models` on `POST /v1/agents/:id/policy`, or "Allowed models" in the dashboard; `null` clears it). Enrolled wrappers enforce the synced list offline. All lists combine as an intersection, so the most restrictive wins; an empty intersection refuses every call. `costcap check --models ...`, `agent-status` and the MCP budget tools report `allowed_models`; `check` also reports `blocked_model_count`. Receipts CSV exports and `/v1/evidence.json` carry an `outcome` column.
 
+#### Per-model caps
+
+Cap one expensive model without stopping the others: `costcap wrap --model-cap claude-opus-4-8:day=20 -- node agent.js` (repeatable, SCOPE `hour|day|month`; the split is on the last `:` so Bedrock ids like `anthropic.claude-opus-4-8-v1:0:day=5` work). Models are matched the way pricing resolves them, so a rule on `claude-opus-4-8` also covers its dated snapshots, `anthropic/claude-opus-4-8` on OpenRouter and the Bedrock/Vertex ids; an id with no pricing row matches exactly. Once the model's spend in the window reaches the cap, calls to it get `429 {"error":"model_budget_exceeded","model","scope","spend_usd","cap_usd"}` (plus `retry_after_s` and `Retry-After` for `hour`) and are never forwarded; other models keep working and the run is not frozen. Every OpenRouter `models` fallback entry is checked, a #207 downgrade counts against the model actually sent, `--preflight` also checks the worst case against the model's remaining headroom, and an unsettled unknown-cost receipt for a capped model returns `accounting_unavailable` for that model only until it is reconciled.
+
+`costcap check --model-cap claude-opus-4-8:day=20` lists rules at or over their cap in `model_caps` and fails (the Action takes `model-caps: "claude-opus-4-8:day=20"` and outputs `model-caps`). Hosted: `POST /v1/agents/:id/policy` takes `modelCaps: [{"model":"claude-opus-4-8","scope":"day","usd":20}]` (null clears); enrolled wrappers enforce it offline against the local ledger, merged with local rules (for the same model:scope the lower cap wins), and the agent card shows a "Model caps" line. OpenAI batch creates and Files uploads are not pre-checked; their settled spend still counts under the receipt's model.
+
 An agent entry replaces the default. An agent with no entry and no default is
 refused (`no_budget_policy`).
 

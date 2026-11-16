@@ -26,6 +26,9 @@ inputs:
   tag-caps:
     description: Optional per-tag caps, space separated KEY:SCOPE=USD rules (e.g. "customer:day=5 customer:month=50"); each tag value gets its own cap
     required: false
+  model-caps:
+    description: Optional per-model caps, space separated MODEL:SCOPE=USD rules (e.g. "claude-opus-4-8:day=20")
+    required: false
   baseline:
     description: Optional path to a baseline summary JSON (costcap summary --json, e.g. downloaded from the last main run); enables the cost diff
     required: false
@@ -72,6 +75,9 @@ outputs:
   tag-caps:
     description: Tag values at or over a tag-caps rule, as key=value:scope:spent/cap pairs; empty if none
     value: ${{ steps.check.outputs.tag-caps }}
+  model-caps:
+    description: Models at or over a model-caps rule, as model:scope:spent/cap; empty if none
+    value: ${{ steps.check.outputs.model-caps }}
   delta-usd:
     description: With baseline, current minus baseline USD; empty when current cost is unknown
     value: ${{ steps.check.outputs.delta-usd }}
@@ -100,6 +106,7 @@ runs:
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
         COSTCAP_RUN_ID: ${{ inputs.run-id }}
         COSTCAP_TAG_CAPS: ${{ inputs.tag-caps }}
+        COSTCAP_MODEL_CAPS: ${{ inputs.model-caps }}
         COSTCAP_BASELINE: ${{ inputs.baseline }}
         COSTCAP_MAX_INCREASE_PCT: ${{ inputs.max-increase-pct }}
         COSTCAP_MAX_INCREASE_USD: ${{ inputs.max-increase-usd }}
@@ -112,6 +119,7 @@ runs:
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
         if [ -n "$COSTCAP_RUN_ID" ]; then args+=(--run-id "$COSTCAP_RUN_ID"); fi
         for rule in $COSTCAP_TAG_CAPS; do args+=(--tag-cap "$rule"); done
+        for rule in $COSTCAP_MODEL_CAPS; do args+=(--model-cap "$rule"); done
         if [ -n "$COSTCAP_BASELINE" ]; then args+=(--baseline "$COSTCAP_BASELINE"); fi
         if [ -n "$COSTCAP_MAX_INCREASE_PCT" ]; then args+=(--max-increase-pct "$COSTCAP_MAX_INCREASE_PCT"); fi
         if [ -n "$COSTCAP_MAX_INCREASE_USD" ]; then args+=(--max-increase-usd "$COSTCAP_MAX_INCREASE_USD"); fi

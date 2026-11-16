@@ -14,6 +14,7 @@ import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
 import { warningLine } from "./cap-warn.js";
+import { modelBudgetExceededBody } from "./model-cap.js";
 import { DOWNGRADE_HEADER, downgradeLine, downgradeRoute, rewriteModel } from "./downgrade.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, checkEstimate, estimateBatch, openRouterModels } from "./preflight.js";
@@ -507,7 +508,7 @@ function batchIdOf(raw) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, now = Date.now } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, modelCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, now = Date.now } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
@@ -526,6 +527,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const complete = { id: randomUUID(), ts: new Date(now()).toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     tagCaps?.record(complete);
+    modelCaps?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     sharedLedger?.track?.(complete);
@@ -777,6 +779,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const tagHit = tagCaps?.check(reqTags);
           if (tagHit?.verdict === "accounting_unavailable") return block("accounting_unavailable", tagHit, { error: "accounting_unavailable", ...tagHit });
           if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
+          // #238: per-model caps, checked after any #207 rewrite; never latch the run.
+          const capModels = generates && !freeMgmt ? checkModels.filter(Boolean) : [];
+          const modelHit = capModels.length ? modelCaps?.check(capModels) : null;
+          if (modelHit?.verdict === "accounting_unavailable") { requestedModel = modelHit.model; return block("accounting_unavailable", modelHit, { error: "accounting_unavailable", ...modelHit }); }
+          if (modelHit) { requestedModel = modelHit.model; const { rule_model: _rm, ...d } = modelHit; return block("model_budget_exceeded", d, modelBudgetExceededBody(modelHit)); }
           // #205: preflight estimates generating calls only. GET/HEAD (polls, retrieves,
           // model lists), file uploads and OpenAI batch creates (models live in an
           // uploaded file) pass through; audio checks only that the model is priced.
@@ -833,6 +840,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
               const tagPf = tagCaps?.preflight?.(reqTags, est);
               if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));
+              const modelPf = capModels.length ? modelCaps?.preflight?.(capModels, est) : null;
+              if (modelPf) return block("model_budget_exceeded", modelPf, modelBudgetExceededBody(modelPf));
             }
           }
           // #192: RPM/TPM refuse with Retry-After; never latches, never a step.
@@ -1011,6 +1020,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               recordSpend({ cost_usd: c.cost_usd, ts: bgPending.ts }, { external });
               agentBudgets?.settle({ receipt_id: bgPending.id, cost_usd: c.cost_usd });
               tagCaps?.settle(bgPending.id, c.cost_usd);
+              modelCaps?.settle(bgPending.id, c.cost_usd);
               rateLimit?.record(usageTokens(metered.usage));
               // #201: another run's settle counts toward day/month and budgets, never this run's velocity (matches batches).
               if (external) velocity?.step?.();
@@ -1123,6 +1133,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 // #179: --policy agent/team budgets count the batch at its original ts, no restart needed.
                 agentBudgets?.settle({ receipt_id: pending.id, cost_usd: folded.cost_usd });
                 tagCaps?.settle(pending.id, folded.cost_usd);
+                modelCaps?.settle(pending.id, folded.cost_usd);
                 flushWarnings();
               } else {
                 // Unpriced, premium-speed or malformed results: the batch stays unknown, never $0.
@@ -1183,7 +1194,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const tagHit = tagCaps?.check(tags);
     if (tagHit?.verdict === "accounting_unavailable") return { status: 429, reason: "accounting_unavailable", detail: tagHit, body: { error: "accounting_unavailable", ...tagHit } };
     if (tagHit) return { status: 429, reason: "tag_budget_exceeded", detail: tagHit, body: tagBudgetExceededBody(tagHit) };
-    void model;
+    const modelHit = model ? modelCaps?.check([model]) : null;
+    if (modelHit?.verdict === "accounting_unavailable") return { status: 429, reason: "accounting_unavailable", detail: modelHit, body: { error: "accounting_unavailable", ...modelHit } };
+    if (modelHit) { const { rule_model: _rm, ...d } = modelHit; return { status: 429, reason: "model_budget_exceeded", detail: d, body: modelBudgetExceededBody(modelHit) }; }
     return null;
   };
   const ensureKillTimer = () => {

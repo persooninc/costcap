@@ -1003,7 +1003,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const downgrade = body.downgrade === undefined ? a.policy.downgrade : body.downgrade;
           // anomaly (issue #223): omitted keeps, null clears (org default applies).
           const anomaly = body.anomaly === undefined ? a.policy.anomaly : body.anomaly;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(anomaly != null ? { anomaly } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
+          // modelCaps (issue #238): omitted keeps, null clears.
+          const modelCaps = body.modelCaps === undefined ? a.policy.modelCaps : body.modelCaps;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(anomaly != null ? { anomaly } : {}), ...(modelCaps != null ? { modelCaps } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
           { const errs = validatePolicy(policy); if (errs.length) fail(400, `Invalid policy: ${errs.join("; ")}`); }
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }) };

@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { formatDiffMarkdown } from "./cost-diff.js";
 
-export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id", "tag-caps"]);
+export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id", "tag-caps", "model-caps"]);
 export const DIFF_OUTPUT_NAMES = Object.freeze(["delta-usd", "delta-pct", "baseline-usd", "diff-markdown"]);
 
 const usd = (n) => (n == null ? "" : String(Number(Number(n).toFixed(6))));
@@ -29,6 +29,8 @@ export function checkOutputs(result, caps = {}) {
   // Only run-scoped checks emit run-id, so ledger-wide output stays unchanged.
   if (result.run_id != null) out["run-id"] = String(result.run_id);
   // #191: e.g. "customer=acme:day:1.2/1"; only present when --tag-cap was given.
+  // #238: e.g. "claude-opus-4-8:day:1.2/1"; only present when --model-cap was given.
+  if (Array.isArray(result.model_caps)) out["model-caps"] = result.model_caps.map((t) => `${t.model}:${t.scope}:${t.spend_usd}/${t.cap_usd}`).join(",");
   if (Array.isArray(result.tag_caps)) out["tag-caps"] = result.tag_caps.map((t) => `${t.key}=${t.value}:${t.scope}:${t.spend_usd}/${t.cap_usd}`).join(",");
   return out;
 }
@@ -44,10 +46,10 @@ export function formatOutputFile(outputs, delim = () => `costcap_${randomUUID()}
   return out;
 }
 
-const cell = (v, k) => String(v === "" ? (k === "warnings" || k === "tag-caps" ? "none" : "unknown") : v).replace(/[|\r\n]/g, " ");
+const cell = (v, k) => String(v === "" ? (k === "warnings" || k === "tag-caps" || k === "model-caps" ? "none" : "unknown") : v).replace(/[|\r\n]/g, " ");
 
 export function formatSummary(outputs) {
-  const rows = OUTPUT_NAMES.filter((k) => (k !== "run-id" && k !== "tag-caps") || outputs[k] != null).map((k) => `| ${k} | ${cell(outputs[k], k)} |`).join("\n");
+  const rows = OUTPUT_NAMES.filter((k) => (k !== "run-id" && k !== "tag-caps" && k !== "model-caps") || outputs[k] != null).map((k) => `| ${k} | ${cell(outputs[k], k)} |`).join("\n");
   const unknown = Number(outputs["unknown-receipts"]) > 0;
   return `## CostCap budget check: ${cell(outputs.verdict)}\n\n| Field | Value |\n| --- | --- |\n${rows}\n\n` +
     "Totals are estimates from receipts metered through the CostCap proxy, not provider invoices.\n" +
