@@ -1,6 +1,7 @@
 // SRM evidence export (costcap.evidence/v1). A versioned, org-scoped document
 // that ShipReady Metrics can ingest: per-agent caps, spend, unknown-cost counts,
 // open alerts and receipts. Null cost stays null and is never summed as $0.
+import { activeRaises, effectiveCaps } from "./policy.js";
 export const EVIDENCE_SCHEMA = "costcap.evidence/v1";
 
 const known = (unknown) => unknown === 0;
@@ -17,6 +18,8 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
       revoked: Boolean(a.revoked),
       killed: Boolean(a.policy?.killed),
       caps: { ...(a.policy?.caps ?? {}) },
+      // #208: caps in force now (base + any active time-boxed raise) and the raises themselves.
+      ...(Object.keys(activeRaises(a.policy, nowMs)).length ? { effective_caps: effectiveCaps(a.policy, nowMs), raises: activeRaises(a.policy, nowMs) } : {}),
       team: teams.find((t) => t.agents.includes(a.id))?.name ?? null,
       spend: Object.fromEntries(["day", "month"].map((w) => [w, {
         usd_known: Number(spend[w].usd.toFixed(6)),

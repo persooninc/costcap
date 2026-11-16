@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, statSync, appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { enroll, createFleetClient, loadEnrollment, serviceUrl } from "../src/hosted/client.js";
+import { enroll, createFleetClient, loadEnrollment, serviceUrl, saveEnrollment, requestRaise } from "../src/hosted/client.js";
 
 async function setup(t) {
   const dir = mkdtempSync(join(tmpdir(), "cc-fleet-"));
@@ -198,4 +198,46 @@ test("#204 fleet tag caps: cached offline, merged with local rules, invalid payl
   assert.equal((await client.sync()).online, true);
   assert.equal(client.tagCaps(), null);
   assert.equal(client.tagCheck({ customer: "acme" }), null);
+});
+
+// Issue #208 regression: an offline wrapper on a cached raised policy refuses again
+// after expires_at, with no fetch, and a local cap still tightens the raised cap.
+test("regression #208: offline wrapper reverts to base caps when a cached raise expires", async (t) => {
+  const f = await setup(t);
+  const now = Date.now();
+  const data = loadEnrollment(f.path);
+  data.policy = { version: 5, caps: { day: 5 }, killed: false, raise: { day: { cap: 25, expires_at: new Date(now + 3600_000).toISOString(), request_id: "req-1" } } };
+  data.agentSpend = { spent: { day: 6, month: 6 }, unknown: 0, as_of: new Date(now).toISOString() };
+  saveEnrollment(f.path, data);
+  f.server.closeAllConnections(); f.server.close(); // offline from here on
+  const client = createFleetClient(f);
+  assert.equal(client.policy(now).caps.day, 25);
+  assert.equal(client.agentCheck(now), null);
+  const later = now + 3600_000 + 1;
+  assert.equal(client.policy(later).caps.day, 5);
+  assert.equal(client.agentCheck(later).verdict, "budget_exceeded");
+  assert.equal(client.agentCheck(later).cap_usd, 5);
+  assert.equal((await client.sync()).online, false);
+});
+
+test("#208: requestRaise files a request with the enrollment token and maps errors", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-raise-"));
+  const path = join(dir, "enrollment.json");
+  let status = 201, seen;
+  const server = http.createServer(async (req, res) => {
+    let body = ""; for await (const c of req) body += c;
+    seen = { url: req.url, auth: req.headers.authorization, body: JSON.parse(body) };
+    res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(status === 201 ? { id: "req-1", status: "pending", ...seen.body } : { error: "x" }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  saveEnrollment(path, { url: `http://127.0.0.1:${server.address().port}`, token: "agent-token", agentId: "agent-1", policy: { version: 1, caps: { day: 5 }, killed: false }, syncedIds: [] });
+  const r = await requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "batch" });
+  assert.equal(r.id, "req-1");
+  assert.equal(seen.url, "/v1/agents/agent-1/cap-requests");
+  assert.equal(seen.auth, "Bearer agent-token");
+  assert.deepEqual(seen.body, { scope: "day", amount_usd: 20, duration_hours: 4, reason: "batch" });
+  status = 409; await assert.rejects(requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "b" }), /already pending/);
+  status = 400; await assert.rejects(requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "b" }), /request rejected/);
+  status = 500; await assert.rejects(requestRaise({ path, scope: "day", amountUsd: 20, durationHours: 4, reason: "b" }), /HTTP 500/);
 });

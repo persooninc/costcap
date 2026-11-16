@@ -4,7 +4,8 @@ import http from "node:http";
 import { uiResponse } from "./ui.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
-import { hashToken, validatePolicy } from "./policy.js";
+import { hashToken, validatePolicy, effectiveCaps } from "./policy.js";
+import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
@@ -238,6 +239,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const orgMembers = (s, orgId) => Object.values(s.users).filter((m) => m.orgId === orgId).map((m) => ({ id: m.id, email: m.email, role: m.role, verified: Boolean(m.verified) })).sort((a, b) => a.email.localeCompare(b.email));
   // Issue #123: org teams and their verdicts from synced receipts.
   const orgTeams = (s, orgId) => Object.values(s.teams ?? {}).filter((t) => t.orgId === orgId).sort((a, b) => a.name.localeCompare(b.name));
+  const sweepRaises = (s) => { for (const row of expireRaises(s, now())) audit(s, row.orgId, "cap-raise-expiry", "cap_request.expire", row.agentId, { request_id: row.request_id, scope: row.scope, reason: row.reason, before: row.before, after: row.after }); };
   const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map(costedReceipt);
   // Issue #127: org-scoped, so another org's receipts never count toward agent_spend.
   const orgAgentReceipts = (s, orgId, agentId) => Object.values(s.receipts).filter((r) => r.orgId === orgId && r.agentId === agentId).map(costedReceipt);
@@ -709,6 +711,50 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null, team: t ? verdictOf(s, t) : null });
         }));
       }
+      // Issue #208: time-boxed cap raise requests.
+      const capReqRoute = /^\/v1\/agents\/([^/]+)\/cap-requests$/.exec(path);
+      if (capReqRoute && req.method === "POST") {
+        const input = parseCapRequest(body);
+        const result = store.transaction((s) => {
+          const caller = req.headers.authorization && !bearerApiKey(req) ? { agent: agentUser(s, req) } : { user: member(s, req) };
+          const a = s.agents[decodeURIComponent(capReqRoute[1])];
+          const orgId = caller.agent?.orgId ?? caller.user.orgId;
+          if (!a || a.orgId !== orgId || a.revoked || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
+          const actor = caller.agent?.id ?? caller.user.id;
+          const record = createCapRequest(s, { agent: a, actor, input, id: randomUUID(), nowMs: now() });
+          audit(s, orgId, actor, "cap_request.create", a.id, { request_id: record.id, scope: input.scope, amount_usd: input.amount_usd, duration_hours: input.duration_hours, reason: input.reason, before: { caps: { ...a.policy.caps } }, after: { caps: { ...a.policy.caps } } });
+          return record;
+        });
+        return json(201, result);
+      }
+      if (path === "/v1/cap-requests" && req.method === "GET") {
+        const status = new URL(req.url, origin).searchParams.get("status") ?? "all";
+        if (!CAP_REQUEST_STATUSES.includes(status)) fail(400, `status must be one of ${CAP_REQUEST_STATUSES.join("|")}`);
+        return json(200, store.transaction((s) => {
+          const u = member(s, req);
+          sweepRaises(s);
+          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
+          return { requests: listCapRequests(s, u.orgId, status).map((r) => ({ ...r, agent_name: names[r.agentId] ?? null })), canDecide: ["owner", "admin"].includes(u.role) };
+        }));
+      }
+      const decideRoute = /^\/v1\/cap-requests\/([^/]+)\/(approve|deny)$/.exec(path);
+      if (decideRoute && req.method === "POST") {
+        return json(200, store.transaction((s) => {
+          const u = memberAdmin(s, req);
+          const r = findRequest(s, u.orgId, decodeURIComponent(decideRoute[1]));
+          const a = s.agents[r.agentId];
+          if (decideRoute[2] === "deny") {
+            const note = typeof body?.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 500) : null;
+            denyCapRequest(r, { actor: u.id, note, nowMs: now() });
+            audit(s, u.orgId, u.id, "cap_request.deny", r.agentId, { request_id: r.id, scope: r.scope, reason: r.reason, note, before: { caps: { ...a.policy.caps } }, after: { caps: { ...a.policy.caps } } });
+            return r;
+          }
+          const approval = parseApproval(body, r);
+          const { before, after } = approveCapRequest(s, { request: r, approval, actor: u.id, nowMs: now() });
+          audit(s, u.orgId, u.id, "cap_request.approve", r.agentId, { request_id: r.id, scope: r.scope, amount_usd: approval.amount_usd, duration_hours: approval.duration_hours, expires_at: r.expires_at, reason: r.reason, note: approval.note, before, after });
+          return r;
+        }));
+      }
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
         const freeze = path.endsWith("/freeze");
         const result = store.transaction((s) => {
@@ -737,7 +783,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           // rpm/tpm (issue #192): omitted keeps the current value, null clears it.
           const rpm = body.rpm === undefined ? a.policy.rpm : body.rpm;
           const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}) };
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }) };
@@ -842,6 +888,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const warnExtra = (alert) => (alert.fraction !== undefined && alert.run_id === undefined ? { period: capPeriod(alert.scope, now()) } : {});
   async function evaluateFleetAlerts() {
     const queued = store.transaction((s) => {
+      sweepRaises(s);
       const out = [];
       for (const a of Object.values(s.agents)) {
         if (a.revoked) {
@@ -857,10 +904,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (r.reason === "budget_exceeded" && ["run", "day", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
-        const alerts = evaluateAlerts({ agentId: a.id, caps: a.policy.caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions });
+        const caps = effectiveCaps(a.policy, now());
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
-        const runCap = a.policy.caps?.run;
+        const runCap = caps.run;
         const hasRunCap = typeof runCap === "number" && Number.isFinite(runCap);
         const activeRuns = hasRunCap || blockedRunIds.length
           ? summarizeRuns(receipts.filter((r) => typeof r.run_id === "string" && r.run_id)).filter((run) => Date.parse(run.last_ts) > now() - 3600_000)
@@ -874,7 +922,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
-        const warnOk = gateWarnings(s, a.id, a.policy.caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions);
+        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);

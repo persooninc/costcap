@@ -56,6 +56,18 @@ export async function enroll({ url, token, name, path }) {
   return { agentId: data.agentId };
 }
 
+// Issue #208: an enrolled agent asks for a time-boxed cap raise; an admin approves it in the dashboard.
+export async function requestRaise({ path, scope, amountUsd, durationHours, reason }) {
+  const data = loadEnrollment(path);
+  try {
+    return await request(data.url, data.token, `/v1/agents/${encodeURIComponent(data.agentId)}/cap-requests`, { scope, amount_usd: amountUsd, duration_hours: durationHours, reason });
+  } catch (err) {
+    if (err.status === 409) throw new Error(`a ${scope} cap request is already pending`);
+    if (err.status === 400) throw new Error("request rejected (check scope, amount, duration 1-168h, reason, and that the agent has that cap)");
+    throw err;
+  }
+}
+
 // Server accepts at most 100 receipts per POST (src/hosted/server.js).
 const SYNC_BATCH = 100;
 
@@ -63,7 +75,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
   let data = loadEnrollment(path);
   let revoked = Boolean(data.revoked);
   let busy = false, inflight = Promise.resolve();
-  const policy = () => resolvePolicy({ lastKnown: data.policy });
+  const policy = (nowMs = Date.now()) => resolvePolicy({ lastKnown: data.policy, nowMs });
   // Issue #129: each local reconcile settlement of a synced null-cost receipt goes up
   // once. An older server without the endpoint (404) skips it; receipt sync still succeeds.
   async function uploadSettlements(synced) {
@@ -122,7 +134,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     agentCheck(nowMs = Date.now()) {
       if (!data.agentSpend) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedAgentVerdict(data.agentSpend, policy().caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
+      return cachedAgentVerdict(data.agentSpend, policy(nowMs).caps, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs);
     },
     // #195: fleet agent / hosted team remainders for --preflight.
     preflightRemaining(nowMs = Date.now()) {
@@ -130,7 +142,7 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       const synced = new Set(data.syncedIds ?? []);
       const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
       return {
-        agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy().caps, pending, nowMs) : null,
+        agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs) : null,
         teamName: data.team?.name ?? null,
       };

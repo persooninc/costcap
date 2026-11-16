@@ -2,6 +2,7 @@
 // agent-budget engine so the hosted answer and `costcap agent-status` cannot
 // drift. An unknown cost (cost_usd: null) is never treated as $0.
 import { createAgentBudgets, budgetRemaining } from "../agent-budget.js";
+import { effectiveCaps } from "./policy.js";
 
 const HOSTED_SCOPES = ["day", "month"];
 
@@ -15,7 +16,9 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   const month = nowDate.toISOString().slice(0, 7);
   const who = { agent_id: agent.id, run_id: runId };
   const limits = {};
-  for (const scope of HOSTED_SCOPES) if (agent.policy?.caps?.[scope] != null) limits[scope] = agent.policy.caps[scope];
+  // #208: an active cap raise applies until its expires_at, then the base cap again.
+  const caps = effectiveCaps(agent.policy, nowMs);
+  for (const scope of HOSTED_SCOPES) if (caps[scope] != null) limits[scope] = caps[scope];
   const maxSteps = agent.policy?.maxSteps ?? null;
   if (maxSteps != null && runId) limits.maxSteps = maxSteps;
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};

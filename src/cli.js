@@ -8,7 +8,7 @@ import { reconcileFiles, applyReconciliation } from "./reconcile.js";
 import { serveMcp } from "./mcp.js";
 import { parseTagList } from "./tags.js";
 import { createTagCaps, parseTagCaps, withFleetTagCaps } from "./tag-cap.js";
-import { enroll, createFleetClient } from "./hosted/client.js";
+import { enroll, createFleetClient, requestRaise } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
@@ -41,6 +41,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] 
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
+  "       costcap request-raise --scope run|hour|day|month --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
@@ -200,8 +201,12 @@ export async function wrap(argv) {
     const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
     rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
   };
+  let raiseTimer = null;
   const setPolicy = (p) => {
     fleetPolicy = p;
+    // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
+    clearTimeout(raiseTimer);
+    if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
     const resolved = resolvePolicy({ local: { ...caps, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
     cap.updateCaps(resolved.caps);
     checkWarnings();
@@ -320,6 +325,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
     enroll({ url: option("--url"), name: option("--name"), token: process.env.COSTCAP_ENROLL_TOKEN, path: option("--enrollment") ?? ".costcap/enrollment.json" })
       .then(({ agentId }) => console.error(`costcap: enrolled ${agentId}. Use --enrollment with wrap.`), (e) => { console.error(`costcap: ${e.message}`); process.exitCode = 2; });
+  } else if (cmd === "request-raise") {
+    const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
+    requestRaise({ path: option("--enrollment") ?? ".costcap/enrollment.json", scope: option("--scope"), amountUsd: Number(option("--amount")), durationHours: Number(option("--hours")), reason: option("--reason") })
+      .then((r) => { console.log(JSON.stringify({ request_id: r.id, status: r.status, scope: r.scope, amount_usd: r.amount_usd, duration_hours: r.duration_hours })); console.error("costcap: cap raise requested; an admin can approve it in the dashboard."); }, (e) => { console.error(`costcap: ${e.message}`); process.exitCode = 2; });
   } else if (cmd === "reconcile") {
     try {
       const option = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
