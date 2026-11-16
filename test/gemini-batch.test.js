@@ -10,6 +10,7 @@ import { costForUsage } from "../src/pricing.js";
 import { batchCreateProvider, batchReadPath, foldBatchResults, geminiBatchId, geminiBatchOutput, geminiBatchRequests, isGeminiBatchFreeCall } from "../src/batch.js";
 import { GEMINI_EXPECTED, GEMINI_INLINE, GEMINI_OK_1, GEMINI_OK_2, GEMINI_RESULTS, geminiOp, mockUpstream } from "./support/batch.js";
 import { checkBudget } from "../src/check.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const CREATE = "/gemini/v1beta/models/gemini-2.5-flash:batchGenerateContent";
 const REQ = { contents: [{ parts: [{ text: "hi" }] }], generationConfig: { maxOutputTokens: 1000 } };

@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { buildRunSummary, rollupLine, listRunSummaries, writeRunSummary, runsCommand, stopReason, SCHEMA } from "../src/run-summary.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const priced = (model, cost, extra = {}) => ({ provider: "openai", blocked: false, model, cost_usd: cost, input_tokens: 10, output_tokens: 5, cached_input_tokens: 2, cache_write_input_tokens: 1, cache_write_1h_input_tokens: 1, ...extra });
 

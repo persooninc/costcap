@@ -11,6 +11,7 @@ import { pricingCommand } from "../src/pricing-cli.js";
 import { extractUsage, createSseUsageParser, startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 import { digestPathFor } from "../src/pricing-digest.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const table = JSON.parse(readFileSync(DEFAULT_TABLE_PATH, "utf8"));
 const usd = (n) => Number(n.toFixed(6));

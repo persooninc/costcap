@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { extractUsage, isCountTokensPath, isEmbeddingsPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
 import { costForUsage } from "../src/pricing.js";
 import { createCapEngine } from "../src/cap.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 async function fixture(t, handler, options = {}) {
   const up = http.createServer(handler);

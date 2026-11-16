@@ -12,6 +12,7 @@ import { run as digestRun } from "../scripts/pricing-digest.mjs";
 import { canonicalize, verifyTableDigest } from "../src/pricing-digest.js";
 import { createCapEngine } from "../src/cap.js";
 import { startMeteringProxy } from "../src/proxy.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const usd = (n) => Number(n.toFixed(6));
 

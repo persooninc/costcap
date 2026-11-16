@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { lookupPrice, costForUsage, TABLE_VERSION } from "../src/pricing.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const table = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
 

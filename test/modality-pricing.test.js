@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { costForUsage, modalityAdjustment, lookupPrice } from "../src/pricing.js";
 import { extractUsage, geminiModalitySlice, openaiModalitySlice } from "../src/proxy.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const gem = (meta) => extractUsage("gemini", JSON.stringify({ modelVersion: "gemini-2.5-flash", usageMetadata: meta }));
 const price = (m) => costForUsage(m.model, m.usage);

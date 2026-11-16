@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { parseWrapArgs } from "../src/cli.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 test("costcap --version prints the package.json version and exits 0", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));

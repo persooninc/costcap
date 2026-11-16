@@ -12,6 +12,7 @@ import { classifyCloudRoute, mapCloudModel, mapVertexGemini } from "../src/cloud
 import { costForUsage, vertexGeminiModels } from "../src/pricing.js";
 import { BUILTIN_ENV_VARS } from "../src/upstreams.js";
 import { createCapEngine } from "../src/cap.js";
+import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const P = "/v1/projects/p/locations/us-central1/publishers/google/models";
