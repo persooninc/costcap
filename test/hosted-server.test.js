@@ -1379,7 +1379,7 @@ test("#204: PUT /v1/tag-caps validates, enforces roles, audits, and ships tag_ca
 
 // Issue #206: per-channel retry, backoff and attempt cap.
 test("issue #206: only failed channels retry, with backoff and a give-up cap; a new occurrence resends all", async (t) => {
-  let clock = Date.now();
+  let clock = Date.parse("2026-01-15T01:00:00Z"); // fixed UTC morning: retries must not cross a day rollover (#228)
   const calls = { email: 0, slack: 0, webhook: 0 };
   const status = { email: "accepted", slack: "accepted", webhook: "failed" };
   const deliverAlert = async (_a, _settings, opts) => {
@@ -1413,7 +1413,7 @@ test("issue #206: only failed channels retry, with backoff and a give-up cap; a 
 });
 
 test("issue #206: email failing retries only email; cap writes one gave_up row; re-fire resends all", async (t) => {
-  let clock = Date.now();
+  let clock = Date.parse("2026-01-15T01:00:00Z"); // fixed UTC morning: retries must not cross a day rollover (#228)
   const calls = { email: 0, slack: 0, webhook: 0 };
   const status = { email: "failed", slack: "accepted", webhook: "accepted" };
   const deliverAlert = async (_a, _settings, opts) => (opts?.channels ?? ["email", "slack", "webhook"]).map((channel) => { calls[channel]++; return { channel, status: status[channel] }; });
