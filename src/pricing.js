@@ -47,25 +47,42 @@ export function lookupPrice(model) {
   return { model, ...table.fallback, ...pin, fallback: true };
 }
 
+// Long-context tier (#151): a model may publish a higher rate set once the whole
+// prompt (uncached input + cache read + cache writes) exceeds a threshold. Every
+// component of that call is then priced at the long-context rates.
+export function promptTokens({ input_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0 } = {}) {
+  return input_tokens + cached_input_tokens + cache_write_input_tokens + cache_write_1h_input_tokens;
+}
+
+export function selectTier(price, prompt_tokens) {
+  const lc = price?.long_context;
+  if (!price?.fallback && lc && Number.isFinite(lc.threshold_input_tokens) && prompt_tokens > lc.threshold_input_tokens) {
+    return { pricing_tier: "long_context", rates: lc };
+  }
+  return { pricing_tier: "standard", rates: price };
+}
+
 export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0 } = {}) {
   const price = lookupPrice(model);
+  const { pricing_tier, rates } = selectTier(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }));
   // A cache write with no published rate is unpriced, not guessed at another rate.
-  const unpriced = (cache_write_input_tokens > 0 && price.cache_write == null) || (cache_write_1h_input_tokens > 0 && price.cache_write_1h == null);
+  const unpriced = (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
   const cost =
-    (input_tokens * price.input +
-      cached_input_tokens * price.cached_input +
-      cache_write_input_tokens * (price.cache_write ?? 0) +
-      cache_write_1h_input_tokens * (price.cache_write_1h ?? 0) +
-      output_tokens * price.output) / 1_000_000;
+    (input_tokens * rates.input +
+      cached_input_tokens * rates.cached_input +
+      cache_write_input_tokens * (rates.cache_write ?? 0) +
+      cache_write_1h_input_tokens * (rates.cache_write_1h ?? 0) +
+      output_tokens * rates.output) / 1_000_000;
   return {
     model,
     cost_usd: unpriced ? null : Number(cost.toFixed(6)),
-    ...(unpriced ? { reason: "cache_write_unpriced" } : {}),
+    ...(unpriced ? { reason: pricing_tier === "long_context" ? "long_context_cache_write_unpriced" : "cache_write_unpriced" } : {}),
     input_tokens,
     output_tokens,
     cached_input_tokens,
     cache_write_input_tokens,
     cache_write_1h_input_tokens,
+    pricing_tier,
     table_version: price.table_version,
     table_sha256: price.table_sha256,
     fallback: price.fallback,

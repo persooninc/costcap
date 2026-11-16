@@ -39,11 +39,13 @@ export function pricingCommand(args, { tablePath } = {}) {
   const model = rest.find((a) => !a.startsWith("--"));
   const head = `pricing table ${table.version} (${table.currency}) sha256 ${v.actual}${v.ok ? "" : " UNVERIFIED"}`;
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
+  // A long-context tier (#151) prints as a second row for the same model.
+  const rowsFor = (name, r) => [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : [])];
   if (!model) {
-    const rows = Object.entries(table.models).map(([k, r]) => row(k, r));
+    const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
   }
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const entry = table.models[model] ?? table.models[base];
-  return { code: 0, out: [head, entry ? row(model, entry) : row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };
+  return { code: 0, out: [head, entry ? rowsFor(model, entry).join("\n") : row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };
 }

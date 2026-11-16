@@ -5,7 +5,7 @@
 // conservative provider default when absent. It prices at the model's
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
-import { lookupPrice, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+import { lookupPrice, selectTier, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // Conservative default output ceilings when the request sets no limit.
 export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, gemini: 65_536 };
@@ -58,9 +58,11 @@ export function estimateWorstCase(provider, body, path = "") {
   const out = embeddings ? { tokens: 0, defaulted: false } : requestedOutputTokens(provider, req);
   const mult = outputMultiplier(provider, req);
   const output_tokens = out.tokens * mult.multiplier;
-  const estimate_usd = Number(((input_tokens * price.input + output_tokens * price.output) / 1_000_000).toFixed(6));
+  // Long-context tier (#151): a prompt estimated over the threshold budgets at the higher rates.
+  const { pricing_tier, rates } = selectTier(price, input_tokens);
+  const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000).toFixed(6));
   const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
+  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, estimate_usd, pricing_tier, cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 };
 }
 
 // Compares the estimate with the remaining run/day/month budget.
@@ -72,7 +74,7 @@ export function preflightCheck(cap, provider, body, path, onFit) {
   const remaining = cap?.remaining?.() ?? {};
   for (const scope of ["run", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
-      return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model,
+      return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,
         input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier };
     }
   }

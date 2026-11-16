@@ -144,19 +144,19 @@ test("SSE fixtures for OpenAI, Anthropic and Gemini stream in real time and are 
 });
 
 test("Anthropic cache creation is priced at the cache-write rate, not the input rate", () => {
-  const parsed = extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage: { input_tokens: 0, cache_creation_input_tokens: 1_000_000, output_tokens: 0 } }));
+  const parsed = extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage: { input_tokens: 0, cache_creation_input_tokens: 100_000, output_tokens: 0 } }));
   const cost = costForUsage(parsed.model, parsed.usage);
   assert.equal(parsed.usage.input_tokens, 0);
-  assert.equal(parsed.usage.cache_write_input_tokens, 1_000_000);
-  assert.equal(cost.cost_usd, 3.75);
+  assert.equal(parsed.usage.cache_write_input_tokens, 100_000);
+  assert.equal(cost.cost_usd, 0.375); // under the 200K long-context threshold (#151)
 });
 
 test("Anthropic 5-minute and 1-hour writes are priced apart", () => {
-  const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 1_000_000, cache_creation: { ephemeral_5m_input_tokens: 400_000, ephemeral_1h_input_tokens: 600_000 } };
+  const usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 100_000, cache_creation: { ephemeral_5m_input_tokens: 40_000, ephemeral_1h_input_tokens: 60_000 } };
   const parsed = extractUsage("anthropic", JSON.stringify({ model: "claude-sonnet-4-6", usage }));
-  assert.equal(parsed.usage.cache_write_input_tokens, 400_000);
-  assert.equal(parsed.usage.cache_write_1h_input_tokens, 600_000);
-  assert.equal(costForUsage(parsed.model, parsed.usage).cost_usd, 0.4 * 3.75 + 0.6 * 6);
+  assert.equal(parsed.usage.cache_write_input_tokens, 40_000);
+  assert.equal(parsed.usage.cache_write_1h_input_tokens, 60_000);
+  assert.equal(costForUsage(parsed.model, parsed.usage).cost_usd, 0.04 * 3.75 + 0.06 * 6);
 });
 
 test("an impossible 1-hour count is unusable usage, not a discount", () => {

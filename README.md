@@ -139,8 +139,13 @@ traffic bypasses CostCap.
   route is ignored. `costcap runs` shows each model's `cost_source`, and
   `costcap receipts --export csv`, `/v1/receipts.csv` and `/v1/evidence.json`
   include the column. Rates are the
-  standard text price in force on the table version date (the lower tier when a
-  model publishes a prompt-length split). Check `src/pricing-table.json` before
+  standard text price in force on the table version date. When a model
+  publishes a prompt-length split (Gemini 2.5 Pro / 3.1 Pro, Claude Sonnet
+  4.5 / 4.6 above 200K prompt tokens), a call whose whole prompt (input +
+  cache read + cache writes) exceeds the threshold is priced entirely at the
+  `long_context` rates, and the receipt says `pricing_tier: "long_context"`
+  (otherwise `"standard"`). Preflight and `costcap pricing show` use the same
+  tier. Check `src/pricing-table.json` before
   relying on rates.
 - OpenAI embeddings (`POST /openai/v1/embeddings`, exact path) are metered
   input-only: `text-embedding-3-small` ($0.02/M), `text-embedding-3-large`
