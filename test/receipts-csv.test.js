@@ -10,9 +10,9 @@ test("receipt csv quotes formulas and keeps an empty cost empty", () => {
   assert.equal(truncated, false);
   assert.equal(count, 2);
   const lines = body.trim().split("\n");
-  assert.equal(lines[0], "ts,agent_id,receipt_id,model,cost_usd,reason,scope");
-  assert.equal(lines[1], "2026-10-12T00:00:00.000Z,a,0,gpt,1.5,,");
-  assert.equal(lines[2], "2026-10-13T00:00:00.000Z,a,1,'=cmd(),,'+sum,day");
+  assert.equal(lines[0], "ts,agent_id,receipt_id,model,cost_usd,settled_cost_usd,settle_source,reason,scope");
+  assert.equal(lines[1], "2026-10-12T00:00:00.000Z,a,0,gpt,1.5,,,,");
+  assert.equal(lines[2], "2026-10-13T00:00:00.000Z,a,1,'=cmd(),,,,'+sum,day");
 });
 
 test("receipt csv keeps only the newest rows past the limit", () => {

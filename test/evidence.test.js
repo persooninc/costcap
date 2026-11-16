@@ -26,7 +26,7 @@ test("evidence keeps unknown cost null and marks spend incomplete", () => {
   assert.deepEqual(a1.spend.day, { usd_known: 0.25, unknown_count: 1, cost_complete: false });
   assert.deepEqual(a2, { agent_id: "a2", name: null, revoked: false, killed: false, caps: {}, team: null, spend: { day: { usd_known: 0, unknown_count: 0, cost_complete: true }, month: { usd_known: 0, unknown_count: 0, cost_complete: true } } });
   assert.equal(doc.receipts[1].cost_usd, null);
-  assert.deepEqual(doc.receipts[2], { agent_id: "a1", receipt_id: null, ts: null, model: null, cost_usd: null, blocked: false, reason: null, scope: null });
+  assert.deepEqual(doc.receipts[2], { agent_id: "a1", receipt_id: null, ts: null, model: null, cost_usd: null, settled_cost_usd: null, settled_at: null, settled_by: null, settle_source: null, settle_reason: null, blocked: false, reason: null, scope: null });
   assert.deepEqual(doc.alerts[1], { kind: null, key: null, agent_id: null, scope: null });
   assert.deepEqual(doc.totals, { agents: 2, receipts: 3, unknown_cost_receipts: 2, cost_complete: false });
 });
@@ -56,10 +56,10 @@ test("#118 evidence audit is org-scoped, oldest first, with agent_ids normalized
 
 test("#118 blocked receipt keeps blocked, reason, scope and its recorded cost", () => {
   const doc = buildEvidence({ orgId: "o", nowMs: NOW, spendFor, receipts: [
-    { agentId: "a", receipt: { id: "b1", ts: "2026-11-15T01:00:00.000Z", cost_usd: 0.1, blocked: true, reason: "cap_exceeded", scope: "day" } },
+    { agentId: "a", receipt: { id: "b1", ts: "2026-11-15T01:00:00.000Z", cost_usd: 0.1, settled_cost_usd: null, settled_at: null, settled_by: null, settle_source: null, settle_reason: null, blocked: true, reason: "cap_exceeded", scope: "day" } },
     { agentId: "a", receipt: { id: "b2", ts: "2026-11-15T01:00:00.000Z", cost_usd: null, blocked: true, reason: "killed" } },
   ] });
-  assert.deepEqual(doc.receipts[0], { agent_id: "a", receipt_id: "b1", ts: "2026-11-15T01:00:00.000Z", model: null, cost_usd: 0.1, blocked: true, reason: "cap_exceeded", scope: "day" });
+  assert.deepEqual(doc.receipts[0], { agent_id: "a", receipt_id: "b1", ts: "2026-11-15T01:00:00.000Z", model: null, cost_usd: 0.1, settled_cost_usd: null, settled_at: null, settled_by: null, settle_source: null, settle_reason: null, blocked: true, reason: "cap_exceeded", scope: "day" });
   assert.equal(doc.receipts[1].cost_usd, null);
   assert.equal(doc.receipts[1].scope, null);
 });

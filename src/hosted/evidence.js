@@ -31,6 +31,11 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
     ts: item.receipt?.ts ?? null,
     model: item.receipt?.model ?? null,
     cost_usd: typeof item.receipt?.cost_usd === "number" ? item.receipt.cost_usd : null,
+    settled_cost_usd: typeof item.settlement?.cost_usd === "number" ? item.settlement.cost_usd : null,
+    settled_at: item.settlement?.at ?? null,
+    settled_by: item.settlement?.by ?? null,
+    settle_source: item.settlement?.source ?? null,
+    settle_reason: item.settlement?.reason ?? null,
     blocked: Boolean(item.receipt?.blocked),
     reason: item.receipt?.reason ?? null,
     scope: item.receipt?.scope ?? null,
@@ -44,7 +49,7 @@ export function buildEvidence({ orgId, agents = [], receipts = [], alerts = [], 
       const detail = agentIds !== undefined ? { ...rest, agent_ids: agentIds } : rest;
       return { ts: e.ts ?? null, actor: e.actor ?? null, action: e.action, target: e.target ?? null, detail };
     });
-  const unknownTotal = rows.filter((r) => r.cost_usd === null).length;
+  const unknownTotal = rows.filter((r) => r.cost_usd === null && r.settled_cost_usd === null).length;
   return {
     schema: EVIDENCE_SCHEMA,
     generated_at: new Date(nowMs).toISOString(),

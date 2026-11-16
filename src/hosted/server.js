@@ -64,6 +64,22 @@ export function resumeFleet(s, u, reason) {
   audit(s, u.orgId, u.id, "fleet.resume", null, { reason, agentIds });
   return { frozen: false, notFrozen: false, count: agentIds.length, agentIds };
 }
+// Issue #125: a settled unknown-cost receipt keeps cost_usd null on the stored receipt;
+// budget, spend and alert math uses the audited settled cost instead.
+export const SETTLE_SOURCES = ["provider_invoice", "provider_usage_export", "manual_evidence"];
+export function costedReceipt(item) {
+  const r = item?.receipt ?? item;
+  const settled = item?.settlement?.cost_usd;
+  return r && r.cost_usd == null && typeof settled === "number" ? { ...r, cost_usd: settled } : r;
+}
+export function settleInput(body) {
+  const cost = body?.cost_usd, source = body?.source, reason = body?.reason;
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) fail(400, "cost_usd must be a finite number >= 0");
+  if (!SETTLE_SOURCES.includes(source)) fail(400, `source must be one of ${SETTLE_SOURCES.join("|")}`);
+  if (typeof reason !== "string" || !reason.trim() || reason.trim().length > 500) fail(400, "Reason must be 1-500 characters");
+  if (body.agent_id !== undefined && typeof body.agent_id !== "string") fail(400, "agent_id must be a string");
+  return { cost_usd: cost, source, reason: reason.trim(), agentId: body.agent_id };
+}
 const audit = (s, orgId, actor, action, target, detail = {}) => s.audit.push(auditEntry({ orgId, actor, action, target, detail }));
 
 // A missing channel is not a failed send. Retry only when a configured
@@ -83,7 +99,7 @@ export function spendSummary(receipts, nowMs) {
   const fold = (window) => {
     let usd = 0, unknown = 0;
     for (const item of receipts) {
-      const r = item.receipt ?? item;
+      const r = costedReceipt(item);
       const instant = new Date(r.ts);
       if (Number.isNaN(instant.getTime())) continue;
       const iso = instant.toISOString();
@@ -137,7 +153,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const admin = (s, req) => { const u = sessionUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
   // Issue #123: org teams and their verdicts from synced receipts.
   const orgTeams = (s, orgId) => Object.values(s.teams ?? {}).filter((t) => t.orgId === orgId).sort((a, b) => a.name.localeCompare(b.name));
-  const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map((r) => r.receipt);
+  const agentReceipts = (s, agentId) => Object.values(s.receipts).filter((r) => r.agentId === agentId).map(costedReceipt);
   const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
@@ -305,6 +321,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             receipt_id: item.receipt?.id ?? "",
             model: item.receipt?.model ?? "",
             cost_usd: item.receipt?.cost_usd == null ? "" : item.receipt.cost_usd,
+            settled_cost_usd: item.settlement?.cost_usd ?? "",
+            settle_source: item.settlement?.source ?? "",
             reason: item.receipt?.reason ?? "",
             scope: item.receipt?.scope ?? "",
           }));
@@ -444,7 +462,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const a = s.agents[budgetRoute[1]];
           const orgId = caller.agent?.orgId ?? caller.user.orgId;
           if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
-          const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
+          const receipts = agentReceipts(s, a.id);
           const runId = new URL(req.url, origin).searchParams.get("run_id");
           const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id);
           return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null, team: t ? verdictOf(s, t) : null });
@@ -478,6 +496,24 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, result);
       }
+      const settleRoute = /^\/v1\/receipts\/([^/]+)\/settle$/.exec(path);
+      if (settleRoute && req.method === "POST") {
+        const input = settleInput(body);
+        const receiptId = decodeURIComponent(settleRoute[1]);
+        const result = store.transaction((s) => {
+          const u = admin(s, req);
+          const matches = Object.values(s.receipts).filter((r) => r.orgId === u.orgId && r.receipt?.id === receiptId && (input.agentId === undefined || r.agentId === input.agentId));
+          if (!matches.length) fail(404, "Receipt not found");
+          if (matches.length > 1) fail(409, "Receipt id is ambiguous; pass agent_id");
+          const item = matches[0];
+          if (item.settlement) { const e = new Error("Receipt already settled"); e.status = 409; e.body = { code: "already_settled" }; throw e; }
+          if (item.receipt.cost_usd != null) { const e = new Error("Receipt cost is already known"); e.status = 409; e.body = { code: "already_known" }; throw e; }
+          item.settlement = { cost_usd: input.cost_usd, at: new Date(now()).toISOString(), by: u.id, source: input.source, reason: input.reason };
+          audit(s, u.orgId, u.id, "receipt.settle", receiptId, { event: "reconciliation", agent_id: item.agentId, before: null, after: input.cost_usd, source: input.source, reason: input.reason });
+          return { agent_id: item.agentId, receipt_id: receiptId, cost_usd: null, settled_cost_usd: input.cost_usd, settled_at: item.settlement.at, settled_by: u.id, settle_source: input.source, settle_reason: input.reason };
+        });
+        return json(200, result);
+      }
       fail(404, "Route not found");
     } catch (err) { if (!res.headersSent) await json(err.status ?? 500, { error: err.status ? err.message : "Internal error", ...(err.status && err.body ? err.body : {}) }); }
   });
@@ -489,7 +525,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && x.active)) prior.active = false;
           continue;
         }
-        const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
+        const receipts = agentReceipts(s, a.id);
         const spent = spendSummary(receipts, now());
         const recent = receipts.filter((r) => Date.parse(r.ts) > now() - 3600_000);
         const blockedReasons = recent.flatMap((r) => {

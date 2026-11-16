@@ -152,6 +152,17 @@ test("store contract: Postgres adapter, roles, and row-level security", { skip: 
   });
   await assert.rejects(scoped({ "app.org_id": ORG_A }, () => app.query(`INSERT INTO store_records (kind, id, org_id, body) VALUES ('receipts', 'x', '${ORG_B}', '{}')`)), /row-level security/);
   await assert.rejects(scoped({ "app.org_id": ORG_A }, () => app.query(`UPDATE store_records SET org_id = '${ORG_B}' WHERE org_id = '${ORG_A}'`)), /row-level security/);
+  // Issue #125: a receipt settlement persists through Postgres, and org A cannot settle an org B receipt.
+  const settleStore = await openPostgresStore({ connectionString: appUrl, max: 2 }); opened.push(settleStore);
+  settleStore.transaction((s) => { s.receipts["settle-agent:unk"] = { orgId: ORG_A, agentId: "settle-agent", receipt: { id: "unk", ts: "2026-11-15T00:00:00.000Z", cost_usd: null } }; });
+  await settleStore.flush();
+  settleStore.transaction((s) => { s.receipts["settle-agent:unk"].settlement = { cost_usd: 2.5, at: "2026-11-15T01:00:00.000Z", by: "u", source: "provider_invoice", reason: "inv" }; });
+  await settleStore.flush();
+  const reopened = await openPostgresStore({ connectionString: appUrl, max: 2 }); opened.push(reopened);
+  assert.deepEqual(reopened.read((s) => [s.receipts["settle-agent:unk"].receipt.cost_usd, s.receipts["settle-agent:unk"].settlement.cost_usd]), [null, 2.5]);
+  await scoped({ "app.org_id": ORG_B }, async () => {
+    assert.equal((await app.query(`UPDATE store_records SET body = '{"settlement":{"cost_usd":0}}' WHERE kind = 'receipts' AND id = 'settle-agent:unk'`)).rowCount, 0);
+  });
   // No scope: nothing visible. Loader: read-only. System: no tenant rows.
   assert.equal(await count(), 0);
   await scoped({ "app.scope": "loader" }, async () => assert.ok(await count(`org_id = '${ORG_B}'`) > 0));
