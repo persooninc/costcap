@@ -683,7 +683,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   });
   // #171: a settlement (hosted poll or reconciliation) of a receipt that caused an
   // accounting failure clears that failure; the block lifts once all are settled.
-  server.settle = (r) => failures.delete(r?.receipt_id ?? r?.id);
+  // #176: a settled pending batch is resolved, so a later results read in this run
+  // neither emits a second reconciliation nor records its spend again.
+  server.settle = (r) => {
+    const id = r?.receipt_id ?? r?.id;
+    if (typeof r?.batch_id === "string") resolvedBatches.add(r.batch_id);
+    for (const [batchId, p] of pendingBatches) if (p.id === id) resolvedBatches.add(batchId);
+    return failures.delete(id);
+  };
   server.accountingFailure = accountingFailureNow;
   return server;
 }

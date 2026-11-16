@@ -12,7 +12,8 @@ import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
-import { createCapEngine, loadSettledReceipts, loadEvents, isPendingBatch } from "./cap.js";
+import { createCapEngine, loadSettledReceipts, loadEvents } from "./cap.js";
+import { createSettler } from "./settle.js";
 import { DEFAULT_WARN_AT, createCapWarner, parseWarnAt } from "./cap-warn.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
@@ -139,17 +140,13 @@ export async function wrap(argv) {
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
   let cap, agentBudgets;
   let proxySettle = () => {}; // #171: bound once the proxy is listening
+  // #176: fleet and shared-ledger settlements share one helper (batch_pending aware).
+  const settleReceipt = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle });
   const sharedLedger = shared ? openSharedLedger(receiptsPath, {
     onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); },
     // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
     // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
-    onExternalSettle: (s, r) => {
-      const settled = { ...r, cost_usd: s.cost_usd };
-      if (isPendingBatch(r)) cap.record({ ts: r.ts, cost_usd: s.cost_usd }, { external: true });
-      else cap.settle(settled);
-      agentBudgets?.settle?.(s);
-      proxySettle(s);
-    },
+    onExternalSettle: (s, r) => settleReceipt(s, r),
   }) : null;
   const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
@@ -167,7 +164,7 @@ export async function wrap(argv) {
     fleetModels = resolved.models;
   };
   if (enrollmentPath) {
-    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => { cap.settle(r); agentBudgets?.settle(r); proxySettle(r); } });
+    fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => settleReceipt(r) });
     setPolicy(fleet.policy());
     const result = await fleet.sync();
     if (!result.online) console.error("costcap: fleet offline; cached policy enforced");
