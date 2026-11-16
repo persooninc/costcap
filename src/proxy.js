@@ -77,6 +77,8 @@ export function createUsageAccumulator(provider, requestedModel) {
   };
   const result = () => {
     if (!Object.keys(usage).length) return null;
+    // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
+    if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const value of Object.values(usage)) if (!Number.isFinite(value) || value < 0) return null;
     return { model, usage: { ...usage } };
   };

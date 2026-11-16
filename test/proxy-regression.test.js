@@ -239,3 +239,11 @@ for (const [provider, path, keyHeader] of [["anthropic", "/anthropic/v1/messages
     assert.deepEqual([receipts[0].reason, receipts[0].cost_usd, receipts[0].status], ["upstream_redirect", 0, 302]);
   });
 }
+
+test("#138 anthropic usage needs both input and output counters", () => {
+  assert.equal(extractUsage("anthropic", '{"usage":{"output_tokens":5}}'), null);
+  assert.equal(extractUsage("anthropic", '{"usage":{"input_tokens":5}}'), null);
+  assert.equal(extractUsage("anthropic", '[{"type":"message_delta","usage":{"output_tokens":7}}]'), null);
+  const known = extractUsage("anthropic", '{"model":"claude-x","usage":{"input_tokens":0,"output_tokens":0}}');
+  assert.deepEqual(known.usage, { input_tokens: 0, output_tokens: 0 });
+});
