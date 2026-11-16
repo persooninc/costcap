@@ -10,7 +10,7 @@ import { costForUsage, isPricedModel } from "./pricing.js";
 import { budgetExceededBody } from "./cap.js";
 import { warningLine } from "./cap-warn.js";
 import { createSpiralDetector } from "./spiral.js";
-import { preflightCheck } from "./preflight.js";
+import { preflightCheck, openRouterModels } from "./preflight.js";
 import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults } from "./batch.js";
 import { loadLedgerLines, isSettlement } from "./cap.js";
 
@@ -438,8 +438,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           send(429, response);
           return "blocked";
         };
-        let requestedModel;
-        try { requestedModel = JSON.parse(body).model; } catch { /* provider handles malformed JSON */ }
+        let requestedModel, parsedBody;
+        try { parsedBody = JSON.parse(body); requestedModel = parsedBody?.model; } catch { /* provider handles malformed JSON */ }
+        // #167: OpenRouter routes to `models` fallbacks, so every entry is a candidate.
+        const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
         const batchCreate = batchCreateProvider(req.method, req.url);
@@ -459,7 +461,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           const generates = !["GET", "HEAD"].includes(req.method);
           const allow = generates ? allowedModels?.() ?? null : null;
-          const checkModels = batchModels ?? [requestedModel];
+          if (generates && routerModels === null) {
+            emit({ provider, path: storedPath, blocked: true, reason: "invalid_models", outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
+            send(400, { error: "invalid_models", model: requestedModel ?? null, message: "CostCap: `models` must be an array of model id strings. The upstream call was not made." });
+            return "blocked";
+          }
+          const checkModels = batchModels ?? (generates && routerModels?.length ? routerModels : [requestedModel]);
           // Index of the first missing or refused model (-1: every model passes).
           const offending = (ok) => checkModels.findIndex((m) => !m || !ok(m));
           const refuse = (i) => { requestedModel = checkModels[i] ?? undefined; };

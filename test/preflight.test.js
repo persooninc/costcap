@@ -237,3 +237,19 @@ test("#145 preflight on OpenAI embeddings estimates input only; unpriced embeddi
   assert.equal(estimateWorstCase("openai", body({ model: "gpt-4o-mini" }), "/v1/chat/completions").output_tokens, DEFAULT_MAX_OUTPUT.openai);
   assert.equal(preflightCheck(null, "openai", body({ model: "text-embedding-foo" }), "/v1/embeddings").reason, "preflight_unpriced");
 });
+
+// #167: worst case is the max over OpenRouter fallback candidates.
+test("estimator: OpenRouter models fallbacks budget at the priciest candidate", () => {
+  const cheap = estimateWorstCase("openrouter", body({ model: "openai/gpt-4o-mini", max_tokens: 20_000 }));
+  const both = estimateWorstCase("openrouter", body({ model: "openai/gpt-4o-mini", models: ["openai/gpt-4o"], max_tokens: 20_000 }));
+  assert.equal(both.ok, true);
+  assert.equal(both.model, "openai/gpt-4o");
+  assert.deepEqual(both.candidate_models, ["openai/gpt-4o-mini", "openai/gpt-4o"]);
+  assert.ok(both.estimate_usd > cheap.estimate_usd);
+  assert.equal(estimateWorstCase("openrouter", body({ models: ["openai/gpt-4o-mini", "nope/x"] })).reason, "preflight_unpriced");
+  assert.equal(estimateWorstCase("openrouter", body({ models: ["openai/gpt-4o-mini"] })).model, "openai/gpt-4o-mini");
+  assert.equal(estimateWorstCase("openai", body({ model: "gpt-4o-mini", models: ["gpt-4o"] })).model, "gpt-4o-mini");
+  const cap = createCapEngine({ caps: { day: 0.05 } });
+  assert.equal(preflightCheck(cap, "openrouter", body({ model: "openai/gpt-4o-mini", max_tokens: 20_000 })), null);
+  assert.equal(preflightCheck(cap, "openrouter", body({ model: "openai/gpt-4o-mini", models: ["openai/gpt-4o"], max_tokens: 20_000 })).reason, "preflight_estimate");
+});

@@ -41,11 +41,37 @@ export function outputMultiplier(provider, req) {
 }
 
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
+// #167: an OpenRouter `models` fallback list may route to any entry, so the
+// worst case is the max over every candidate (any unpriced candidate refuses).
 export function estimateWorstCase(provider, body, path = "") {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
-  let model = typeof req.model === "string" ? req.model : undefined;
+  const candidates = provider === "openrouter" ? openRouterModels(req) : null;
+  if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0]);
+  let worst;
+  for (const m of candidates) {
+    const e = estimateOne(provider, req, text, path, m);
+    if (!e.ok) return e;
+    if (!worst || e.estimate_usd > worst.estimate_usd) worst = e;
+  }
+  return { ...worst, candidate_models: candidates };
+}
+
+// De-duplicated union of `model` and a `models` array (OpenRouter fallbacks).
+// Returns null when `models` is present but not an array of non-empty strings.
+export function openRouterModels(req) {
+  const out = [];
+  if (typeof req?.model === "string" && req.model) out.push(req.model);
+  if (req && req.models !== undefined) {
+    if (!Array.isArray(req.models) || !req.models.every((m) => typeof m === "string" && m)) return null;
+    for (const m of req.models) if (!out.includes(m)) out.push(m);
+  }
+  return out;
+}
+
+function estimateOne(provider, req, text, path, forcedModel) {
+  let model = forcedModel ?? (typeof req.model === "string" ? req.model : undefined);
   if (!model && provider === "gemini") model = /models\/([^/:]+)/.exec(path)?.[1];
   const price = model ? lookupPrice(model) : null;
   if (!price || price.fallback || !Number.isFinite(price.input) || !Number.isFinite(price.output)) {

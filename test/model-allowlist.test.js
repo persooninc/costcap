@@ -227,3 +227,55 @@ test("e2e: enrolled wrapper enforces the synced hosted models offline, intersect
     { receiptsPath: receipts, policy: { default: { run: 5, models: ["gpt-4o"] } } });
   assert.deepEqual(JSON.parse(mcp.result.content[0].text).allowed_models, ["gpt-4o"]);
 });
+
+// #167: OpenRouter `models` fallback array cannot bypass the allowlist.
+test("proxy: OpenRouter models fallbacks are each checked against the allowlist", async (t) => {
+  const f = await proxyFixture(t, { allowedModels: () => ["openai/gpt-4o-mini", "google/gemini-2.5-flash"] });
+  const p = "/openrouter/v1/chat/completions";
+  let r = await f.call(p, { model: "openai/gpt-4o-mini", models: ["openai/gpt-4o-mini", "anthropic/claude-opus-4"] });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.error, "model_not_allowed");
+  assert.equal(r.body.model, "anthropic/claude-opus-4");
+  assert.equal(f.seen.length, 0);
+  assert.equal(f.receipts.at(-1).outcome, "blocked_model");
+  assert.equal(f.receipts.at(-1).cost_usd, 0);
+  // models without model: every entry checked.
+  r = await f.call(p, { models: ["google/gemini-2.5-flash", "openai/gpt-4o"] });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.model, "openai/gpt-4o");
+  // openrouter/auto is refused unless itself allowlisted.
+  r = await f.call(p, { model: "openrouter/auto" });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.model, "openrouter/auto");
+  // Invalid models shape: 400 invalid_models, zero-cost blocked receipt.
+  for (const models of ["openai/gpt-4o", [1], [""], {}]) {
+    r = await f.call(p, { model: "openai/gpt-4o-mini", models });
+    assert.equal(r.status, 400, JSON.stringify(models));
+    assert.equal(r.body.error, "invalid_models");
+  }
+  assert.equal(f.receipts.at(-1).reason, "invalid_models");
+  assert.equal(f.receipts.at(-1).cost_usd, 0);
+  assert.equal(f.seen.length, 0);
+  // All allowed: forwarded unchanged.
+  const ok = { model: "openai/gpt-4o-mini", models: ["openai/gpt-4o-mini", "google/gemini-2.5-flash"], messages: [] };
+  r = await f.call(p, ok);
+  assert.equal(r.status, 200);
+  assert.deepEqual(JSON.parse(f.seen[0].body).models, ok.models);
+  assert.equal(JSON.parse(f.seen[0].body).model, ok.model);
+  r = await f.call(p, { models: ["google/gemini-2.5-flash"] });
+  assert.equal(r.status, 200);
+  // Non-OpenRouter providers ignore a models field.
+  const g = await proxyFixture(t, { allowedModels: () => ["gpt-4o-mini"] });
+  assert.equal((await g.call("/openai/v1/chat/completions", { model: "gpt-4o-mini", models: ["gpt-4o", 3] })).status, 200);
+  const a = await proxyFixture(t, { allowedModels: () => ["openrouter/auto"] });
+  assert.equal((await a.call(p, { model: "openrouter/auto" })).status, 200);
+});
+
+test("proxy: --unknown-models refuse applies to every OpenRouter fallback", async (t) => {
+  const f = await proxyFixture(t, { unknownModels: "refuse" });
+  const r = await f.call("/openrouter/v1/chat/completions", { model: "openai/gpt-4o-mini", models: ["made-up/secret-9"] });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.error, "model_unpriced");
+  assert.equal(r.body.model, "made-up/secret-9");
+  assert.equal(f.seen.length, 0);
+});
