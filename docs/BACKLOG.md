@@ -150,7 +150,7 @@ Compared the README's promises, category expectations, and the agent-to-agent ne
 ### CC-4 Kill and resume receipts in the local ledger
 - Acceptance: `costcap kill` and `resume` append an event with note and time, excluded from spend. A ledger write failure still leaves the kill file in place.
 
-### CC-5 Shared budgets across wrappers
+### CC-5 Shared budgets across wrappers (done, #116: `wrap --shared-ledger`)
 Separate ledgers don't share caps, so a fleet on one host can overspend.
 - Acceptance: multiple wrappers can share one agent policy through a local coordinator or per-ledger reservation. Concurrent wrappers can't exceed a cap by more than the documented overshoot, proven by a test with parallel processes.
 

@@ -77,6 +77,19 @@ CostCap. The local proxy binds to 127.0.0.1.
 - Requests are serialized inside a proxy. A receipt ledger is exclusively locked
   for each wrapper. Separate ledgers do not share day/month caps. A crashed
   wrapper leaves a lock that you must remove only after checking it stopped.
+- `--shared-ledger` lets several wrappers on **one host** share one ledger, so
+  their combined day/month spend (and `--policy` agent/team budgets) is capped
+  together. Every decision and every receipt append runs in a short
+  cross-process critical section (`<ledger>.cs`) that first reads what the other
+  wrappers appended. **Documented overshoot: at most one in-flight call per
+  wrapper**, so recorded spend stays within `cap + wrappers × max single-call
+  cost`. `--cap` (run) stays per wrapper. An unknown-cost receipt from any
+  wrapper blocks every wrapper on the ledger. Stale critical sections are
+  fail-closed: a holder is reclaimed only when it is on this host and its PID
+  is provably gone; any other holder (another host, unreadable owner) is waited
+  on for 5s and then the wrapper refuses calls with `receipt_ledger_unavailable`.
+  Shared and exclusive (default) wrappers refuse to run on the same ledger.
+  Sharing across hosts is the hosted fleet's job.
 - Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Unknown models use the declared fallback. Rates are the

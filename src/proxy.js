@@ -117,18 +117,25 @@ export function createSseUsageParser(provider, requestedModel) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
-  const emit = (receipt) => {
+  // Shared ledger (CC-5): decide and append inside the cross-process critical section.
+  // Reentrant: emit() inside an already-guarded decision reuses the held section.
+  let held = false;
+  const guarded = (fn) => {
+    if (!sharedLedger || held) return fn();
+    return sharedLedger.withLock(() => { held = true; try { return fn(); } finally { held = false; } });
+  };
+  const emit = (receipt) => guarded(() => {
     const complete = { id: randomUUID(), ts: new Date().toISOString(), ...who, ...receipt };
     agentBudgets?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
-  };
+  });
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     const [, provider, ...rest] = url.pathname.split("/");
@@ -148,18 +155,23 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const block = (reason, detail, response) => {
           emit({ provider, path, blocked: true, reason, cost_usd: 0, ...detail });
           send(429, response);
+          return "blocked";
         };
-        const killed = killCheck?.();
-        if (killed) return block("killed", killed, { error: "killed", ...killed });
-        if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
-        const agentHit = agentBudgets?.check(who);
-        if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
-        const hit = cap?.check();
-        if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
-        const vhit = velocity?.check();
-        if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
-        const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
-        if (spiralHit) return block("spiral_detected", spiralHit, { error: "spiral_detected", ...spiralHit });
+        const verdict = guarded(() => {
+          const killed = killCheck?.();
+          if (killed) return block("killed", killed, { error: "killed", ...killed });
+          if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
+          const agentHit = agentBudgets?.check(who);
+          if (agentHit) return block(agentHit.reason, agentHit, { error: agentHit.verdict, ...agentHit });
+          const hit = cap?.check();
+          if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
+          const vhit = velocity?.check();
+          if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
+          const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
+          if (spiralHit) return block("spiral_detected", spiralHit, { error: "spiral_detected", ...spiralHit });
+          return null;
+        });
+        if (verdict === "blocked") return;
         const headers = { ...req.headers };
         for (const key of ["host", "content-length", "connection", "transfer-encoding", "accept-encoding"]) delete headers[key];
         let requestedModel;

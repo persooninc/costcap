@@ -9,7 +9,7 @@ import { reconcileFiles } from "./reconcile.js";
 import { serveMcp } from "./mcp.js";
 import { enroll, createFleetClient } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
-import { lockLedger } from "./ledger-lock.js";
+import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadReceipts } from "./cap.js";
@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] -- <command...>\n" +
   "       costcap check [--cap USD] [--receipts FILE]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
@@ -43,6 +43,7 @@ export function parseWrapArgs(argv) {
   };
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
+    if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -80,14 +81,18 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath } = parseWrapArgs(argv);
+  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared } = parseWrapArgs(argv);
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
   const who = agentId ? { agent_id: agentId, run_id: runId ?? randomUUID() } : {};
-  const release = lockLedger(receiptsPath);
+  // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
+  let cap, agentBudgets;
+  const sharedLedger = shared ? openSharedLedger(receiptsPath, { onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); } }) : null;
+  const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
   try {
-  const cap = createCapEngine({ caps, history: loadReceipts(receiptsPath) });
+  const history = sharedLedger ? sharedLedger.history() : loadReceipts(receiptsPath);
+  cap = createCapEngine({ caps, history });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -106,8 +111,8 @@ export async function wrap(argv) {
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
-  const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });
+  agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

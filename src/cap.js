@@ -67,9 +67,11 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       }
       return null;
     },
-    record(receipt) {
+    // external: a receipt another wrapper sharing this ledger wrote. It counts
+    // toward day/month (and unknown) but not toward this wrapper's run cap.
+    record(receipt, { external = false } = {}) {
       if (receipt.cost_usd === null) { unknown += 1; return; }
-      run += receipt.cost_usd;
+      if (!external) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);
     },
   };
