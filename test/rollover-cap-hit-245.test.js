@@ -30,8 +30,12 @@ test("unit: blocksInCurrentPeriod drops last period's blocks (UTC day, non-UTC t
   assert.deepEqual(blocksInCurrentPeriod(undefined, { reason: "x", nowMs: now }), []);
 });
 
-test("unit: isFleetTagBlock accepts fleet refusals and legacy blocks at the rule cap only", () => {
-  assert.equal(isFleetTagBlock({ fleet: true, cap_usd: 0.5 }, rule), true);
+test("unit: isFleetTagBlock accepts fleet refusals at or above the rule cap (#248: a fleet block at a stricter local cap does not page) and legacy blocks at the rule cap only", () => {
+  assert.equal(isFleetTagBlock({ fleet: true, cap_usd: 0.5 }, rule), false);
+  assert.equal(isFleetTagBlock({ fleet: true, cap: 0.5 }, rule), false);
+  assert.equal(isFleetTagBlock({ fleet: true, cap_usd: 5 }, rule), true);
+  assert.equal(isFleetTagBlock({ fleet: true, cap_usd: 6 }, rule), true);
+  assert.equal(isFleetTagBlock({ fleet: true }, rule), true);
   assert.equal(isFleetTagBlock({ fleet: false }, rule), false);
   assert.equal(isFleetTagBlock({}, rule), true);
   assert.equal(isFleetTagBlock({ cap_usd: 5 }, rule), true);

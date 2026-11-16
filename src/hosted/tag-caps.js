@@ -90,7 +90,7 @@ export function validFleetTagCaps(t) {
 export function mergeTagCapRules(fleetRules = [], localRules = []) {
   return fleetRules.map((r) => {
     const local = localRules.find((l) => l.key === r.key && l.scope === r.scope);
-    return { key: r.key, scope: r.scope, cap: local ? Math.min(local.cap, r.usd) : r.usd };
+    return { key: r.key, scope: r.scope, cap: local ? Math.min(local.cap, r.usd) : r.usd, fleetUsd: r.usd };
   });
 }
 
@@ -111,7 +111,8 @@ function syncedEntry(policy, key, value) {
 /**
  * Offline fleet tag verdict for one request's merged tags. pending: this host's
  * unsynced, settled-aware receipts. Returns null, a tag_budget_exceeded hit
- * (fleet: true) or an accounting_unavailable verdict for that value only.
+ * (fleet: true, or fleet: false when a stricter local --tag-cap was the binding
+ * cap, #248) or an accounting_unavailable verdict for that value only.
  */
 export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs, budgetPeriod = null) {
   if (!policy?.rules?.length) return null;
@@ -131,7 +132,7 @@ export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs, 
     }
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", tag_key: rule.key, tag_value: value, unknown_receipts: unknown, fleet: true,
       message: `CostCap: ${rule.key}=${value} has ${unknown} receipt(s) with unknown cost, so its fleet tag cap cannot be enforced. The upstream call was not made.` };
-    if (total >= rule.cap) return { verdict: "tag_budget_exceeded", tag_key: rule.key, tag_value: value, scope: rule.scope, spend_usd: round6(total), cap_usd: rule.cap, fleet: true };
+    if (total >= rule.cap) return { verdict: "tag_budget_exceeded", tag_key: rule.key, tag_value: value, scope: rule.scope, spend_usd: round6(total), cap_usd: rule.cap, fleet: !(rule.cap < rule.fleetUsd) };
   }
   return null;
 }

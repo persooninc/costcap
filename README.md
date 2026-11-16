@@ -894,6 +894,7 @@ value, not just the 1000 in the policy payload), the alert worker fires
 `cap_approaching` at the rule's warning fractions. Set them per rule with
 `"warnFractions":[0.5,0.8]` in `PUT /v1/tag-caps` (or **Warn at (%)** in the
 card); the default is `[0.8]`, and each fraction fires at most once per period.
+A refusal caused by a stricter local `--tag-cap` (for example `customer:day=0.5` under a fleet `customer:day $5` rule) is still reported to the caller with the same refusal body, but it is synced with `fleet: false` and never pages the fleet rule (#248); a refusal at the fleet cap (local cap equal or absent) does.
 Alert keys look like `cap_hit:tag:<orgId>:customer=acme:day`. Email and Slack
 read `tag customer=acme, day (spent $X of $Y cap)`; the webhook JSON and
 `/v1/evidence.json` add `tag: {key, value}`. A value with an unknown-cost

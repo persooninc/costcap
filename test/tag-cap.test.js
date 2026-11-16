@@ -269,7 +269,7 @@ test("#204 fleet rules: validation, merge (lower cap wins) and composite engine"
   assert.deepEqual(parseFleetTagCaps([{ key: "customer", scope: "day", usd: 1, extra: 1 }]), { rules: [{ key: "customer", scope: "day", usd: 1 }] });
   for (const bad of [null, [null], [{ key: "x", scope: "day", usd: Infinity }], [{ key: "x", scope: "week", usd: 1 }]]) assert.ok(parseFleetTagCaps(bad).error);
   assert.deepEqual(mergeTagCapRules([{ key: "customer", scope: "day", usd: 1 }, { key: "customer", scope: "month", usd: 9 }], [{ key: "customer", scope: "day", cap: 0.5 }, { key: "customer", scope: "month", cap: 20 }]),
-    [{ key: "customer", scope: "day", cap: 0.5 }, { key: "customer", scope: "month", cap: 9 }]);
+    [{ key: "customer", scope: "day", cap: 0.5, fleetUsd: 1 }, { key: "customer", scope: "month", cap: 9, fleetUsd: 9 }]);
   const calls = [];
   const fleet = { tagCheck: (tags, rules) => { calls.push([tags, rules]); return { fleet: true }; } };
   const bare = withFleetTagCaps(null, fleet, []);

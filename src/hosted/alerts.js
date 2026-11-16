@@ -98,8 +98,13 @@ export function blocksInCurrentPeriod(receipts, { reason, nowMs, budgetPeriod = 
 // Issue #245: a tag block pages a fleet rule only when the fleet rule refused
 // it (fleet: true). An older wrapper without `fleet` counts when it carries no
 // cap or the rule's own cap; a local --tag-cap refusal (other cap) never does.
+// Issue #248: a fleet: true block whose cap_usd sits below the rule's usd was a
+// stricter local cap checked against fleet spend, so it does not page the rule.
 export function isFleetTagBlock(h, rule) {
-  if (h?.fleet === true) return true;
+  if (h?.fleet === true) {
+    const cap = h.cap_usd ?? h.cap;
+    return cap === undefined || cap === null || !(cap < rule.usd);
+  }
   if (h?.fleet !== undefined) return false;
   const cap = h?.cap_usd ?? h?.cap;
   return cap === undefined || cap === null || cap === rule.usd;
