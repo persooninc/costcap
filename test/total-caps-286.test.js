@@ -3,7 +3,7 @@
 // b91f36e wrapper, and one hosted integration run (API, policy, alerts, retention).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseOrgBudget, orgBudgetVerdict, orgBudgetPolicy, legacyOrgBudgetPolicy, weekOrgBudgetPolicy, totalOrgBudgetPolicy, validOrgTotalPolicy, cachedOrgTotalVerdict, lifetimeSpend } from "../src/hosted/org-budget.js";
@@ -14,6 +14,10 @@ import { tagBudgetExceededBody, parseTagCaps } from "../src/tag-cap.js";
 import { evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts } from "../src/hosted/alerts.js";
 import { totalCapKeep, expiredReceiptKeys } from "../src/hosted/retention.js";
 import { createHostedServer } from "../src/hosted/server.js";
+import http from "node:http";
+import { enroll as wrapperEnroll, createFleetClient } from "../src/hosted/client.js";
+import { startMeteringProxy } from "../src/proxy.js";
+import { withFleetTagCaps } from "../src/tag-cap.js";
 import * as old from "./fixtures/validators-b91f36e.js";
 
 const ms = (iso) => Date.parse(iso);
@@ -180,7 +184,7 @@ async function fixture(t, clock) {
     const r = await fetch(`${base()}/auth/verify`, { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify({ challengeId: c.body.challengeId, code: codes[email] }) });
     return r.headers.get("set-cookie").split(";")[0];
   };
-  return { request, raw, login, delivered, service };
+  return { request, raw, login, delivered, service, base };
 }
 
 test("#286 hosted: org, tag and model totals through the API, /v1/policy, alerts, retention and audit", async (t) => {
@@ -266,4 +270,45 @@ test("#286 hosted: org, tag and model totals through the API, /v1/policy, alerts
   assert.ok((await f.request("/v1/retention", undefined, owner)).body.eligible_count >= 3);
   // Back to no totals: /v1/policy has no total fields.
   assert.equal(/_total"/.test(await f.raw("/v1/policy", a.token)), false);
+});
+
+// #291: a wrapper enrolled against the hosted server refuses a $3 worst case with
+// $1 left of an org total or an acme tag total set through the API; upstream never hit.
+test("#286 hosted (#291): wrapper --preflight refuses a $3 worst case with $1 left of an org or tag total", async (t) => {
+  const clock = { now: NOV };
+  const f = await fixture(t, clock);
+  const owner = await f.login("t291-owner@example.invalid");
+  const enrollToken = (await f.request("/v1/enrollment-tokens", { caps: { month: 10000 } }, owner)).body.token;
+  const dir = mkdtempSync(join(tmpdir(), "cc-291h-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  await wrapperEnroll({ url: f.base(), token: enrollToken, name: "w-bot", path });
+  writeFileSync(receiptsPath, JSON.stringify(rc("h1", "2026-11-16T11:00:00Z", 499, { tags: { customer: "acme" } })) + "\n");
+  const c = createFleetClient({ path, receiptsPath });
+  const up = { hits: 0 };
+  up.server = http.createServer((q, s) => { up.hits += 1; q.resume(); s.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o", usage: { prompt_tokens: 10, completion_tokens: 10 } })); });
+  await new Promise((r) => up.server.listen(0, "127.0.0.1", r));
+  t.after(() => up.server.close());
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.server.address().port}` }, onReceipt: () => {}, preflight: true, fleetRemaining: () => c.preflightRemaining(NOV), tagCaps: withFleetTagCaps(null, c, []) });
+  t.after(() => server.close());
+  const BIG = JSON.stringify({ model: "gpt-4o", max_tokens: 300_000, messages: [{ role: "user", content: "hi" }] });
+  const call = (headers = {}) => fetch(`http://127.0.0.1:${port}/openai/chat/completions`, { method: "POST", body: BIG, headers });
+  // Org total 500 with $499 synced.
+  assert.equal((await f.request("/v1/org-budget", { total: 500 }, owner, null, "PUT")).status, 200);
+  assert.equal((await c.sync()).online, true);
+  let r = await call();
+  assert.equal(r.status, 429);
+  let b = await r.json();
+  assert.deepEqual([b.error, b.reason, b.scope, b.org, b.remaining_usd], ["budget_exceeded", "preflight_estimate", "org:total", true, 1]);
+  assert.equal(r.headers.get("retry-after"), null);
+  // Org total lifted; an acme tag total of 500 refuses acme, globex passes.
+  assert.equal((await f.request("/v1/org-budget", { total: null }, owner, null, "PUT")).status, 200);
+  assert.equal((await f.request("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "total", usd: 500 }] }, owner, null, "PUT")).status, 200);
+  assert.equal((await c.sync()).online, true);
+  r = await call({ "x-costcap-tag": "customer=acme" });
+  assert.equal(r.status, 429);
+  b = await r.json();
+  assert.deepEqual([b.error, b.reason, b.scope, b.tag_value, b.remaining_usd], ["tag_budget_exceeded", "preflight_estimate", "total", "acme", 1]);
+  assert.equal(up.hits, 0);
+  assert.equal((await call({ "x-costcap-tag": "customer=globex" })).status, 200);
+  assert.equal(up.hits, 1);
 });
