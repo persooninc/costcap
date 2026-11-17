@@ -67,6 +67,8 @@ test("every table rate is finite and positive and each provider has a source URL
       if (rates.input_only && field === "output") { assert.equal(rates.output, 0, model); continue; }
       // #269: Gemini image models publish no cached rate; the key is absent (cache reads are unpriced), never 0.
       if (field === "cached_input" && !Object.hasOwn(rates, "cached_input") && /-image$/.test(model)) continue;
+      // Documented exception (#270): Gemini TTS publishes no context-caching rate; a cache read is unpriced.
+      if (rates.no_cache_rate && field === "cached_input") { assert.equal(rates.cached_input, undefined, model); continue; }
       assert.equal(Number.isFinite(rates[field]) && rates[field] > 0, true, `${model}.${field}`);
     }
   }

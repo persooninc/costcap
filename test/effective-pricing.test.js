@@ -258,3 +258,11 @@ test("#257 cache_storage is a dated component: billed_as rows inherit it, 3.8 Fl
   assert.equal(cacheStorageCost("gemini-3.8-flash", 1000000, "2026-12-31T23:00:00Z", "2027-01-01T01:00:00Z").cost_usd, 1.5);
   assert.equal(validateSchedules(JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"))), null);
 });
+
+test("#270: dated Gemini TTS rows switch on 2027-01-01 (standard and priority)", () => {
+  const U = { input_tokens: 1_000_000, output_tokens: 1_000_000, cached_input_tokens: 0, modality_tokens: { output: { text: 0, audio: 1_000_000 } } };
+  assert.equal(costForUsage("gemini-3.8-flash-tts", U, { at: "2026-12-31T23:59:59Z" }).cost_usd, 9.5);
+  assert.equal(costForUsage("gemini-3.8-flash-tts", U, { at: "2027-01-01T00:00:00Z" }).cost_usd, 19);
+  assert.equal(costForUsage("gemini-3.8-flash-lite-tts", { ...U, service_tier: "priority" }, { at: "2027-01-01T00:00:00Z" }).cost_usd, 23.4);
+  assert.equal(lookupPrice("gemini-2.5-pro-preview-tts", "2027-06-01T00:00:00Z").rates_effective_from, undefined);
+});

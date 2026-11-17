@@ -375,3 +375,11 @@ test("#255 AC4: fleet agent/team/org remaining subtracts in-flight estimates", a
     assert.equal(rs[2].json.fleet, true);
   }
 });
+
+test("#270: Gemini TTS estimates at the audio output rate (default output when maxOutputTokens is absent)", () => {
+  const b = JSON.stringify({ contents: [{ parts: [{ text: "hi" }] }], generationConfig: { responseModalities: ["AUDIO"] } });
+  const e = estimateWorstCase("gemini", b, "/v1beta/models/gemini-2.5-flash-preview-tts:generateContent");
+  assert.equal(e.ok, true);
+  assert.equal(e.output_tokens, DEFAULT_MAX_OUTPUT.gemini);
+  assert.ok(e.estimate_usd >= DEFAULT_MAX_OUTPUT.gemini * 10 / 1_000_000);
+});

@@ -175,3 +175,9 @@ test("allowlist, --unknown-models refuse and downgrade see the path model of a G
   assert.deepEqual([r.reason, r.downgrade, r.model], ["batch_pending", "unsupported_route", "gemini-2.5-flash"]);
   assert.equal(d.seen[0].url, "/v1beta/models/gemini-2.5-flash:batchGenerateContent");
 });
+
+test("#270: a gemini-3.8-flash-tts batch result settles 1M/1M at 0.5x ($4.75)", () => {
+  const r = { candidates: [{ content: { parts: [] }, finishReason: "STOP" }], modelVersion: "gemini-3.8-flash-tts",
+    usageMetadata: { promptTokenCount: 1_000_000, candidatesTokenCount: 1_000_000, candidatesTokensDetails: [{ modality: "AUDIO", tokenCount: 1_000_000 }] } };
+  assert.deepEqual(foldBatchResults("gemini", JSON.stringify({ response: r }), null, { model: "gemini-3.8-flash-tts" }).cost_usd, 4.75);
+});

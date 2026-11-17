@@ -365,6 +365,10 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   declared `text_rate_modalities`. Any other non-text token (including every
   unknown/fallback model) gives `cost_usd: null`, `reason: "modality_unpriced"`
   and the next call returns `accounting_unavailable`: never priced as text.
+  Gemini text-to-speech (`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`
+  and the preview TTS models) prices text input and audio output at Google's
+  published rates, including the 2027-01-01 change on the 3.8 rows; TTS has no
+  cache rate, so a cache read gives `cost_usd: null` (`cache_read_unpriced`).
   `costcap pricing show` prints the modality rates. When a model
   publishes a prompt-length split (Gemini 2.5 Pro / 3.1 Pro, Claude Sonnet
   4.5 / 4.6 above 200K prompt tokens, Claude Haiku 5.5 above 100K), a call whose whole prompt (input +

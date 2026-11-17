@@ -109,3 +109,12 @@ test("#194 realtime usage shape prices audio at realtime rates with the cached s
   assert.equal(costForUsage("gpt-realtime-2.1", usage).cost_usd, Number(((200 * 4 + 100 * 0.4 + 600 * 32 + 400 * 0.4 + 100 * 24 + 500 * 64) / 1e6).toFixed(6)));
   assert.equal(lookupPrice("gpt-realtime-2.1-mini").modalities.audio.output, 20);
 });
+
+test("#270: audio output priced on Gemini TTS rows; audio/image input still unpriced", () => {
+  const out = { input_tokens: 20, output_tokens: 250, cached_input_tokens: 0, modality_tokens: { input: { text: 20 }, output: { text: 0, audio: 250 } } };
+  assert.equal(costForUsage("gemini-2.5-flash-preview-tts", out).cost_usd, 0.00251);
+  for (const m of ["audio", "image"]) {
+    const r = costForUsage("gemini-3.8-flash-tts", { ...out, modality_tokens: { input: { text: 0, [m]: 20 }, output: { audio: 250 } } }, { at: "2026-11-16T12:00:00Z" });
+    assert.deepEqual([r.cost_usd, r.reason], [null, "modality_unpriced"], m);
+  }
+});
