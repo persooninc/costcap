@@ -5,7 +5,7 @@ import { createTransactionalEmail } from "./email.js";
 import { digestText, digestHtml, digestSlack, digestWebhookPayload, digestSubject } from "./digest.js";
 // Hosted delivery adapter. The caller authorizes recipients and supplies secrets.
 // Tests pass a fake fetch. This module does not send by itself.
-export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook, webhook, dashboardUrl, lookup = dnsLookup, fetchImpl = fetch, nowMs = () => Date.now() } = {}) {
+export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook, webhook, kinds = null, routes = [], dashboardUrl, lookup = dnsLookup, fetchImpl = fetch, nowMs = () => Date.now() } = {}) {
   if (slackWebhook) {
     const url = new URL(slackWebhook);
     if (url.protocol !== "https:" || url.hostname !== "hooks.slack.com" || !url.pathname.startsWith("/services/")) throw new Error("Slack webhook must use hooks.slack.com/services over HTTPS");
@@ -20,15 +20,19 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
     const text = alert.kind === "test" ? `CostCap test alert for ${alert.org_name ?? alert.orgId ?? "your org"}: your destinations are working. No spend or cap is involved.` : `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : alert.model ? `agent ${alert.agentName ?? alert.agentId ?? "unknown"}, model ${alert.model}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.kind === "cap_projected" && num(alert.projected) !== null ? ` (spent $${fmt(alert.spent)}, projected $${fmt(alert.projected)} of $${fmt(alert.cap)} cap by period end)` : alert.model && alert.spent != null ? ` (spent $${alert.spent} of $${alert.cap} cap)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
+    // Issue #258: `kinds` filters the default email/Slack; the signed webhook gets every alert.
+    const defaultsOn = kindMatches(kinds, alert.kind);
+    const sentEmails = new Set(defaultsOn ? (emailTo ?? []) : []);
+    const sentSlack = new Set(defaultsOn && slackWebhook ? [slackWebhook] : []);
     if (!want("email")) { /* already settled for this occurrence */ }
-    else if (emailKey && emailFrom && emailTo?.length) {
+    else if (defaultsOn && emailKey && emailFrom && emailTo?.length) {
       try {
         await createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to: emailTo, subject: alert.kind === "test" ? "CostCap: test alert" : `CostCap: ${alert.kind}`, text });
         results.push({ channel: "email", status: "accepted" });
       } catch (err) { results.push({ channel: "email", status: "failed", error: err.message }); }
     } else results.push({ channel: "email", status: "unconfigured" });
     if (!want("slack")) { /* skip */ }
-    else if (slackWebhook) {
+    else if (defaultsOn && slackWebhook) {
       try { await post(slackWebhook, {}, { text }); results.push({ channel: "slack", status: "accepted" }); }
       catch (err) { results.push({ channel: "slack", status: "failed", error: err.message }); }
     } else results.push({ channel: "slack", status: "unconfigured" });
@@ -43,8 +47,41 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
         results.push({ channel: "webhook", status: "accepted" });
       } catch (err) { results.push({ channel: "webhook", status: "failed", error: err.message }); }
     } else results.push({ channel: "webhook", status: "unconfigured" });
+    // Issue #258: additive routes. Defaults first, then routes in order; an
+    // address or Slack URL already covered in this occurrence is not sent again.
+    for (const route of matchingRoutes(routes, alert)) {
+      const emailCh = `route:${route.id}:email`, slackCh = `route:${route.id}:slack`;
+      const to = (route.emails ?? []).filter((e) => !sentEmails.has(e));
+      to.forEach((e) => sentEmails.add(e));
+      if (to.length && emailKey && emailFrom && want(emailCh)) {
+        try {
+          await createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to, subject: `CostCap: ${alert.kind}`, text });
+          results.push({ channel: emailCh, status: "accepted" });
+        } catch (err) { results.push({ channel: emailCh, status: "failed", error: err.message }); }
+      }
+      const hook = route.slackWebhook && validSlackWebhook(route.slackWebhook) && !sentSlack.has(route.slackWebhook) ? route.slackWebhook : null;
+      if (hook) sentSlack.add(hook);
+      if (hook && want(slackCh)) {
+        try { await post(hook, {}, { text }); results.push({ channel: slackCh, status: "accepted" }); }
+        catch (err) { results.push({ channel: slackCh, status: "failed", error: err.message }); }
+      }
+    }
     return results;
   };
+}
+
+// Issue #258: alert routes. `kinds` null = all kinds; `teams` null = any team
+// (including no team); `teams: []` (its teams were deleted) matches nothing.
+export const MAX_ALERT_ROUTES = 10;
+const kindMatches = (kinds, kind) => !Array.isArray(kinds) || kinds.includes(kind);
+/** The team an alert routes by: its own team, else (agent alerts) the team listing the agent at send time. */
+export const alertRouteTeam = (alert) => (alert.org || alert.tag ? null : alert.team ?? alert.routeTeam ?? null);
+export function matchingRoutes(routes, alert) {
+  const team = alertRouteTeam(alert);
+  return (Array.isArray(routes) ? routes : []).filter((r) => kindMatches(r.kinds, alert.kind) && (!Array.isArray(r.teams) || (team !== null && r.teams.includes(team))));
+}
+export function maskRoute(r) {
+  return { id: r.id, name: r.name, kinds: Array.isArray(r.kinds) ? [...r.kinds] : null, teams: Array.isArray(r.teams) ? [...r.teams] : null, emails: [...(r.emails ?? [])], slackWebhook: maskWebhook(r.slackWebhook), disabled: Array.isArray(r.teams) && r.teams.length === 0 };
 }
 
 // Issue #121: per-org alert destinations. Validation and masking for the
@@ -61,7 +98,7 @@ export function maskWebhook(value) {
   return `https://hooks.slack.com/services/…${value.slice(-4)}`;
 }
 export function maskAlertSettings(settings) {
-  return { emails: [...(settings?.emails ?? [])], slackWebhook: maskWebhook(settings?.slackWebhook), webhook: maskSignedWebhook(settings?.webhook), configured: Boolean(settings?.emails?.length || settings?.slackWebhook || settings?.webhook?.url) };
+  return { emails: [...(settings?.emails ?? [])], slackWebhook: maskWebhook(settings?.slackWebhook), webhook: maskSignedWebhook(settings?.webhook), ...(Array.isArray(settings?.kinds) ? { kinds: [...settings.kinds] } : {}), ...(settings?.routes?.length ? { routes: settings.routes.map(maskRoute) } : {}), configured: Boolean(settings?.emails?.length || settings?.slackWebhook || settings?.webhook?.url || settings?.routes?.length) };
 }
 
 // Issue #199: signed generic webhook. One HTTPS endpoint per org receives
@@ -154,8 +191,8 @@ export async function assertWebhookTarget(value, lookup = dnsLookup) {
 export function createOrgAlertRouter({ emailKey, emailFrom, fetchImpl = fetch, fallback, dashboardUrl, lookup = dnsLookup, nowMs } = {}) {
   const fallbackDelivery = fallback?.orgId ? createAlertDelivery({ emailKey, emailFrom, emailTo: fallback.emailTo, slackWebhook: fallback.slackWebhook, fetchImpl }) : null;
   return async (alert, settings, opts) => {
-    const has = settings && (settings.emails?.length || settings.slackWebhook || settings.webhook?.url);
-    if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
+    const has = settings && (settings.emails?.length || settings.slackWebhook || settings.webhook?.url || settings.routes?.length);
+    if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, kinds: settings.kinds ?? null, routes: settings.routes ?? [], dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
     if (fallbackDelivery && alert.orgId === fallback.orgId) return fallbackDelivery(alert, opts);
     return [{ status: "unconfigured" }];
   };
