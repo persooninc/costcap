@@ -93,6 +93,7 @@ test("integration: fleet, evidence and audit.csv label who did what; org isolati
   assert.equal((await f.request("/v1/fleet/freeze", { reason: "runaway" }, owner)).status, 200);
   assert.equal((await f.request("/v1/fleet/resume", { reason: "fixed" }, owner)).status, 200);
   assert.equal((await f.request("/v1/alert-settings", { emails: ["audit-owner@example.invalid"] }, owner)).status, 200);
+  assert.equal((await f.request("/v1/alert-settings/test", {}, owner)).status, 200);
   assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "u", ts: new Date().toISOString(), cost_usd: null, model: "m" }] }, null, agent.token)).status, 200);
   assert.equal((await f.request("/v1/receipts/u/settle", { agent_id: agent.agentId, cost_usd: 1, source: "manual_evidence", reason: "r" }, owner)).status, 200);
   assert.equal((await f.request("/v1/invitations", { email: "audit-viewer@example.invalid", role: "viewer" }, owner)).status, 201);
@@ -101,7 +102,7 @@ test("integration: fleet, evidence and audit.csv label who did what; org isolati
   assert.equal(policy.actor_label, "audit-owner@example.invalid");
   assert.equal(policy.target_label, "=builder");
   assert.equal(policy.actor.length > 10, true, "raw actor kept");
-  for (const action of ["fleet.freeze", "fleet.resume", "team.change", "receipt.settle", "alert_settings.change", "agent.enroll", "receipts.sync"]) {
+  for (const action of ["fleet.freeze", "fleet.resume", "team.change", "receipt.settle", "alert_settings.change", "alert_settings.test", "agent.enroll", "receipts.sync"]) {
     const e = fleet.audit.find((x) => x.action === action);
     assert.ok(e, action);
     assert.notEqual(e.actor_label, "unknown", action);

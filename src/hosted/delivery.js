@@ -18,12 +18,12 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
   // channels are not sent and not reported.
   return async (alert, { channels } = {}) => {
     const want = (ch) => !Array.isArray(channels) || channels.includes(ch);
-    const text = `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : alert.model ? `agent ${alert.agentName ?? alert.agentId ?? "unknown"}, model ${alert.model}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.kind === "cap_projected" && num(alert.projected) !== null ? ` (spent $${fmt(alert.spent)}, projected $${fmt(alert.projected)} of $${fmt(alert.cap)} cap by period end)` : alert.model && alert.spent != null ? ` (spent $${alert.spent} of $${alert.cap} cap)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
+    const text = alert.kind === "test" ? `CostCap test alert for ${alert.org_name ?? alert.orgId ?? "your org"}: your destinations are working. No spend or cap is involved.` : `CostCap ${alert.kind}: ${alert.org ? "org budget" : alert.tag ? `tag ${alert.tag.key}=${alert.tag.value}` : alert.team ? `team ${alert.team}` : alert.model ? `agent ${alert.agentName ?? alert.agentId ?? "unknown"}, model ${alert.model}` : `agent ${alert.agentId ?? "unknown"}`}${alert.scope ? `, ${alert.scope}` : ""}${alert.kind === "spend_anomaly" ? ` (today $${alert.today}${alert.lower_bound ? "+" : ""} vs $${alert.baseline} daily median, ${alert.multiplier}x)` : alert.kind === "cap_projected" && num(alert.projected) !== null ? ` (spent $${fmt(alert.spent)}, projected $${fmt(alert.projected)} of $${fmt(alert.cap)} cap by period end)` : alert.model && alert.spent != null ? ` (spent $${alert.spent} of $${alert.cap} cap)` : alert.team || alert.org || alert.tag ? ` (spent $${alert.spent} of $${alert.cap} cap)` : ""}. Estimated spend guardrails, not a billing guarantee.`;
     const results = [];
     if (!want("email")) { /* already settled for this occurrence */ }
     else if (emailKey && emailFrom && emailTo?.length) {
       try {
-        await createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to: emailTo, subject: `CostCap: ${alert.kind}`, text });
+        await createTransactionalEmail({ apiKey: emailKey, from: emailFrom, fetchImpl })({ to: emailTo, subject: alert.kind === "test" ? "CostCap: test alert" : `CostCap: ${alert.kind}`, text });
         results.push({ channel: "email", status: "accepted" });
       } catch (err) { results.push({ channel: "email", status: "failed", error: err.message }); }
     } else results.push({ channel: "email", status: "unconfigured" });
@@ -104,6 +104,8 @@ export function webhookPayload(alert, { dashboardUrl } = {}) {
     top_models: Array.isArray(alert.top_models) ? alert.top_models.map((m) => ({ model: m.model, usd: num(m.usd) })) : null,
     lower_bound: typeof alert.lower_bound === "boolean" ? alert.lower_bound : null,
     fired_at: alert.fired_at ?? null, dashboard_url: dashboardUrl ?? null,
+    // Issue #259: a test send is marked so receivers can ignore it after verifying the signature.
+    ...(alert.kind === "test" ? { test: true } : {}),
   };
 }
 

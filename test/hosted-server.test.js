@@ -1620,3 +1620,100 @@ test("#244 model caps: agent_spend.models, cap_approaching/cap_hit per model, re
   await f.service().evaluateFleetAlerts();
   assert.equal((await f.request("/v1/alerts?status=active", undefined, owner.cookie)).body.alerts.filter((al) => al.model).length, 0);
 });
+
+// Issue #259: Send test alert.
+test("#259 test alert: roles, isolation, validation, partial config, SSRF, no side effects, masking, audit, rate limit", async (t) => {
+  const { createOrgAlertRouter, verifyWebhookSignature } = await import("../src/hosted/delivery.js");
+  let clock = Date.parse("2026-11-16T12:00:00Z");
+  const sent = [];
+  let slackStatus = 200, address = "93.184.216.34";
+  const resolveHost = async () => [{ address, family: 4 }];
+  const deliverAlert = createOrgAlertRouter({ emailKey: "brevo-key", emailFrom: "alerts@costcap.dev", lookup: resolveHost, nowMs: () => clock,
+    fetchImpl: async (url, o) => { sent.push({ url, body: o.body, headers: o.headers }); return { ok: !url.startsWith("https://hooks.slack.com") || slackStatus === 200, status: url.startsWith("https://hooks.slack.com") ? slackStatus : 200, json: async () => ({}) }; } });
+  const f = await fixture(t, { now: () => clock, extra: { deliverAlert, resolveHost } });
+  const hook = "https://hooks.slack.com/services/T000/B000/fullSecretHookValue9";
+  const owner = await f.login("owner@a.invalid");
+  const other = await f.login("owner@b.invalid");
+  assert.equal((await f.request("/v1/invitations", { email: "viewer@a.invalid", role: "viewer" }, owner.cookie)).status, 201);
+  assert.equal((await f.request("/v1/invitations", { email: "admin@a.invalid", role: "admin" }, owner.cookie)).status, 201);
+  const viewer = await f.login("viewer@a.invalid");
+  const adminU = await f.login("admin@a.invalid");
+  // Partial config: only email.
+  assert.equal((await f.request("/v1/alert-settings", { emails: ["owner@a.invalid", "admin@a.invalid"] }, owner.cookie)).status, 200);
+  let r = await f.request("/v1/alert-settings/test", {}, owner.cookie);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.results.map((x) => [x.channel, x.status]), [["email", "accepted"], ["slack", "unconfigured"], ["webhook", "unconfigured"]]);
+  assert.equal(sent.length, 1);
+  // Full config.
+  const saved = await f.request("/v1/alert-settings", { slackWebhook: hook, webhook: "https://receiver.example.com/costcap/pathSecretK3" }, owner.cookie);
+  const secret = saved.body.webhookSecret;
+  // Access.
+  assert.equal((await f.request("/v1/alert-settings/test", {})).status, 401);
+  assert.equal((await f.request("/v1/alert-settings/test", {}, viewer.cookie)).status, 403);
+  const key = (await f.request("/v1/api-keys", { name: "rw", role: "admin" }, owner.cookie)).body.key;
+  assert.equal((await f.request("/v1/alert-settings/test", {}, null, key)).status, 403);
+  assert.equal((await f.request("/v1/alert-settings/test", { channels: ["sms"] }, owner.cookie)).status, 400);
+  assert.equal((await f.request("/v1/alert-settings/test", { channels: "slack" }, owner.cookie)).status, 400);
+  // Org B sends nothing anywhere: no saved settings.
+  sent.length = 0;
+  r = await f.request("/v1/alert-settings/test", {}, other.cookie);
+  assert.equal(r.status, 200);
+  assert.ok(r.body.results.every((x) => x.status === "unconfigured"));
+  assert.equal(sent.length, 0);
+  // Admin, all three channels.
+  const alertsBefore = JSON.stringify((await f.request("/v1/alerts", undefined, owner.cookie)).body);
+  r = await f.request("/v1/alert-settings/test", {}, adminU.cookie);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.results.map((x) => [x.channel, x.status]), [["email", "accepted"], ["slack", "accepted"], ["webhook", "accepted"]]);
+  assert.equal(r.body.results[1].destination, "https://hooks.slack.com/services/…lue9");
+  assert.equal(r.body.results[2].destination, "https://receiver.example.com/…");
+  assert.equal(sent.length, 3);
+  assert.ok(sent.some((s) => s.url.includes("brevo")));
+  const wh = sent.find((s) => s.url === "https://receiver.example.com/costcap/pathSecretK3");
+  assert.equal(verifyWebhookSignature(secret, wh.body, wh.headers["x-costcap-signature"], { nowMs: clock }), true);
+  assert.deepEqual([JSON.parse(wh.body).kind, JSON.parse(wh.body).test], ["test", true]);
+  // Removed member's email is not sent to.
+  const adminId = (await f.request("/v1/fleet", undefined, owner.cookie)).body.members.find((m) => m.email === "admin@a.invalid").id;
+  assert.equal((await f.request(`/v1/members/${adminId}/remove`, {}, owner.cookie)).status, 200);
+  sent.length = 0;
+  r = await f.request("/v1/alert-settings/test", { channels: ["email"] }, owner.cookie);
+  assert.deepEqual(r.body.results.map((x) => x.channel), ["email"]);
+  const mail = JSON.parse(sent[0].body);
+  assert.equal(JSON.stringify(mail).includes("admin@a.invalid"), false);
+  // Slack 404 and SSRF re-check.
+  slackStatus = 404; address = "10.0.0.5";
+  sent.length = 0;
+  r = await f.request("/v1/alert-settings/test", {}, owner.cookie);
+  const by = Object.fromEntries(r.body.results.map((x) => [x.channel, x]));
+  assert.equal(by.email.status, "accepted");
+  assert.deepEqual([by.slack.status, by.slack.error], ["failed", "delivery HTTP 404"]);
+  assert.equal(by.webhook.status, "failed");
+  assert.equal(sent.some((s) => s.url.startsWith("https://receiver.example.com")), false);
+  // Rate limit: 5 per org per 10 minutes (4 sends so far in org A; org B has its own budget).
+  assert.equal((await f.request("/v1/alert-settings/test", { channels: ["email"] }, owner.cookie)).status, 200);
+  r = await f.request("/v1/alert-settings/test", {}, owner.cookie);
+  assert.equal(r.status, 429);
+  const port = f.service().server.address().port;
+  const raw = await fetch(`http://127.0.0.1:${port}/v1/alert-settings/test`, { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json", cookie: owner.cookie }, body: "{}" });
+  assert.equal(raw.status, 429);
+  assert.ok(Number(raw.headers.get("retry-after")) > 0);
+  // No side effects: alerts unchanged, worker sends nothing.
+  assert.equal(JSON.stringify((await f.request("/v1/alerts", undefined, owner.cookie)).body), alertsBefore);
+  sent.length = 0;
+  clock += 600_001;
+  await f.service().evaluateFleetAlerts();
+  assert.equal(sent.length, 0);
+  assert.equal((await f.request("/v1/alert-settings/test", { channels: ["slack"] }, owner.cookie)).status, 200);
+  // Audit: one entry per completed call, masked; nothing leaks anywhere.
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  const tests = fleet.audit.filter((e) => e.action === "alert_settings.test");
+  assert.equal(tests.length, 6);
+  const bodies = [JSON.stringify(fleet)];
+  for (const p of ["/v1/evidence.json", "/v1/alerts", "/v1/alert-settings"]) bodies.push(JSON.stringify((await f.request(p, undefined, owner.cookie)).body));
+  const metrics = await (await fetch(`http://127.0.0.1:${port}/v1/metrics`, { headers: { cookie: owner.cookie } })).text();
+  assert.equal(metrics.includes("kind=\"test\""), false);
+  bodies.push(metrics);
+  bodies.push(await (await fetch(`http://127.0.0.1:${port}/v1/audit.csv`, { headers: { cookie: owner.cookie } })).text());
+  for (const b of bodies) for (const s of ["fullSecretHookValue9", "pathSecretK3", secret]) assert.equal(b.includes(s), false, `leaked ${s.slice(0, 8)}`);
+  assert.equal(JSON.stringify(fleet).includes("test_"), false, "test alert never stored as an alert");
+});

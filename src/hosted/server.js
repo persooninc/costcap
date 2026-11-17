@@ -33,6 +33,7 @@ import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.j
 import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy } from "./org-budget.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
+const ALERT_TEST_LIMIT = 5, ALERT_TEST_WINDOW_MS = 600_000;
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
 
 // Issue #130: one-time, idempotent startup scrub of credential query parameters in
@@ -234,6 +235,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   };
   const billingReady = billingFactory ? Promise.resolve().then(() => billingFactory(store)).then(b => { billing = b; }) : Promise.resolve();
   const rate = new Map();
+  const testRate = new Map(); // #259: test sends per org
   const sessionUser = (s, req) => {
     const cookie = /(?:^|;\s*)costcap_session=([^;]+)/.exec(req.headers.cookie ?? "")?.[1];
     const found = cookie && s.sessions[hashToken(cookie)];
@@ -728,6 +730,43 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return { ...maskAlertSettings(next), canEdit: true, ...(issued ? { webhookSecret: issued } : {}) };
         });
         return json(200, result);
+      }
+      // Issue #259: on-demand test send to the org's saved destinations. Never stored
+      // as an alert (no /v1/alerts row, no retry), audited with masked results only.
+      if (path === "/v1/alert-settings/test" && req.method === "POST") {
+        sessionOnly(req);
+        const CHANNELS = ["email", "slack", "webhook"];
+        if (body.channels !== undefined && (!Array.isArray(body.channels) || !body.channels.length || body.channels.some((c) => !CHANNELS.includes(c)))) fail(400, "channels must be a list of email, slack, webhook");
+        const channels = body.channels === undefined ? CHANNELS : CHANNELS.filter((c) => body.channels.includes(c));
+        const { u, settings } = store.read((s) => {
+          const u = admin(s, req);
+          const saved = s.orgs[u.orgId]?.alertSettings;
+          if (!saved) return { u, settings: null };
+          const members = new Set(Object.values(s.users).filter((m) => m.orgId === u.orgId && m.verified).map((m) => m.email));
+          return { u, settings: { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null } };
+        });
+        if (testRate.size > 10000) testRate.clear();
+        const recent = (testRate.get(u.orgId) ?? []).filter((ts) => ts > now() - ALERT_TEST_WINDOW_MS);
+        if (recent.length >= ALERT_TEST_LIMIT) {
+          const retryAfter = Math.max(1, Math.ceil((recent[0] + ALERT_TEST_WINDOW_MS - now()) / 1000));
+          return json(429, { error: "Too many test alerts; try again later", retry_after: retryAfter }, { "retry-after": String(retryAfter) });
+        }
+        testRate.set(u.orgId, [...recent, now()]);
+        const alert = { kind: "test", id: `test_${randomUUID()}`, orgId: u.orgId, org_name: store.read((s) => s.orgs[u.orgId]?.name ?? u.orgId), fired_at: new Date(now()).toISOString() };
+        let raw;
+        try { raw = deliverAlert ? await deliverAlert(alert, settings, { channels }) : []; }
+        catch (err) { raw = channels.map((channel) => ({ channel, status: "failed", error: err.message })); }
+        const masked = maskAlertSettings(settings);
+        const destination = { email: settings?.emails?.length ? settings.emails : null, slack: masked.slackWebhook, webhook: masked.webhook?.url ?? null };
+        const secrets = [settings?.slackWebhook, settings?.webhook?.url, settings?.webhook?.secret].filter(Boolean);
+        const scrub = (msg) => secrets.reduce((m, v) => m.split(v).join("[redacted]"), String(msg));
+        const byChannel = new Map((Array.isArray(raw) ? raw : []).filter((r) => r?.channel).map((r) => [r.channel, r]));
+        const results = channels.map((channel) => {
+          const r = byChannel.get(channel) ?? { status: "unconfigured" };
+          return { channel, status: r.status, ...(r.error ? { error: scrub(r.error) } : {}), destination: destination[channel] };
+        });
+        store.transaction((s) => { audit(s, u.orgId, u.id, "alert_settings.test", u.orgId, { channels, results }); });
+        return json(200, { id: alert.id, results });
       }
       // Issue #223: org default spend-anomaly settings. Any member reads, owner/admin writes (audited).
       if (path === "/v1/anomaly-settings" && req.method === "GET") {

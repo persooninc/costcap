@@ -319,3 +319,69 @@ test("team mid-month run rate shows cap_projected · team ops month · projected
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #259: "Send test alert" on the Alert destinations card. Fixture receiver only.
+for (const viewport of [{ name: "desktop", width: 1280, height: 800 }, { name: "mobile", width: 390, height: 844 }]) {
+  test(`admin sends a test alert and sees per-channel results; viewer has no button (${viewport.name})`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    const { createOrgAlertRouter, verifyWebhookSignature } = await import("../src/hosted/delivery.js");
+    const port = await freePort();
+    const origin = `http://127.0.0.1:${port}`;
+    const codes = [];
+    const received = [];
+    const resolveHost = async () => [{ address: "93.184.216.34", family: 4 }];
+    const deliverAlert = createOrgAlertRouter({ lookup: resolveHost, dashboardUrl: origin, fetchImpl: async (url, o) => { received.push({ url, body: o.body, sig: o.headers["x-costcap-signature"] }); return { ok: true, status: 200 }; } });
+    const service = createHostedServer({
+      storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-testalert-")), "data.json"),
+      origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", resolveHost,
+      verifyChallenge: async (token) => token === fixtureToken,
+      sendCode: async (message) => { codes.push(message); },
+      sendInvite: async () => {},
+      deliverAlert,
+    });
+    await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+    const signIn = async (email) => {
+      await page.goto(origin);
+      await page.locator("#email").fill(email);
+      await expect(page.locator("#requestButton")).toBeEnabled();
+      await page.locator("#requestButton").click();
+      await expect(page.locator("#verify")).toBeVisible();
+      await page.locator("#code").fill(codes.at(-1).code);
+      await page.locator("#verify button[type=submit]").click();
+      await expect(page.locator("#workspace")).toBeVisible();
+    };
+    try {
+      await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+        status: 200, contentType: "application/javascript",
+        body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+      }));
+      await signIn("test-owner@example.invalid");
+      await page.locator("#alertForm input[name=emails]").fill("");
+      await page.locator("#alertForm input[name=slack]").fill("https://hooks.slack.com/services/T0/B0/e2eSlackK9");
+      await page.locator("#alertForm input[name=webhook]").fill("https://receiver.example.com/costcap/e2eTestK3");
+      await page.locator("#alertForm button.primary").click();
+      await expect(page.locator("#webhookSecretBox")).toBeVisible();
+      const secret = (await page.locator("#webhookSecret").innerText()).trim();
+      await page.locator("#testAlert").click();
+      const rows = page.locator("#testAlertResults li");
+      await expect(rows).toHaveCount(3);
+      await expect(page.locator("#testAlertResults li[data-channel=email]")).toHaveText("email: not configured");
+      await expect(page.locator("#testAlertResults li[data-channel=slack]")).toHaveText("slack: accepted · https://hooks.slack.com/services/…ckK9");
+      await expect(page.locator("#testAlertResults li[data-channel=webhook]")).toHaveText("webhook: accepted · https://receiver.example.com/…");
+      const hook = received.find((r) => r.url === "https://receiver.example.com/costcap/e2eTestK3");
+      expect(verifyWebhookSignature(secret, hook.body, hook.sig)).toBe(true);
+      expect(JSON.parse(hook.body)).toMatchObject({ kind: "test", test: true });
+      expect(await page.content()).not.toContain("e2eSlackK9");
+      await page.locator("#invite input[name=email]").fill("test-viewer@example.invalid");
+      await page.locator("#invite button").click();
+      await expect(page.locator("#invites")).toContainText("test-viewer@example.invalid");
+      await page.locator("#logout").click();
+      await signIn("test-viewer@example.invalid");
+      await expect(page.locator("#alertSlack")).toContainText("https://hooks.slack.com/services/…");
+      await expect(page.locator("#testAlert")).toBeHidden();
+    } finally {
+      service.server.closeAllConnections();
+      await new Promise((resolve) => service.server.close(resolve));
+    }
+  });
+}

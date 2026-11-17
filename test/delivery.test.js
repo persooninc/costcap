@@ -158,3 +158,31 @@ test("#244: model alert text and webhook payload name the model", async () => {
   const hook = JSON.parse(calls.find((c) => c.url === "https://hooks.example.com/costcap").options.body);
   assert.equal(hook.model, "claude-opus-4-8");
 });
+
+// Issue #259: on-demand test alert.
+test("#259: test-kind text, signed webhook with kind:test/test:true, channels filter", async () => {
+  const calls = [];
+  const secret = "whsec_" + "a".repeat(48);
+  const send = createAlertDelivery({
+    emailKey: "k", emailFrom: "alerts@costcap.dev", emailTo: ["o@a.invalid"],
+    slackWebhook: "https://hooks.slack.com/services/T/B/x", webhook: { url: "https://r.example.com/h", secret },
+    lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    fetchImpl: async (url, o) => { calls.push({ url, o }); return { ok: true, status: 200, json: async () => ({}) }; },
+  });
+  const alert = { kind: "test", id: "test_1", orgId: "org1", org_name: "a.invalid", fired_at: "2026-11-16T00:00:00.000Z" };
+  const rows = await send(alert);
+  assert.deepEqual(rows.map((r) => [r.channel, r.status]), [["email", "accepted"], ["slack", "accepted"], ["webhook", "accepted"]]);
+  const slack = calls.find((c) => c.url.startsWith("https://hooks.slack.com"));
+  assert.equal(JSON.parse(slack.o.body).text, "CostCap test alert for a.invalid: your destinations are working. No spend or cap is involved.");
+  const hook = calls.find((c) => c.url === "https://r.example.com/h");
+  const body = JSON.parse(hook.o.body);
+  assert.equal(body.kind, "test");
+  assert.equal(body.test, true);
+  assert.equal(body.id, "test_1");
+  assert.equal(verifyWebhookSignature(secret, hook.o.body, hook.o.headers["x-costcap-signature"]), true);
+  assert.equal("test" in webhookPayload({ kind: "cap_hit" }), false);
+  calls.length = 0;
+  const only = await send(alert, { channels: ["slack"] });
+  assert.deepEqual(only, [{ channel: "slack", status: "accepted" }]);
+  assert.equal(calls.length, 1);
+});
