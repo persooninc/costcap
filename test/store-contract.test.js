@@ -120,6 +120,26 @@ async function contract(open, mode) {
   assert.deepEqual(weekPolicy.model_caps_week, [{ model: "claude-opus-4-8", scope: "week", usd: 5 }]);
   assert.ok(!JSON.stringify(weekPolicy.tag_caps ?? null).includes("\"week\""));
   assert.equal(weekPolicy.org_budget_v2.caps.week, 10);
+  // #286 AC3: lifetime org, tag and model totals survive a restart and count org-A receipts only;
+  // planted org-B receipts (same agent id, same tag value, same model) never count.
+  weekStore.transaction((s) => {
+    s.orgs[ORG_A].orgBudget = { week: 10, total: 1000 };
+    s.orgs[ORG_A].tagCaps = [{ key: "customer", scope: "total", usd: 500 }];
+    s.agents.ag1.policy = { ...s.agents.ag1.policy, version: 4, modelCaps: [{ model: "gpt-6", scope: "total", usd: 20 }] };
+    s.receipts["ag1:acme-old"] = { orgId: ORG_A, agentId: "ag1", receipt: { id: "acme-old", ts: "2026-09-10T00:00:00Z", model: "gpt-6", cost_usd: 3, tags: { customer: "acme" } } };
+    s.receipts["ag1:acme-foreign"] = { orgId: ORG_B, agentId: "ag1", receipt: { id: "acme-foreign", ts: "2026-09-10T00:00:00Z", model: "gpt-6", cost_usd: 77, tags: { customer: "acme" } } };
+  });
+  await weekStore.flush();
+  const totalStore = await open();
+  assert.deepEqual(totalStore.read((s) => s.orgs[ORG_A].orgBudget), { week: 10, total: 1000 });
+  assert.deepEqual(totalStore.read((s) => s.orgs[ORG_A].tagCaps), [{ key: "customer", scope: "total", usd: 500 }]);
+  const lifePolicy = await policyOf(totalStore, "ag1-token");
+  assert.equal(lifePolicy.org_budget_total.spend_usd, 4.25);
+  assert.equal(lifePolicy.org_budget_total.cap, 1000);
+  assert.deepEqual(lifePolicy.tag_caps_total.spend.customer.acme, { total: 3, unknown: 0 });
+  assert.deepEqual(lifePolicy.model_caps_total, [{ model: "gpt-6", scope: "total", usd: 20 }]);
+  assert.equal(lifePolicy.agent_spend.models["gpt-6"].total, 3);
+  assert.equal(totalStore.read((s) => s.orgs[ORG_B].orgBudget), undefined);
   return { store, reopened };
 }
 
