@@ -620,7 +620,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const bp = orgPeriod(s, u.orgId);
           return buildMetrics({ nowMs: now(), budgetPeriod: bp, byModel: byParam === "model",
             cutoff: retentionCutoff(entitlements(s, u.orgId), now()),
-            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId && !a.revoked).map((a) => ({ ...a, caps: effectiveCaps(a.policy, now()) })),
+            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId && !a.revoked).map((a) => {
+              const caps = effectiveCaps(a.policy, now());
+              const out = { ...a, caps };
+              // #285: model caps and lifetime total, from the same helpers the dashboard and verdict use.
+              if (a.policy?.modelCaps?.length) out.modelCapStatus = modelCapStatus(orgAgentReceipts(s, u.orgId, a.id), a.policy.modelCaps, now(), bp);
+              if (caps.total != null) out.totalRemaining = hostedAgentVerdict({ agent: a, receipts: orgAgentReceipts(s, u.orgId, a.id), nowMs: now(), budgetPeriod: bp }).budget_remaining?.total_usd;
+              return out;
+            }),
+            orgBudget: orgBudgetOfOrg(s, u.orgId),
+            tagCaps: s.orgs?.[u.orgId]?.tagCaps?.length ? fleetTagCapsPolicy(s.orgs[u.orgId].tagCaps, orgReceipts(s, u.orgId), now(), Infinity, bp, { week: true }) : null,
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
             receipts: visibleReceipts(s, u.orgId),
             alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId) });

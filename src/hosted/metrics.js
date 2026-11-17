@@ -38,7 +38,10 @@ const labels = (l) => {
 // teams: [{ name, agents, caps:{day,month}, spend:{day_usd,month_usd} }] (team verdicts).
 // receipts: [{ agentId, receipt, settlement? }] already retention-filtered.
 // alerts: alert occurrences of this org.
-export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = [], nowMs, budgetPeriod = null, cutoff = null, byModel = false, maxSeries = MAX_SERIES }) {
+// #285: orgBudget: orgBudgetVerdict() (null when unset); tagCaps: fleetTagCapsPolicy()
+// ({ rules, spend }, null when unset); agent.modelCapStatus: modelCapStatus() rows;
+// agent.totalRemaining: the verdict's budget_remaining.total_usd (else computed here).
+export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = [], nowMs, budgetPeriod = null, cutoff = null, byModel = false, maxSeries = MAX_SERIES, orgBudget = null, tagCaps = null }) {
   const bp = normalizeBudgetPeriod(budgetPeriod);
   const series = new Map(Object.keys(HELP).map((k) => [k, []]));
   const add = (name, l, v) => series.get(name).push(`${name}${labels(l)} ${fmt(v)}`);
@@ -65,6 +68,20 @@ export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = 
       }
       if (byModel) for (const m of b.buckets) modelLines.push(`costcap_spend_usd${labels({ agent, team, window, model: m.key })} ${fmt(m.usd_known)}`);
     }
+    // #285: lifetime total cap (window="total").
+    if (caps.total != null) {
+      const remaining = Number.isFinite(a.totalRemaining) ? a.totalRemaining
+        : caps.total - spendBreakdown(items, { groupBy: "model", since: 0, cutoff, budgetPeriod: bp }).total.usd_known;
+      add("costcap_cap_usd", { scope: "agent", name: agent, window: "total" }, caps.total);
+      add("costcap_cap_remaining_usd", { scope: "agent", name: agent, window: "total" }, Math.max(0, remaining));
+    }
+    // #285: hosted model caps; spent null (hour scope or unknown cost) emits nothing, never $0.
+    for (const m of a.modelCapStatus ?? []) {
+      if (!METRIC_WINDOWS.includes(m.scope) || m.spent == null) continue;
+      const l = { scope: "model", name: agent, model: m.model, window: m.scope };
+      add("costcap_cap_usd", l, m.usd);
+      add("costcap_cap_remaining_usd", l, Math.max(0, m.usd - m.spent));
+    }
     add("costcap_agent_frozen", { agent }, a.policy?.killed || a.frozen ? 1 : 0);
     const seen = Number(a.lastSeen);
     if (Number.isFinite(seen) && seen > 0) add("costcap_agent_last_sync_timestamp_seconds", { agent }, Math.floor(seen / 1000));
@@ -76,21 +93,67 @@ export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = 
       add("costcap_cap_usd", { scope: "team", name: t.name, window }, cap);
       add("costcap_cap_remaining_usd", { scope: "team", name: t.name, window }, Math.max(0, cap - (t.spend?.[`${window}_usd`] ?? 0)));
     }
+    if (t.caps?.total != null) {
+      add("costcap_cap_usd", { scope: "team", name: t.name, window: "total" }, t.caps.total);
+      add("costcap_cap_remaining_usd", { scope: "team", name: t.name, window: "total" }, Math.max(0, t.caps.total - (t.spend?.total_usd ?? 0)));
+    }
+  }
+  // #285: org-wide budget, same verdict as GET /v1/org-budget (revoked agents' spend included).
+  if (orgBudget) {
+    for (const window of METRIC_WINDOWS) {
+      const cap = orgBudget.caps?.[window];
+      if (cap == null) continue;
+      add("costcap_cap_usd", { scope: "org", name: "org", window }, cap);
+      add("costcap_cap_remaining_usd", { scope: "org", name: "org", window }, Math.max(0, cap - (orgBudget.spend?.[`${window}_usd`] ?? 0)));
+    }
   }
   // Every kind is emitted per agent/team (0 when none open) so a resolved alert reads 0, not "absent".
   const open = new Map();
   for (const al of alerts) {
     if (!al.active || al.acknowledged_at) continue;
-    const scopeName = al.team ?? nameOf.get(al.agentId);
+    const scopeName = al.org ? "\u0001org" : al.tag ? `\u0001tag\u0000${al.tag.key}=${al.tag.value}` : al.team ?? nameOf.get(al.agentId);
     if (scopeName === undefined) continue;
     const k = `${al.kind}\u0000${scopeName}`;
     open.set(k, (open.get(k) ?? 0) + 1);
   }
   const scopes = [...agents.map((a) => nameOf.get(a.id)), ...teams.map((t) => t.name)];
   for (const kind of ALERT_KINDS) for (const scope_name of scopes) add("costcap_alerts_open", { kind, scope_name }, open.get(`${kind}\u0000${scope_name}`) ?? 0);
-  const base = [...series.values()].reduce((n, l) => n + l.length, 0);
-  const truncated = byModel && base + modelLines.length > maxSeries;
-  if (byModel && !truncated) series.get("costcap_spend_usd").push(...modelLines);
+  if (orgBudget) for (const kind of ALERT_KINDS) add("costcap_alerts_open", { kind, scope_name: "org", scope: "org" }, open.get(`${kind}\u0000\u0001org`) ?? 0);
+  // #285: fleet tag caps, one group of series per tag value; groups count toward maxSeries
+  // and the lowest-spend values are dropped first (org/agent/team/model series never are).
+  const groups = [];
+  for (const [key, values] of Object.entries(tagCaps?.spend ?? {})) {
+    const rules = (tagCaps.rules ?? []).filter((r) => r.key === key && METRIC_WINDOWS.includes(r.scope));
+    if (!rules.length) continue;
+    for (const [value, e] of Object.entries(values)) {
+      const name = `${key}=${value}`;
+      const caps = [], rems = [];
+      for (const window of METRIC_WINDOWS) {
+        const r = rules.find((x) => x.scope === window);
+        if (!r) continue;
+        const l = { scope: "tag", name, tag_key: key, tag_value: value, window };
+        caps.push(`costcap_cap_usd${labels(l)} ${fmt(r.usd)}`);
+        rems.push(`costcap_cap_remaining_usd${labels(l)} ${fmt(Math.max(0, r.usd - (e[window] ?? 0)))}`);
+      }
+      const al = ALERT_KINDS.map((kind) => `costcap_alerts_open${labels({ kind, scope_name: name, scope: "tag" })} ${fmt(open.get(`${kind}\u0000\u0001tag\u0000${name}`) ?? 0)}`);
+      groups.push({ spend: Math.max(e.month ?? 0, e.week ?? 0, e.day ?? 0), name, caps, rems, al });
+    }
+  }
+  groups.sort((x, y) => y.spend - x.spend || (x.name < y.name ? -1 : 1));
+  let count = [...series.values()].reduce((n, l) => n + l.length, 0) + 1;
+  let tagTruncated = false;
+  for (const g of groups) {
+    const n = g.caps.length + g.rems.length + g.al.length;
+    if (count + n > maxSeries) { tagTruncated = true; break; }
+    count += n;
+    series.get("costcap_cap_usd").push(...g.caps);
+    series.get("costcap_cap_remaining_usd").push(...g.rems);
+    series.get("costcap_alerts_open").push(...g.al);
+  }
+  const base = count - 1;
+  const modelTruncated = byModel && base + modelLines.length > maxSeries;
+  if (byModel && !modelTruncated) series.get("costcap_spend_usd").push(...modelLines);
+  const truncated = tagTruncated || modelTruncated;
   add("costcap_metrics_truncated", {}, truncated ? 1 : 0);
   const out = [];
   for (const [name, lines] of series) {

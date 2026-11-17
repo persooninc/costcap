@@ -171,7 +171,7 @@ test("AC1-AC3, AC5: sweep fires agent/team/org cost_unknown once, settle resolve
   assert.equal(otherAlerts.filter((a) => a.kind === "cost_unknown").length, 0);
   const key = (await f.request("/v1/api-keys", { name: "prom", role: "viewer" }, owner)).body.key;
   const metric = async () => { const r = await f.request("/v1/metrics", undefined, null, key); return [...String(r.body).matchAll(/^costcap_alerts_open\{kind="cost_unknown",[^}]*\} (\d+)$/gm)].reduce((n, m) => n + Number(m[1]), 0); };
-  assert.equal(await metric(), 2, "agent A and team ops series (org alerts carry no agent/team scope_name)");
+  assert.equal(await metric(), 3, "agent A, team ops and (#285) the org series");
   const otherKey = (await f.request("/v1/api-keys", { name: "prom", role: "viewer" }, other)).body.key;
   assert.doesNotMatch(String((await f.request("/v1/metrics", undefined, null, otherKey)).body), /costcap_alerts_open\{kind="cost_unknown",[^}]*\} 1/);
 

@@ -84,6 +84,30 @@ test("metrics: viewer key scrapes spend, cap headroom and unknown-cost honesty",
     expect(body).toContain('costcap_cap_remaining_usd{scope="agent",name="w",window="week"} 6');
     expect(body).toContain('costcap_cap_usd{scope="team",name="wk",window="week"} 5');
     expect(body).toContain('costcap_cap_remaining_usd{scope="team",name="wk",window="week"} 1');
+
+    // #285: org day budget and a customer:day tag cap, set through the API; the sweep fires the org cap_hit.
+    const put = (path, data) => page.request.put(`${origin}${path}`, { data, headers: { origin } });
+    const ob = await put("/v1/org-budget", { day: 5 });
+    expect(ob.status(), await ob.text()).toBe(200);
+    const tc = await put("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "day", usd: 5 }] });
+    expect(tc.status(), await tc.text()).toBe(200);
+    expect((await post("/v1/receipts", { receipts: [{ id: "c1", ts, cost_usd: 2, model: "m", tags: { customer: "acme" } }] }, { authorization: `Bearer ${a.token}` })).status()).toBe(200);
+    await service.evaluateFleetAlerts();
+    const r2 = await fetch(`${origin}/v1/metrics`, { headers: { authorization: `Bearer ${key}` } });
+    const body2 = await r2.text();
+    expect(validateExposition(body2)).toEqual([]);
+    // Known org spend today: 1.25 + 0.5 + 4 + 2 = 7.75 > 5 (floored at 0).
+    expect(body2).toContain('costcap_cap_usd{scope="org",name="org",window="day"} 5');
+    expect(body2).toContain('costcap_cap_remaining_usd{scope="org",name="org",window="day"} 0');
+    // b's unknown-cost receipt pauses the org budget: the org alert is cost_unknown, never a $0 guess.
+    expect(body2).toContain('costcap_alerts_open{kind="cost_unknown",scope_name="org",scope="org"} 1');
+    const settled = await post("/v1/receipts/r3/settle", { agent_id: b.agentId, cost_usd: 0.1, source: "manual_evidence", reason: "e2e" });
+    expect(settled.status(), await settled.text()).toBe(200);
+    await service.evaluateFleetAlerts();
+    const body3 = await (await fetch(`${origin}/v1/metrics`, { headers: { authorization: `Bearer ${key}` } })).text();
+    expect(body3).toContain('costcap_alerts_open{kind="cap_hit",scope_name="org",scope="org"} 1');
+    expect(body3).toContain('costcap_alerts_open{kind="cost_unknown",scope_name="org",scope="org"} 0');
+    expect(body2).toContain('costcap_cap_remaining_usd{scope="tag",name="customer=acme",tag_key="customer",tag_value="acme",window="day"} 3');
   } finally {
     service.server.closeAllConnections();
     service.server.close();
