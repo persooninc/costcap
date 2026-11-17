@@ -1803,7 +1803,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       socket.write(lines.join("\r\n") + "\r\n\r\n");
       let closed = false, admitted = false, pendingTurn = false, grounded = false;
       let held = [];
-      const down = createFrameParser(), up = createFrameParser(), upTap = createFrameParser();
+      const down = createFrameParser(), up = createFrameParser();
       const rcpt = (extra) => ({ ...base, status: 101, blocked: false, model, ...extra });
       const latch = (receipt, msg) => {
         const done = emit(receipt);
@@ -1900,8 +1900,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       };
       const fromClient = (bytes) => {
         if (closed) return;
-        if (admitted) { upSocket.write(bytes); tapClient(upTap.push(bytes)); return; }
-        for (const frame of up.push(bytes)) {
+        // #283: after admission bytes pass through raw; `up` keeps parsing only to tap turns.
+        if (admitted) { upSocket.write(bytes); tapClient(up.push(bytes)); return; }
+        const frames = up.push(bytes);
+        for (const frame of frames) {
           if (admitted) { upSocket.write(frame.raw); tapClient([frame]); continue; }
           held.push(frame.raw);
           if (!frame.message) { if (frame.opcode === 0x8) { closed = true; sessions.delete(session); socket.end(); upSocket.destroy(); } continue; }
@@ -1919,6 +1921,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           admitted = true;
           upSocket.write(Buffer.concat(held)); held = [];
         }
+        // #283: a partial next frame that shared this read with `setup` is still in `up`'s buffer.
+        // Forward it now; `up` keeps it so the frame is tapped once its tail arrives.
+        if (admitted && up.pending) upSocket.write(up.buffered);
       };
       if (upHead?.length) fromUpstream(upHead);
       upSocket.on("data", fromUpstream);

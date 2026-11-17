@@ -81,7 +81,7 @@ export function createFrameParser({ maxMessageBytes = 16 * 1024 * 1024 } = {}) {
     }
     return frames;
   };
-  return { push, get corrupt() { return corrupt; }, get pending() { return buf.length; } };
+  return { push, get corrupt() { return corrupt; }, get pending() { return buf.length; }, get buffered() { return Buffer.from(buf); } };
 }
 
 /**

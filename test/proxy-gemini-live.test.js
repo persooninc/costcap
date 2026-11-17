@@ -268,3 +268,51 @@ test("AC6 Gemini HTTP and Anthropic upgrades still get 501", async (t) => {
   }
   assert.equal(up.upgrades, 0);
 });
+
+// #283: a partial frame sharing a client read with `setup` must not be dropped at admission.
+const { createHash } = await import("node:crypto");
+const sha = (b) => createHash("sha256").update(b).digest("hex");
+const upBytes = (conn) => Buffer.concat(conn.frames.map((f) => f.raw));
+
+test("#283 AC1 setup + first 100 bytes of a 3 KB realtimeInput in one write: upstream gets every byte in order", async (t) => {
+  const { up, port } = await setup(t, { upstream: geminiUpstream() });
+  const c = await connectRealtime(port, PATH);
+  const s = encodeFrame(1, JSON.stringify(SETUP()), { mask: true });
+  const big = { realtimeInput: { audio: { data: "A".repeat(3000), mimeType: "audio/pcm;rate=16000" } } };
+  const f = encodeFrame(1, JSON.stringify(big), { mask: true });
+  c.socket.write(Buffer.concat([s, f.subarray(0, 100)]));
+  await sleep(50);
+  c.socket.write(f.subarray(100));
+  await until(() => up.sessions[0]?.received.length === 2);
+  assert.deepEqual(up.sessions[0].received, [SETUP(), big]);
+  assert.ok(upBytes(up.sessions[0]).equals(Buffer.concat([s, f])));
+  c.close();
+});
+
+test("#283 AC2 setup back-to-back with a 150 KB realtimeInput.video frame reaches upstream byte-identical", async (t) => {
+  const { up, port } = await setup(t, { upstream: geminiUpstream() });
+  const c = await connectRealtime(port, PATH);
+  const video = { realtimeInput: { video: { data: "V".repeat(150 * 1024), mimeType: "image/jpeg" } } };
+  const sent = Buffer.concat([encodeFrame(1, JSON.stringify(SETUP()), { mask: true }), encodeFrame(1, JSON.stringify(video), { mask: true })]);
+  c.socket.write(sent);
+  await until(() => up.sessions[0] && upBytes(up.sessions[0]).length >= sent.length);
+  const got = upBytes(up.sessions[0]);
+  assert.equal(got.length, sent.length);
+  assert.equal(sha(got), sha(sent));
+  assert.deepEqual(up.sessions[0].received.map((m) => Object.keys(m)[0]), ["setup", "realtimeInput"]);
+  c.close();
+});
+
+test("#283 AC4 the frame straddling admission is tapped: upstream close before usage latches stream_incomplete", async (t) => {
+  const { up, port, receipts } = await setup(t, { upstream: geminiUpstream({ onInput: (conn) => setTimeout(() => conn.socket.destroy(), 20) }) });
+  const c = await connectRealtime(port, PATH);
+  const s = encodeFrame(1, JSON.stringify(SETUP()), { mask: true });
+  const f = encodeFrame(1, JSON.stringify(INPUT), { mask: true });
+  c.socket.write(Buffer.concat([s, f.subarray(0, 10)]));
+  await sleep(50);
+  c.socket.write(f.subarray(10));
+  await until(() => ws(receipts).some((r) => r.reason === "stream_incomplete"));
+  assert.equal(ws(receipts).filter((r) => r.reason === "stream_incomplete").length, 1);
+  assert.deepEqual(up.sessions[0].received, [SETUP(), INPUT]);
+  c.close();
+});

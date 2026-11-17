@@ -339,3 +339,20 @@ test("costcap pricing show lists the gpt-live-1 per-minute row", async () => {
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /gpt-live-1: \$0\.05 per minute/);
 });
+
+// #283 AC3: a partial input frame sharing a client read with session.start is forwarded in full.
+test("#283 AC3 session.start + first 100 bytes of a 3 KB input frame in one write: upstream gets every byte", async (t) => {
+  const { encodeFrame } = await import("../src/realtime.js");
+  const { up, port } = await setup(t, { upstream: liveUpstream() });
+  const c = await connectRealtime(port, PATH);
+  const s = encodeFrame(1, JSON.stringify(START), { mask: true });
+  const input = { type: "input_audio_buffer.append", audio: "A".repeat(3000) };
+  const f = encodeFrame(1, JSON.stringify(input), { mask: true });
+  c.socket.write(Buffer.concat([s, f.subarray(0, 100)]));
+  await sleep(50);
+  c.socket.write(f.subarray(100));
+  await until(() => up.sessions[0]?.received.length === 2);
+  assert.deepEqual(up.sessions[0].received, [START, input]);
+  assert.ok(Buffer.concat(up.sessions[0].frames.map((x) => x.raw)).equals(Buffer.concat([s, f])));
+  c.close();
+});
