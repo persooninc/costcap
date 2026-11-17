@@ -104,8 +104,12 @@ then close `1008`. `costcap kill` closes open sessions within a second.
 - **Node SDK:** unsupported. It forces `wss:`, and the loopback proxy is plain HTTP.
 - **Hardcoded `wss://api.openai.com`:** bypasses CostCap.
 
-A response cut before `response.done`, audio on a model with no audio rate
-(`gpt-realtime-mini` is text only here) and a billed input transcription are recorded as
+`gpt-realtime-2`, `gpt-realtime-1.5` and `gpt-realtime-mini` are priced at OpenAI's
+published text/audio/image rates. Chat Completions audio on `gpt-audio-1.5`, `gpt-audio`
+and `gpt-audio-mini` is priced at their audio rates (they have no cached rate, so a cache
+read is `cache_read_unpriced`).
+
+A response cut before `response.done`, audio on a model with no audio rate and a billed input transcription are recorded as
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
 pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
 

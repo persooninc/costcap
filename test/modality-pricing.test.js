@@ -104,8 +104,12 @@ test("#194 realtime usage shape prices audio at realtime rates with the cached s
   // Image input at $5 / cached $0.50.
   const img = costForUsage("gpt-realtime", realtimeUsage({ input_tokens: 1000, output_tokens: 0, input_token_details: { image_tokens: 1000 } }));
   assert.equal(img.cost_usd, 0.005);
-  // gpt-realtime-mini has text rates only: audio is unknown, never text-priced.
-  assert.equal(costForUsage("gpt-realtime-mini", usage).reason, "modality_unpriced");
+  // #276: gpt-realtime-mini now has published audio/image rates.
+  assert.equal(costForUsage("gpt-realtime-mini", usage).cost_usd, 0.016486);
+  assert.equal(costForUsage("gpt-realtime-2", usage).cost_usd, 0.0546);
+  assert.equal(costForUsage("gpt-realtime-1.5", usage).cost_usd, 0.0538);
+  // An id with no row still never text-prices audio.
+  assert.equal(costForUsage("gpt-realtime-9", usage).reason, "modality_unpriced");
   assert.equal(costForUsage("gpt-realtime-2.1", usage).cost_usd, Number(((200 * 4 + 100 * 0.4 + 600 * 32 + 400 * 0.4 + 100 * 24 + 500 * 64) / 1e6).toFixed(6)));
   assert.equal(lookupPrice("gpt-realtime-2.1-mini").modalities.audio.output, 20);
 });
@@ -117,4 +121,22 @@ test("#270: audio output priced on Gemini TTS rows; audio/image input still unpr
     const r = costForUsage("gemini-3.8-flash-tts", { ...out, modality_tokens: { input: { text: 0, [m]: 20 }, output: { audio: 250 } } }, { at: "2026-11-16T12:00:00Z" });
     assert.deepEqual([r.cost_usd, r.reason], [null, "modality_unpriced"], m);
   }
+});
+
+// #276: Chat Completions audio on gpt-audio-1.5 / gpt-audio / gpt-audio-mini.
+const chatAudio = (extra = {}) => JSON.stringify({ usage: { prompt_tokens: 1000, completion_tokens: 600, total_tokens: 1600,
+  prompt_tokens_details: { audio_tokens: 800, ...extra }, completion_tokens_details: { audio_tokens: 500 } } });
+test("#276 AC2: chat completions audio priced on gpt-audio rows", () => {
+  const cost = (model, body = chatAudio()) => { const m = extractUsage("openai", body, model); return costForUsage(m.model, m.usage); };
+  assert.equal(cost("gpt-audio-1.5").cost_usd, 0.0591);
+  assert.equal(cost("gpt-audio").cost_usd, 0.0591);
+  assert.equal(cost("gpt-audio-mini").cost_usd, 0.01836);
+  assert.equal(cost("gpt-audio-mini-2025-12-15").cost_usd, 0.01836);
+  assert.equal(cost("gpt-audio-mini-2025-12-15").cost_source, "table");
+  const cached = cost("gpt-audio-1.5", chatAudio({ cached_tokens: 100 }));
+  assert.equal(cached.cost_usd, null);
+  assert.equal(cached.reason, "cache_read_unpriced");
+  const img = cost("gpt-audio-1.5", JSON.stringify({ usage: { input_tokens: 100, output_tokens: 10, input_tokens_details: { image_tokens: 60 } } }));
+  assert.equal(img.reason, "modality_unpriced");
+  assert.equal(lookupPrice("gpt-audio-mini-2025-12-15").fallback, false);
 });

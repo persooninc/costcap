@@ -142,3 +142,11 @@ test("e2e AC5: --model-cap gpt-image-2.6-sunburst:day=1 forwards 8 images and re
   assert.equal((await ninth.json()).error, "model_budget_exceeded");
   assert.equal(f.hits(), 8);
 });
+
+test("#276: gpt-audio rows have no cached rate: cache reads stay cache_read_unpriced", () => {
+  for (const id of ["gpt-audio-1.5", "gpt-audio", "gpt-audio-mini"]) {
+    const r = costForUsage(id, { input_tokens: 10, cached_input_tokens: 100, output_tokens: 5 });
+    assert.equal(r.cost_usd, null, id);
+    assert.equal(r.reason, "cache_read_unpriced", id);
+  }
+});

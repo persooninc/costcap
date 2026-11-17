@@ -178,10 +178,10 @@ test("AC4 client disconnect mid-response -> stream_incomplete latch; settle unbl
   assert.equal((await chatCall()).status, 200);
 });
 
-test("AC4 audio on gpt-realtime-mini -> modality_unpriced (latched, session closed)", async (t) => {
+test("AC4 audio on an unpriced id (gpt-realtime-9) -> modality_unpriced (latched, session closed)", async (t) => {
   let conn;
-  const { port, receipts, server } = await setup(t, { upstream: { onSession: (cn) => { conn = cn; } } });
-  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime-mini");
+  const { port, receipts, server, chatCall } = await setup(t, { upstream: { onSession: (cn) => { conn = cn; } } });
+  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime-9");
   await until(() => conn);
   respond(conn, "r_mini");
   await c.closed;
@@ -190,6 +190,41 @@ test("AC4 audio on gpt-realtime-mini -> modality_unpriced (latched, session clos
   assert.equal(mini.cost_usd, null);
   assert.equal(c.messages.at(-1).error.code, "accounting_unavailable");
   assert.equal(server.settle({ receipt_id: mini.id }), true);
+  assert.equal((await chatCall()).status, 200);
+});
+
+// #276: current OpenAI voice models are priced and never latch.
+for (const [model, cost] of [["gpt-realtime-2", 0.0546], ["gpt-realtime-1.5", 0.0538], ["gpt-realtime-mini", 0.016486]]) {
+  test(`#276 AC1 ${model} response.done priced at ${cost}, no latch`, async (t) => {
+    let conn;
+    const { port, receipts, chatCall } = await setup(t, { upstream: { onSession: (cn) => { conn = cn; } } });
+    const c = await connectRealtime(port, `/openai/v1/realtime?model=${model}`);
+    assert.equal(c.status, 101);
+    await until(() => conn);
+    respond(conn, "r_ok");
+    await until(() => rt(receipts).length === 1);
+    const r = rt(receipts)[0];
+    assert.equal(r.cost_usd, cost);
+    assert.equal(r.cost_source, "table");
+    assert.equal(r.reason, undefined);
+    assert.equal((await chatCall()).status, 200);
+    c.close();
+  });
+}
+
+test("#276 AC3 gpt-realtime-2: --cap 0.10 closes 1008 after the second response; refuse admits it", async (t) => {
+  let conn;
+  const { port, receipts } = await setup(t, { upstream: { onSession: (cn) => { conn = cn; } }, proxy: { cap: createCapEngine({ caps: { run: 0.1 } }), unknownModels: "refuse" } });
+  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime-2");
+  assert.equal(c.status, 101);
+  await until(() => conn);
+  respond(conn, "r1");
+  await until(() => rt(receipts).length === 1);
+  respond(conn, "r2");
+  await c.closed;
+  assert.equal(c.closeCode, 1008);
+  assert.equal(c.messages.at(-1).error.code, "budget_exceeded");
+  assert.equal(rt(receipts).length, 2);
 });
 
 test("AC4 transcription-completed with usage -> transcription_unpriced", async (t) => {

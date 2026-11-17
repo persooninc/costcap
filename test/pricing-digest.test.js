@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.26");
+  assert.equal(TABLE_VERSION, "2026-11-16.28");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -252,4 +252,13 @@ test("#230 the bumped table declares batch.gemini 0.5 with a source, and the dig
   assert.equal(JSON.parse(readFileSync(digestPathFor(tablePath), "utf8")).sha256, tableDigest(table));
   const { p } = tempTable((t) => { t.batch.gemini = 0.4; });
   assert.equal(verifyTableDigest(JSON.parse(readFileSync(p, "utf8")), JSON.parse(readFileSync(digestPathFor(p), "utf8"))).ok, false);
+});
+
+test("#276 pricing show gpt-realtime-2 prints the audio rates; digest --check passes", () => {
+  const c = spawnSync(process.execPath, ["scripts/pricing-digest.mjs", "--check"], { encoding: "utf8" });
+  assert.equal(c.status, 0, c.stderr);
+  const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-realtime-2"], { encoding: "utf8" });
+  assert.equal(s.status, 0, s.stderr);
+  assert.match(s.stdout, /audio/);
+  assert.match(s.stdout, /\$64/);
 });

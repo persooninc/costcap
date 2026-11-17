@@ -720,6 +720,48 @@ test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered an
   assert.match(runs.stdout, /0\.1076/);
 });
 
+// #276: the same wrap path on gpt-realtime-2 (priced since #276), and pricing show for gpt-audio-1.5.
+test("#276 wrap --cap 0.10 closes a gpt-realtime-2 session; runs shows spend; pricing show gpt-audio-1.5", async (t) => {
+  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const usage = { input_tokens: 1300, output_tokens: 600,
+    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
+    output_token_details: { text_tokens: 100, audio_tokens: 500 } };
+  const up = await startRealtimeUpstream({ onSession: (conn) => {
+    conn.socket.on("data", () => {
+      const n = conn.received.filter((m) => m.type === "response.create").length;
+      if (n > (conn.answered ?? 0)) { conn.answered = n; conn.send({ type: "response.done", response: { id: `r${n}`, usage } }); }
+    });
+  } });
+  t.after(() => up.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt2-cli-"));
+  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
+  const script = `
+    import { connectRealtime } from ${JSON.stringify(fixture)};
+    const u = new URL(process.env.COSTCAP_OPENAI_REALTIME_URL);
+    const c = await connectRealtime(Number(u.port), u.pathname + "?model=gpt-realtime-2");
+    for (let i = 0; i < 3 && c.closeCode === null; i++) { c.send({ type: "response.create" }); await new Promise((r) => setTimeout(r, 150)); }
+    await c.closed;
+    console.log(c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--unknown-models", "refuse", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out }));
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.out.trim(), "101 2 budget_exceeded 1008");
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.transport === "websocket");
+  assert.ok(lines.length === 2 && lines.every((r) => r.cost_usd === 0.0546 && r.model === "gpt-realtime-2"));
+  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(runs.status, 0);
+  assert.match(runs.stdout, /0\.1092/);
+  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-audio-1.5"], { encoding: "utf8" });
+  assert.equal(show.status, 0, show.stderr);
+  assert.match(show.stdout, /audio/);
+  assert.match(show.stdout, /\$32/);
+});
+
 test("#197 wrap warns once per ignored {discount} on an unpriced model and still starts", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
   const f = path.join(dir, "p.json");
