@@ -31,10 +31,11 @@ export function verifyToken(token, storedHash) {
 
 // #265: total is a lifetime cap that never resets.
 export const CAP_KEYS = ["run", "hour", "day", "week", "month", "total"];
-// Scopes a time-boxed cap raise (#208) can target; week joined in #271, total raises are out of scope (#265 Out).
-export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "total");
-// What a pre-#271 wrapper accepts under policy.raise; week raises travel in the additive `raise_week` field.
-export const LEGACY_RAISE_KEYS = Object.freeze(RAISE_KEYS.filter((k) => k !== "week"));
+// Scopes a time-boxed cap raise (#208) can target; week joined in #271, total in #287.
+export const RAISE_KEYS = [...CAP_KEYS];
+// What a pre-#271 wrapper accepts under policy.raise; week and total raises travel in the additive
+// `raise_week` / `raise_total` fields.
+export const LEGACY_RAISE_KEYS = Object.freeze(RAISE_KEYS.filter((k) => k !== "week" && k !== "total"));
 
 // #271: split a stored policy for GET /v1/policy so an old wrapper never sees raise.week.
 export function splitWeekRaise(policy) {
@@ -42,6 +43,20 @@ export function splitWeekRaise(policy) {
   if (!raise || !("week" in raise)) return { policy: policy ?? {}, raise_week: null };
   const { week, ...legacy } = raise;
   return { policy: { ...rest, ...(Object.keys(legacy).length ? { raise: legacy } : {}) }, raise_week: raiseEntries(week) };
+}
+
+// #287: split total raises out the same way (raise_total), so a b91f36e wrapper never sees raise.total.
+export function splitTotalRaise(policy) {
+  const { raise, ...rest } = policy ?? {};
+  if (!raise || !("total" in raise)) return { policy: policy ?? {}, raise_total: null };
+  const { total, ...legacy } = raise;
+  return { policy: { ...rest, ...(Object.keys(legacy).length ? { raise: legacy } : {}) }, raise_total: raiseEntries(total) };
+}
+
+// #287: validates the additive raise_total field (null = no total raises).
+export function raiseTotalError(v) {
+  if (v === null || v === undefined) return null;
+  return raiseError({ total: v });
 }
 
 // #271: validates the additive raise_week field (null = no week raises).

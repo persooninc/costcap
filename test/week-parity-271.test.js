@@ -48,9 +48,9 @@ test("AC1 unit: agent, team and org week cap_projected; none under the cap; hit 
 });
 
 test("AC2 unit: week raises parse, stack onto caps.week and need a base week cap", () => {
-  assert.deepEqual(RAISE_KEYS, ["run", "hour", "day", "week", "month"]);
+  assert.deepEqual(RAISE_KEYS, ["run", "hour", "day", "week", "month", "total"]);
   assert.equal(parseCapRequest({ scope: "week", amount_usd: 20, duration_hours: 24, reason: "big job" }).scope, "week");
-  assert.throws(() => parseCapRequest({ scope: "total", amount_usd: 20, duration_hours: 24, reason: "x" }), /scope must be one of run\|hour\|day\|week\|month/);
+  assert.equal(parseCapRequest({ scope: "total", amount_usd: 20, duration_hours: 24, reason: "x" }).scope, "total");
   const policy = { version: 2, caps: { week: 10 }, raise: { week: [{ amount_usd: 20, expires_at: "2026-11-19T12:00:00Z", request_id: "r" }] } };
   assert.equal(effectiveCaps(policy, WED_NOON).week, 30);
   assert.equal(effectiveCaps(policy, Date.parse("2026-11-19T12:00:00Z")).week, 10);

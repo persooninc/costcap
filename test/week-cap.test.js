@@ -146,7 +146,7 @@ test("#261 AC4 (#271: week is now a raise scope): caps.week validation; unknown 
   assert.equal(resolvePolicy({ fetched: { version: 1, caps: { week: 50, day: 9 } } }).caps.week, 50);
   assert.equal(resolvePolicy({ local: { week: 20 }, fetched: { version: 1, caps: { week: 50 } } }).caps.week, 20);
   assert.equal(raiseError({ week: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), null);
-  assert.match(raiseError({ total: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), /not a cap scope/);
+  assert.match(raiseError({ lifetime: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), /not a cap scope/);
   assert.equal(parseCapRequest({ scope: "week", amount_usd: 20, duration_hours: 4, reason: "x" }).scope, "week");
   // An old snapshot (no spent.week) is still a valid policy response and counts week from 0 + pending.
   const old = { spent: { day: 1, month: 2 }, unknown: 0, pending_batches: 0, as_of: "2026-11-18T00:00:00Z" };

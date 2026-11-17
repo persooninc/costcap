@@ -56,11 +56,11 @@ test("#265 agent-budget: total scope in spend/check/remaining and --policy files
   assert.match(totalCapMessage("team:ops:total", 15).message, /\$15/);
 });
 
-test("#265 AC1: validation of caps.total and team total; total is not a raise scope", () => {
+test("#265 AC1: validation of caps.total and team total; total is a raise scope since #287", () => {
   for (const bad of [0, -1, "5", null]) assert.ok(validatePolicy({ version: 1, caps: { total: bad } }).length, String(bad));
   assert.deepEqual(validatePolicy({ version: 1, caps: { total: 10, month: 100 } }), []);
-  assert.ok(raiseError({ total: [{ amount_usd: 5, expires_at: "2027-01-01T00:00:00Z", request_id: "r" }] }));
-  assert.throws(() => parseCapRequest({ scope: "total", amount_usd: 5, duration_hours: 1, reason: "x" }), /scope must be one of/);
+  assert.equal(raiseError({ total: [{ amount_usd: 5, expires_at: "2027-01-01T00:00:00Z", request_id: "r" }] }), null);
+  assert.equal(parseCapRequest({ scope: "total", amount_usd: 5, duration_hours: 1, reason: "x" }).scope, "total");
   const orgAgents = [{ id: "a", orgId: "o" }, { id: "b", orgId: "o" }];
   assert.deepEqual(parseTeamInput({ name: "pilot", agents: ["a"], total: 50 }, { orgAgents, teams: [], orgId: "o" }), { name: "pilot", agents: ["a"], total: 50 });
   for (const total of [0, -5, "50"]) assert.throws(() => parseTeamInput({ name: "pilot", agents: ["a"], total }, { orgAgents, teams: [], orgId: "o" }), /total cap must be a positive number/);

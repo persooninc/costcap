@@ -371,3 +371,34 @@ test("#267 wrapper agent_spend counts last month's unknown only when a week is c
   assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: false }).unknown, 0);
   assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: true }).unknown, 1);
 });
+
+// #287: total raises arrive in raise_total; the wrapper folds them under raise.total,
+// enforces the raised cap until expires_at (offline too) and rejects a malformed field.
+test("#287 folds raise_total, reverts at expiry offline and rejects a malformed raise_total", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-287-"));
+  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
+  const expires = Date.now() + 3600_000;
+  let body = { version: 2, caps: { total: 200 }, killed: false, raise_total: [{ amount_usd: 40, expires_at: new Date(expires).toISOString(), request_id: "r1" }] };
+  const server = http.createServer(async (req, res) => {
+    for await (const _ of req);
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: { total: 200 }, killed: false } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify(body));
+    else res.end(JSON.stringify({ acceptedIds: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "enrollment-token", name: "t", path });
+  const client = createFleetClient({ path, receiptsPath });
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.policy().caps.total, 240);
+  assert.equal(client.policy(expires).caps.total, 200);
+  body = { version: 3, caps: { total: 200 }, killed: true, raise_total: [{ amount_usd: -1, expires_at: "nope", request_id: "r" }] };
+  assert.equal((await client.sync()).online, false);
+  assert.equal(client.policy().killed, false);
+  assert.equal(client.policy().version, 2);
+  body = { version: 4, caps: { total: 200 }, killed: true };
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.policy().killed, true);
+  assert.equal(client.policy().caps.total, 200);
+});

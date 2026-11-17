@@ -4,7 +4,7 @@ import http from "node:http";
 import { uiResponse } from "./ui.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
-import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise, dropLegacyCapKeys } from "./policy.js";
+import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise, splitTotalRaise, dropLegacyCapKeys } from "./policy.js";
 import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
@@ -511,13 +511,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           // #268: week scopes travel in additive fields (org_budget_v2, tag_caps_v2,
           // model_caps_week) so a pre-#268 wrapper keeps accepting the policy.
           // #271: week raises travel in raise_week, never under raise (a pre-#271 validator rejects raise.week).
-          const { policy: legacyPolicy, raise_week: raiseWeek } = splitWeekRaise(a.policy);
+          // #287: total raises likewise travel in raise_total (a b91f36e validator rejects raise.total).
+          const { policy: noTotalRaise, raise_total: raiseTotal } = splitTotalRaise(a.policy);
+          const { policy: legacyPolicy, raise_week: raiseWeek } = splitWeekRaise(noTotalRaise);
           const { modelCaps: allModelCaps, ...rest } = legacyPolicy;
           const mc = splitWeekModelCaps(allModelCaps);
           const orgVerdict = orgBudgetOfOrg(s, a.orgId);
           const org = orgBudgetPolicy(orgVerdict, now());
           const orgTotal = totalOrgBudgetPolicy(orgVerdict, now());
-          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), ...(mc.total.length ? { model_caps_total: mc.total } : {}), ...(raiseWeek ? { raise_week: raiseWeek } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null, week: effectiveCaps(a.policy, now()).week != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), ...(orgTotal ? { org_budget_total: orgTotal } : {}), budget_period: { ...bp } }; });
+          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), ...(mc.total.length ? { model_caps_total: mc.total } : {}), ...(raiseWeek ? { raise_week: raiseWeek } : {}), ...(raiseTotal ? { raise_total: raiseTotal } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null, week: effectiveCaps(a.policy, now()).week != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), ...(orgTotal ? { org_budget_total: orgTotal } : {}), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {

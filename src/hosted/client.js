@@ -4,7 +4,7 @@ import { budgetPeriodError } from "../period.js";
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { validatePolicy, resolvePolicy, raiseWeekError, dropLegacyCapKeys } from "./policy.js";
+import { validatePolicy, resolvePolicy, raiseWeekError, raiseTotalError, dropLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict } from "./tag-caps.js";
 import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict } from "./model-caps.js";
@@ -252,10 +252,12 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
         // #268: week scopes arrive in additive fields; a pre-#268 server omits them (day/month enforced as before).
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, model_caps_total: modelCapsTotal = null, tag_caps_total: tagCapsTotal = null, org_budget_total: orgTotal = null, raise_week: raiseWeek = null, ...serverPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, model_caps_total: modelCapsTotal = null, tag_caps_total: tagCapsTotal = null, org_budget_total: orgTotal = null, raise_week: raiseWeek = null, raise_total: raiseTotal = null, ...serverPolicy } = fetched ?? {};
         // #271: active week raises arrive in raise_week and are folded back under raise.week.
-        if (raiseWeekError(raiseWeek)) throw new Error("Invalid fleet policy response");
-        const fetchedPolicy = raiseWeek ? { ...serverPolicy, raise: { ...(serverPolicy.raise ?? {}), week: raiseWeek } } : serverPolicy;
+        // #287: active total raises arrive in raise_total and are folded back under raise.total.
+        if (raiseWeekError(raiseWeek) || raiseTotalError(raiseTotal)) throw new Error("Invalid fleet policy response");
+        const folded = { ...(raiseWeek ? { week: raiseWeek } : {}), ...(raiseTotal ? { total: raiseTotal } : {}) };
+        const fetchedPolicy = Object.keys(folded).length ? { ...serverPolicy, raise: { ...(serverPolicy.raise ?? {}), ...folded } } : serverPolicy;
         const tagCaps = tagCapsV2 ?? legacyTagCaps, orgBudget = orgBudgetV2 ?? legacyOrgBudget;
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);

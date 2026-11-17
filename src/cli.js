@@ -51,7 +51,7 @@ const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] 
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
   "       costcap bill-check --receipts FILE --provider openai|anthropic (--provider-export FILE | --fetch) [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tolerance-pct 5] [--project ID] [--workspace ID] [--json]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
-  "       costcap request-raise --scope run|hour|day|week|month --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
+  "       costcap request-raise --scope run|hour|day|week|month|total --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +

@@ -126,3 +126,43 @@ test("#271 week raise is requested, approved in the dashboard and shown as ACTIV
     await new Promise((r) => service.server.close(r));
   }
 });
+
+test("#287 total raise is requested, approved in the dashboard and the agent card reads left against the raised cap", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-capreq-total-e2e-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const c = await post("/auth/request", { email: "capreq-total@example.invalid", turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes["capreq-total@example.invalid"] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", { caps: { total: 200 } }, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "total-agent" }) }).then((r) => r.json());
+    const asAgent = { authorization: `Bearer ${agent.token}` };
+    await post("/v1/receipts", { receipts: [{ id: "t-1", ts: new Date().toISOString(), cost_usd: 200, model: "m" }] }, asAgent);
+    expect((await fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: asAgent }).then((r) => r.json())).ok).toBe(false);
+    expect((await post(`/v1/agents/${agent.agentId}/cap-requests`, { scope: "total", amount_usd: 50, duration_hours: 48, reason: "finish eval" }, asAgent)).status).toBe(201);
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "window.turnstile={render(){return 1},reset(){}}" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    const card = page.locator("#capRequests .cap-request").first();
+    await expect(card).toContainText("total-agent · total +$50.00 for 48h · finish eval");
+    await card.getByRole("button", { name: "Approve" }).click();
+    await expect(card).toContainText("ACTIVE until");
+    await expect(page.locator("#agents .agent").first()).toContainText("total $200.00 of $250.00 (left $50.00) +$50.00 raise until");
+    const verdict = await fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: asAgent }).then((r) => r.json());
+    expect(verdict.ok).toBe(true);
+    expect(verdict.budget_remaining.total_usd).toBe(50);
+    const pol = await fetch(`${origin}/v1/policy`, { headers: asAgent }).then((r) => r.json());
+    expect(pol.raise?.total).toBeUndefined();
+    expect(pol.raise_total).toHaveLength(1);
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});
