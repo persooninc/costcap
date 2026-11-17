@@ -63,8 +63,10 @@ test("table: Gemini priority sets, dated sets, digest verifies", () => {
   assert.equal(lookupPrice("gemini-4-argon", "2026-12-02T00:00:00Z").priority.output, 36);
   assert.equal(lookupPrice("gemini-4-hydrogen", MID).priority.output, 13.5);
   assert.equal(lookupPrice("gemini-3.1-pro-preview", MID).priority.output, 21.6);
-  // No published Priority column: stays unpriced, never standard.
-  for (const m of ["gemini-3.6-flash", "gemini-3.5-flash-lite"]) assert.equal(lookupPrice(m, MID).priority, undefined);
+  // #266: published Priority columns for 3.6-flash (dated) and 3.5-flash-lite.
+  assert.deepEqual(lookupPrice("gemini-3.6-flash", MID).priority, { input: 1.35, cached_input: 0.135, output: 6.75 });
+  assert.deepEqual(lookupPrice("gemini-3.6-flash", "2027-01-02T00:00:00Z").priority, { input: 2.70, cached_input: 0.27, output: 13.50 });
+  assert.deepEqual(lookupPrice("gemini-3.5-flash-lite", MID).priority, { input: 0.54, cached_input: 0.05, output: 4.50 });
 });
 
 test("AC1 costForUsage: gemini-3.8-flash priority 8.10 today, 16.20 from 2027-01-01", () => {
@@ -84,8 +86,8 @@ test("AC4 edges: long context x1.8, Priority audio rate, unpriced model, billed_
   const lite = costForUsage("gemini-2.5-flash-lite", { input_tokens: M, output_tokens: 0, cached_input_tokens: 0, service_tier: "priority",
     modality_tokens: { input: { text: 0, audio: M } } }, { at: MID });
   assert.equal(lite.cost_usd, 0.54);
-  const none = costForUsage("gemini-3.6-flash", { ...P, service_tier: "priority" }, { at: MID });
-  assert.deepEqual([none.cost_usd, none.reason], [null, "service_tier_unpriced"]);
+  const none = costForUsage("gemini-4-unknown", { ...P, service_tier: "priority" }, { at: MID });
+  assert.equal(none.cost_usd, null);
   const remap = costForUsage("gemini-2.5-pro", { ...P, service_tier: "priority" }, { at: "2026-12-02T00:00:00Z" });
   assert.deepEqual([remap.billed_as, remap.cost_usd], ["gemini-3.8-flash", 8.1]);
 });
@@ -148,12 +150,13 @@ test("proxy e2e AC3: --cap 10 trips on the second priority call, third refused u
   assert.equal(hits.length, 2);
 });
 
-test("proxy e2e AC4: model with no Priority rate latches accounting_unavailable", async (t) => {
+test("proxy e2e AC4: Vertex Priority (no rate) latches accounting_unavailable", async (t) => {
   withClock(t, MID);
-  const { receipts, call } = await setup(t, () => ({ json: body("gemini-3.6-flash"), headers: { "x-gemini-service-tier": "priority" } }));
-  await call("/gemini/v1beta/models/gemini-3.6-flash:generateContent");
+  const { receipts, call } = await setup(t, () => ({ json: body("gemini-3.6-flash", { trafficType: "ON_DEMAND_PRIORITY" }) }));
+  const V = "/vertex/v1/projects/p/locations/global/publishers/google/models/gemini-3.6-flash:generateContent";
+  await call(V, { contents: [] });
   assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "service_tier_unpriced"]);
-  const next = await call("/gemini/v1beta/models/gemini-3.6-flash:generateContent");
+  const next = await call(V, { contents: [] });
   assert.equal(next.status, 429);
   assert.match(await next.text(), /accounting_unavailable/);
 });
@@ -184,10 +187,71 @@ test("AC6 preflight: Gemini priority body estimates at Priority rates and refuse
   const cap = createCapEngine({ caps: { run: limit } });
   assert.equal(preflightCheck(cap, "gemini", JSON.stringify(req), path, undefined, undefined, undefined, MID), null);
   assert.ok(preflightCheck(cap, "gemini", JSON.stringify({ ...req, service_tier: "priority" }), path, undefined, undefined, undefined, MID));
-  const none = estimateWorstCase("gemini", JSON.stringify({ ...req, service_tier: "priority" }), "/v1beta/models/gemini-3.6-flash:generateContent", undefined, undefined, MID);
-  assert.deepEqual([none.ok, none.reason], [false, "preflight_unpriced"]);
+  for (const m of ["gemini-3.6-flash", "gemini-3.5-flash-lite"]) {
+    const p = estimateWorstCase("gemini", JSON.stringify({ ...req, service_tier: "priority" }), `/v1beta/models/${m}:generateContent`, undefined, undefined, MID);
+    const s = estimateWorstCase("gemini", JSON.stringify(req), `/v1beta/models/${m}:generateContent`, undefined, undefined, MID);
+    assert.equal(p.ok, true, m);
+    assert.equal(p.pricing_tier, "priority");
+    assert.ok(p.estimate_usd > s.estimate_usd * 1.7, m);
+  }
 });
 
 test("AC6 pricing show lists a (priority) row for gemini-3.8-flash", () => {
   assert.match(pricingCommand(["show", "gemini-3.8-flash"]).out, /gemini-3\.8-flash \(priority\): input \$1\.35/);
+});
+
+// #266: Priority rates for gemini-3.6-flash / 3.5-flash-lite, 2.5-flash billed_as, 2.5-flash-lite cached audio.
+const pri = (m, u, at = MID) => costForUsage(m, { ...u, service_tier: "priority" }, { at });
+const CACHED = { input_tokens: 0, output_tokens: 0, cached_input_tokens: M };
+
+test("#266 AC1: gemini-3.6-flash priority 8.10 / 16.20, cached 0.135 / 0.27, 2027-01-01 boundary", () => {
+  assert.equal(pri("gemini-3.6-flash", P).cost_usd, 8.1);
+  assert.equal(pri("gemini-3.6-flash", P, "2027-01-02T00:00:00Z").cost_usd, 16.2);
+  assert.equal(pri("gemini-3.6-flash", CACHED).cost_usd, 0.135);
+  assert.equal(pri("gemini-3.6-flash", CACHED, "2027-01-02T00:00:00Z").cost_usd, 0.27);
+  assert.equal(pri("gemini-3.6-flash", P, "2026-12-31T23:59:59Z").cost_usd, 8.1);
+  assert.equal(pri("gemini-3.6-flash", P, "2027-01-01T00:00:00Z").cost_usd, 16.2);
+  assert.equal(pri("gemini-3.6-flash", P).pricing_tier, "priority");
+});
+
+test("#266 AC2: gemini-3.5-flash-lite priority 5.04, cached 0.05, audio at text rate", () => {
+  assert.equal(pri("gemini-3.5-flash-lite", P).cost_usd, 5.04);
+  assert.equal(pri("gemini-3.5-flash-lite", CACHED).cost_usd, 0.05);
+  const audio = pri("gemini-3.5-flash-lite", { input_tokens: M, output_tokens: 0, cached_input_tokens: 0, modality_tokens: { input: { text: 0, audio: M } } });
+  assert.equal(audio.cost_usd, 0.54);
+});
+
+test("#266 AC3: gemini-2.5-flash priority across the 2026-12-01 billed_as boundary", () => {
+  assert.equal(pri("gemini-2.5-flash", P, "2026-11-30T23:59:59Z").cost_usd, 5.04);
+  for (const at of ["2026-12-01T00:00:00Z", "2026-12-02T00:00:00Z"]) {
+    const r = pri("gemini-2.5-flash", P, at);
+    assert.deepEqual([r.billed_as, r.cost_usd, r.reason], ["gemini-3.5-flash-lite", 5.04, undefined]);
+  }
+});
+
+test("#266 AC4: gemini-2.5-flash-lite priority cached audio 0.054", () => {
+  const r = pri("gemini-2.5-flash-lite", { input_tokens: 0, output_tokens: 0, cached_input_tokens: M, modality_tokens: { cached_input: { text: 0, audio: M } } });
+  assert.deepEqual([r.cost_usd, r.reason], [0.054, undefined]);
+});
+
+test("#266 AC5 proxy e2e: priority, downgrade on 3.6-flash and 3.5-flash-lite", async (t) => {
+  withClock(t, MID);
+  let headers = { "x-gemini-service-tier": "priority" };
+  let model = "gemini-3.6-flash";
+  const { receipts, call } = await setup(t, () => ({ json: body(model), headers }));
+  await call(`/gemini/v1beta/models/${model}:generateContent`);
+  headers = { "x-gemini-service-tier": "standard" };
+  await call(`/gemini/v1beta/models/${model}:generateContent`);
+  model = "gemini-3.5-flash-lite";
+  headers = { "x-gemini-service-tier": "priority" };
+  await call(`/gemini/v1beta/models/${model}:generateContent`);
+  headers = { "x-gemini-service-tier": "standard" };
+  await call(`/gemini/v1beta/models/${model}:generateContent`);
+  assert.deepEqual(receipts.map((r) => [r.cost_usd, r.pricing_tier, r.requested_service_tier]),
+    [[8.1, "priority", undefined], [4.5, "standard", "priority"], [5.04, "priority", undefined], [2.8, "standard", "priority"]]);
+});
+
+test("#266 AC6: pricing show prints (priority) rows for 3.6-flash and 3.5-flash-lite", () => {
+  assert.match(pricingCommand(["show", "gemini-3.6-flash"]).out, /gemini-3\.6-flash \(priority\): input \$1\.35/);
+  assert.match(pricingCommand(["show", "gemini-3.5-flash-lite"]).out, /gemini-3\.5-flash-lite \(priority\): input \$0\.54/);
 });
