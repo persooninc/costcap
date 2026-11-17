@@ -15,13 +15,13 @@ jobs:
     strategy:
       matrix:
         node: [20, 22]
+    env:
+      COSTCAP_RUN_LABEL: ${{ github.run_id }}-${{ github.run_attempt }}-node${{ matrix.node }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-      - name: Record dangling docker volumes (leak guard)
-        run: docker volume ls -qf dangling=true | grep -E "^[0-9a-f]{64}$" | sort > "$RUNNER_TEMP/vols-before.txt"
       - run: npm ci
       - run: npm audit --audit-level=high
       - run: node scripts/security-scan.mjs
@@ -33,15 +33,14 @@ jobs:
       - run: npm run acceptance:runaway
       - run: npm pack --dry-run
       - run: node scripts/pack-check.mjs
-      - name: Fail if dangling docker volumes grew (leak guard)
+      - name: Fail if this job leaked docker volumes (leak guard)
         if: always()
         run: |
-          docker volume ls -qf dangling=true | grep -E "^[0-9a-f]{64}$" | sort > "$RUNNER_TEMP/vols-after.txt"
-          before=$(wc -l < "$RUNNER_TEMP/vols-before.txt"); after=$(wc -l < "$RUNNER_TEMP/vols-after.txt")
-          echo "dangling volumes before=$before after=$after"
-          if [ "$after" -gt "$before" ]; then
-            echo "::error::dangling docker volumes grew by $((after - before)); new:"; comm -13 "$RUNNER_TEMP/vols-before.txt" "$RUNNER_TEMP/vols-after.txt" | head -20; exit 1
-          fi
+          # Only volumes carrying THIS job's label (set by test/support/postgres.js);
+          # other repos/lanes on the shared host can't trip it.
+          leaked=$(docker volume ls -q --filter "label=costcap.ci-run=$COSTCAP_RUN_LABEL")
+          echo "volumes left with label costcap.ci-run=$COSTCAP_RUN_LABEL: $(printf '%s' "$leaked" | grep -c . || true)"
+          if [ -n "$leaked" ]; then echo "::error::this job leaked docker volumes:"; echo "$leaked" | head -20; exit 1; fi
   action-self-test:
     runs-on: [self-hosted, dev-home-01]
     timeout-minutes: 10
