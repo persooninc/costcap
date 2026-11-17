@@ -146,7 +146,10 @@ thinking tokens bill as text output. Caps are re-checked after each turn: on a h
 forwarded, then the client is closed `1008` (`costcap: <reason>`). `costcap kill` closes a session
 within 1 s. A close after client input but before that turn's usage (`stream_incomplete`), a
 modality with no rate (`modality_unpriced`), a cache read (`cache_read_unpriced`) and a grounded
-turn (`tool_use_unpriced`) are unknown cost and pause the run until settled. Live on Vertex AI stays
+turn (`tool_use_unpriced`) are unknown cost and pause the run until settled. Trailing mic input after
+the last usage is not a cut turn: streamed `realtimeInput` audio/video and `audioStreamEnd` followed by a
+normal client close write nothing, while `clientContent{turnComplete}`, `activityEnd`, `toolResponse` or
+server output without usage still latch `stream_incomplete`. Live on Vertex AI stays
 `404 cloud_route_unsupported`.
 
 ### Other OpenAI-compatible providers

@@ -10,7 +10,7 @@ import { startMeteringProxy, baseUrlOverrides } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 import { createKillCheck, kill } from "../src/kill.js";
 import { encodeFrame } from "../src/realtime.js";
-import { GEMINI_LIVE_PATH, geminiLiveUsage, isTurnInput, setupModel } from "../src/gemini-live.js";
+import { GEMINI_LIVE_PATH, geminiLiveUsage, isExplicitTurn, isTurnInput, setupModel } from "../src/gemini-live.js";
 import { startRealtimeUpstream, connectRealtime } from "./fixtures/realtime-upstream.js";
 
 const PATH = "/gemini/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -315,4 +315,73 @@ test("#283 AC4 the frame straddling admission is tapped: upstream close before u
   assert.equal(ws(receipts).filter((r) => r.reason === "stream_incomplete").length, 1);
   assert.deepEqual(up.sessions[0].received, [SETUP(), INPUT]);
   c.close();
+});
+
+// #284: trailing mic input after the last usage, then a normal hang-up, is not a cut turn.
+const AUDIO_END = { realtimeInput: { audioStreamEnd: true } };
+const closeNormal = (c) => { c.socket.write(encodeFrame(0x8, Buffer.from([0x03, 0xe8]), { mask: true })); c.socket.end(); };
+async function hangUp(t, { after, proxy = {} }) {
+  const { up, port, receipts, geminiCall } = await setup(t, { upstream: { onMessage: (conn, m) => {
+    if (m.setup) conn.send({ setupComplete: {} });
+    if (m.realtimeInput?.audio && !conn.replied) { conn.replied = true; conn.send(turn()); }
+  } }, proxy });
+  const c = await connectRealtime(port, PATH);
+  c.send(SETUP());
+  await c.waitFor((m) => m.setupComplete);
+  c.send(INPUT);
+  await c.waitFor((m) => m.usageMetadata);
+  await after(c, up);
+  return { c, up, receipts, geminiCall };
+}
+
+test("#284 helper: isExplicitTurn only for turnComplete, activityEnd and toolResponse", () => {
+  assert.ok(isExplicitTurn({ clientContent: { turnComplete: true } }) && isExplicitTurn({ realtimeInput: { activityEnd: {} } }) && isExplicitTurn({ toolResponse: {} }));
+  assert.ok(!isExplicitTurn(INPUT) && !isExplicitTurn(AUDIO_END) && !isExplicitTurn({ clientContent: { turns: [] } }) && !isExplicitTurn(null));
+});
+
+test("#284 AC1 trailing audio + audioStreamEnd then close 1000: no stream_incomplete, next call 200", async (t) => {
+  const { up, receipts, geminiCall } = await hangUp(t, { after: async (c, up) => {
+    c.send(INPUT); c.send(AUDIO_END);
+    await until(() => up.sessions[0].received.some((m) => m.realtimeInput?.audioStreamEnd));
+    closeNormal(c);
+    await up.sessions[0].closed;
+  } });
+  await sleep(50);
+  assert.equal(ws(receipts).filter((r) => r.reason === "stream_incomplete").length, 0);
+  assert.equal(turns(receipts).length, 1);
+  assert.equal((await geminiCall()).status, 200);
+  assert.ok(up);
+});
+
+test("#284 AC2 serverContent without usage then client close 1000 still latches", async (t) => {
+  const { receipts, geminiCall } = await hangUp(t, { after: async (c, up) => {
+    up.sessions[0].send({ serverContent: { modelTurn: { parts: [{ text: "hi" }] } } });
+    await c.waitFor((m) => m.serverContent?.modelTurn);
+    closeNormal(c);
+    await up.sessions[0].closed;
+  } });
+  await until(() => ws(receipts).some((r) => r.reason === "stream_incomplete"));
+  assert.equal(ws(receipts).filter((r) => r.reason === "stream_incomplete").length, 1);
+  assert.equal((await geminiCall()).status, 429);
+});
+
+for (const [name, msg] of [["clientContent turnComplete", { clientContent: { turns: [{ role: "user", parts: [{ text: "q" }] }], turnComplete: true } }], ["activityEnd", { realtimeInput: { activityEnd: {} } }], ["toolResponse", { toolResponse: { functionResponses: [] } }]]) {
+  test(`#284 AC3 ${name} then close 1000 with no usage still latches`, async (t) => {
+    const { receipts, geminiCall } = await hangUp(t, { after: async (c, up) => {
+      c.send(msg);
+      await until(() => up.sessions[0].received.length >= 3);
+      closeNormal(c);
+      await up.sessions[0].closed;
+    } });
+    await until(() => ws(receipts).some((r) => r.reason === "stream_incomplete"));
+    assert.equal((await geminiCall()).status, 429);
+  });
+}
+
+test("#284 AC4 cap close while the mic streams writes the cap receipt only", async (t) => {
+  const cap = createCapEngine({ caps: { run: 0.01 } });
+  const { c, receipts } = await hangUp(t, { proxy: { cap }, after: async (c) => { c.send(INPUT); c.send(INPUT); await c.closed; } });
+  assert.equal(c.closeCode, 1008);
+  await sleep(50);
+  assert.equal(ws(receipts).filter((r) => r.reason === "stream_incomplete").length, 0);
 });

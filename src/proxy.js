@@ -30,7 +30,7 @@ import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
-import { GEMINI_LIVE_PATH, geminiLiveUsage, isTurnInput, setupModel } from "./gemini-live.js";
+import { GEMINI_LIVE_PATH, geminiLiveUsage, isExplicitTurn, isTurnInput, setupModel } from "./gemini-live.js";
 import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "./live.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
@@ -1801,7 +1801,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         lines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
       }
       socket.write(lines.join("\r\n") + "\r\n\r\n");
-      let closed = false, admitted = false, pendingTurn = false, grounded = false;
+      // #284: pendingTurn is "hard" (explicit turn request, or the server started a turn) or "soft"
+      // (streamed mic input only). A normal client close drops a soft pending turn: trailing mic
+      // input after the last usage is not a cut turn. An upstream drop or cap close still latches.
+      let closed = false, admitted = false, pendingTurn = false, hardTurn = false, grounded = false;
       let held = [];
       const down = createFrameParser(), up = createFrameParser();
       const rcpt = (extra) => ({ ...base, status: 101, blocked: false, model, ...extra });
@@ -1824,14 +1827,17 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       };
       const finishIncomplete = () => {
         if (!pendingTurn) return;
-        pendingTurn = false;
+        pendingTurn = false; hardTurn = false;
         try { latch(rcpt({ cost_usd: null, reason: "stream_incomplete" }), "A Gemini Live turn was cut before its usage arrived. Restart only after reconciling this session."); } catch { hardFailure = "Receipt ledger unavailable."; }
       };
       const onMessage = (msg) => {
         if (!msg || typeof msg !== "object") return false;
         if (msg.serverContent?.groundingMetadata && typeof msg.serverContent.groundingMetadata === "object") grounded = true;
-        if (!msg.usageMetadata || typeof msg.usageMetadata !== "object") return false;
-        pendingTurn = false;
+        if (!msg.usageMetadata || typeof msg.usageMetadata !== "object") {
+          if (msg.serverContent && typeof msg.serverContent === "object") { pendingTurn = true; hardTurn = true; }
+          return false;
+        }
+        pendingTurn = false; hardTurn = false;
         const usage = geminiLiveUsage(msg.usageMetadata);
         const wasGrounded = grounded;
         grounded = false;
@@ -1894,8 +1900,13 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       };
       const tapClient = (frames) => {
         for (const f of frames) {
+          if (f.opcode === 0x8) { if (!hardTurn) pendingTurn = false; continue; }
           if (!f.message) continue;
-          try { if (isTurnInput(JSON.parse(f.message.data.toString("utf8")))) pendingTurn = true; } catch { /* not JSON */ }
+          try {
+            const m = JSON.parse(f.message.data.toString("utf8"));
+            if (isTurnInput(m)) pendingTurn = true;
+            if (isExplicitTurn(m)) hardTurn = true;
+          } catch { /* not JSON */ }
         }
       };
       const fromClient = (bytes) => {

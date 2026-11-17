@@ -19,6 +19,14 @@ export function setupModel(msg) {
 export const isTurnInput = (msg) => !!msg && typeof msg === "object" && ("realtimeInput" in msg || "clientContent" in msg || "toolResponse" in msg);
 
 /**
+ * #284: true for a client message that explicitly requests a model turn: clientContent with
+ * turnComplete, realtimeInput.activityEnd, or toolResponse. Streamed realtimeInput (mic audio,
+ * video, audioStreamEnd) "can be sent continuously" and does not by itself request a turn.
+ */
+export const isExplicitTurn = (msg) => !!msg && typeof msg === "object" &&
+  ("toolResponse" in msg || msg.clientContent?.turnComplete === true || (!!msg.realtimeInput && typeof msg.realtimeInput === "object" && "activityEnd" in msg.realtimeInput));
+
+/**
  * Live UsageMetadata -> the proxy's usage shape, or null when the required counters are missing.
  * Input = promptTokenCount + toolUsePromptTokenCount (cached share split out); output =
  * responseTokenCount + thoughtsTokenCount (thinking billed as text output).
