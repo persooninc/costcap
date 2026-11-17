@@ -236,6 +236,13 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   allowlist and preflight (`generationConfig.maxOutputTokens`). Receipts have provider `vertex`.
   `@version` / `-NNN` suffixes price as the base id; only Gemini models listed under
   `vertex_gemini` in the pricing table are priced, any other id is unknown (never $0).
+  That list covers Gemini 2.5 Pro / Flash / Flash-Lite, Gemini 4 Carbon / Argon / Hydrogen,
+  3.8 / 3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview (#256). Their global rates are the same as
+  the Gemini API rates, and they are priced at the request instant (`COSTCAP_PRICING_CLOCK` pins it),
+  so dated rate changes apply (Carbon/Argon from 2026-12-01, 3.8/3.6 Flash from 2027-01-01, with
+  `rates_effective_from` on the receipt). Gemini API `billed_as` remaps never apply on Vertex.
+  A regional (non-global) endpoint adds Vertex's +10% on GA Gemini 3+ models (`regional_multiplier: 1.1`,
+  on every component including cached input and long context). 3.1 Pro Preview and 2.5 have no premium.
   Batch prediction, `cachedContents`, tuning, Imagen, Veo, embeddings and Live stay
   `404 cloud_route_unsupported`.
 - **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes

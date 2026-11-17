@@ -58,15 +58,24 @@ export function resolveModelId(model) {
 
 export { dayOf, datedRow, validateSchedules, pricingAt } from "./pricing-schedule.js";
 
-// opts.undated: price from the base row only (Vertex keeps its 2.5 rows undated).
-export function lookupPrice(model, at, { undated = false } = {}) {
+// opts.undated: price from the base row only (Claude on Bedrock/Vertex stays undated).
+// opts.vertex (#256): Gemini on Vertex AI is dated (rate-only `effective` entries apply at `at`),
+// but `billed_as` entries never do: Vertex keeps its own rows for retired Gemini API ids.
+export function lookupPrice(model, at, { undated = false, vertex = false } = {}) {
   assertTableIntegrity();
   const id = resolveModelId(model);
   const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
   if (id === null) return { model, ...table.fallback, ...pin, fallback: true };
   if (undated) { const { effective, ...base } = table.models[id]; return { model, ...base, ...pin, fallback: false }; }
-  const d = datedRow(table, id, dayOf(at));
+  const d = datedRow(vertex ? vertexView(id) : table, id, dayOf(at));
   return { model, ...d.row, ...(d.rates_effective_from && { rates_effective_from: d.rates_effective_from }), ...(d.billed_as && { billed_as: d.billed_as }), ...pin, fallback: false };
+}
+
+// A one-row table view of id without its billed_as effective entries (#256).
+function vertexView(id) {
+  const { effective, ...base } = table.models[id];
+  const kept = Array.isArray(effective) ? effective.filter((e) => e.billed_as === undefined) : [];
+  return { models: { [id]: kept.length ? { ...base, effective: kept } : base } };
 }
 
 // True when a model (or its dated snapshot base) has a published rate (#153: --unknown-models refuse).
@@ -142,6 +151,14 @@ export function regionalMultiplier(model) {
   return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
 }
 
+// #256: Vertex non-global premium for GA Gemini 3+ (vertex_gemini.regional). null when none applies.
+export function vertexGeminiRegionalMultiplier(model) {
+  const r = table.vertex_gemini?.regional;
+  const id = resolveModelId(model);
+  if (!r || id === null || !Array.isArray(r.models) || !r.models.includes(id)) return null;
+  return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
+}
+
 // #217: Gemini models with a published Vertex AI rate (same per-token rates as the table entry).
 export function vertexGeminiModels() {
   const list = table.vertex_gemini?.models;
@@ -182,8 +199,8 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false } = {}) {
-  const price = lookupPrice(model, at, { undated });
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false, vertex = false } = {}) {
+  const price = lookupPrice(model, at, { undated, vertex });
   // #198: a per-minute / per-character model (whisper-1, tts-1) has no token rate: unknown, never NaN or $0.
   if (!price.fallback && !(Number.isFinite(price.input) && Number.isFinite(price.output))) {
     return { model, cost_usd: null, reason: "unit_unpriced", input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
@@ -194,7 +211,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   const batchM = batch ? batchMultiplier(batch) : null;
   if (batch && batchM === null) throw new Error(`no batch rate for provider ${batch}`);
   // Regional premium stacks with batch and long-context like batch_multiplier (#188).
-  const regionalM = regional && !price.fallback ? regionalMultiplier(model) : null;
+  const regionalM = regional && !price.fallback ? (vertex ? vertexGeminiRegionalMultiplier(model) : regionalMultiplier(model)) : null;
   // #189: a user discount (scale = 1 - d) stacks like batch/regional; never on the fallback rate.
   const userM = scale !== undefined && !price.fallback ? scale : null;
   const multiplier = batchM === null && regionalM === null && userM === null ? null : (batchM ?? 1) * (regionalM ?? 1) * (userM ?? 1);

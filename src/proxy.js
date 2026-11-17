@@ -12,7 +12,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling, cacheStorageCost } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, vertexGeminiRegionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling, cacheStorageCost } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
@@ -908,8 +908,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // #188: cloud preflight prices the mapped path model, with the regional premium.
             const cloudPrice = cloud ? () => {
               if (!cloudModel) return null;
-              const rm = cloudRoute.scope === "regional" ? regionalMultiplier(cloudModel) : null;
-              return rm ? scalePrice(lookupPrice(cloudModel, undefined, { undated: true }), rm) : lookupPrice(cloudModel, undefined, { undated: true });
+              // #256: Gemini on Vertex is priced at the (pinned) request instant, with its own non-global premium.
+              const g = cloudRoute.gemini === true;
+              const rm = cloudRoute.scope === "regional" ? (g ? vertexGeminiRegionalMultiplier(cloudModel) : regionalMultiplier(cloudModel)) : null;
+              const base = g ? lookupPrice(cloudModel, priceAt, { vertex: true }) : lookupPrice(cloudModel, undefined, { undated: true });
+              return rm ? scalePrice(base, rm) : base;
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
             const reserved = reservedUsd(); // #249: in-flight worst cases are already spoken for
@@ -1204,7 +1207,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (metered) {
             if (cloud) metered.model = cloudModel;
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
-              : cloud ? costForUsage(metered.model, metered.usage, { regional: cloudRoute.scope === "regional", undated: true })
+              : cloud ? costForUsage(metered.model, metered.usage, cloudRoute.gemini === true
+                ? { regional: cloudRoute.scope === "regional", vertex: true, at: priceAt }
+                : { regional: cloudRoute.scope === "regional", undated: true })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: priceAt }));
             rateLimit?.record(usageTokens(metered.usage));
             // #235/#242: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier / modality / --price gap).

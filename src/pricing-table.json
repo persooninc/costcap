@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.19",
+  "version": "2026-11-16.20",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -35,6 +35,7 @@
     "https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool (#254: no code execution charge when web_search_20260209+ or web_fetch_20260209+ is in the request; otherwise per container-hour, not priced; retrieved 2026-11-16)",
     "https://ai.google.dev/gemini-api/docs/pricing and https://ai.google.dev/gemini-api/docs/google-search#pricing (#250: Grounding with Google Search: Gemini 3 and newer $14 per 1,000 search queries the model executes, empty queries not billed; Gemini 2.5 / 2.0 $35 per 1,000 grounded prompts; free allowances not subtracted; retrieved 2026-11-16)",
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (#250: Vertex AI Gemini 2.5 Grounding with Google Search $35 per 1,000 grounded prompts, a prompt with several queries is one charge; retrieved 2026-11-16)",
+    "https://cloud.google.com/vertex-ai/generative-ai/pricing (#256, Standard, retrieved 2026-11-16: Gemini 4 Carbon/Argon/Hydrogen, 3.8/3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview global rates equal the Gemini API rows, including their dated changes; non-global endpoints cost 1.1x global for GA Gemini 3+ from 2026-07-01; 3.1 Pro Preview has a Global row only; Gemini 2.5 has no region split)",
     "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
   "tools": {
@@ -53,7 +54,7 @@
     }
   },
   "batch": { "openai": 0.5, "anthropic": 0.5, "gemini": 0.5 },
-  "vertex_gemini": { "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"] },
+  "vertex_gemini": { "models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview"], "regional": { "multiplier": 1.1, "models": ["gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"] } },
   "regional_endpoint": { "multiplier": 1.1, "models": ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-4-6", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-mythos-5-2", "claude-mythos-5-1", "claude-mythos-5", "claude-opus-4-8", "claude-opus-4-7", "claude-haiku-5-5"] },
   "currency": "usd_per_1m_tokens",
   "fallback": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "cache_write": 3.125, "cache_write_1h": 5.00 },
