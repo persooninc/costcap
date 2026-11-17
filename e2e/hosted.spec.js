@@ -351,3 +351,71 @@ test("#123 admin creates a team in the dashboard and sees the team spend card", 
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+test("#265 admin sets Total (never resets) on an agent and a team; spend across months is refused and alerted", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const delivered = [];
+  const clock = { now: Date.parse("2026-11-16T12:00:00.000Z") };
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-total-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock.now,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("total-admin@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    const agents = await page.evaluate(async () => {
+      const out = [];
+      for (const name of ["research-bot", "pilot-bot"]) {
+        const t = await (await fetch("/v1/enrollment-tokens", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+        out.push(await (await fetch("/v1/enroll", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + t.token }, body: JSON.stringify({ name }) })).json());
+      }
+      return out;
+    });
+    // Receipts spanning October and November.
+    const sync = (agent, receipts) => page.request.post(`${origin}/v1/receipts`, { headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, data: { receipts } });
+    await sync(agents[0], [{ id: "oct", ts: "2026-10-20T12:00:00Z", cost_usd: 6 }, { id: "nov", ts: "2026-11-10T12:00:00Z", cost_usd: 4 }]);
+    await sync(agents[1], [{ id: "oct", ts: "2026-10-21T12:00:00Z", cost_usd: 8 }, { id: "nov", ts: "2026-11-11T12:00:00Z", cost_usd: 7.1 }]);
+    await page.locator("#refresh").click();
+    const card = page.locator("#agents article, #agents .agent", { hasText: "research-bot" }).first();
+    await card.locator("input[name=total]").fill("10");
+    await card.locator("button[type=submit]").click();
+    await expect(page.locator("#agents")).toContainText("total $10.00 of $10.00 (left $0.00)");
+    // Team form: Total (never resets) only.
+    await page.locator("#teamForm input[name=name]").fill("pilot");
+    await page.locator("#teamAgents label", { hasText: "pilot-bot" }).locator("input").check();
+    await page.locator("#teamForm input[name=total]").fill("15");
+    await page.locator("#teamForm button").click();
+    const team = page.locator('#teams [data-team="pilot"]');
+    await expect(team).toContainText("total $15.10 of $15.00 (left $0.00)");
+    // The next call is refused with scope total (agent) and team:pilot:total, counting October spend too.
+    const verdicts = await page.evaluate(async (ids) => Promise.all(ids.map(async (id) => (await fetch(`/v1/agents/${id}/budget`)).json())), agents.map((a) => a.agentId));
+    expect([verdicts[0].verdict, verdicts[0].scope, verdicts[0].cap_usd]).toEqual(["budget_exceeded", "total", 10]);
+    expect(verdicts[0].message).toContain("never resets");
+    expect(verdicts[0].retry_after_s).toBeUndefined();
+    expect(verdicts[1].scope).toBe("team:pilot:total");
+    // The alert appears in the dashboard.
+    await service.evaluateFleetAlerts();
+    expect(delivered.some((a) => a.kind === "cap_hit" && a.scope === "total")).toBe(true);
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_hit" }).first()).toBeVisible();
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

@@ -277,10 +277,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   // Issue #211: org receipt retention (null = keep). Deleted receipts take their settlement with them.
   const orgRetention = (s, orgId) => { const days = s.orgs?.[orgId]?.receiptRetentionDays; return Number.isInteger(days) ? days : null; };
   const retentionWindow = (s, orgId) => ({ cutoff: retentionCutoffMs(orgRetention(s, orgId), now()), floor: retentionFloorMs(now(), orgPeriod(s, orgId)) });
+  // #265: agents whose receipts count toward a total cap (own caps.total or a team total); never swept.
+  const totalCapped = (s, orgId) => {
+    const ids = new Set(Object.values(s.agents).filter((a) => a.orgId === orgId && a.policy?.caps?.total != null).map((a) => a.id));
+    for (const t of Object.values(s.teams ?? {})) if (t.orgId === orgId && t.total != null) t.agents.forEach((id) => ids.add(id));
+    return ids;
+  };
   const retentionView = (s, orgId, role) => {
     const days = orgRetention(s, orgId);
     const { cutoff, floor } = retentionWindow(s, orgId);
-    return { days, cutoff: cutoff === null ? null : new Date(cutoff).toISOString(), protected_since: new Date(floor).toISOString(), eligible_count: expiredReceiptKeys(s.receipts, orgId, cutoff, floor).length,
+    return { days, cutoff: cutoff === null ? null : new Date(cutoff).toISOString(), protected_since: new Date(floor).toISOString(), eligible_count: expiredReceiptKeys(s.receipts, orgId, cutoff, floor, totalCapped(s, orgId)).length,
       min: RETENTION_MIN_DAYS, max: retentionMaxDays(entitlements(s, orgId)), canEdit: ["owner", "admin"].includes(role) };
   };
   // Nightly sweep (run.js): one receipts.purge audit entry per org that lost receipts.
@@ -289,7 +295,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       const out = [];
       for (const orgId of Object.keys(s.orgs ?? {})) {
         const { cutoff, floor } = retentionWindow(s, orgId);
-        const keys = expiredReceiptKeys(s.receipts, orgId, cutoff, floor);
+        const keys = expiredReceiptKeys(s.receipts, orgId, cutoff, floor, totalCapped(s, orgId));
         if (!keys.length) continue;
         for (const key of keys) delete s.receipts[key];
         audit(s, orgId, "retention-sweep", "receipts.purge", orgId, { count: keys.length, cutoff: new Date(cutoff).toISOString() });
@@ -485,7 +491,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps, { allTime: a.policy.caps?.total != null }), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -495,6 +501,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const acceptedIds = [];
           let expired = 0;
           const keep = retentionWindow(s, a.orgId);
+          const keepAll = totalCapped(s, a.orgId).has(a.id);
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
@@ -502,7 +509,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             if ("saved_usd" in r && (r.reason !== "cache_hit" || r.cost_usd !== 0 || typeof r.saved_usd !== "number" || !Number.isFinite(r.saved_usd) || r.saved_usd < 0)) fail(400, "Invalid receipt: saved_usd");
             const key = `${a.id}:${r.id}`;
             // #211: older than the org retention cutoff: acknowledged so the backlog drains, never stored.
-            if (!s.receipts[key] && isExpired({ receipt: r }, keep.cutoff, keep.floor)) { expired++; acceptedIds.push(r.id); continue; }
+            // #265: an agent under a total cap keeps every receipt (they count toward the cap).
+            if (!s.receipts[key] && !keepAll && isExpired({ receipt: r }, keep.cutoff, keep.floor)) { expired++; acceptedIds.push(r.id); continue; }
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");
             s.receipts[key] ??= { orgId: a.orgId, agentId: a.id, receipt: r };
             acceptedIds.push(r.id);
@@ -946,7 +954,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const input = parseTeamInput(body, { orgId: u.orgId, orgAgents: Object.values(s.agents).filter((a) => !a.revoked), teams: Object.values(s.teams) });
           const key = teamKey(u.orgId, input.name);
           const current = s.teams[key] ?? null;
-          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, ...(t.week != null ? { week: t.week } : {}), month: t.month ?? null, ...(Array.isArray(t.warnFractions) ? { warnFractions: [...t.warnFractions] } : {}) } : null);
+          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, ...(t.week != null ? { week: t.week } : {}), month: t.month ?? null, ...(t.total != null ? { total: t.total } : {}), ...(Array.isArray(t.warnFractions) ? { warnFractions: [...t.warnFractions] } : {}) } : null);
           if (input.remove) {
             if (!current) fail(404, "Team not found");
             delete s.teams[key];
@@ -956,10 +964,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             audit(s, u.orgId, u.id, "team.change", input.name, { previous: strip(current), next: null });
             return { removed: true, name: input.name };
           }
-          const { name, agents, day, week, month } = input;
+          const { name, agents, day, week, month, total } = input;
           const warnFractions = input.warnFractions === undefined ? current?.warnFractions : input.warnFractions;
           const anomaly = input.anomaly === undefined ? current?.anomaly : input.anomaly;
-          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(week != null ? { week } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}), ...(anomaly ? { anomaly } : {}) };
+          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(week != null ? { week } : {}), ...(month != null ? { month } : {}), ...(total != null ? { total } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}), ...(anomaly ? { anomaly } : {}) };
           if (JSON.stringify(current?.anomaly ?? null) !== JSON.stringify(anomaly ?? null)) audit(s, u.orgId, u.id, "anomaly.change", name, { scope: "team", before: current?.anomaly ?? null, after: anomaly ?? null });
           audit(s, u.orgId, u.id, "team.change", name, { previous: strip(current), next: strip(s.teams[key]) });
           return verdictOf(s, s.teams[key]);
@@ -1204,7 +1212,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     if (!Array.isArray(fractions)) return () => true;
     s.warnArm ??= {};
     const states = {};
-    for (const scope of ["day", "week", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now(), budgetPeriod });
+    for (const scope of ["day", "week", "month", "total"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now(), budgetPeriod });
     return (alert) => alert.kind !== "cap_approaching" || alert.fraction === undefined || !states[alert.scope] || claimWarning(states[alert.scope], alert, fractions);
   }
   // Issue #168: run warnings fire at most once per run (period = run id).
@@ -1260,11 +1268,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const blockedReasons = recent.flatMap((r) => {
           // Issue #168: a run block with a run_id pages through the per-run key.
           if (r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id) return [];
-          if (r.reason === "budget_exceeded" && ["run", "day", "week", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
+          if (r.reason === "budget_exceeded" && ["run", "day", "week", "month", "total"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
         const caps = effectiveCaps(a.policy, now());
-        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
+        // #265: a total cap's spend is the whole synced history; unknown cost raises no total alert.
+        const totalSpend = spent.all.unknown === 0 ? spent.all.usd : undefined;
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: totalSpend }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
         const runCap = caps.run;
@@ -1291,7 +1301,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
-        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd }, a.policy.warnFractions, bp);
+        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: totalSpend }, a.policy.warnFractions, bp);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
@@ -1316,7 +1326,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const teamScope = (r) => (typeof r.scope === "string" && r.scope.startsWith(prefix) ? r.scope.slice(prefix.length) : null);
         const blockedScopes = blocksInCurrentPeriod(t.agents.flatMap((id) => agentReceipts(s, id)), { reason: "budget_exceeded", nowMs: now(), budgetPeriod: orgPeriod(s, t.orgId), scopeOf: teamScope }).map(teamScope);
         const verdict = verdictOf(s, t);
-        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, week: verdict.spend.week_usd, month: verdict.spend.month_usd }, t.warnFractions, orgPeriod(s, t.orgId));
+        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, week: verdict.spend.week_usd, month: verdict.spend.month_usd, total: verdict.spend.total_usd }, t.warnFractions, orgPeriod(s, t.orgId));
         const tbp = orgPeriod(s, t.orgId);
         const teamAlerts = stickProjections(s, evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: tbp }, { warnFractions: t.warnFractions }), { orgId: t.orgId, owns: (x) => x.team === t.name, eligible: () => verdict.spend?.unknown_count === 0 && verdict.verdict !== "accounting_unavailable" && typeof verdict.caps?.month === "number", bp: tbp });
         for (const alert of teamAlerts) {

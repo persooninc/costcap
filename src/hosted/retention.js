@@ -49,8 +49,11 @@ export function isExpired(item, cutoffMs, floorMs) {
   return true;
 }
 
-/** Keys of `receipts` (store map) belonging to `orgId` that a sweep would delete. */
-export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs) {
+/**
+ * Keys of `receipts` (store map) belonging to `orgId` that a sweep would delete.
+ * keepAgents (#265): agent ids under a total cap; their receipts are never deleted.
+ */
+export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs, keepAgents = null) {
   if (cutoffMs === null) return [];
-  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
+  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !keepAgents?.has(item.agentId) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
 }

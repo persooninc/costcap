@@ -5,7 +5,7 @@ import { createAgentBudgets, budgetRemaining } from "../agent-budget.js";
 import { effectiveCaps } from "./policy.js";
 import { inSpendWindow } from "../period.js";
 
-const HOSTED_SCOPES = ["day", "week", "month"];
+const HOSTED_SCOPES = ["day", "week", "month", "total"];
 
 // agent: { id, policy: { caps, killed }, revoked }
 // receipts: stored receipt objects for that agent ({ id, ts, cost_usd, blocked? })
@@ -23,12 +23,14 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   if (maxSteps != null && runId) limits.maxSteps = maxSteps;
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};
   // Only receipts in the widest window (this budget-period month, #209) count, unknown ones included.
+  // #265: a total cap counts every receipt the agent ever synced (unknown ones included).
+  const allTime = limits.total != null;
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod))
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (allTime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod)))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
   const remaining = budgetRemaining(budgets, who);
-  const budget_remaining = remaining && { day_usd: remaining.day_usd, ...("week_usd" in remaining ? { week_usd: remaining.week_usd } : {}), month_usd: remaining.month_usd };
+  const budget_remaining = remaining && { day_usd: remaining.day_usd, ...("week_usd" in remaining ? { week_usd: remaining.week_usd } : {}), month_usd: remaining.month_usd, ...("total_usd" in remaining ? { total_usd: remaining.total_usd } : {}) };
   let hit;
   if (agent.revoked) hit = { verdict: "revoked", reason: "agent_revoked", ...who };
   else if (agent.policy?.killed) hit = { verdict: "killed", reason: "policy_killed", ...who };
@@ -37,7 +39,7 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   if ((team || orgBudget) && hit?.verdict === "no_budget_policy") hit = null;
   if (!hit && team && team.verdict !== "ok") {
     hit = { verdict: team.verdict, reason: team.verdict === "accounting_unavailable" ? "unreconciled_receipt" : "budget_exceeded", team: team.name, ...who,
-      ...Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in team).map((k) => [k, team[k]])) };
+      ...Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts", "message"].filter((k) => k in team).map((k) => [k, team[k]])) };
   }
   // Issue #240: the org-wide budget applies after the agent and team caps.
   if (!hit && orgBudget && orgBudget.verdict !== "ok") {
@@ -51,6 +53,6 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
     ...(orgBudget ? { org_budget: orgBudget } : {}),
     ...(maxSteps != null || runId ? { max_steps: maxSteps } : {}),
     ...(runId ? { steps: history.filter((r) => r.run_id === runId && !r.blocked).length } : {}),
-    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
+    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts", "message"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
   };
 }

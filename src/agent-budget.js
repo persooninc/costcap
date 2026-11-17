@@ -6,7 +6,9 @@ import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // using the shared ledger's rows for that agent.
 
 export const UNKNOWN_AGENT = "unknown";
-export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month"]);
+export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month", "total"]);
+// #265: a total cap never resets; its refusal says so and carries no retry hint.
+export const TOTAL_NEVER_RESETS = "This total budget never resets; raise the cap to continue.";
 const HOUR_MS = 60 * 60 * 1000;
 
 const round6 = (n) => Number(n.toFixed(6));
@@ -108,13 +110,14 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     const nowMs = nowDate.getTime();
     // #209: day/month windows follow the org budget period (UTC/day 1 by default).
     const today = { day: periodKey("day", nowMs, budgetPeriod), week: periodKey("week", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
-    const out = { run: 0, hour: 0, day: 0, week: 0, month: 0, steps: 0, unknown: 0 };
+    const out = { run: 0, hour: 0, day: 0, week: 0, month: 0, total: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
       if (r.cost_usd === null && !isPendingBatch(r)) out.unknown += 1;
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
       const tsMs = Date.parse(r.ts);
+      out.total += cost; // #265: every receipt since the beginning
       if (tsMs > nowMs - HOUR_MS) out.hour += cost;
       if (periodKey("day", tsMs, budgetPeriod) === today.day) out.day += cost;
       if (periodKey("week", tsMs, budgetPeriod) === today.week) out.week += cost;
@@ -136,7 +139,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     entries.sort((a, b) => a[0] - b[0]);
     return retryAfterSeconds(entries, spent, cap, nowMs);
   }
-  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : {});
+  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : scope === "total" ? { message: TOTAL_NEVER_RESETS } : {});
 
   // Effective model allowlist (#153): intersection of the agent's, its team's and the default lists.
   // null = unrestricted; [] = every model refused.
@@ -216,6 +219,7 @@ export function budgetRemaining(budgets, who) {
   const models = budgets.modelsFor?.(who.agent_id) ?? null;
   const hour = tight("hour");
   const week = tight("week");
+  const total = tight("total");
   // hour_usd (#172) appears only when an hour cap applies, so existing consumers see no new null field.
-  return { run_usd: tight("run"), ...(hour != null ? { hour_usd: hour } : {}), day_usd: tight("day"), ...(week != null ? { week_usd: week } : {}), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
+  return { run_usd: tight("run"), ...(hour != null ? { hour_usd: hour } : {}), day_usd: tight("day"), ...(week != null ? { week_usd: week } : {}), month_usd: tight("month"), ...(total != null ? { total_usd: total } : {}), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
 }

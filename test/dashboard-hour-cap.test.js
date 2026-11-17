@@ -27,7 +27,7 @@ function renderCard(policy) {
 
 test("#175 card renders an Hour field pre-filled from policy.caps.hour and round-trips it", () => {
   const card = renderCard({ caps: { hour: 5, day: 50 } });
-  assert.deepEqual(card.inputs.map((i) => i.name), ["run", "hour", "day", "week", "month", "maxSteps"]);
+  assert.deepEqual(card.inputs.map((i) => i.name), ["run", "hour", "day", "week", "month", "total", "maxSteps"]); // #265 total
   assert.equal(card.form.elements.hour.value, 5);
   card.form.elements.hour.value = String(card.form.elements.hour.value); // as a browser input reports it
   card.form.elements.day.value = String(card.form.elements.day.value);

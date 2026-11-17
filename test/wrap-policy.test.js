@@ -111,3 +111,60 @@ test("#114 enrolled wrapper enforces the cached hosted maxSteps per run, offline
   assert.equal((await run(["--max-steps", "10"])).out.filter((s) => s === "200").length, 5);
   up.close();
 });
+
+// #265: a hosted caps.total refuses the next call once synced (all-time) spend
+// plus this host's unsynced spend reaches it; no Retry-After, upstream untouched.
+// A local --policy file accepts `total` for agents too.
+test("#265 enrolled wrapper refuses at caps.total with scope total and no Retry-After; local policy total", async () => {
+  let hits = 0;
+  const now = new Date().toISOString();
+  const servedPolicy = { version: 2, caps: { total: 10, month: 100 }, killed: false, agent_spend: { spent: { day: 0, week: 0, month: 3, total: 9.5 }, unknown: 0, pending_batches: 0, as_of: now } };
+  const up = http.createServer((req, res) => {
+    hits++;
+    res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1_000_000, completion_tokens: 0 } }));
+  });
+  const fleet = http.createServer((req, res) => {
+    let text = "";
+    req.on("data", (chunk) => { text += chunk; });
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/v1/policy") res.end(JSON.stringify(servedPolicy));
+      else if (req.url === "/v1/receipts") res.end(JSON.stringify({ acceptedIds: [] })); // never synced: counts as unsynced
+      else { res.statusCode = 404; res.end("{}"); }
+    });
+  });
+  const upPort = await listen(up);
+  const fleetPort = await listen(fleet);
+  const dir = mkdtempSync(join(tmpdir(), "cc-total-"));
+  const enrollment = join(dir, "enrollment.json");
+  writeFileSync(enrollment, JSON.stringify({ url: `http://127.0.0.1:${fleetPort}`, token: "agent-token", agentId: "agent-1", policy: { version: 1, caps: {}, killed: false }, syncedIds: [] }), { mode: 0o600 });
+  const script = `for (let i = 0; i < 3; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: JSON.stringify({ n: i }) }); const b = await r.json(); console.log(r.status, r.headers.get("retry-after"), b.scope ?? b.error?.scope ?? "", b.message ?? b.error?.message ?? ""); if (r.status === 429) break; }`;
+  const run = (args) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--receipts", join(dir, `r-${args.length}.jsonl`), "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${upPort}` } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n"), err }));
+  });
+  try {
+    // gpt-4o-mini: 1M input tokens = $0.15; $9.50 + $0.15 < $10 -> first call goes, then 429.
+    servedPolicy.agent_spend.spent.total = 9.9;
+    const hosted = await run(["--enrollment", enrollment]);
+    assert.equal(hosted.code, 0, hosted.err);
+    assert.match(hosted.out[0], /^200 /);
+    assert.match(hosted.out[1], /^429 null total .*never resets/);
+    assert.equal(hits, 1);
+    // Local --policy file with an agent total.
+    hits = 0;
+    const policy = join(dir, "policy.json");
+    writeFileSync(policy, JSON.stringify({ agents: { local: { total: 0.1 } } }));
+    const local = await run(["--policy", policy, "--agent", "local"]);
+    assert.equal(local.code, 0, local.err);
+    assert.match(local.out[0], /^200 /);
+    assert.match(local.out[1], /^429 null total .*never resets/);
+    assert.equal(hits, 1);
+  } finally {
+    up.close();
+    fleet.close();
+  }
+});
