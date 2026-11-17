@@ -697,6 +697,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(200, store.read((s) => { const u = sessionUser(s, req); return { ...maskAlertSettings(s.orgs[u.orgId]?.alertSettings), canEdit: ["owner", "admin"].includes(u.role) }; }));
       }
       if (path === "/v1/alert-settings" && req.method === "POST") {
+        sessionOnly(req); // #258 AC1: destinations are session-only; any API key (viewer included) gets 403.
         if (body.emails !== undefined && (!Array.isArray(body.emails) || body.emails.length > 20 || body.emails.some((e) => typeof e !== "string"))) fail(400, "emails must be a list of up to 20 addresses");
         if (body.slackWebhook !== undefined && body.slackWebhook !== null && body.slackWebhook !== "" && !validSlackWebhook(body.slackWebhook)) fail(400, "Slack webhook must be https://hooks.slack.com/services/...");
         if (body.webhook !== undefined && body.webhook !== null && body.webhook !== "") {

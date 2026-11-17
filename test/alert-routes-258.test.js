@@ -154,6 +154,9 @@ test("API + worker: roles, isolation, validation, masking, retry/gave_up, dedupe
   // AC1: access.
   assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, viewer.cookie)).status, 403);
   assert.equal((await f.request("/v1/alert-settings", { routes: [r1] })).status, 401);
+  const viewerKey = (await f.request("/v1/api-keys", { name: "ro", role: "viewer" }, owner.cookie)).body.key;
+  assert.match(viewerKey, /^cck_/);
+  assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, null, viewerKey)).status, 403);
   // AC1: validation.
   const bads = [
     { kinds: ["nope"] }, { kinds: "cap_hit" }, { routes: {} }, { routes: [null] },
