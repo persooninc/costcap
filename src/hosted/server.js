@@ -2,6 +2,7 @@
 // Existing company membership is never inferred from an email domain.
 import http from "node:http";
 import { uiResponse } from "./ui.js";
+import { applySecurityBaseline } from "./security-baseline.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
 import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise, splitTotalRaise, dropLegacyCapKeys } from "./policy.js";
@@ -352,6 +353,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       const line = JSON.stringify({ method: req.method, path, status: res.statusCode, durationMs: Date.now() - started });
       try { requestLog(line); } catch { /* a log sink failure must not change the response */ }
     });
+    if (applySecurityBaseline(req, res, { canonicalOrigin: origin, now })) return;
     // Answer only after the datastore holds every committed change (a no-op for the file store).
     const json = async (status, value, headers = {}) => {
       try { await store.flush?.(); }
