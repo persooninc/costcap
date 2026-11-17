@@ -358,3 +358,123 @@ test("#285 HTTP on the Postgres store: same series and isolation", async (t) => 
   const pool = { async connect() { return { async query() { return { rows: [] }; }, release() {} }; } };
   await scenario285(t, await openPostgresStore({ pool, log: () => {} }));
 });
+
+// --- #293: org, tag and model lifetime total series (window="total") ---
+import { fleetTagTotalPolicy } from "../src/hosted/tag-caps.js";
+
+const SEPT = "2026-09-10T00:00:00Z";
+const tagSeries = (v, w) => `{scope="tag",name="customer=${v}",tag_key="customer",tag_value="${v}",window="${w}"}`;
+
+test("#293 AC1: org total series equal 1000 - orgBudgetVerdict lifetime spend (old months, revoked agents)", () => {
+  const receiptsByAgent = { "ag-a": [{ id: "1", ts: SEPT, cost_usd: 2, model: "m" }], "ag-rev": [{ id: "2", ts: iso(NOW - HOUR), cost_usd: 1, model: "m" }] };
+  const orgBudget = orgBudgetVerdict({ budget: { total: 1000 }, agentIds: ["ag-a", "ag-rev"], receiptsByAgent, nowMs: NOW });
+  const { body } = buildMetrics({ ...fixture(), nowMs: NOW, orgBudget });
+  assert.deepEqual(validateExposition(body), []);
+  assert.equal(value(body, 'costcap_cap_usd{scope="org",name="org",window="total"}'), 1000);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), 997);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), 1000 - orgBudget.spend.total_usd, "parity");
+  const unknown = orgBudgetVerdict({ budget: { total: 1000 }, agentIds: ["ag-a"], receiptsByAgent: { "ag-a": [{ id: "u", ts: SEPT, cost_usd: null, model: "m" }] }, nowMs: NOW });
+  const ub = buildMetrics({ ...fixture(), nowMs: NOW, orgBudget: unknown }).body;
+  assert.equal(value(ub, 'costcap_cap_usd{scope="org",name="org",window="total"}'), 1000);
+  assert.equal(value(ub, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), undefined, "unknown cost never full headroom");
+  const over = buildMetrics({ ...fixture(), nowMs: NOW, orgBudget: { caps: { total: 1 }, spend: { total_usd: 3 } } }).body;
+  assert.equal(value(over, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), 0, "floored");
+});
+
+function tagTotals(rules, receipts) {
+  const out = fleetTagCapsPolicy(rules, receipts, NOW, Infinity, null, { week: true });
+  for (const [key, values] of Object.entries(fleetTagTotalPolicy(rules, receipts, NOW, Infinity)?.spend ?? {})) {
+    out.spend[key] ??= {};
+    for (const [v, e] of Object.entries(values)) out.spend[key][v] = { ...(out.spend[key][v] ?? { day: 0, week: 0, month: 0, unknown: 0 }), total: e.total, unknown_total: e.unknown };
+  }
+  return out;
+}
+
+test("#293 AC2: tag total series equal fleetTagTotalPolicy; unknown omitted; groups count toward maxSeries", () => {
+  const rules = [{ key: "customer", scope: "total", usd: 500 }];
+  const receipts = [
+    { id: "1", ts: SEPT, cost_usd: 3, tags: { customer: "acme" } },
+    { id: "2", ts: SEPT, cost_usd: null, tags: { customer: "gamma" } },
+  ];
+  const tagCaps = tagTotals(rules, receipts);
+  const life = fleetTagTotalPolicy(rules, receipts, NOW, Infinity);
+  const f = fixture();
+  f.alerts.push({ kind: "cap_hit", agentId: null, tag: { key: "customer", value: "acme" }, active: true, acknowledged_at: null });
+  const { body } = buildMetrics({ ...f, nowMs: NOW, tagCaps });
+  assert.deepEqual(validateExposition(body), []);
+  assert.equal(value(body, `costcap_cap_usd${tagSeries("acme", "total")}`), 500);
+  assert.equal(value(body, `costcap_cap_remaining_usd${tagSeries("acme", "total")}`), 497);
+  assert.equal(value(body, `costcap_cap_remaining_usd${tagSeries("acme", "total")}`), 500 - life.spend.customer.acme.total, "parity");
+  assert.equal(value(body, `costcap_cap_usd${tagSeries("gamma", "total")}`), 500);
+  assert.equal(value(body, `costcap_cap_remaining_usd${tagSeries("gamma", "total")}`), undefined, "unknown cost never full headroom");
+  assert.equal(value(body, 'costcap_alerts_open{kind="cap_hit",scope_name="customer=acme",scope="tag"}'), 1);
+  const base = buildMetrics({ ...fixture(), nowMs: NOW }).series;
+  const small = buildMetrics({ ...fixture(), nowMs: NOW, tagCaps, maxSeries: base + 2 + ALERT_KINDS.length });
+  assert.equal(small.truncated, true);
+  assert.ok(small.body.includes('tag_value="acme"') && !small.body.includes('tag_value="gamma"'), "lowest-spend total group dropped first");
+});
+
+test("#293 AC3: model total series (parity with modelCapStatus); unknown cost omits the series", () => {
+  const rules = [{ model: "gpt-6", scope: "total", usd: 20 }];
+  const status = modelCapStatus([{ id: "1", ts: SEPT, cost_usd: 3, model: "gpt-6" }], rules, NOW);
+  const f = fixture();
+  f.agents[0] = { ...f.agents[0], modelCapStatus: status };
+  const { body } = buildMetrics({ ...f, nowMs: NOW });
+  assert.deepEqual(validateExposition(body), []);
+  assert.equal(value(body, 'costcap_cap_usd{scope="model",name="a",model="gpt-6",window="total"}'), 20);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="model",name="a",model="gpt-6",window="total"}'), 17);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="model",name="a",model="gpt-6",window="total"}'), 20 - status[0].spent, "parity");
+  f.agents[0].modelCapStatus = modelCapStatus([{ id: "1", ts: SEPT, cost_usd: 3, model: "gpt-6" }, { id: "2", ts: iso(NOW - HOUR), cost_usd: null, model: "gpt-6" }], rules, NOW);
+  assert.ok(!buildMetrics({ ...f, nowMs: NOW }).body.includes('model="gpt-6"'), "unsettled unknown cost omits the series");
+});
+
+test("#293 AC5: no org, tag or model totals keeps the body byte-identical", () => {
+  assert.equal(buildMetrics({ ...fixture(), nowMs: NOW, orgBudget: null, tagCaps: null }).body, AC6_BODY);
+});
+
+async function scenario293(t, store) {
+  store.transaction((s) => {
+    for (const org of [ORG_A, ORG_B]) s.orgs[org] = { id: org, name: org };
+    s.orgs[ORG_A].orgBudget = { total: 1000 };
+    s.orgs[ORG_A].tagCaps = [{ key: "customer", scope: "total", usd: 500 }];
+    s.orgs[ORG_B].orgBudget = { total: 888 };
+    s.orgs[ORG_B].tagCaps = [{ key: "customer", scope: "total", usd: 999 }];
+    s.agents["ag-a"] = { id: "ag-a", orgId: ORG_A, name: "a", hash: "h1", policy: { version: 1, caps: { total: 10 }, modelCaps: [{ model: "gpt-6", scope: "total", usd: 20 }] } };
+    s.agents["ag-r"] = { id: "ag-r", orgId: ORG_A, name: "r", hash: "h2", revoked: true, policy: { version: 1, caps: {} } };
+    s.agents["ag-z"] = { id: "ag-z", orgId: ORG_B, name: "z", hash: "h3", policy: { version: 1, caps: {}, modelCaps: [{ model: "zz-model", scope: "total", usd: 9 }] } };
+    s.receipts["ag-a:1"] = { orgId: ORG_A, agentId: "ag-a", receipt: { id: "1", ts: SEPT, cost_usd: 2, model: "gpt-6", tags: { customer: "acme" } } };
+    s.receipts["ag-r:2"] = { orgId: ORG_A, agentId: "ag-r", receipt: { id: "2", ts: iso(NOW - HOUR), cost_usd: 1, model: "m", tags: { customer: "acme" } } };
+    s.receipts["ag-z:9"] = { orgId: ORG_B, agentId: "ag-z", receipt: { id: "9", ts: SEPT, cost_usd: 1, model: "zz-model", tags: { customer: "zcorp" } } };
+  });
+  const keys = {};
+  store.transaction((s) => {
+    keys.a = createApiKey(s, { orgId: ORG_A, createdBy: "u", name: "g", role: "viewer", expiresAt: null }, NOW).raw;
+    keys.b = createApiKey(s, { orgId: ORG_B, createdBy: "u", name: "g", role: "viewer", expiresAt: null }, NOW).raw;
+  });
+  const service = createHostedServer({ store, origin: "http://localhost", secureCookies: false, now: () => NOW, stripeEnv: {}, verifyChallenge: async () => true, sendCode: async () => {} });
+  await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
+  t.after(() => { service.server.closeAllConnections(); service.server.close(); });
+  const get = async (path, key) => (await fetch(`http://127.0.0.1:${service.server.address().port}${path}`, { headers: { authorization: `Bearer ${key}` } })).text();
+  const body = await get("/v1/metrics", keys.a);
+  assert.deepEqual(validateExposition(body), []);
+  const ob = JSON.parse(await get("/v1/org-budget", keys.a)).org_budget;
+  assert.equal(value(body, 'costcap_cap_usd{scope="org",name="org",window="total"}'), 1000);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), 997);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="org",name="org",window="total"}'), 1000 - ob.spend.total_usd, "parity with /v1/org-budget");
+  assert.equal(value(body, `costcap_cap_remaining_usd${tagSeries("acme", "total")}`), 497);
+  assert.equal(value(body, 'costcap_cap_remaining_usd{scope="model",name="a",model="gpt-6",window="total"}'), 18);
+  assert.ok(!body.includes("zcorp") && !body.includes("zz-model") && !body.includes(" 888"), "no org B series");
+  const other = await get("/v1/metrics", keys.b);
+  assert.ok(other.includes("zcorp") && other.includes("zz-model") && other.includes('window="total"} 888'));
+  assert.ok(!other.includes("acme") && !other.includes("gpt-6"));
+}
+
+test("#293 HTTP on the JSON store: org, tag, model total series and isolation", async (t) => {
+  await scenario293(t, openStore(join(mkdtempSync(join(tmpdir(), "cc-metrics293-")), "store.json")));
+});
+
+test("#293 HTTP on the Postgres store: same total series and isolation", async (t) => {
+  const { openPostgresStore } = await import("../src/hosted/store-postgres.js");
+  const pool = { async connect() { return { async query() { return { rows: [] }; }, release() {} }; } };
+  await scenario293(t, await openPostgresStore({ pool, log: () => {} }));
+});

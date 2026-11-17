@@ -233,6 +233,18 @@ export function spendSummary(receipts, nowMs, budgetPeriod = null) {
 
 // `store` (optional) injects any adapter with the store interface (mode, read, transaction,
 // flush), for example openPostgresStore(); otherwise the JSON file at `storePath` is used.
+// #293: periodic tag spend plus lifetime total/unknown_total (fleetTagTotalPolicy) for /v1/metrics.
+function metricsTagCaps(rules, receiptsOf, nowMs, bp) {
+  if (!rules?.length) return null;
+  const receipts = receiptsOf();
+  const out = fleetTagCapsPolicy(rules, receipts, nowMs, Infinity, bp, { week: true });
+  for (const [key, values] of Object.entries(fleetTagTotalPolicy(rules, receipts, nowMs, Infinity)?.spend ?? {})) {
+    out.spend[key] ??= {};
+    for (const [v, e] of Object.entries(values)) out.spend[key][v] = { ...(out.spend[key][v] ?? { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 }), total: e.total, unknown_total: e.unknown };
+  }
+  return out;
+}
+
 export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert, deliverDigest,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
@@ -629,7 +641,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
               return out;
             }),
             orgBudget: orgBudgetOfOrg(s, u.orgId),
-            tagCaps: s.orgs?.[u.orgId]?.tagCaps?.length ? fleetTagCapsPolicy(s.orgs[u.orgId].tagCaps, orgReceipts(s, u.orgId), now(), Infinity, bp, { week: true }) : null,
+            tagCaps: metricsTagCaps(s.orgs?.[u.orgId]?.tagCaps, () => orgReceipts(s, u.orgId), now(), bp),
             teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
             receipts: visibleReceipts(s, u.orgId),
             alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId) });

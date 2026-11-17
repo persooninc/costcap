@@ -77,7 +77,8 @@ export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = 
     }
     // #285: hosted model caps; spent null (hour scope or unknown cost) emits nothing, never $0.
     for (const m of a.modelCapStatus ?? []) {
-      if (!METRIC_WINDOWS.includes(m.scope) || m.spent == null) continue;
+      // #293: lifetime model total caps emit window="total" (unknown cost: spent null, omitted).
+      if ((!METRIC_WINDOWS.includes(m.scope) && m.scope !== "total") || m.spent == null) continue;
       const l = { scope: "model", name: agent, model: m.model, window: m.scope };
       add("costcap_cap_usd", l, m.usd);
       add("costcap_cap_remaining_usd", l, Math.max(0, m.usd - m.spent));
@@ -106,6 +107,12 @@ export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = 
       add("costcap_cap_usd", { scope: "org", name: "org", window }, cap);
       add("costcap_cap_remaining_usd", { scope: "org", name: "org", window }, Math.max(0, cap - (orgBudget.spend?.[`${window}_usd`] ?? 0)));
     }
+    // #293: org lifetime total; remaining omitted while unsettled unknown cost exists.
+    if (orgBudget.caps?.total != null) {
+      const l = { scope: "org", name: "org", window: "total" };
+      add("costcap_cap_usd", l, orgBudget.caps.total);
+      if (!(orgBudget.spend?.total_unknown_count > 0)) add("costcap_cap_remaining_usd", l, Math.max(0, orgBudget.caps.total - (orgBudget.spend?.total_usd ?? 0)));
+    }
   }
   // Every kind is emitted per agent/team (0 when none open) so a resolved alert reads 0, not "absent".
   const open = new Map();
@@ -123,20 +130,23 @@ export function buildMetrics({ agents = [], teams = [], receipts = [], alerts = 
   // and the lowest-spend values are dropped first (org/agent/team/model series never are).
   const groups = [];
   for (const [key, values] of Object.entries(tagCaps?.spend ?? {})) {
-    const rules = (tagCaps.rules ?? []).filter((r) => r.key === key && METRIC_WINDOWS.includes(r.scope));
+    const rules = (tagCaps.rules ?? []).filter((r) => r.key === key && (METRIC_WINDOWS.includes(r.scope) || r.scope === "total"));
     if (!rules.length) continue;
     for (const [value, e] of Object.entries(values)) {
       const name = `${key}=${value}`;
       const caps = [], rems = [];
-      for (const window of METRIC_WINDOWS) {
+      for (const window of [...METRIC_WINDOWS, "total"]) {
         const r = rules.find((x) => x.scope === window);
         if (!r) continue;
         const l = { scope: "tag", name, tag_key: key, tag_value: value, window };
         caps.push(`costcap_cap_usd${labels(l)} ${fmt(r.usd)}`);
+        // #293: lifetime total from fleetTagTotalPolicy; unsettled unknown cost omits remaining.
+        if (window === "total") { if (Number.isFinite(e.total) && !(e.unknown_total > 0)) rems.push(`costcap_cap_remaining_usd${labels(l)} ${fmt(Math.max(0, r.usd - e.total))}`); continue; }
         rems.push(`costcap_cap_remaining_usd${labels(l)} ${fmt(Math.max(0, r.usd - (e[window] ?? 0)))}`);
       }
       const al = ALERT_KINDS.map((kind) => `costcap_alerts_open${labels({ kind, scope_name: name, scope: "tag" })} ${fmt(open.get(`${kind}\u0000\u0001tag\u0000${name}`) ?? 0)}`);
-      groups.push({ spend: Math.max(e.month ?? 0, e.week ?? 0, e.day ?? 0), name, caps, rems, al });
+      if (!caps.length) continue;
+      groups.push({ spend: Math.max(e.month ?? 0, e.week ?? 0, e.day ?? 0, e.total ?? 0), name, caps, rems, al });
     }
   }
   groups.sort((x, y) => y.spend - x.spend || (x.name < y.name ? -1 : 1));
