@@ -193,11 +193,11 @@ test("#261 AC6: unknown cost in the current week refuses; a pending batch stays 
   // Unknown receipt on Nov 30 (previous month, current week) is still counted as unknown.
   const unknown = [{ id: "u", ts: "2026-11-30T12:00:00Z", cost_usd: null }];
   assert.equal(hostedAgentVerdict({ agent, receipts: unknown, nowMs: now }).verdict, "accounting_unavailable");
-  const snap = agentSpendPolicy(unknown, now);
+  const snap = agentSpendPolicy(unknown, now, null, null, { week: true }); // #267: the server passes the week cap
   assert.equal(snap.unknown, 1);
   assert.equal(cachedAgentVerdict({ ...snap, unknown: 0 }, { week: 10 }, [{ id: "p", ts: "2026-12-02T11:00:00Z", cost_usd: null }], now).verdict, "accounting_unavailable");
   const pending = [{ id: "pb", ts: "2026-11-30T12:00:00Z", cost_usd: null, reason: "batch_pending" }];
-  const ps = agentSpendPolicy(pending, now);
+  const ps = agentSpendPolicy(pending, now, null, null, { week: true });
   assert.deepEqual([ps.unknown, ps.pending_batches], [0, 1]);
 });
 

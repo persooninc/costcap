@@ -75,3 +75,26 @@ test("regression: agent-status CLI enforces a team cap", () => {
   writeFileSync(policy, JSON.stringify({ teams: { ops: { agents: ["a", "b"], day: 5 } } }));
   assert.equal(run("b").status, 0);
 });
+
+// #267: team and org verdicts across the Nov 30 -> Dec 2 boundary.
+test("#267: previous-month unknown receipt refuses team/org only when they cap the week", async () => {
+  const { teamVerdict } = await import("../src/hosted/teams.js");
+  const { orgBudgetVerdict } = await import("../src/hosted/org-budget.js");
+  const { hostedAgentVerdict } = await import("../src/hosted/agent-verdict.js");
+  const nowMs = Date.parse("2026-12-02T10:00:00Z");
+  const receiptsByAgent = { a1: [{ id: "u1", ts: "2026-11-30T10:00:00Z", cost_usd: null }] };
+  const month = teamVerdict({ team: { name: "t", agents: ["a1"], month: 100 }, receiptsByAgent, nowMs });
+  assert.equal(month.verdict, "ok");
+  assert.equal(month.spend.unknown_count, 0);
+  const week = teamVerdict({ team: { name: "t", agents: ["a1"], month: 100, week: 50 }, receiptsByAgent, nowMs });
+  assert.equal(week.verdict, "accounting_unavailable");
+  assert.equal(week.spend.unknown_count, 1);
+  const org = orgBudgetVerdict({ budget: { month: 100 }, agentIds: ["a1"], receiptsByAgent, nowMs });
+  assert.equal(org.verdict, "ok");
+  assert.equal(org.spend.unknown_count, 0);
+  assert.equal(orgBudgetVerdict({ budget: { week: 50 }, agentIds: ["a1"], receiptsByAgent, nowMs }).verdict, "accounting_unavailable");
+  // The agent (no week cap) is refused through its week-capped team.
+  const agent = { id: "a1", policy: { version: 1, caps: { month: 100 }, killed: false } };
+  assert.equal(hostedAgentVerdict({ agent, receipts: receiptsByAgent.a1, nowMs, team: week }).verdict, "accounting_unavailable");
+  assert.equal(hostedAgentVerdict({ agent, receipts: receiptsByAgent.a1, nowMs, team: month, orgBudget: org }).verdict, "ok");
+});

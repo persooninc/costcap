@@ -1,4 +1,4 @@
-import { periodKey, samePeriod, inSpendWindow } from "../period.js";
+import { periodKey, samePeriod, countsAtNow } from "../period.js";
 // Hosted team budgets (issue #123, SRM #3017). Pure, no I/O.
 // A team shares one day/month cap across a group of enrolled agents in one org.
 // The verdict reuses the local agent-budget engine (src/agent-budget.js), so the
@@ -80,7 +80,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
       // #261: current month OR current week (a week can start in the previous month).
-      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod))) continue;
+      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || countsAtNow(r, nowMs, budgetPeriod, team.week != null))) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
@@ -162,7 +162,7 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 // #244: modelCaps adds `models`, the same totals split per capped model.
 // #265: { total: true } (the agent has caps.total) counts every receipt since the
 // beginning into spent.total; unknown cost anywhere in that history then refuses.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false } = {}) {
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false, week: weekCapped = false } = {}) {
   const now = new Date(nowMs).toISOString();
   const month = periodKey("month", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const spent = { day: 0, week: 0, month: 0, total: 0 };
@@ -174,7 +174,8 @@ export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps
     const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
     if (!inMonth && !inWeek && !lifetime) continue; // #261: a week can start in the previous month
     if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
-    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    // #267: a previous-month unknown counts only when the agent caps the week.
+    if (r.cost_usd === null || r.cost_usd === undefined) { if (inMonth || lifetime || weekCapped) unknown += 1; continue; }
     spent.total += r.cost_usd;
     if (inMonth) spent.month += r.cost_usd;
     if (inWeek) spent.week += r.cost_usd;

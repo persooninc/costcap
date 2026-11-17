@@ -110,6 +110,18 @@ export function nextRaiseExpiry(policy, nowMs = Date.now()) {
   return t.length ? Math.min(...t) : null;
 }
 
+/**
+ * #267: drop caps.* keys that are not cap scopes (stored before #261 made them a 400).
+ * Returns { policy, dropped } ; policy is the same object when nothing is dropped.
+ */
+export function stripLegacyCapKeys(p) {
+  const caps = p?.caps;
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) return { policy: p, dropped: [] };
+  const dropped = Object.keys(caps).filter((k) => !CAP_KEYS.includes(k));
+  if (!dropped.length) return { policy: p, dropped };
+  return { policy: { ...p, caps: Object.fromEntries(Object.entries(caps).filter(([k]) => CAP_KEYS.includes(k))) }, dropped };
+}
+
 export function validatePolicy(p) {
   const errors = [];
   if (!p || typeof p !== "object") return ["policy must be an object"];

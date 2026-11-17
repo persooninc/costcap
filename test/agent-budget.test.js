@@ -162,3 +162,23 @@ test("wrap enforces a policy and agent-status exits by verdict", async (t) => {
   assert.equal(status().status, 2);
   assert.equal(spawnSync(process.execPath, [...base, "--", "true"], { encoding: "utf8" }).status, 2);
 });
+
+// #267: a previous-month unknown receipt in the current ISO week refuses only a week cap.
+test("#267: Nov 30 unknown receipt does not refuse a month-only agent on Dec 2; a week cap still refuses", async () => {
+  const { hostedAgentVerdict } = await import("../src/hosted/agent-verdict.js");
+  const { agentSpendPolicy } = await import("../src/hosted/teams.js");
+  const nowMs = Date.parse("2026-12-02T10:00:00Z");
+  const receipts = [{ id: "u1", ts: "2026-11-30T10:00:00Z", cost_usd: null }];
+  const agent = (caps) => ({ id: "a1", policy: { version: 1, caps, killed: false } });
+  assert.equal(hostedAgentVerdict({ agent: agent({ month: 100 }), receipts, nowMs }).verdict, "ok");
+  assert.equal(hostedAgentVerdict({ agent: agent({ day: 5 }), receipts, nowMs }).verdict, "ok");
+  const weekly = hostedAgentVerdict({ agent: agent({ month: 100, week: 50 }), receipts, nowMs });
+  assert.equal(weekly.verdict, "accounting_unavailable");
+  assert.equal(weekly.reason, "unreconciled_receipt");
+  assert.equal(agentSpendPolicy(receipts, nowMs, null, null, {}).unknown, 0);
+  assert.equal(agentSpendPolicy(receipts, nowMs, null, null, { week: true }).unknown, 1);
+  // A known Nov 30 cost still counts toward the week total.
+  assert.equal(agentSpendPolicy([{ id: "k", ts: "2026-11-30T10:00:00Z", cost_usd: 2 }], nowMs).spent.week, 2);
+  // Same-month unknown still refuses a month cap.
+  assert.equal(hostedAgentVerdict({ agent: agent({ month: 100 }), receipts: [{ id: "u2", ts: "2026-12-01T10:00:00Z", cost_usd: null }], nowMs }).verdict, "accounting_unavailable");
+});
