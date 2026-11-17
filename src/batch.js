@@ -2,7 +2,7 @@
 // exact-path matchers, request model extraction and JSONL results folding.
 // A batch create has no usage; its cost is known only once results are read.
 // Results are priced at the provider's batch multiplier (pricing table `batch`).
-import { createUsageAccumulator } from "./proxy.js";
+import { billedAsGrounding, createUsageAccumulator } from "./proxy.js";
 import { costWithOverrides, withToolCost } from "./price-overrides.js";
 import { premiumTier } from "./pricing.js";
 
@@ -106,16 +106,18 @@ function priceLine(provider, body, userPrices, model, instants = [undefined]) {
   if (premiumTier(metered.usage)) return null;
   // #189: a discount stacks on the batch multiplier; an absolute override has no batch rate (unknown).
   // #236: priced at the create and the settle instant; the higher cost is kept, never the cheaper guess.
-  let tokens = null;
+  // #263: grounding follows the instant's `billed_as` unit (#260's live rule), so each instant is
+  // priced whole (tokens + tools) and the higher total is kept.
+  let best = null;
   for (const at of instants) {
     const t = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider, at });
     if (t.fallback || t.cost_usd === null) return null;
-    if (!tokens || t.cost_usd > tokens.cost_usd) tokens = t;
+    // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
+    const c = withToolCost(t, userPrices, provider, billedAsGrounding(provider, false, t, metered), null, body);
+    if (c.cost_usd === null) return null;
+    if (!best || c.cost_usd > best.cost_usd) best = c;
   }
-  // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
-  const c = withToolCost(tokens, userPrices, provider, metered, null, body);
-  if (c.cost_usd === null) return null;
-  return { ...c, model: metered.model ?? null };
+  return { ...best, model: metered.model ?? null };
 }
 
 /**
