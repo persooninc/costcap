@@ -317,3 +317,61 @@ test("#234 AC6: preflight prices claude-fable-5-2 instead of preflight_unpriced"
   assert.equal(preflightCheck(createCapEngine({ caps: { day: 0.1 } }), "anthropic", req).reason, "preflight_estimate");
   assert.equal(preflightCheck(createCapEngine({ caps: { day: 1 } }), "anthropic", req), null);
 });
+
+// #255 AC3–AC4: --preflight --max-concurrent reserves in-flight estimates for tag, model and fleet caps.
+import { createTagCaps } from "../src/tag-cap.js";
+import { createModelCaps } from "../src/model-cap.js";
+
+async function slowUpstream(t) {
+  const st = { hits: 0 };
+  const s = http.createServer((q, res) => {
+    q.resume();
+    q.on("end", () => { st.hits++; setTimeout(() => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } })), 300); });
+  });
+  await new Promise((r) => s.listen(0, "127.0.0.1", r));
+  t.after(() => { s.closeAllConnections(); s.close(); });
+  st.url = `http://127.0.0.1:${s.address().port}`;
+  return st;
+}
+async function concurrentProxy(t, up, opts) {
+  const p = await startMeteringProxy({ receiptsPath: join(mkdtempSync(join(tmpdir(), "cc-255-")), "r.jsonl"), upstreams: { openai: up.url }, maxConcurrent: 3, preflight: true, ...opts });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); });
+  let seq = 0;
+  return async (tag) => {
+    const r = await fetch(`http://127.0.0.1:${p.port}/openai/v1/chat/completions`, { method: "POST", headers: tag ? { "x-costcap-tag": tag } : {},
+      body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 1000, user: `u${seq++}` }) });
+    return { status: r.status, json: await r.json().catch(() => null) };
+  };
+}
+const est255 = () => estimateWorstCase("openai", JSON.stringify({ model: "gpt-4o-mini", max_tokens: 1000, user: "u0" }), "/v1/chat/completions").estimate_usd;
+
+test("#255 AC3: tag cap subtracts same-value in-flight estimates; other tag values are unaffected", async (t) => {
+  const up = await slowUpstream(t);
+  const call = await concurrentProxy(t, up, { tagCaps: createTagCaps({ rules: [{ key: "customer", scope: "day", cap: est255() * 2.5 }] }) });
+  const rs = await Promise.all([call("customer=acme"), call("customer=acme"), call("customer=acme")]);
+  assert.deepEqual(rs.map((r) => r.status), [200, 200, 429]);
+  assert.equal(rs[2].json.error, "tag_budget_exceeded", JSON.stringify(rs[2].json));
+  assert.equal(rs[2].json.reason, "preflight_estimate");
+  const mixed = await Promise.all([call("customer=a1"), call("customer=a1"), call("customer=b2")]);
+  assert.deepEqual(mixed.map((r) => r.status), [200, 200, 200], JSON.stringify(mixed[0].json));
+});
+
+test("#255 AC4: model cap reserves only matching in-flight models", async (t) => {
+  const up = await slowUpstream(t);
+  const call = await concurrentProxy(t, up, { modelCaps: createModelCaps({ rules: [{ model: "gpt-4o-mini", scope: "day", cap: est255() * 2.5 }] }) });
+  const rs = await Promise.all([call(), call(), call()]);
+  assert.deepEqual(rs.map((r) => r.status), [200, 200, 429]);
+  assert.equal(rs[2].json.error, "model_budget_exceeded");
+  assert.equal(rs[2].json.reason, "preflight_estimate");
+});
+
+test("#255 AC4: fleet agent/team/org remaining subtracts in-flight estimates", async (t) => {
+  for (const kind of ["agent", "team", "org"]) {
+    const up = await slowUpstream(t);
+    const call = await concurrentProxy(t, up, { fleetRemaining: () => ({ [kind]: { day: est255() * 2.5 }, teamName: "t1" }) });
+    const rs = await Promise.all([call(), call(), call()]);
+    assert.deepEqual(rs.map((r) => r.status), [200, 200, 429], kind);
+    assert.equal(rs[2].json.reason, "preflight_estimate");
+    assert.equal(rs[2].json.fleet, true);
+  }
+});

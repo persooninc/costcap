@@ -534,11 +534,21 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   let inFlight = 0;
   const inFlightEstimates = new Map(); // token -> preflight estimate_usd of an in-flight call
   let slotWaiter = null;
+  // #255: re-check periodically so a raised ceiling admits queued calls without a release.
   const acquireSlot = async () => {
-    while (inFlight >= concurrency()) await new Promise((resolve) => { slotWaiter = resolve; });
+    while (inFlight >= concurrency()) {
+      await new Promise((resolve) => { slotWaiter = resolve; const t = setTimeout(resolve, 25); t.unref?.(); });
+    }
   };
   const releaseSlot = () => { const w = slotWaiter; slotWaiter = null; w?.(); };
-  const reservedUsd = () => { let t = 0; for (const v of inFlightEstimates.values()) t += v; return t; };
+  const reservedUsd = () => { let t = 0; for (const v of inFlightEstimates.values()) t += v.est; return t; };
+  // #255: in-flight reservations for one tag-cap or model-cap remaining entry.
+  const reservedTag = (x) => {
+    let t = 0;
+    for (const v of inFlightEstimates.values()) if (tagCaps?.remaining?.(v.tags)?.some((y) => y.tag_key === x.tag_key && y.tag_value === x.tag_value && y.scope === x.scope)) t += v.est;
+    return t;
+  };
+  const reservedModel = (x) => { let t = 0; for (const v of inFlightEstimates.values()) if (v.models.includes(x.model)) t += v.est; return t; };
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
   // of that receipt clears it. Failures with no receipt (ledger/persistence) never clear.
   const failures = new Map();
@@ -752,7 +762,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           send(status, { error, model: requestedModel ?? null, message });
           return "blocked";
         };
-        let preflightEst;
+        let preflightEst, reserveModels = [];
         // #207: budget-triggered downgrade; dg is the applied decision, dgReceipt the receipt fields.
         let dg = null, dgReceipt = {};
         const verdict = guarded(() => {
@@ -811,6 +821,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (tagHit) return block("tag_budget_exceeded", tagHit, tagBudgetExceededBody(tagHit));
           // #238: per-model caps, checked after any #207 rewrite; never latch the run.
           const capModels = generates && !freeMgmt ? checkModels.filter(Boolean) : [];
+          reserveModels = capModels;
           const modelHit = capModels.length ? modelCaps?.check(capModels) : null;
           if (modelHit?.verdict === "accounting_unavailable") { requestedModel = modelHit.model; return block("accounting_unavailable", modelHit, { error: "accounting_unavailable", ...modelHit }); }
           if (modelHit) { requestedModel = modelHit.model; const { rule_model: _rm, ...d } = modelHit; return block("model_budget_exceeded", d, modelBudgetExceededBody(modelHit)); }
@@ -858,7 +869,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
               // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
               const fr = fleetRemaining?.();
-              for (const [kind, left] of [["agent", fr?.agent], ["team", fr?.team], ["org", fr?.org]]) {
+              const resv = reservedUsd();
+              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "month"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
+              for (const [kind, left] of [["agent", fleetLeft(fr?.agent)], ["team", fleetLeft(fr?.team)], ["org", fleetLeft(fr?.org)]]) {
                 const sc = left && ["day", "month"].find((x) => left[x] != null && est > left[x]);
                 if (!sc) continue;
                 const isTeam = kind === "team", isOrg = kind === "org";
@@ -869,9 +882,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
                   message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.` });
               }
-              const tagPf = tagCaps?.preflight?.(reqTags, est);
+              const tagPf = tagCaps?.preflight?.(reqTags, est, reservedTag);
               if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));
-              const modelPf = capModels.length ? modelCaps?.preflight?.(capModels, est) : null;
+              const modelPf = capModels.length ? modelCaps?.preflight?.(capModels, est, reservedModel) : null;
               if (modelPf) return block("model_budget_exceeded", modelPf, modelBudgetExceededBody(modelPf));
             }
           }
@@ -1210,12 +1223,13 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         if (concurrency() <= 1 && inFlight === 0) return forwardAndRecord();
         const token = {};
         inFlight += 1;
-        if (preflightEst && !preflightEst.pass && Number.isFinite(preflightEst.estimate_usd)) inFlightEstimates.set(token, preflightEst.estimate_usd);
+        if (preflightEst && !preflightEst.pass && Number.isFinite(preflightEst.estimate_usd)) inFlightEstimates.set(token, { est: preflightEst.estimate_usd, tags: reqTags, models: reserveModels });
         return { detached: forwardAndRecord().finally(() => { inFlight -= 1; inFlightEstimates.delete(token); }) };
       };
       const ledgerDown = () => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); };
       queue = queue.then(async () => {
-        if (concurrency() > 1) await acquireSlot();
+        // #255: also wait when a lowered ceiling still has calls in flight.
+        if (concurrency() > 1 || inFlight > 0) await acquireSlot();
         const out = await run();
         if (out?.detached) out.detached.catch(ledgerDown).finally(releaseSlot);
       }).catch(ledgerDown);

@@ -134,8 +134,10 @@ export function createTagCaps({ rules = [], history = [], now = () => new Date()
       });
     },
     /** #193: first rule whose remainder cannot fit a preflight worst-case estimate, else null. */
-    preflight(tags, estimateUsd) {
-      const r = engine.remaining(tags).find((x) => estimateUsd > x.remaining_usd);
+    preflight(tags, estimateUsd, reservedFor = null) {
+      // #255: in-flight worst cases on the same (key, value, scope) are reserved first.
+      const left = (x) => { const res = reservedFor ? reservedFor(x) : 0; return res ? round(Math.max(x.remaining_usd - res, 0)) : x.remaining_usd; };
+      const r = engine.remaining(tags).map((x) => ({ ...x, remaining_usd: left(x) })).find((x) => estimateUsd > x.remaining_usd);
       return r ? { reason: "preflight_estimate", estimate: true, estimate_usd: estimateUsd, ...r } : null;
     },
     /** Every (rule, value) at or over its cap in the current window, sorted. */
@@ -168,7 +170,7 @@ export function withFleetTagCaps(local, fleet, localRules = []) {
     settle: (id, cost) => local?.settle(id, cost) ?? false,
     check: (tags) => local?.check(tags) ?? fleet.tagCheck(tags, localRules),
     remaining: (tags) => local?.remaining(tags) ?? [],
-    preflight: (tags, est) => local?.preflight(tags, est) ?? null,
+    preflight: (tags, est, reservedFor) => local?.preflight(tags, est, reservedFor) ?? null,
     over: () => local?.over() ?? [],
   };
 }

@@ -357,3 +357,34 @@ test("--policy maxConcurrent alone sets concurrency (min with flag)", { timeout:
   assert.equal(r.code, 0, r.err);
   assert.equal(up.peak, 3);
 });
+
+// #255 AC1: lowering the ceiling while calls are in flight must not unbound concurrency.
+test("#255 AC1: lowering maxConcurrent 4→1 with 4 in flight never exceeds 4, then ≤1 (20 runs)", { timeout: 120_000 }, async (t) => {
+  for (let run = 0; run < 20; run++) {
+    let n = 4;
+    const up = await upstream(t, { delay: () => 60 });
+    const p = await proxy(t, up, { maxConcurrent: () => n });
+    const first = Array.from({ length: 4 }, () => p.call());
+    while (up.inFlight < 4) await new Promise((r) => setTimeout(r, 5));
+    n = 1;
+    const rest = Array.from({ length: 12 }, () => p.call());
+    await Promise.all(first);
+    assert.ok(up.peak <= 4, `run ${run}: peak ${up.peak} > 4`);
+    up.peak = up.inFlight;
+    await Promise.all(rest);
+    assert.ok(up.peak <= 1, `run ${run}: peak after drain ${up.peak} > 1`);
+    assert.equal(up.hits, 16);
+  }
+});
+
+test("#255 AC2: raising maxConcurrent while requests are queued lets up to the new N run", async (t) => {
+  let n = 2;
+  const up = await upstream(t, { delay: () => 400 });
+  const p = await proxy(t, up, { maxConcurrent: () => n });
+  const all = Array.from({ length: 6 }, () => p.call());
+  while (up.inFlight < 2) await new Promise((r) => setTimeout(r, 5));
+  n = 6;
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(up.inFlight, 6, "queued calls start without waiting for a release");
+  assert.deepEqual((await Promise.all(all)).map((r) => r.status), Array(6).fill(200));
+});

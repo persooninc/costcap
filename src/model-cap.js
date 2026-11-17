@@ -183,8 +183,10 @@ export function createModelCaps({ rules = [], history = [], now = () => new Date
       return out;
     },
     /** First rule whose remainder cannot fit a preflight worst-case estimate, else null. */
-    preflight(models, estimateUsd) {
-      const r = engine.remaining(models).find((x) => estimateUsd > x.remaining_usd);
+    preflight(models, estimateUsd, reservedFor = null) {
+      // #255: in-flight worst cases on the same model and scope are reserved first.
+      const left = (x) => { const res = reservedFor ? reservedFor(x) : 0; return res ? round(Math.max(x.remaining_usd - res, 0)) : x.remaining_usd; };
+      const r = engine.remaining(models).map((x) => ({ ...x, remaining_usd: left(x) })).find((x) => estimateUsd > x.remaining_usd);
       return r ? { reason: "preflight_estimate", estimate: true, estimate_usd: estimateUsd, ...r } : null;
     },
     /** Every rule at or over its cap in the current window. */
