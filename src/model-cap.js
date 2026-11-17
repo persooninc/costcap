@@ -207,7 +207,7 @@ export function modelBudgetExceededBody(hit) {
   const { rule_model: _r, ...rest } = hit;
   if (hit.reason === "preflight_estimate") {
     return { error: "model_budget_exceeded", ...rest,
-      message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit model ${hit.model}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.` };
+      message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit model ${hit.model}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.${hit.scope === "total" ? " A total budget does not reset." : ""}` };
   }
   if (hit.scope === "total") return { error: "model_budget_exceeded", ...rest, ...totalCapMessage("total", hit.cap_usd) }; // #286
   return { error: "model_budget_exceeded", ...rest,

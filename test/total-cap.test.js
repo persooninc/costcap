@@ -17,6 +17,7 @@ import { parseCapRequest } from "../src/hosted/cap-requests.js";
 import { createHostedServer } from "../src/hosted/server.js";
 
 const ms = (iso) => Date.parse(iso);
+const round6 = (n) => Number(n.toFixed(6));
 const NOV = ms("2026-11-16T12:00:00Z");
 const DEC = ms("2026-12-02T12:00:00Z");
 
@@ -91,8 +92,8 @@ test("#265 AC2: hosted verdict counts every month; the wrapper's cached verdict 
   assert.equal(cachedAgentVerdict(synced, { total: 10, month: 100 }, [], DEC).scope, "total");
   assert.equal(hostedAgentVerdict({ agent, receipts: [...receipts, { id: "p", ts: "2026-11-16T11:00:00Z", cost_usd: 1.2 }], nowMs: DEC }).scope, "total");
   assert.equal(cachedAgentVerdict(synced, { total: 20, month: 100 }, [], DEC), null);
-  // Preflight remainders stay day/month (total preflight is out of scope).
-  assert.equal(cachedAgentRemaining(synced, { total: 20 }, [], DEC), null);
+  // #291: preflight remainders include the lifetime total (cap - lifetime spend).
+  assert.deepEqual(cachedAgentRemaining(synced, { total: 20 }, [], DEC), { day: null, month: null, total: round6(20 - synced.spent.total) });
 });
 
 test("#265 AC3: team total spans months and members; another org never counts", () => {

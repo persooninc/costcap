@@ -173,6 +173,12 @@ export function cachedOrgVerdict(org, pending, nowMs, budgetPeriod = null) {
   return null;
 }
 
+// #291: what is left of the lifetime org total (org_budget_total) for --preflight.
+export function cachedOrgTotalRemaining(t, pending) {
+  if (!t) return null;
+  return round6(Math.max(0, t.cap - (t.spend_usd + lifetimeSpend(pending).usd)));
+}
+
 // What is left of each capped org window for --preflight.
 export function cachedOrgRemaining(org, pending, nowMs, budgetPeriod = null) {
   if (!org) return null;

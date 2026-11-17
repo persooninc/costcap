@@ -6,10 +6,13 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy, raiseWeekError, raiseTotalError, dropLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
-import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict } from "./tag-caps.js";
-import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict } from "./model-caps.js";
+import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict, cachedFleetTagTotalRemaining } from "./tag-caps.js";
+import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict, cachedFleetModelTotalRemaining } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
-import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining, validOrgTotalPolicy, cachedOrgTotalVerdict } from "./org-budget.js";
+import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining, validOrgTotalPolicy, cachedOrgTotalVerdict, cachedOrgTotalRemaining } from "./org-budget.js";
+
+// #291: org window remainders plus the lifetime org total (null when neither applies).
+const orgLeft = (windows, total) => (total == null ? windows : { ...(windows ?? {}), total });
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -172,14 +175,14 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     },
     // #195: fleet agent / hosted team remainders for --preflight.
     preflightRemaining(nowMs = Date.now()) {
-      if (!data.agentSpend && !data.team && !data.orgBudget) return null;
+      if (!data.agentSpend && !data.team && !data.orgBudget && !data.orgTotal) return null;
       const synced = new Set(data.syncedIds ?? []);
       const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
       return {
         agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs, data.budgetPeriod) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs, data.budgetPeriod) : null,
         teamName: data.team?.name ?? null,
-        org: data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null,
+        org: orgLeft(data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null, cachedOrgTotalRemaining(data.orgTotal ?? null, pending)),
       };
     },
     // #244 (#268: plus week rules from model_caps_week): hosted modelCaps against the agent's fleet-wide per-model
@@ -195,13 +198,17 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     modelRemaining(models, nowMs = Date.now()) {
       if (!data.agentSpend?.models) return [];
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetModelRemaining(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      return [...cachedFleetModelRemaining(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod),
+        ...cachedFleetModelTotalRemaining(data.agentSpend, data.modelCapsTotal ?? [], models, pending)]; // #291
     },
     // #272: fleet tag remainders for --preflight (merged with local rules).
     tagRemaining(tags, localRules = [], nowMs = Date.now()) {
-      if (!data.tagCaps) return [];
+      if (!data.tagCaps && !data.tagCapsTotal) return [];
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetTagRemaining(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      return [...(data.tagCaps ? cachedFleetTagRemaining(data.tagCaps, localRules, tags, pending, nowMs, data.budgetPeriod) : []),
+        ...cachedFleetTagTotalRemaining(data.tagCapsTotal ?? null, tags, pending)]; // #291
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,

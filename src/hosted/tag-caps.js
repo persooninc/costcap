@@ -154,21 +154,39 @@ export function validFleetTagTotal(t) {
  * (an unlisted value of a truncated list counts at the lowest listed known total)
  * plus every unsynced receipt on this host with that value.
  */
+// #291: lifetime tag-total remainders for --preflight. Unknown cost is left out (its verdict refuses).
+export function cachedFleetTagTotalRemaining(policy, tags, pending) {
+  if (!policy?.rules?.length) return [];
+  const out = [];
+  for (const rule of policy.rules) {
+    const value = valueOf(tags, rule.key);
+    const { total, unknown } = tagTotalSpend(policy, rule, value, pending);
+    if (unknown > 0) continue;
+    out.push({ tag_key: rule.key, tag_value: value, scope: "total", cap_usd: rule.usd, remaining_usd: round6(Math.max(rule.usd - total, 0)), fleet: true });
+  }
+  return out;
+}
+
+function tagTotalSpend(policy, rule, value, pending) {
+  const values = policy.spend?.[rule.key] ?? {};
+  let e = values[value];
+  if (!e) {
+    const known = Object.values(values).filter((x) => x.unknown === 0);
+    e = !policy.truncated ? { total: 0, unknown: 0 } : known.length ? { total: Math.min(...known.map((x) => x.total)), unknown: 0 } : { total: 0, unknown: Object.keys(values).length ? 1 : 0 };
+  }
+  let total = e.total, unknown = e.unknown;
+  for (const r of pending) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
+  }
+  return { total, unknown };
+}
+
 export function cachedFleetTagTotalVerdict(policy, tags, pending) {
   if (!policy?.rules?.length) return null;
   for (const rule of policy.rules) {
     const value = valueOf(tags, rule.key);
-    const values = policy.spend?.[rule.key] ?? {};
-    let e = values[value];
-    if (!e) {
-      const known = Object.values(values).filter((x) => x.unknown === 0);
-      e = !policy.truncated ? { total: 0, unknown: 0 } : known.length ? { total: Math.min(...known.map((x) => x.total)), unknown: 0 } : { total: 0, unknown: Object.keys(values).length ? 1 : 0 };
-    }
-    let total = e.total, unknown = e.unknown;
-    for (const r of pending) {
-      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
-      if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
-    }
+    const { total, unknown } = tagTotalSpend(policy, rule, value, pending);
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", tag_key: rule.key, tag_value: value, scope: "total", unknown_receipts: unknown, fleet: true,
       message: `CostCap: ${rule.key}=${value} has ${unknown} receipt(s) with unknown cost, so its fleet tag cap cannot be enforced. The upstream call was not made.` };
     if (total >= rule.usd) return { verdict: "tag_budget_exceeded", tag_key: rule.key, tag_value: value, scope: "total", spend_usd: round6(total), cap_usd: rule.usd, fleet: true };

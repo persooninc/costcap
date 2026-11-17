@@ -678,11 +678,14 @@ function batchIdOf(raw) {
   } catch { return null; }
 }
 
+// #291: a lifetime total never resets, so its preflight refusal says so (and has no Retry-After).
+const totalNote = (scope) => (scope === "total" ? " A total budget does not reset." : "");
+
 // #249: subtract in-flight preflight worst cases from an agent's remaining budgets.
 function reserveLeft(left, reserved) {
   if (!left || !reserved) return left;
   const out = { ...left };
-  for (const k of ["run_usd", "hour_usd", "day_usd", "week_usd", "month_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
+  for (const k of ["run_usd", "hour_usd", "day_usd", "week_usd", "month_usd", "total_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
   return out;
 }
 
@@ -1049,18 +1052,18 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (preflightEst && !preflightEst.pass) {
               const est = preflightEst.estimate_usd;
               const left = agentBudgets?.limitsFor ? reserveLeft(budgetRemaining(agentBudgets, who), reservedUsd()) : null;
-              const agentScope = left && ["run", "hour", "day", "week", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
+              const agentScope = left && ["run", "hour", "day", "week", "month", "total"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
               if (agentScope) {
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
-                  message: `CostCap preflight estimate: worst case $${est} does not fit this agent's remaining ${agentScope} budget ($${detail.remaining_usd}). This is an estimate. The upstream call was not made.` });
+                  message: `CostCap preflight estimate: worst case $${est} does not fit this agent's remaining ${agentScope} budget ($${detail.remaining_usd}). This is an estimate. The upstream call was not made.${totalNote(agentScope)}` });
               }
               // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
               const fr = fleetRemaining?.();
               const resv = reservedUsd();
-              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "week", "month"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
+              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "week", "month", "total"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
               for (const [kind, left] of [["agent", fleetLeft(fr?.agent)], ["team", fleetLeft(fr?.team)], ["org", fleetLeft(fr?.org)]]) {
-                const sc = left && ["day", "week", "month"].find((x) => left[x] != null && est > left[x]);
+                const sc = left && ["day", "week", "month", "total"].find((x) => left[x] != null && est > left[x]);
                 if (!sc) continue;
                 const isTeam = kind === "team", isOrg = kind === "org";
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, fleet: true,
@@ -1068,7 +1071,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                   ...(isTeam ? { team: fr.teamName } : {}), ...(isOrg ? { org: true } : {}), ...who };
                 const what = isTeam ? `team "${fr.teamName}"` : isOrg ? "org" : "fleet agent";
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
-                  message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.` });
+                  message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.${totalNote(sc)}` });
               }
               const tagPf = tagCaps?.preflight?.(reqTags, est, reservedTag);
               if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));

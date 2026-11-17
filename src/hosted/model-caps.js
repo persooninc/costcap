@@ -69,19 +69,39 @@ export function validTotalModelCaps(list) {
  * #286: offline lifetime model verdict: agent_spend.models[norm].total plus every
  * unsynced receipt of that model on this host. Unknown cost refuses (never $0).
  */
+// #291: lifetime model-total remainders for --preflight. Unknown cost is left out (its verdict refuses).
+export function cachedFleetModelTotalRemaining(spend, rules, models, pending) {
+  if (!spend?.models || !rules?.length) return [];
+  const out = [];
+  for (const m of models ?? []) {
+    const norm = normalizeModel(m);
+    const rs = rules.filter((r) => r.scope === "total" && normalizeModel(r.model) === norm);
+    if (!rs.length) continue;
+    const { total, unknown } = modelTotalSpend(spend, norm, pending);
+    if (unknown > 0) continue;
+    for (const r of rs) out.push({ model: m, rule_model: r.model, scope: "total", cap_usd: r.usd, remaining_usd: round6(Math.max(r.usd - total, 0)), fleet: true });
+  }
+  return out;
+}
+
+function modelTotalSpend(spend, norm, pending) {
+  const e = spend.models[norm];
+  // A server that did not send this model's lifetime spend cannot be enforced: refuse, never $0.
+  let total = e?.total ?? 0, unknown = e && typeof e.total === "number" ? e.unknown_total ?? 0 : 1;
+  for (const r of pending) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
+  }
+  return { total, unknown };
+}
+
 export function cachedFleetModelTotalVerdict(spend, rules, models, pending) {
   if (!spend?.models || !rules?.length) return null;
   for (const m of models ?? []) {
     const norm = normalizeModel(m);
     const rs = rules.filter((r) => r.scope === "total" && normalizeModel(r.model) === norm);
     if (!rs.length) continue;
-    const e = spend.models[norm];
-    // A server that did not send this model's lifetime spend cannot be enforced: refuse, never $0.
-    let total = e?.total ?? 0, unknown = e && typeof e.total === "number" ? e.unknown_total ?? 0 : 1;
-    for (const r of pending) {
-      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
-      if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
-    }
+    const { total, unknown } = modelTotalSpend(spend, norm, pending);
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", model: m, scope: "total", unknown_receipts: unknown, fleet: true,
       message: `CostCap: model "${m}" has a fleet model cap and ${unknown} receipt(s) with unknown cost. Reconcile it before calling this model again.` };
     for (const r of rs) if (total >= r.usd) return { model: m, rule_model: r.model, scope: "total", spend_usd: round6(total), cap_usd: r.usd, fleet: true };

@@ -187,7 +187,7 @@ export function withFleetTagCaps(local, fleet, localRules = []) {
 export function tagBudgetExceededBody(hit) {
   if (hit.reason === "preflight_estimate") {
     return { error: "tag_budget_exceeded", ...hit,
-      message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit ${hit.tag_key}=${hit.tag_value}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.` };
+      message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit ${hit.tag_key}=${hit.tag_value}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.${hit.scope === "total" ? " A total budget does not reset." : ""}` };
   }
   if (hit.scope === "total") return { error: "tag_budget_exceeded", ...hit, ...totalCapMessage("total", hit.cap_usd) }; // #286
   return { error: "tag_budget_exceeded", ...hit,

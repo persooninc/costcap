@@ -209,11 +209,13 @@ export function cachedAgentVerdict(spend, caps, pending, nowMs, budgetPeriod = n
 // Returns { day, month } (null = no cap on that window), or null when nothing applies.
 // Unknown-cost receipts make the verdict functions refuse already; here they add 0.
 function cachedRemaining(entry, caps, pending, nowMs, budgetPeriod = null) {
-  if (!entry || ![...REMAINING_SCOPES, "week"].some((s) => caps?.[s] != null)) return null;
+  if (!entry || ![...REMAINING_SCOPES, "week", "total"].some((s) => caps?.[s] != null)) return null;
   const { total } = cachedTotals(entry, pending, nowMs, budgetPeriod);
   const left = {};
   for (const s of REMAINING_SCOPES) left[s] = caps[s] == null ? null : round6(Math.max(0, caps[s] - total[s]));
   if (caps.week != null) left.week = round6(Math.max(0, caps.week - (total.week ?? 0)));
+  // #291: lifetime total = cap - (lifetime synced spend + every unsynced receipt).
+  if (caps.total != null) left.total = round6(Math.max(0, caps.total - (total.total ?? 0)));
   return left;
 }
 
