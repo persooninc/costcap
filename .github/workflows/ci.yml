@@ -2,6 +2,12 @@ name: verify
 on: [push, pull_request]
 permissions:
   contents: read
+# One running + one pending run per ref. A newer push replaces the older
+# pending run, so pushes cannot stack dozens of queued runs on the shared
+# dev-home-01 org runner pool. Running jobs are never cancelled.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   test:
     runs-on: [self-hosted, dev-home-01]
