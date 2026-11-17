@@ -9,6 +9,7 @@ export const CONTENT_LASTMOD = "2026-11-13";
 export const PUBLIC_ROUTES = Object.freeze([
   Object.freeze({ path: "/", priority: 1.0, changefreq: "weekly" }),
   Object.freeze({ path: "/cli", priority: 0.8, changefreq: "monthly" }),
+  Object.freeze({ path: "/compare", priority: 0.6, changefreq: "monthly" }),
   ...TRUST_ROUTES,
 ]);
 
