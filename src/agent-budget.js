@@ -20,8 +20,14 @@ function assertLimits(limits, label) {
   if (steps != null && (!Number.isInteger(steps) || steps <= 0)) throw new Error(`Invalid ${label} maxSteps`);
   // #192: requests/tokens per minute, positive integers.
   for (const k of ["rpm", "tpm"]) if (limits?.[k] != null && !(Number.isInteger(limits[k]) && limits[k] > 0)) throw new Error(`Invalid ${label} ${k}`);
+  // #249: parallel upstream calls per wrapper, 1..64.
+  if (limits?.maxConcurrent != null && !isMaxConcurrent(limits.maxConcurrent)) throw new Error(`Invalid ${label} maxConcurrent`);
   if (limits?.models !== undefined && !isModelList(limits.models)) throw new Error(`Invalid ${label} models`);
 }
+
+// #249: --max-concurrent / maxConcurrent is an integer from 1 to 64.
+export const MAX_CONCURRENT_LIMIT = 64;
+export function isMaxConcurrent(n) { return Number.isInteger(n) && n >= 1 && n <= MAX_CONCURRENT_LIMIT; }
 
 // Model allowlist (#153): a non-empty array of non-empty model id strings (exact ids, no wildcards).
 export function isModelList(models) {
@@ -45,7 +51,7 @@ function assertReceipt(r) {
 
 const POLICY_KEYS = new Set(["default", "agents", "teams"]);
 const TEAM_KEYS = new Set([...SCOPES, "agents", "models"]);
-const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models", "rpm", "tpm"]);
+const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models", "rpm", "tpm", "maxConcurrent"]);
 
 // Unknown keys are refused: a misspelled limit must not silently mean "no limit".
 export function assertAgentPolicy(policy) {

@@ -456,14 +456,17 @@ test("#244: validModelSpend, cappedModels, modelCapStatus", () => {
 });
 
 test("#244: withFleetModelCaps uses the local engine first, fleet with a snapshot, fallback without", () => {
-  const local = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "hour", cap: 1 }] });
-  const fallback = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "day", cap: 2 }] });
+  // Fixed midday clock: "now - 2h" must stay in the same UTC day whenever the suite runs.
+  const at = Date.parse("2026-11-16T12:00:00Z");
+  const now = () => new Date(at);
+  const local = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "hour", cap: 1 }], now });
+  const fallback = createModelCaps({ rules: [{ model: "claude-opus-4-8", scope: "day", cap: 2 }], now });
   let snap = null;
   const fleet = { agentSpend: () => snap, modelCheck: () => ({ model: "claude-opus-4-8", scope: "day", fleet: true }) };
   const w = withFleetModelCaps(local, fallback, fleet);
   assert.equal(w.check(["claude-opus-4-8"]), null);
-  w.record({ id: "r1", ts: new Date().toISOString(), model: "claude-opus-4-8", cost_usd: 0.5 });
-  w.record({ id: "r2", ts: new Date(Date.now() - 2 * 3600_000).toISOString(), model: "claude-opus-4-8", cost_usd: 1.6 });
+  w.record({ id: "r1", ts: new Date(at).toISOString(), model: "claude-opus-4-8", cost_usd: 0.5 });
+  w.record({ id: "r2", ts: new Date(at - 2 * 3600_000).toISOString(), model: "claude-opus-4-8", cost_usd: 1.6 });
   assert.equal(w.check(["claude-opus-4-8"]).scope, "day", "fallback enforces before a snapshot");
   assert.equal(w.remaining(["claude-opus-4-8"]).length, 2);
   assert.equal(w.over().length, 1);

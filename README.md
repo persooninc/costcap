@@ -253,16 +253,18 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   never written to the ledger or the hosted store. The upstream still receives
   the full query. The hosted ingest redacts older clients' uploads too, and
   stored receipts are scrubbed once at server startup.
-- Requests are serialized inside a proxy. A receipt ledger is exclusively locked
+- Admission decisions are serialized inside a proxy. By default upstream calls
+  are too (one in flight); `--max-concurrent N` forwards up to N at once (see
+  [Parallel calls](#parallel-calls)). A receipt ledger is exclusively locked
   for each wrapper. Separate ledgers do not share day/month caps. A crashed
   wrapper leaves a lock that you must remove only after checking it stopped.
 - `--shared-ledger` lets several wrappers on **one host** share one ledger, so
   their combined day/month spend (and `--policy` agent/team budgets) is capped
   together. Every decision and every receipt append runs in a short
   cross-process critical section (`<ledger>.cs`) that first reads what the other
-  wrappers appended. **Documented overshoot: at most one in-flight call per
-  wrapper**, so recorded spend stays within `cap + wrappers × max single-call
-  cost`. `--cap` (run) stays per wrapper. An unknown-cost receipt from any
+  wrappers appended. **Documented overshoot: at most N in-flight calls per
+  wrapper** (N = `--max-concurrent`, default 1), so recorded spend stays within
+  `cap + Σ(N per wrapper) × max single-call cost`. `--cap` (run) stays per wrapper. An unknown-cost receipt from any
   wrapper blocks every wrapper on the ledger. Stale critical sections are
   fail-closed: a holder is reclaimed only when it is on this host and its PID
   is provably gone; any other holder (another host, unreadable owner) is waited
@@ -780,6 +782,20 @@ node src/cli.js wrap --rpm 60 --tpm 200000 -- node your-agent.js
 - **RPM** counts requests admitted to the upstream; the slot is reserved before forwarding, so a concurrent burst cannot overshoot. GET/HEAD, cache hits and calls CostCap refuses do not count. A call the provider rejects (including its own 429) does count.
 - **TPM** adds the metered tokens (input + cached input + cache writes + output) when a call completes. It is checked before each call, so one in-flight call can overshoot it. Unknown usage adds 0 tokens.
 - **Refusal:** CostCap never queues. It returns `429` with `Retry-After` (seconds, at least 1) and `{error:{type:"rate_limited", source:"costcap", limit:"rpm"|"tpm", limit_value, observed, window_s:60, retry_after_s, message}}`, which the OpenAI and Anthropic SDKs retry. Each refusal writes a $0 `blocked:true, reason:"rate_limited"` receipt. It never latches and never counts toward `maxSteps`, velocity, spiral, caps or alerts.
+
+## Parallel calls
+
+By default a wrapper forwards one model call at a time. An agent that fans out (parallel tool calls, sub-agents, `asyncio.gather`) can run several at once:
+
+```sh
+node src/cli.js wrap --cap 5 --max-concurrent 8 -- node your-agent.js
+```
+
+- **Where:** `--max-concurrent N` (integer 1–64, default 1), `maxConcurrent` on `default` or an agent in a `--policy` file, or `maxConcurrent` on `POST /v1/agents/:id/policy` (API only, audited as `policy.change`; a dashboard save keeps it). The minimum of all three applies; the fleet value is a ceiling and the cached value is enforced offline.
+- **Admission stays serialized.** Requests beyond N wait in FIFO order (never a 429 for concurrency). When a slot frees, the next request runs the full verdict (kill, accounting failure, allowlist, caps, tag/model caps, preflight, rate, velocity, spiral) against every completed receipt. Only the upstream fetch and forwarding run in parallel; receipt append, spend recording, cap warnings and the `--shared-ledger` critical section stay serialized.
+- **Bounds.** `--max-steps` counts in-flight calls, so it is never exceeded. The RPM slot is reserved before forwarding, as before. With `--preflight`, the worst-case estimates of in-flight calls are subtracted from the remaining budget first. An unknown-cost receipt or the kill switch stops new admissions; calls already in flight finish and are recorded.
+- **Overshoot:** at most N in-flight calls per wrapper, so recorded spend stays within `cap + Σ(N per wrapper) × max single-call cost`. Without `--preflight`, no dollars are reserved for in-flight calls.
+- The run summary, rollup line and `costcap runs` show `max_concurrent` when it is above 1.
 
 ## Soft warnings
 

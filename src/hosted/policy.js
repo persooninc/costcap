@@ -112,6 +112,8 @@ export function validatePolicy(p) {
   }
   // Rate limits (issue #192): optional positive integers per 60 s.
   for (const k of ["rpm", "tpm"]) if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] > 0)) errors.push(`${k} must be a positive integer`);
+  // #249: parallel upstream calls per wrapper (a ceiling), optional integer 1..64.
+  if (p.maxConcurrent !== undefined && p.maxConcurrent !== null && !(Number.isInteger(p.maxConcurrent) && p.maxConcurrent >= 1 && p.maxConcurrent <= 64)) errors.push("maxConcurrent must be an integer from 1 to 64");
   // Budget-triggered model downgrade (issue #207): optional { at, map }.
   if (p.downgrade !== undefined && p.downgrade !== null) {
     const err = downgradeError(p.downgrade);
@@ -145,6 +147,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");
   if (local.models != null && !isModelList(local.models)) throw new Error("Invalid local models");
   for (const k of ["rpm", "tpm"]) if (local[k] != null && !(Number.isInteger(local[k]) && local[k] > 0)) throw new Error(`Invalid local ${k}`);
+  if (local.maxConcurrent != null && !(Number.isInteger(local.maxConcurrent) && local.maxConcurrent >= 1 && local.maxConcurrent <= 64)) throw new Error("Invalid local maxConcurrent");
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
   if (fetched && validatePolicy(fetched).length === 0 && (!lastKnown || fetched.version > lastKnown.version)) {
@@ -166,5 +169,5 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
   // #207: fleet downgrade; local can only add unmapped models and lower `at`.
   const downgrade = mergeDowngrade(server?.downgrade ?? null, local?.downgrade ?? null);
-  return { caps, maxSteps, models, ...(server?.modelCaps ? { modelCaps: server.modelCaps } : {}), ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+  return { caps, maxSteps, models, ...(server?.modelCaps ? { modelCaps: server.modelCaps } : {}), ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), ...(minOf("maxConcurrent") != null && { maxConcurrent: minOf("maxConcurrent") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }

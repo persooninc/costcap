@@ -20,7 +20,7 @@ accepted request.
 | Language | JavaScript ESM (`"type": "module"`), **no runtime dependencies** |
 | Runtime | Node.js 20+ (image is `node:22-alpine`) |
 | CLI | `src/cli.js` (`costcap` bin, shebanged): `wrap`, `kill`, `resume`, `check`, `mcp`, `enroll`, `reconcile` |
-| Local proxy | `src/proxy.js`, binds `127.0.0.1`; serializes upstream calls |
+| Local proxy | `src/proxy.js`, binds `127.0.0.1`; serializes admission and recording; forwards up to `--max-concurrent` N calls at once (default 1, #249) |
 | Guardrail engines | `src/cap.js`, `src/spiral.js`, `src/velocity.js`, `src/kill.js`, `src/ledger-lock.js` |
 | Pricing | `src/pricing-table.json` (versioned estimate) + `src/pricing.js` |
 | Providers metered | openai, anthropic, openrouter, gemini (base-URL override, `src/proxy.js`) |

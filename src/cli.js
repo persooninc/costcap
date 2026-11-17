@@ -21,7 +21,7 @@ import { createSettler } from "./settle.js";
 import { DEFAULT_WARN_AT, createCapWarner, parseWarnAt } from "./cap-warn.js";
 import { createVelocityBreaker } from "./velocity.js";
 import { createRateLimiter, minLimit } from "./rate-limit.js";
-import { assertAgentPolicy, createAgentBudgets, intersectModels } from "./agent-budget.js";
+import { assertAgentPolicy, createAgentBudgets, intersectModels, isMaxConcurrent, MAX_CONCURRENT_LIMIT } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -42,7 +42,7 @@ import { createDowngrader, mergeDowngrade, parseDowngradeAt, parseDowngradeMap, 
 import { isPricedModel } from "./pricing.js";
 import { createOtlpExporter, parseOtlpHeaders, parseOtlpUrl } from "./otlp.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--model-cap MODEL:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] [--otlp URL] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--max-concurrent N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--model-cap MODEL:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] [--otlp URL] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
   "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output] [--baseline FILE] [--max-increase-pct N] [--max-increase-usd N] [--summary-out FILE]\n" +
@@ -92,6 +92,11 @@ export function parseWrapArgs(argv) {
       const n = Number(v);
       if (!/^\d+$/.test(v) || !Number.isInteger(n) || n <= 0) throw new Error(`${f} must be a positive integer, got "${v}"`);
       opts[f.slice(2)] = n;
+    } else if (f === "--max-concurrent") {
+      // #249: up to N upstream calls in flight per wrapper (default 1: serialized).
+      const n = Number(v);
+      if (!/^\d+$/.test(v) || !isMaxConcurrent(n)) throw new Error(`--max-concurrent must be an integer from 1 to ${MAX_CONCURRENT_LIMIT}, got "${v}"`);
+      opts.maxConcurrent = n;
     } else if (f === "--velocity-multiple") {
       const n = Number(v);
       if (!Number.isFinite(n) || n <= 1) throw new Error(`--velocity-multiple must be a number greater than 1, got "${v}"`);
@@ -181,7 +186,7 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, modelCaps: modelCapRules, rpm, tpm, downgradeMap, downgradeAt, otlp } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, modelCaps: modelCapRules, rpm, tpm, maxConcurrent: maxConcurrentFlag, downgradeMap, downgradeAt, otlp } = parseWrapArgs(argv);
   for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
   if (otlp?.insecure) console.error(`costcap: warning: --otlp uses plain http to a non-loopback host (${new URL(otlp.url).host})`);
@@ -233,9 +238,12 @@ export async function wrap(argv) {
   // #192: effective rate limit = min(flag, --policy agent/default, fleet); re-applied on each fleet sync.
   const rateLimit = createRateLimiter();
   let fleetRate = {};
+  let effectiveConcurrent = 1;
   const applyRate = () => {
     const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
     rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
+    // #249: effective concurrency = min(flag, --policy agent/default, fleet ceiling); default 1.
+    effectiveConcurrent = minLimit(maxConcurrentFlag, own?.maxConcurrent, fleetRate.maxConcurrent) ?? 1;
   };
   // #207: local --downgrade / --downgrade-at merged with the fleet downgrade (local only adds or lowers).
   const localDowngrade = downgradeMap ? { map: downgradeMap, at: downgradeAt } : downgradeAt != null ? { at: downgradeAt } : null;
@@ -252,7 +260,7 @@ export async function wrap(argv) {
     checkWarnings();
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
-    fleetRate = { rpm: p.rpm, tpm: p.tpm };
+    fleetRate = { rpm: p.rpm, tpm: p.tpm, maxConcurrent: p.maxConcurrent };
     // #244: hosted hour rules stay local; hosted day/month rules go fleet-wide.
     const hosted = p.modelCaps ?? [];
     modelCaps?.setRules(mergeModelCapRules(hosted.filter((r) => r.scope === "hour"), modelCapRules ?? []));
@@ -302,7 +310,7 @@ export async function wrap(argv) {
   downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, maxConcurrent: () => effectiveConcurrent, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
@@ -349,7 +357,7 @@ export async function wrap(argv) {
   if (syncTimer) clearInterval(syncTimer);
   const s = cap.spend();
   const summary = buildRunSummary({ run_id: summaryRunId, started_at: startedAt, ended_at: new Date().toISOString(), exit_code: code,
-    receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted, cacheEnabled: Boolean(cache), signal: killedByCostcap ? null : exitSignal });
+    receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted, cacheEnabled: Boolean(cache), signal: killedByCostcap ? null : exitSignal, maxConcurrent: effectiveConcurrent });
   // #225: the run-end record goes up with the final receipt sync (retried on later syncs if it fails).
   if (fleet) { fleet.queueRunEnd(runEndRecord(summary)); await fleet.sync({ wait: true }); }
   server.closeAllConnections();

@@ -118,8 +118,8 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel, at) {
-  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel, at), onFit);
+export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel, at, reserved = 0) {
+  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel, at), onFit, reserved);
 }
 
 // #205: an Anthropic Message Batches create is estimated as the SUM of every
@@ -155,9 +155,11 @@ export function estimateBatch(provider, body, priceFor, pathModel, at) {
 }
 
 // Compares a precomputed estimate (estimateWorstCase / estimateBatch) with the remaining budget.
-export function checkEstimate(cap, est, onFit) {
+// #249: `reserved` is the summed worst case of calls already in flight (--max-concurrent).
+export function checkEstimate(cap, est, onFit, reserved = 0) {
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
-  const remaining = cap?.remaining?.() ?? {};
+  const remaining = { ...(cap?.remaining?.() ?? {}) };
+  if (reserved > 0) for (const k of Object.keys(remaining)) if (typeof remaining[k] === "number") remaining[k] = Number(Math.max(remaining[k] - reserved, 0).toFixed(6));
   for (const scope of ["run", "hour", "day", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
       return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,

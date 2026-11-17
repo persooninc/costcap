@@ -102,7 +102,7 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     const rpmView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
     expect(rpmView.agents[0].policy.rpm).toBe(30);
     expect(rpmView.audit.filter((x) => x.action === "policy.change").at(-1).detail.policy.rpm).toBe(30);
-    const apiTpm = await page.evaluate(async (id) => (await fetch(`/v1/agents/${encodeURIComponent(id)}/policy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tpm: 5000 }) })).status, rpmView.agents[0].id);
+    const apiTpm = await page.evaluate(async (id) => (await fetch(`/v1/agents/${encodeURIComponent(id)}/policy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tpm: 5000, maxConcurrent: 4 }) })).status, rpmView.agents[0].id);
     expect(apiTpm).toBe(200);
     await page.locator("#refresh").click();
     await expect(page.locator("#agents small")).toContainText("Policy v8");
@@ -110,7 +110,11 @@ test("hosted UI login, invitation, enrollment, freeze, resume, cap, revoke, and 
     await page.locator("#agents button[type=submit]").click();
     await expect(page.locator("#agents small")).toContainText("Policy v9");
     const keptView = await page.evaluate(async () => (await fetch("/v1/fleet")).json());
-    expect(keptView.agents[0].policy).toMatchObject({ rpm: 30, tpm: 5000, caps: { day: 4 } });
+    // #249: an API-set maxConcurrent survives the dashboard save and is audited.
+    expect(keptView.agents[0].policy).toMatchObject({ rpm: 30, tpm: 5000, maxConcurrent: 4, caps: { day: 4 } });
+    const pc = keptView.audit.filter((x) => x.action === "policy.change");
+    expect(pc.some((x) => x.detail.policy.maxConcurrent === 4 && x.detail.previous.maxConcurrent === undefined)).toBe(true);
+    expect(pc.at(-1).detail.previous.maxConcurrent).toBe(4);
     await page.locator("#agents .danger").nth(1).click();
     await expect(page.locator("#agents strong")).toHaveText("REVOKED");
     await page.locator("#invite input[name=email]").fill("teammate@example.invalid");

@@ -1,7 +1,10 @@
 import { teamScope } from "./hosted/teams.js";
 // Local, post-response metering. Only proxy-routed traffic is covered.
-// Requests are serialized per proxy, so the next decision sees prior usage.
-// A request already accepted by a provider can exceed the remaining budget.
+// Admission decisions are serialized per proxy, so the next decision sees prior usage.
+// #249: with maxConcurrent N > 1, up to N admitted calls are forwarded at once; each
+// decision still sees every completed receipt, and recording stays serialized (sync).
+// A request already accepted by a provider can exceed the remaining budget: at most
+// N in-flight calls per wrapper (N = 1 by default).
 import http from "node:http";
 import https from "node:https";
 import { appendFileSync, mkdirSync } from "node:fs";
@@ -507,13 +510,31 @@ function batchIdOf(raw) {
   } catch { return null; }
 }
 
+// #249: subtract in-flight preflight worst cases from an agent's remaining budgets.
+function reserveLeft(left, reserved) {
+  if (!left || !reserved) return left;
+  const out = { ...left };
+  for (const k of ["run_usd", "hour_usd", "day_usd", "month_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
+  return out;
+}
+
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, modelCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, now } = {}) {
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, modelCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, maxConcurrent = 1, now } = {}) {
   // #237: the COSTCAP_PRICING_CLOCK pin applies only when the caller did not inject a clock.
   const pinPrices = now === undefined;
   if (now === undefined) now = Date.now;
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
+  // #249: concurrency slots. A number or a getter (fleet sync can lower it live).
+  const concurrency = () => { const n = typeof maxConcurrent === "function" ? maxConcurrent() : maxConcurrent; return Number.isInteger(n) && n > 1 ? n : 1; };
+  let inFlight = 0;
+  const inFlightEstimates = new Map(); // token -> preflight estimate_usd of an in-flight call
+  let slotWaiter = null;
+  const acquireSlot = async () => {
+    while (inFlight >= concurrency()) await new Promise((resolve) => { slotWaiter = resolve; });
+  };
+  const releaseSlot = () => { const w = slotWaiter; slotWaiter = null; w?.(); };
+  const reservedUsd = () => { let t = 0; for (const v of inFlightEstimates.values()) t += v; return t; };
   // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
   // of that receipt clears it. Failures with no receipt (ledger/persistence) never clear.
   const failures = new Map();
@@ -813,8 +834,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               return rm ? scalePrice(lookupPrice(cloudModel, undefined, { undated: true }), rm) : lookupPrice(cloudModel, undefined, { undated: true });
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
-            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor, requestedModel, priceAt), onFit)
-              : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined, cloud ? undefined : priceAt);
+            const reserved = reservedUsd(); // #249: in-flight worst cases are already spoken for
+            const pf = pfMode === "batch" ? checkEstimate(cap, estimateBatch(provider, body, priceFor, requestedModel, priceAt), onFit, reserved)
+              : preflightCheck(cap, cloudRoute?.gemini ? "gemini" : provider, body, path, onFit, cloud ? cloudPrice : priceFor, cloud ? requestedModel ?? null : undefined, cloud ? undefined : priceAt, reserved);
             if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
               message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
             if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
@@ -823,7 +845,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // #193: the estimate must also fit the agent/team remainder and every matching tag cap.
             if (preflightEst && !preflightEst.pass) {
               const est = preflightEst.estimate_usd;
-              const left = agentBudgets?.limitsFor ? budgetRemaining(agentBudgets, who) : null;
+              const left = agentBudgets?.limitsFor ? reserveLeft(budgetRemaining(agentBudgets, who), reservedUsd()) : null;
               const agentScope = left && ["run", "hour", "day", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
               if (agentScope) {
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
@@ -852,7 +874,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           // #192: RPM/TPM refuse with Retry-After; never latches, never a step.
           const rateHit = generates ? rateLimit?.check() : null;
           if (rateHit) return block("rate_limited", rateHit, rateLimitedBody(rateHit));
-          const vhit = velocity?.check();
+          const vhit = velocity?.check(inFlight);
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
           const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
           if (spiralHit) return block("spiral_detected", spiralHit, { error: "spiral_detected", ...spiralHit });
@@ -887,6 +909,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         }
         // #192: reserve the RPM slot only for a request actually forwarded upstream.
         if (!["GET", "HEAD"].includes(req.method)) rateLimit?.admit();
+        const forwardAndRecord = async () => {
         const cacheHeaders = cacheMode ? { [CACHE_HEADER]: cacheMode } : {};
         const injected = injectStreamUsage(provider, req.method, `/${rest.join("/")}`, body);
         let headers = { ...req.headers };
@@ -1176,8 +1199,20 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           try { emit({ provider, path: storedPath, blocked: false, cost_usd: null, reason: "upstream_outcome_unknown" }); } catch { /* stop on broken ledger */ }
           send(502, { error: "upstream_outcome_unknown" });
         }
+        };
+        // #249: at the default (1) the forward is awaited inside the queue, as before.
+        if (concurrency() <= 1 && inFlight === 0) return forwardAndRecord();
+        const token = {};
+        inFlight += 1;
+        if (preflightEst && !preflightEst.pass && Number.isFinite(preflightEst.estimate_usd)) inFlightEstimates.set(token, preflightEst.estimate_usd);
+        return { detached: forwardAndRecord().finally(() => { inFlight -= 1; inFlightEstimates.delete(token); }) };
       };
-      queue = queue.then(run).catch(() => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); });
+      const ledgerDown = () => { hardFailure = "Receipt ledger unavailable."; send(503, { error: "receipt_ledger_unavailable" }); };
+      queue = queue.then(async () => {
+        if (concurrency() > 1) await acquireSlot();
+        const out = await run();
+        if (out?.detached) out.detached.catch(ledgerDown).finally(releaseSlot);
+      }).catch(ledgerDown);
     });
   });
   // #194: OpenAI Realtime API over WebSocket. Every other upgrade is refused locally (never
@@ -1432,6 +1467,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return failures.delete(id);
   };
   server.accountingFailure = accountingFailureNow;
+  server.inFlight = () => inFlight;
   // Upgraded sockets are detached from the HTTP server, so close() shuts open sessions itself.
   const closeServer = server.close.bind(server);
   server.close = (cb) => { for (const s of [...sessions]) s.close(); if (killTimer) { clearInterval(killTimer); killTimer = null; } return closeServer(cb); };

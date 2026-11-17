@@ -17,7 +17,7 @@ export function stopReason(reason) {
 }
 
 // Build a summary from this run's receipt lines (event lines are ignored).
-export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false, signal = null }) {
+export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false, signal = null, maxConcurrent = 1 }) {
   let firstStop = null;
   const by_model = {};
   let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, downgraded_calls = 0, total = 0;
@@ -64,6 +64,8 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     schema: SCHEMA, run_id, started_at, ended_at, exit_code, stop_reason, outcome: deriveOutcome({ exit_code, stop_reason }), calls, blocked_calls, rejected_calls, by_model,
     total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls, ...(downgraded_calls ? { downgraded_calls } : {}),
     caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(cacheSeen ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
+    // #249: shown only when parallel forwarding was on, so default summaries are unchanged.
+    ...(maxConcurrent > 1 ? { max_concurrent: maxConcurrent } : {}),
   };
 }
 
@@ -74,7 +76,7 @@ export function rollupLine(s) {
   const saved = s.cache?.hits > 0 ? ` · cache: ${s.cache.hits} hit${s.cache.hits === 1 ? "" : "s"}, saved $${s.cache.saved_usd.toFixed(4)}` : "";
   const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
   const otlp = s.otlp ? ` otlp=${s.otlp.spans_exported} exported/${s.otlp.spans_dropped} dropped` : "";
-  return `costcap: run ${s.run_id} calls=${s.calls}${s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : ""} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}${otlp}`;
+  return `costcap: run ${s.run_id}${s.max_concurrent ? ` max_concurrent=${s.max_concurrent}` : ""} calls=${s.calls}${s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : ""} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}${otlp}`;
 }
 
 export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");
@@ -113,7 +115,7 @@ export function runsCommand(argv, { log = console.log, warn = console.error } = 
   else if (!runs.length) log("no runs recorded");
   else for (const r of runs) {
     const cost = r.total_cost_usd === null ? "unknown" : `$${Number(r.total_cost_usd).toFixed(4)}`;
-    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}  outcome=${r.outcome ?? (r.stop_reason ? deriveOutcome(r) : "unknown")}`);
+    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.max_concurrent ? `  max_concurrent=${r.max_concurrent}` : ""}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}  outcome=${r.outcome ?? (r.stop_reason ? deriveOutcome(r) : "unknown")}`);
   }
   return { runs, errors };
 }

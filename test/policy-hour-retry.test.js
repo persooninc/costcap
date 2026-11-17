@@ -54,7 +54,7 @@ test("non-hour policy refusals carry no retry_after_s", () => {
   assert.equal("retry_after_s" in steps, false);
 });
 
-async function wrapWithPolicy(t, policy) {
+async function wrapWithPolicy(t, policy, seedTs = new Date(Date.now() - 30 * 60_000).toISOString()) {
   let hits = 0;
   const up = await new Promise((r) => {
     const s = http.createServer((q, res) => { hits += 1; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 10 } })); });
@@ -65,7 +65,7 @@ async function wrapWithPolicy(t, policy) {
   const receipts = path.join(dir, "r.jsonl");
   const policyPath = path.join(dir, "p.json");
   writeFileSync(policyPath, JSON.stringify(policy));
-  writeFileSync(receipts, JSON.stringify({ id: "seed", ts: new Date(Date.now() - 30 * 60_000).toISOString(), provider: "openai", path: "/chat/completions", cost_usd: 1, agent_id: "a", run_id: "old" }) + "\n");
+  writeFileSync(receipts, JSON.stringify({ id: "seed", ts: seedTs, provider: "openai", path: "/chat/completions", cost_usd: 1, agent_id: "a", run_id: "old" }) + "\n");
   const script = `
     const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions",{method:"POST",body:JSON.stringify({model:"gpt-4o-mini"})});
     console.log(JSON.stringify({ status: r.status, retry: r.headers.get("retry-after"), body: await r.json() }));`;
@@ -89,7 +89,8 @@ test("e2e: wrap --agent a --policy hour refusal returns 429 with Retry-After = r
 });
 
 test("e2e: a policy day refusal has no Retry-After", async (t) => {
-  const r = await wrapWithPolicy(t, { default: { day: 1 } });
+  // Seeded "now", not now - 30 min: the seed must fall in today's UTC day even just after midnight.
+  const r = await wrapWithPolicy(t, { default: { day: 1 } }, new Date().toISOString());
   assert.equal(r.status, 429);
   assert.equal(r.body.scope, "day");
   assert.equal(r.retry, null);

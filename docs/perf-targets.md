@@ -5,7 +5,7 @@ The stress suite is `npm run stress` (`test/stress/`). It runs in CI after `npm 
 | Target | Load | Budget |
 |---|---|---|
 | Cap engine check+record | 10k-receipt history, 2k cycles | < 2000 ms |
-| Hard-stop overshoot | 100k attempted calls at $0.0003 against a $1 run cap | at most one call over the cap |
+| Hard-stop overshoot | 100k attempted calls at $0.0003 against a $1 run cap | at most one call over the cap (default `--max-concurrent 1`; with N, at most N calls over) |
 | Ledger load | 100k JSONL lines, 0.1% event lines | < 4000 ms, events excluded |
 | Ledger lock | 1000 acquire/contend/release cycles | < 5000 ms, always exclusive |
 

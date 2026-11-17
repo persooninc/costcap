@@ -27,9 +27,11 @@ export function createVelocityBreaker({
     // #184: a cache hit is a step (counts toward maxSteps) but never velocity spend.
     step() { steps += 1; },
     // Returns null if calls may proceed, else a descriptor. Latches once tripped.
-    check() {
+    // #249: `inFlight` admitted calls not yet recorded count toward maxSteps.
+    check(inFlight = 0) {
       if (tripped) return tripped;
-      if (maxSteps != null && steps >= maxSteps) {
+      if (maxSteps != null && steps + inFlight >= maxSteps) {
+        if (inFlight > 0 && steps < maxSteps) return { reason: "step_budget", steps, in_flight: inFlight, max_steps: maxSteps };
         return (tripped = { reason: "step_budget", steps, max_steps: maxSteps });
       }
       const i = idx();

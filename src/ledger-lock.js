@@ -3,7 +3,7 @@
 // - openSharedLedger: several wrappers on ONE host share a ledger (CC-5). Every
 //   decision and every append runs inside a short critical section that first
 //   folds in receipts other wrappers appended, so day/month caps are shared.
-//   Documented overshoot: at most one in-flight call per wrapper.
+//   Documented overshoot: at most N in-flight calls per wrapper (--max-concurrent, default 1).
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, openSync, readSync, fstatSync, closeSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { hostname } from "node:os";

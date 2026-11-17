@@ -208,7 +208,7 @@ test("e2e #177: wrap --agent --policy hour refusal returns 429 + Retry-After", a
 });
 
 test("e2e #177: wrap --agent --policy day refusal has no Retry-After", async (t) => {
-  const r = await wrapAgainstMock(t, 1, policyFlags({ default: { day: 1 } }), { agent_id: "a" });
+  const r = await wrapAgainstMock(t, 0, policyFlags({ default: { day: 1 } }), { agent_id: "a" });
   assert.equal(r.status, 429);
   assert.equal(r.body.scope, "day");
   assert.equal(r.retry, null);
