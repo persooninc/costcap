@@ -1604,17 +1604,26 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (id) backendSeen.add(id);
           const bModel = typeof r.model === "string" && r.model ? r.model : null;
           const priced = bModel && (userPrices ? isPricedWithOverrides(userPrices, "openai", bModel) : isPricedModel(bModel));
-          const usage = priced ? openaiTextUsage(r.usage) : null;
           const extra = { backend: true, response_id: id };
+          // #281: same accumulator as /v1/responses (tool calls, service_tier, image_generation).
+          let metered = null;
+          if (priced) { const acc = createUsageAccumulator("openai", bModel); acc.add({ type: "response.completed", response: r }); metered = acc.result(); }
+          const usage = metered?.usage;
           if (!priced || !usage || !isCount(usage.input_tokens) || !isCount(usage.output_tokens)) {
             latch(rcpt({ ...extra, model: bModel ?? "unknown", cost_usd: null, reason: priced ? "usage_unavailable" : "model_unpriced" }),
               "A GPT-Live backend response could not be priced. Restart only after reconciling this session.");
             return true;
           }
-          const c = costWithOverrides(userPrices, "openai", bModel, usage, { at: pinPrices ? pricingAt(now()) : now() });
-          const receipt = rcpt({ ...extra, ...c });
+          metered.model = bModel;
+          let receipt = rcpt({ ...extra, ...costWithOverrides(userPrices, "openai", bModel, usage, { at: pinPrices ? pricingAt(now()) : now() }) });
+          if (typeof usage.service_tier === "string") receipt.service_tier = usage.service_tier;
+          if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
+          else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, "openai", metered, null, r));
+          delete receipt.unpriced_tool;
           rateLimit?.record(usageTokens(usage));
-          if (receipt.cost_usd === null) latch(receipt, "A GPT-Live backend response has no published rate. Restart only after reconciling this session.");
+          if (receipt.cost_usd === null) latch(receipt, receipt.reason === "tool_use_unpriced"
+            ? "A GPT-Live backend response used a provider-side tool with no published rate. Restart only after reconciling this session."
+            : "A GPT-Live backend response has no published rate. Restart only after reconciling this session.");
           else { const done = emit(receipt); recordSpend(done); velocity?.record(done.cost_usd); flushWarnings(); }
           return true;
         }
@@ -1662,6 +1671,16 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         if (down.corrupt) { closing = closing ?? { code: 1009, reason: "frame_too_large" }; finish(); }
       };
       // Client frames are held until the first complete message so session.start can be vetted.
+      // #281: session.delegation.responses.model (the Responses backend) is vetted like session.model.
+      const vetDelegation = (ev) => {
+        const d = ev?.session?.delegation?.responses;
+        if (!d || typeof d !== "object" || d.model === undefined) return null;
+        const m = typeof d.model === "string" && d.model ? d.model : null;
+        const allow = allowedModels?.() ?? null;
+        if (allow && (!m || !allow.includes(m))) return { reason: "model_not_allowed", message: `delegation model "${m ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made` };
+        if (unknownModels === "refuse" && (!m || !(userPrices ? isPricedWithOverrides(userPrices, "openai", m) : isPricedModel(m)))) return { reason: "model_unpriced", message: `delegation model "${m ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made` };
+        return null;
+      };
       const admitStart = (ev) => {
         const m = typeof ev.session?.model === "string" && ev.session.model ? ev.session.model : null;
         model = m ?? "unknown";
@@ -1670,14 +1689,23 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         let v = null;
         if (allow && (!m || !allow.includes(m))) v = { reason: "model_not_allowed", message: `model "${m ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made` };
         else if (unknownModels === "refuse" && (!m || !(userPrices ? isPricedWithOverrides(userPrices, "openai", m) : isPricedModel(m)))) v = { reason: "model_unpriced", message: `model "${m ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made` };
+        if (!v) v = vetDelegation(ev);
         if (!v) { const g = guarded(() => sessionGate(m, reqTags)); if (g) v = { reason: g.reason, message: `${g.reason}. The upstream call was not made`, detail: g.detail }; }
         return v;
       };
       const fromClient = (bytes) => {
         if (finished) return;
-        if (admitted) { toUpstream(bytes); return; }
         for (const frame of up.push(bytes)) {
-          if (admitted) { toUpstream(frame.raw); continue; }
+          if (admitted) {
+            // #281: a session.update switching to a disallowed delegation model is not forwarded.
+            if (frame.message?.opcode === 0x1) {
+              let u = null;
+              try { u = JSON.parse(frame.message.data.toString("utf8")); } catch { /* not JSON */ }
+              const v = u?.type === "session.update" ? vetDelegation(u) : null;
+              if (v) { try { emit({ ...base, blocked: true, cost_usd: 0, model, session_id: sessionId, reason: v.reason, outcome: "blocked_model" }); } catch { /* ledger */ } clientError(v.reason, v.message); continue; }
+            }
+            toUpstream(frame.raw); continue;
+          }
           held.push(frame.raw);
           if (!frame.message) { if (frame.opcode === 0x8) { toUpstream(Buffer.concat(held)); held = []; } continue; }
           let ev = null;

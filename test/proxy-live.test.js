@@ -222,6 +222,108 @@ test("AC6 backend response.completed priced once per id; unpriced backend model 
   assert.equal((await chatCall()).status, 429);
 });
 
+// #281: backend tool calls, priority tier, image_generation and delegation model admission.
+const backend = (id, extra = {}) => ({ type: "response.event", event: { type: "response.completed", response: { id, model: "gpt-5.4-mini", usage: { input_tokens: 1000, output_tokens: 200 }, ...extra } } });
+const searches = [{ type: "web_search_call", id: "ws_1", status: "completed" }, { type: "web_search_call", id: "ws_2", status: "completed" }];
+
+test("#281 AC1 backend web_search calls billed like /v1/responses, once per id", async (t) => {
+  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: searches })); conn.send(backend("r1", { output: searches })); conn.send(snap(1)); } }) });
+  const c = await connectRealtime(port, PATH);
+  c.send(START);
+  await c.waitFor((m) => m.type === "session.usage.updated");
+  await until(() => billed(receipts).length === 1);
+  const b = live(receipts).filter((r) => r.backend);
+  assert.equal(b.length, 1);
+  assert.equal(b[0].cost_usd, 0.02165);
+  assert.deepEqual(b[0].tool_calls, { web_search: 2 });
+  assert.equal(b[0].tool_cost_usd, 0.02);
+  c.close();
+});
+
+test("#281 AC2 backend priority tier billed at the priority rate", async (t) => {
+  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { service_tier: "priority" })); conn.send(snap(1)); } }) });
+  const c = await connectRealtime(port, PATH);
+  c.send(START);
+  await c.waitFor((m) => m.type === "session.usage.updated");
+  await until(() => live(receipts).some((r) => r.backend));
+  const b = live(receipts).find((r) => r.backend);
+  assert.equal(b.cost_usd, 0.0033);
+  assert.equal(b.service_tier, "priority");
+  c.close();
+});
+
+test("#281 AC3 backend image_generation latches tool_use_unpriced; next session refused", async (t) => {
+  const { port, receipts, chatCall } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: [{ type: "image_generation_call", id: "ig_1", status: "completed" }] })); conn.send(snap(1)); } }) });
+  const c = await connectRealtime(port, PATH);
+  c.send(START);
+  await until(() => live(receipts).some((r) => r.reason === "tool_use_unpriced"));
+  const b = live(receipts).find((r) => r.backend);
+  assert.equal(b.cost_usd, null);
+  c.close();
+  await sleep(30);
+  assert.equal((await chatCall()).status, 429);
+  const c2 = await connectRealtime(port, PATH);
+  assert.equal(c2.status, 429);
+});
+
+test("#281 AC3 --upstream-prices tools override applies to backend web_search", async (t) => {
+  const userPrices = { tools: { web_search: 0.02 } };
+  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: searches })); conn.send(snap(1)); } }), proxy: { userPrices } });
+  const c = await connectRealtime(port, PATH);
+  c.send(START);
+  await c.waitFor((m) => m.type === "session.usage.updated");
+  await until(() => live(receipts).some((r) => r.backend));
+  const b = live(receipts).find((r) => r.backend);
+  assert.equal(b.tool_cost_usd, 0.04);
+  assert.equal(b.cost_usd, 0.04165);
+  c.close();
+});
+
+test("#281 AC4 delegation model vetted by --models and --unknown-models refuse; session.update not forwarded", async (t) => {
+  const del = (model) => ({ type: "session.start", session: { model: "gpt-live-1", delegation: { responses: { model } } } });
+  {
+    const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1"] } });
+    const c = await connectRealtime(port, PATH);
+    c.send(del("gpt-5.4"));
+    const err = await c.waitFor((m) => m.type === "error");
+    assert.equal(err.error.code, "model_not_allowed");
+    await c.closed;
+    assert.equal(c.closeCode, 1008);
+    await sleep(30);
+    assert.equal(up.sessions[0]?.received.length ?? 0, 0);
+    const b = live(receipts).find((r) => r.blocked);
+    assert.equal(b.cost_usd, 0);
+    assert.equal(b.reason, "model_not_allowed");
+  }
+  {
+    const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { unknownModels: "refuse" } });
+    const c = await connectRealtime(port, PATH);
+    c.send(del("unpriced-model-x"));
+    const err = await c.waitFor((m) => m.type === "error");
+    assert.equal(err.error.code, "model_unpriced");
+    await c.closed;
+    assert.equal(c.closeCode, 1008);
+    await sleep(30);
+    assert.equal(up.sessions[0]?.received.length ?? 0, 0);
+  }
+  {
+    const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
+    const c = await connectRealtime(port, PATH);
+    c.send(del("gpt-5.4-mini"));
+    await c.waitFor((m) => m.type === "session.started");
+    c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } });
+    const err = await c.waitFor((m) => m.type === "error");
+    assert.equal(err.error.code, "model_not_allowed");
+    c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4-mini" } } } });
+    await until(() => up.sessions[0].received.filter((m) => m.type === "session.update").length === 1);
+    await sleep(30);
+    const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
+    assert.equal(ups.length, 1);
+    assert.equal(ups[0].session.delegation.responses.model, "gpt-5.4-mini");
+    c.close();
+  }
+});
+
 test("AC7 /live/sessions/x/fork and chat-path upgrades still get 501", async (t) => {
   const { up, port } = await setup(t);
   for (const p of ["/openai/v1/live/sessions/x/fork", "/openai/v1/chat/completions"]) {

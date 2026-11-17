@@ -119,11 +119,13 @@ get `501 websocket_unsupported`.
 `wrap` also exports `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions`.
 Sessions are billed per second at $0.05/min from each `session.usage.updated` snapshot (only
 the growth since the last snapshot is billed) and the final `session.closed`. The model in
-`session.start` is checked against `--models` and `--unknown-models refuse` before it reaches
+`session.start`, and its `session.delegation.responses.model` backend, are checked against `--models` and `--unknown-models refuse` before it reaches
 OpenAI. Caps are re-checked after every metered event and by a 1 s wall-clock estimate; on a hit
 the proxy sends `session.close`, bills the final duration and closes the client with `1008`.
 `costcap kill` closes a session within 1 s. Backend `response.completed` usage is priced once per
-response id. A session that ends without `session.closed` is recorded as
+response id exactly like `/v1/responses`: `web_search`/`file_search` calls, the priority tier
+and `--upstream-prices` `tools` overrides apply, and an `image_generation_call` is
+`tool_use_unpriced`. A `session.update` switching to a disallowed backend model is not forwarded. A session that ends without `session.closed` is recorded as
 `session_usage_unconfirmed` (with `session_seconds_lower_bound`) and pauses the run until
 settled. WebRTC/SIP (`POST /live/sessions`) stays `usage_unavailable`; `/live/sessions/{id}/fork`
 stays `501`.
