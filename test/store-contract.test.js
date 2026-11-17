@@ -102,6 +102,24 @@ async function contract(open, mode) {
   assert.equal(again.read((s) => s.agents.ag1.policy.caps.total), 5);
   const totalPolicy = await policyOf(again, "ag1-token");
   assert.deepEqual([totalPolicy.caps.total, totalPolicy.agent_spend.spent.total], [5, 1.25]);
+  // #268 AC4: week org budget, week tag rules and week model caps survive a restart,
+  // and travel in the additive policy fields only (legacy fields stay day/month).
+  again.transaction((s) => {
+    s.orgs[ORG_A].orgBudget = { week: 10 };
+    s.orgs[ORG_A].tagCaps = [{ key: "customer", scope: "week", usd: 10 }, { key: "customer", scope: "day", usd: 3 }];
+    s.agents.ag1.policy = { ...s.agents.ag1.policy, version: 3, modelCaps: [{ model: "claude-opus-4-8", scope: "week", usd: 5 }, { model: "gpt-4o", scope: "day", usd: 2 }] };
+  });
+  await again.flush();
+  const weekStore = await open();
+  assert.deepEqual(weekStore.read((s) => s.orgs[ORG_A].orgBudget), { week: 10 });
+  assert.deepEqual(weekStore.read((s) => s.orgs[ORG_A].tagCaps), [{ key: "customer", scope: "week", usd: 10 }, { key: "customer", scope: "day", usd: 3 }]);
+  assert.deepEqual(weekStore.read((s) => s.agents.ag1.policy.modelCaps), [{ model: "claude-opus-4-8", scope: "week", usd: 5 }, { model: "gpt-4o", scope: "day", usd: 2 }]);
+  assert.equal(weekStore.read((s) => s.orgs[ORG_B].orgBudget), undefined);
+  const weekPolicy = await policyOf(weekStore, "ag1-token");
+  assert.deepEqual(weekPolicy.modelCaps, [{ model: "gpt-4o", scope: "day", usd: 2 }]);
+  assert.deepEqual(weekPolicy.model_caps_week, [{ model: "claude-opus-4-8", scope: "week", usd: 5 }]);
+  assert.ok(!JSON.stringify(weekPolicy.tag_caps ?? null).includes("\"week\""));
+  assert.equal(weekPolicy.org_budget_v2.caps.week, 10);
   return { store, reopened };
 }
 
