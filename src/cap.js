@@ -4,7 +4,7 @@
 // traffic that flows through the proxy.
 
 import { readFileSync, existsSync } from "node:fs";
-import { utcWeekLabel } from "./period.js";
+import { utcWeekLabel, weekLabel, normalizeBudgetPeriod } from "./period.js";
 
 function loadLines(path) {
   if (!path || !existsSync(path)) return [];
@@ -92,7 +92,9 @@ export const HOUR_MS = 60 * 60 * 1000;
 // hour (#172) is a rolling window: spend with now - 60min < ts <= now. It never latches.
 // runId (#178): this wrapper's run id; a settlement of a receipt with that run_id
 // also counts toward the run cap.
-export function createCapEngine({ caps = {}, history = [], now = () => new Date(), runId = null } = {}) {
+// fleetWeek (#274): { cap, budgetPeriod } — an enrolled fleet caps.week, bucketed on the
+// org budget-period timezone (Monday 00:00 there), enforced next to a local UTC week cap.
+export function createCapEngine({ caps = {}, history = [], now = () => new Date(), runId = null, fleetWeek = null } = {}) {
   for (const scope of CAP_SCOPES) {
     if (caps[scope] != null && (!Number.isFinite(caps[scope]) || caps[scope] <= 0)) throw new Error(`Invalid ${scope} cap`);
   }
@@ -115,6 +117,12 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   const byDay = new Map();
   const byWeek = new Map();
   const byMonth = new Map();
+  // #274: fleet week buckets on the org timezone; all priced entries are kept so a
+  // budget_period change rebuckets them.
+  let fwCap = null, fwTz = "UTC";
+  const priced = [];
+  let byFleetWeek = new Map();
+  const rebucketFleetWeek = () => { byFleetWeek = new Map(); for (const [ms, c] of priced) { const k = weekLabel(ms, fwTz); byFleetWeek.set(k, (byFleetWeek.get(k) ?? 0) + c); } };
   // Rolling hour window: time-ordered [ms, cost] entries, evicted from the front,
   // so check() stays amortised O(1). Entries stamped after now (clock skew) count
   // right away, which only errs toward stopping; out-of-order inserts (settlements)
@@ -138,8 +146,19 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     const wk = utcWeekLabel(d.getTime());
     byWeek.set(wk, (byWeek.get(wk) ?? 0) + cost);
     byMonth.set(key.slice(0, 7), (byMonth.get(key.slice(0, 7)) ?? 0) + cost);
+    priced.push([d.getTime(), cost]);
+    const fk = weekLabel(d.getTime(), fwTz);
+    byFleetWeek.set(fk, (byFleetWeek.get(fk) ?? 0) + cost);
     addWindow(d.getTime(), cost);
   };
+  const setFleetWeek = (fw) => {
+    const c = fw?.cap ?? null;
+    if (c != null && (!Number.isFinite(c) || c <= 0)) throw new Error("Invalid fleet week cap");
+    const tz = normalizeBudgetPeriod(fw?.budgetPeriod ?? null).timezone;
+    fwCap = c;
+    if (tz !== fwTz) { fwTz = tz; rebucketFleetWeek(); }
+  };
+  setFleetWeek(fleetWeek);
   for (const r of history) if (r.cost_usd !== null) add(r.ts, r.cost_usd);
   // Entries with ts <= now - 60min are evicted; entries with ts > now are not counted yet.
   function hourSpend(nowMs) {
@@ -149,10 +168,19 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     return hourSum;
   }
 
+  // #274: the week scope reports whichever clock binds: the local UTC week cap, the
+  // fleet week cap on the org clock, or (both set) the one closer to its cap.
+  function weekView(ms) {
+    const local = { cap: caps.week ?? null, spent: byWeek.get(utcWeekLabel(ms)) ?? 0 };
+    if (fwCap == null) return local;
+    const fleet = { cap: fwCap, spent: byFleetWeek.get(weekLabel(ms, fwTz)) ?? 0 };
+    if (local.cap == null) return fleet;
+    return fleet.spent / fleet.cap > local.spent / local.cap ? fleet : local;
+  }
   function spend() {
     const d = now();
     const n = d.toISOString();
-    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, week: byWeek.get(utcWeekLabel(d.getTime())) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown, pending_batches: pendingBatches.size + anonPending };
+    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, week: weekView(d.getTime()).spent, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown, pending_batches: pendingBatches.size + anonPending };
   }
 
   // Seconds until hour spend falls below cap (spend ages out from the oldest entry).
@@ -160,10 +188,13 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     return retryAfterSeconds(win.slice(head), hourSpend(nowMs), cap, nowMs);
   }
 
+  function limits() { const out = { ...caps }; const w = weekView(now().getTime()).cap; if (w != null) out.week = w; return out; }
+
   return {
     runId,
     spend,
-    limits: () => ({ ...caps }),
+    limits,
+    setFleetWeek,
     updateCaps(next) {
       for (const scope of CAP_SCOPES) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
       caps = { ...next };
@@ -171,16 +202,26 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     // Remaining USD per capped scope (uncapped scopes omitted). Used by preflight (CC-9).
     remaining() {
       const s = spend();
+      const lim = limits();
       const out = {};
-      for (const scope of CAP_SCOPES) if (caps[scope] != null) out[scope] = Number(Math.max(0, caps[scope] - s[scope]).toFixed(6));
+      for (const scope of CAP_SCOPES) if (lim[scope] != null) out[scope] = Number(Math.max(0, lim[scope] - s[scope]).toFixed(6));
       return out;
     },
     // Returns null if the call may proceed, else a budget-exceeded descriptor.
     check() {
       if (unknown > 0) return { scope: "accounting", cap: 0, spent: 0, reason: "unreconciled_receipt" };
       const s = spend();
+      const ms = now().getTime();
       for (const scope of CAP_SCOPES) {
-        const cap = caps[scope];
+        let cap = caps[scope];
+        if (scope === "week") {
+          // Each week cap on its own clock; either one hitting stops the call.
+          const local = cap != null ? { cap, spent: byWeek.get(utcWeekLabel(ms)) ?? 0 } : null;
+          const fleet = fwCap != null ? { cap: fwCap, spent: byFleetWeek.get(weekLabel(ms, fwTz)) ?? 0 } : null;
+          const hitW = [local, fleet].find((w) => w && w.spent >= w.cap);
+          if (hitW) return { scope, cap: hitW.cap, spent: Number(hitW.spent.toFixed(6)) };
+          continue;
+        }
         if (cap != null && s[scope] >= cap) {
           if (scope === "hour") return { scope, cap, spent: Number(s.hour.toFixed(6)), retry_after_s: retryAfter(cap, now().getTime()) };
           return { scope, cap, spent: Number(s[scope].toFixed(6)) };

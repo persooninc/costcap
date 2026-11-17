@@ -256,8 +256,11 @@ export async function wrap(argv) {
     clearTimeout(raiseTimer);
     if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
     downgradeConfig = mergeDowngrade(p.downgrade ?? null, localDowngrade);
-    const resolved = resolvePolicy({ local: { ...caps, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
-    cap.updateCaps(resolved.caps);
+    // #274: the fleet week cap is not min-merged into the local UTC week; it runs on the org clock.
+    const resolved = resolvePolicy({ local: { ...caps, week: undefined, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
+    const { week: fleetWeekCap, ...nonWeek } = resolved.caps;
+    cap.updateCaps({ ...nonWeek, ...(caps.week != null ? { week: caps.week } : {}) });
+    cap.setFleetWeek({ cap: fleetWeekCap ?? null, budgetPeriod: fleet?.budgetPeriod() ?? null });
     checkWarnings();
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;

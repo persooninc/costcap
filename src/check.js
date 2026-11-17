@@ -28,8 +28,8 @@ export function checkBudget({ tagCaps, modelCaps, ...options }) {
   return out;
 }
 
-function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }) {
-  const cap = createCapEngine({ caps: { hour: caps.hour, day: caps.day, week: caps.week, month: caps.month }, history, now });
+function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT, fleetWeek = null }) {
+  const cap = createCapEngine({ caps: { hour: caps.hour, day: caps.day, week: caps.week, month: caps.month }, history, now, fleetWeek });
   const s = cap.spend();
   const unknown_cost_count = history.filter((r) => r.cost_usd === null).length;
   const total = history.reduce((sum, r) => sum + (typeof r.cost_usd === "number" ? r.cost_usd : 0), 0);
@@ -42,7 +42,7 @@ function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }
   }
   // #164: soft warnings never change ok. Unknown cost makes the spend a lower bound.
   const lb = unknown_cost_count > 0;
-  const warnings = currentWarnings({ caps, spend: { run: total, day: s.day, week: s.week, month: s.month }, fractions: warnAt, lowerBound: { run: lb, day: lb, week: lb, month: lb } });
+  const warnings = currentWarnings({ caps: { ...caps, week: cap.limits().week }, spend: { run: total, day: s.day, week: s.week, month: s.month }, fractions: warnAt, lowerBound: { run: lb, day: lb, week: lb, month: lb } });
   return { ok: !hit, receipt_count: history.length, total_usd: Number(total.toFixed(6)), unknown_cost_count,
     hour: { spent_usd: Number(s.hour.toFixed(6)), cap: caps.hour ?? null, scope: "whole ledger, last 60 minutes" },
     blocked_model_count: history.filter((r) => r.outcome === "blocked_model").length,
@@ -52,7 +52,7 @@ function checkLedgerBudget({ history, caps = {}, now, warnAt = DEFAULT_WARN_AT }
 
 // Run-scoped check: the run cap counts only receipts with this run_id, while
 // day/month caps (and their unknown-cost rule) still cover the whole ledger.
-function checkRunBudget({ history, caps = {}, now, runId, warnAt }) {
+function checkRunBudget({ history, caps = {}, now, runId, warnAt, fleetWeek = null }) {
   if (typeof runId !== "string" || !runId) throw new Error("--run-id needs a non-empty value");
   const runRecs = history.filter((r) => r.run_id === runId);
   if (!runRecs.length) throw new Error(`No receipts for run_id ${JSON.stringify(runId)}; a budget check needs evidence (list runs with: costcap runs)`);
@@ -60,8 +60,8 @@ function checkRunBudget({ history, caps = {}, now, runId, warnAt }) {
   const runUnknown = runRecs.filter((r) => r.cost_usd === null).length;
   const runTotal = sum(runRecs);
   if (caps.run != null && (!Number.isFinite(caps.run) || caps.run <= 0)) throw new Error("Invalid run cap");
-  const ledgerCaps = caps.hour != null || caps.day != null || caps.week != null || caps.month != null;
-  const cap = createCapEngine({ caps: { hour: caps.hour, day: caps.day, week: caps.week, month: caps.month }, history, now });
+  const ledgerCaps = caps.hour != null || caps.day != null || caps.week != null || caps.month != null || fleetWeek?.cap != null;
+  const cap = createCapEngine({ caps: { hour: caps.hour, day: caps.day, week: caps.week, month: caps.month }, history, now, fleetWeek });
   const s = cap.spend();
   let hit = null;
   if (runUnknown > 0) hit = { scope: "run", cap: caps.run ?? null, spent: null, reason: "accounting_unavailable" };
@@ -71,14 +71,14 @@ function checkRunBudget({ history, caps = {}, now, runId, warnAt }) {
   const ledgerPendingBatches = history.filter(isPendingBatch).length;
   if (!hit && ledgerCaps && ledgerPendingBatches > 0) hit = { scope: "accounting", cap: 0, spent: 0, reason: history.find(isPendingBatch).reason };
   const ledgerUnknown = history.filter((r) => r.cost_usd === null).length;
-  const warnings = currentWarnings({ caps, spend: { run: runTotal, day: s.day, week: s.week, month: s.month }, fractions: warnAt,
+  const warnings = currentWarnings({ caps: { ...caps, week: cap.limits().week }, spend: { run: runTotal, day: s.day, week: s.week, month: s.month }, fractions: warnAt,
     lowerBound: { run: runUnknown > 0, day: ledgerUnknown > 0, week: ledgerUnknown > 0, month: ledgerUnknown > 0 } });
   return { ok: !hit, run_id: runId, scope: "run", receipt_count: runRecs.length, total_usd: Number(runTotal.toFixed(6)),
     unknown_cost_count: runUnknown, unknown_cost_counted_as_zero: false,
     run: { receipt_count: runRecs.length, total_usd: Number(runTotal.toFixed(6)), unknown_cost_count: runUnknown, cap: caps.run ?? null },
     hour: { spent_usd: Number(s.hour.toFixed(6)), cap: caps.hour ?? null, scope: "whole ledger, last 60 minutes" },
     day: { spent_usd: Number(s.day.toFixed(6)), cap: caps.day ?? null, scope: "whole ledger, current UTC day" },
-    week: { spent_usd: Number(s.week.toFixed(6)), cap: caps.week ?? null, scope: "whole ledger, current ISO week (UTC, Monday start)" },
+    week: { spent_usd: Number(s.week.toFixed(6)), cap: cap.limits().week ?? null, scope: fleetWeek?.cap != null && cap.limits().week === fleetWeek.cap && caps.week !== fleetWeek.cap ? "whole ledger, current week (org budget-period timezone, Monday start)" : "whole ledger, current ISO week (UTC, Monday start)" },
     month: { spent_usd: Number(s.month.toFixed(6)), cap: caps.month ?? null, scope: "whole ledger, current UTC month" },
     ledger_unknown_cost_count: ledgerUnknown, ledger_pending_batch_count: ledgerPendingBatches, spend: s, hit, warnings, estimate_only: true };
 }
@@ -109,7 +109,7 @@ export function fleetGuard({ killFile, enrollmentPath, receiptsPath, now }) {
   const policy = fleet.policy();
   if (policy.killed || fleet.revoked()) return { killed: { reason: "killed", note: "fleet policy or revoked credentials", enrollment: enrollmentPath } };
   const nowMs = now ? now().getTime() : Date.now();
-  return { fleetCaps: policy.caps, fleetModels: policy.models ?? null, fleetHit: fleet.fleetCheck(nowMs) };
+  return { fleetCaps: policy.caps, budgetPeriod: fleet.budgetPeriod(), fleetModels: policy.models ?? null, fleetHit: fleet.fleetCheck(nowMs) };
 }
 
 const killedResult = (killed, extra = {}) => ({ ok: false, verdict: "killed", reason: "killed", kill: killed, hit: { verdict: "killed", ...killed }, ...extra, estimate_only: true });
@@ -127,12 +127,14 @@ export function guardedBudgetStatus(options) {
 function guardedBudgetBase(options, g) {
   if (!options.enrollmentPath) return checkBudget(options);
   const caps = { ...(options.caps ?? {}) };
-  for (const k of ["hour", "day", "week", "month"]) {
+  for (const k of ["hour", "day", "month"]) {
     const vals = [caps[k], g.fleetCaps?.[k]].filter((v) => v != null);
     if (vals.length) caps[k] = Math.min(...vals);
   }
+  // #274: the fleet week cap runs on the org budget-period clock, next to a local UTC --week-cap.
+  const fleetWeek = g.fleetCaps?.week != null ? { cap: g.fleetCaps.week, budgetPeriod: g.budgetPeriod ?? null } : null;
   let base;
-  try { base = checkBudget({ ...options, caps }); }
+  try { base = checkBudget({ ...options, caps, fleetWeek }); }
   catch (err) { if (!g.fleetHit || !/No receipts/.test(err.message)) throw err; base = { ok: true }; }
   if (g.fleetHit) return applyFleetHit(base, g.fleetHit);
   if (!base.ok && base.hit) return { ...base, verdict: base.unknown_cost_count ? "accounting_unavailable" : "budget_exceeded" };
