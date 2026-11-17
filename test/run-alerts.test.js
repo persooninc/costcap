@@ -41,7 +41,7 @@ test("run arming: once per run, re-arm on new run and raised cap", () => {
 async function fixture(t, clock) {
   let code; const delivery = [];
   const origin = "http://127.0.0.1";
-  const service = createHostedServer({ storePath: join(mkdtempSync(join(tmpdir(), "cc-run-alerts-")), "data.json"), origin, secureCookies: false, now: () => clock.ms, stripeEnv: {}, verifyChallenge: async (v) => v === "test-pass", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {}, deliverAlert: async (a) => { delivery.push(a); return [{ status: "accepted" }]; } });
+  const service = createHostedServer({ storePath: join(mkdtempSync(join(tmpdir(), "cc-run-alerts-")), "data.json"), origin, secureCookies: false, now: () => clock.ms, stripeEnv: {}, verifyChallenge: async (v) => v === "test-pass", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {}, deliverAlert: async (a) => { /* #279: cost_unknown pages are covered in unknown-cost-alerts.test.js */ if (a.kind !== "cost_unknown") delivery.push(a); return [{ status: "accepted" }]; } });
   await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
   t.after(() => { service.server.closeAllConnections(); return new Promise((r) => service.server.close(r)); });
   const base = `http://127.0.0.1:${service.server.address().port}`;

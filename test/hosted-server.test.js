@@ -11,7 +11,7 @@ async function fixture(t, { now, extra = {} } = {}) {
   let service;
   const origin = "http://localhost";
   const start = async () => {
-    service = createHostedServer({ storePath, origin, secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (value) => value === "test-pass", sendCode: async (data) => { if (failCode) throw new Error("mail down"); code = data.code; }, sendInvite: async (data) => { if (failInvite) throw new Error("mail down"); invites.push(data); }, deliverAlert: async (a) => { delivery.push(a); return deliveryResult ?? [{ status: failDelivery ? "failed" : "accepted" }]; }, ...extra });
+    service = createHostedServer({ storePath, origin, secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (value) => value === "test-pass", sendCode: async (data) => { if (failCode) throw new Error("mail down"); code = data.code; }, sendInvite: async (data) => { if (failInvite) throw new Error("mail down"); invites.push(data); }, deliverAlert: async (a) => { /* #279: cost_unknown pages are covered in unknown-cost-alerts.test.js */ if (a.kind !== "cost_unknown") delivery.push(a); return deliveryResult ?? [{ status: failDelivery ? "failed" : "accepted" }]; }, ...extra });
     // Regression: on slow runners undici reused a socket the server had just
     // idle-closed (5s default) and fetch failed mid-test. Outlive the client.
     service.server.keepAliveTimeout = 60_000;

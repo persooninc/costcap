@@ -4,7 +4,7 @@ import { periodBounds, periodKey } from "../period.js";
 // them (Brevo email, Slack) and writes the audit log. Dedupe: an alert
 // with the same key does not fire again until it clears and re-arms.
 
-export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"];
+export const ALERT_KINDS = ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly", "cost_unknown"];
 export { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 
 // state: { agentId, caps:{run,day,month}, spend:{run,day,month},
@@ -396,6 +396,47 @@ export function evaluateModelAlerts({ agentId, rules = [], spend = {}, blockedHi
     if (spent === null) continue;
     const warn = approaching(id, rule.scope, rule.usd, spent, fractions, true, {});
     if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, fraction: warn.fraction });
+  }
+  return out;
+}
+
+// Issue #279: page when unknown cost pauses agents. Pure. items: the org's stored
+// receipt items ({ agentId, receipt, settlement? }); agents: [{ id, name }] (not
+// revoked); teams: [{ name, agents, verdict }]; orgVerdict: orgBudgetVerdict() or
+// null. An unsettled unknown receipt (cost_usd null, no settlement, not a pending
+// batch, not a refusal) in the current period pages its agent; a team or org whose
+// verdict is accounting_unavailable pages with its source and paused agents.
+export const PAUSE_REASONS = ["accounting_unavailable", "unreconciled_receipt"];
+const isPending = (r) => ["batch_pending", "background_pending"].includes(r?.reason) && r?.cost_usd == null;
+export function unsettledUnknown(item, nowMs, budgetPeriod = null) {
+  const r = item?.receipt;
+  if (!r || r.blocked || r.cost_usd != null || isPending(r)) return false;
+  if (typeof item.settlement?.cost_usd === "number") return false;
+  const ts = Date.parse(r.ts);
+  return Number.isFinite(ts) && capPeriod("month", ts, budgetPeriod) === capPeriod("month", nowMs, budgetPeriod);
+}
+export function evaluateUnknownCostAlerts({ orgId, items = [], agents = [], teams = [], orgVerdict = null, nowMs, budgetPeriod = null }) {
+  const out = [];
+  const hourAgo = nowMs - 3600_000;
+  const recent = (r) => { const ts = Date.parse(r?.ts); return Number.isFinite(ts) && ts > hourAgo && ts <= nowMs + 60_000; };
+  const unknown = items.filter((i) => unsettledUnknown(i, nowMs, budgetPeriod)).sort((a, b) => Date.parse(a.receipt.ts) - Date.parse(b.receipt.ts));
+  const names = new Map(agents.map((a) => [a.id, a.name ?? a.id]));
+  for (const a of agents) {
+    const mine = unknown.filter((i) => i.agentId === a.id);
+    if (!mine.length) continue;
+    const f = mine[0].receipt;
+    const blocked = items.filter((i) => i.agentId === a.id && PAUSE_REASONS.includes(i.receipt?.reason) && recent(i.receipt)).length;
+    out.push({ kind: "cost_unknown", key: `cost_unknown:${a.id}`, unknown_count: mine.length, first: { receipt_id: f.id ?? null, ts: f.ts, model: f.model ?? null, reason: f.reason ?? null }, blocked_calls_1h: blocked });
+  }
+  const sources = (ids) => [...new Set(unknown.filter((i) => !ids || ids.includes(i.agentId)).map((i) => names.get(i.agentId) ?? i.agentId))].sort();
+  const paused = (match) => new Set(items.filter((i) => i.receipt?.reason === "unreconciled_receipt" && recent(i.receipt) && match(i.receipt)).map((i) => i.agentId)).size;
+  for (const t of teams) {
+    if (t?.verdict?.verdict !== "accounting_unavailable") continue;
+    const prefix = `team:${t.name}`;
+    out.push({ kind: "cost_unknown", key: `cost_unknown:team:${orgId}:${t.name}`, team: t.name, unknown_count: t.verdict.spend?.unknown_count ?? 0, source_agents: sources(t.agents), paused_agents: paused((r) => r.team === t.name || (typeof r.scope === "string" && (r.scope === prefix || r.scope.startsWith(`${prefix}:`)))) });
+  }
+  if (orgVerdict?.verdict === "accounting_unavailable") {
+    out.push({ kind: "cost_unknown", key: `cost_unknown:org:${orgId}`, org: true, unknown_count: orgVerdict.spend?.unknown_count ?? 0, source_agents: sources(null), paused_agents: paused((r) => r.org === true || r.scope === "org" || (typeof r.scope === "string" && r.scope.startsWith("org:"))) });
   }
   return out;
 }

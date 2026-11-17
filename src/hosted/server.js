@@ -9,7 +9,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { ALERT_KINDS, evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { ALERT_KINDS, evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts, evaluateUnknownCostAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -1318,6 +1318,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const modelHits = modelRules.length ? [...blocksInCurrentPeriod(receipts, { reason: "model_budget_exceeded", nowMs: now(), budgetPeriod: bp }), ...recent.filter((r) => r.reason === "model_budget_exceeded" && r.scope === "hour")].filter((r) => typeof r.model === "string") : [];
         const modelAlerts = evaluateModelAlerts({ agentId: a.id, rules: modelRules, spend: modelSpend, blockedHits: modelHits, normalize: normalizeModel }, { warnFractions: a.policy.warnFractions });
         alerts.push(...modelAlerts);
+        // Issue #279: an unsettled unknown-cost receipt pauses this agent: page it.
+        alerts.push(...evaluateUnknownCostAlerts({ orgId: a.orgId, items: Object.values(s.receipts).filter((i) => i.orgId === a.orgId && i.agentId === a.id), agents: [a], nowMs: now(), budgetPeriod: bp }));
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
@@ -1361,6 +1363,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert, tbp), ...(alert.kind === "cap_projected" ? { period: capPeriod(alert.scope, now(), tbp) } : {}) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
+        // Issue #279: a team paused by unknown cost pages with its source and paused agents.
+        for (const alert of evaluateUnknownCostAlerts({ orgId: t.orgId, items: Object.values(s.receipts).filter((i) => i.orgId === t.orgId), agents: Object.values(s.agents).filter((x) => x.orgId === t.orgId), teams: [{ name: t.name, agents: t.agents, verdict }], nowMs: now(), budgetPeriod: tbp }).filter((x) => x.team)) {
+          teamKeys.add(alert.key);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
+        }
         // Issue #223: team-scoped anomaly on the members' summed daily spend.
         const teamAnomaly = evaluateAnomaly({ id: `team:${t.orgId}:${t.name}`, receipts: t.agents.flatMap((id) => agentReceipts(s, id)), nowMs: now(), budgetPeriod: orgPeriod(s, t.orgId), settings: resolveAnomaly(s.orgs?.[t.orgId]?.anomaly, t.anomaly) });
         if (teamAnomaly) {
@@ -1386,6 +1395,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
           if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId, agentId: null, period: capPeriod(alert.scope, now(), bp) }, { nowMs: now(), id: randomUUID() })) });
+          else queueRetry(prior, out);
+        }
+        // Issue #279: an org budget paused by unknown cost pages once; it resolves when the receipts are settled.
+        for (const alert of evaluateUnknownCostAlerts({ orgId, items: Object.values(s.receipts).filter((i) => i.orgId === orgId), agents: Object.values(s.agents).filter((x) => x.orgId === orgId), orgVerdict: verdict, nowMs: now(), budgetPeriod: bp }).filter((x) => x.org)) {
+          orgKeys.add(alert.key);
+          const prior = activeOccurrence(s.alerts, alert.key);
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId, agentId: null }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }

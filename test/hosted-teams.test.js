@@ -229,12 +229,12 @@ test("unit: alert text names the team, scope, spend and cap", async () => {
 
 test("regression: a two-agent team alerts once at 80% and once at 100%, re-arms, ignores unknown cost, clears on delete", async (t) => {
   const delivered = [];
-  const f = await fixture(t, { deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; } });
+  const f = await fixture(t, { deliverAlert: async (a) => { /* #279: cost_unknown pages are covered in unknown-cost-alerts.test.js */ if (a.kind !== "cost_unknown") delivered.push(a); return [{ status: "accepted" }]; } });
   const owner = await f.login("team-alerts@example.invalid");
   const rb = await f.agent(owner.cookie, "release-bot"), tb = await f.agent(owner.cookie, "triage-bot");
   assert.equal((await f.request("/v1/teams", { name: "ops", agents: [rb.agentId, tb.agentId], day: 30 }, owner.cookie)).status, 200);
   const ts = new Date().toISOString();
-  const teamAlerts = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => a.team);
+  const teamAlerts = async () => (await f.request("/v1/fleet", undefined, owner.cookie)).body.alerts.filter((a) => a.team && a.kind !== "cost_unknown");
   await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 12 }] }, null, rb.token);
   await f.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 13 }] }, null, tb.token);
   await f.sweep(); await f.sweep();

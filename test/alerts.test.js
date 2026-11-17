@@ -6,7 +6,7 @@ const state = (over = {}) => ({ agentId: "a1", caps: {}, spend: {}, blockedReaso
 const kinds = (alerts) => alerts.map((a) => a.kind);
 
 test("alert kinds are the documented set", () => {
-  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"]);
+  assert.deepEqual(ALERT_KINDS, ["cap_approaching", "cap_hit", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly", "cost_unknown"]);
 });
 
 test("no caps and no activity raise nothing", () => {

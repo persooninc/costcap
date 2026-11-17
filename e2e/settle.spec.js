@@ -110,3 +110,43 @@ test("viewer sees an unsettled unknown-cost row without a Settle control", async
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// Issue #279: an unknown-cost receipt pages cost_unknown with a Settle link; settling resolves it.
+test("cost_unknown alert shows a Settle link and resolves after settling", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-279-e2e-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+    deliverAlert: async () => [{ status: "accepted" }],
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const c = await post("/auth/request", { email: "u279-e2e@example.invalid", turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes["u279-e2e@example.invalid"] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", { caps: { day: 5 } }, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "voice-agent" }) }).then((r) => r.json());
+    const ts = new Date().toISOString();
+    await fetch(origin + "/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "unk-279", ts, cost_usd: null, model: "gpt-realtime-2", reason: "modality_unpriced" }] }) });
+    await service.evaluateFleetAlerts();
+
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "window.turnstile={render(){return 1},reset(){}}" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    const entry = page.locator("#alerts .alert-active", { hasText: "cost_unknown" });
+    await expect(entry).toContainText("model gpt-realtime-2 (modality_unpriced)");
+    await expect(entry.getByRole("link", { name: "Settle" })).toHaveAttribute("href", "#unknownCard");
+
+    expect((await post("/v1/receipts/unk-279/settle", { cost_usd: 0.4, source: "provider_invoice", reason: "Invoice 279" }, { cookie: owner })).status).toBe(200);
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#alerts .alert-resolved", { hasText: "cost_unknown" })).toBeVisible();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cost_unknown" })).toHaveCount(0);
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});
