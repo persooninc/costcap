@@ -12,7 +12,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling, cacheStorageCost } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
@@ -97,7 +97,7 @@ const FILES_UPLOAD_PATHS = [/^\/anthropic\/v1\/files$/, /^\/openai\/v1\/files$/,
   /^\/gemini\/v1(?:beta|alpha)?\/batches\/[A-Za-z0-9_-]+:cancel$/];
 const FILES_DELETE_PATHS = [/^\/anthropic\/v1\/files\/[A-Za-z0-9_-]+$/, /^\/openai\/v1\/files\/[A-Za-z0-9_-]+$/,
   /^\/gemini\/v1(?:beta|alpha)?\/files\/[A-Za-z0-9_-]+$/, /^\/anthropic\/v1\/messages\/batches\/[A-Za-z0-9_-]+$/,
-  /^\/gemini\/v1(?:beta|alpha)?\/batches\/[A-Za-z0-9_-]+$/];
+  /^\/gemini\/v1(?:beta|alpha)?\/batches\/[A-Za-z0-9_-]+$/, /^\/gemini\/v1(?:beta|alpha)?\/cachedContents\/[A-Za-z0-9_-]+$/];
 export function isNonBillableFilesRequest(method, rawUrl) {
   if (typeof rawUrl !== "string") return false;
   const pathname = rawUrl.split(/[?#]/, 1)[0];
@@ -106,6 +106,20 @@ export function isNonBillableFilesRequest(method, rawUrl) {
   if (method === "DELETE") return FILES_DELETE_PATHS.some((re) => re.test(pathname));
   return false;
 }
+
+// #257: Gemini context caching. Create (POST) and TTL update (PATCH) bill storage; DELETE is free
+// (FILES_DELETE_PATHS). Exact paths only, same hardening as count_tokens. Returns "create" | "patch" | null.
+export function geminiCacheRoute(method, rawUrl) {
+  if (typeof rawUrl !== "string") return null;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return null;
+  if (method === "POST" && /^\/gemini\/v1(?:beta|alpha)?\/cachedContents$/.test(pathname)) return "create";
+  if (method === "PATCH" && /^\/gemini\/v1(?:beta|alpha)?\/cachedContents\/[A-Za-z0-9_-]+$/.test(pathname)) return "patch";
+  return null;
+}
+const isGeminiCacheRead = (method, rawUrl) => method === "GET" && typeof rawUrl === "string"
+  && /^\/gemini\/v1(?:beta|alpha)?\/cachedContents(?:\/[A-Za-z0-9_-]+)?$/.test(rawUrl.split(/[?#]/, 1)[0]);
+const stripModelsPrefix = (m) => (typeof m === "string" ? m.replace(/^models\//, "") : m);
 
 // OpenAI (#145) and OpenRouter (#202) embeddings: billed on input only. Exact path, same hardening as count_tokens.
 export function isEmbeddingsPath(rawUrl) {
@@ -671,6 +685,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   };
   // #190: one stderr hint when a custom upstream's first response is a 404 (usually a missing /v1).
   const customFirstSeen = new Set();
+  // #257: latest Gemini cachedContents expireTime (ms) this wrapper saw, by cache name.
+  const cacheExpiry = new Map();
+  const noteCacheExpiry = (c) => {
+    const t = Date.parse(c?.expireTime);
+    if (typeof c?.name === "string" && Number.isFinite(t)) cacheExpiry.set(c.name, Math.max(t, cacheExpiry.get(c.name) ?? -Infinity));
+  };
   const server = http.createServer((req, res) => {
     // #236: an interactive call is priced at the instant the proxy received the request.
     const reqAt = now();
@@ -752,6 +772,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
+        // #257: a cachedContents create names its model as models/{id}; caps and receipts see {id}.
+        const cacheOp = provider === "gemini" && !custom ? geminiCacheRoute(req.method, req.url) : null;
+        if (cacheOp === "create") requestedModel = stripModelsPrefix(requestedModel) || undefined;
         // #198: transcriptions/translations are multipart; read only the model field (bounded).
         const audio = provider === "openai" ? audioRoute(req.method, req.url) : null;
         if (audio && audio !== "speech" && !requestedModel) {
@@ -811,14 +834,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           // #233: free management calls (files, batch cancel/delete) skip allowlist, unpriced and preflight checks.
           const generates = !["GET", "HEAD"].includes(req.method);
-          const freeMgmt = generates && isNonBillableFilesRequest(req.method, req.url);
+          // #257: a cache TTL update names no model; it is billed from the response like a create.
+          const freeMgmt = generates && (isNonBillableFilesRequest(req.method, req.url) || cacheOp === "patch");
           // #207: decided before the allowlist, unpriced check, preflight and cache key, so all of them see TO.
           if (downgrader && generates) {
             const candidates = routerModels?.length ? routerModels : batchModels ?? [requestedModel];
             const decision = candidates.map((m) => downgrader.decide(m)).find(Boolean) ?? null;
             if (decision) {
               const multipart = Boolean(audio && audio !== "speech");
-              if (!downgradeRoute({ provider, custom, cloud, batch: Boolean(batchCreate), multipart, routerModels, parsedBody })) dgReceipt = { downgrade: "unsupported_route" };
+              if (cacheOp || !downgradeRoute({ provider, custom, cloud, batch: Boolean(batchCreate), multipart, routerModels, parsedBody })) dgReceipt = { downgrade: "unsupported_route" };
               else {
                 dg = decision;
                 body = rewriteModel(parsedBody, dg.to);
@@ -868,7 +892,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           // model lists), file uploads and OpenAI batch creates (models live in an
           // uploaded file) pass through; audio checks only that the model is priced.
           const pfMode = !preflight || !generates ? null
-            : freeMgmt ? "pass"
+            : freeMgmt || cacheOp ? "pass"
             : batchCreate === "anthropic" && !cloud ? "batch"
             : batchCreate === "gemini" ? (geminiReqs?.length ? "batch" : "pass")
             : batchCreate === "openai" || /^\/v1\/(?:files|uploads)(?:\/|$|\?)/.test(path) ? "pass"
@@ -1078,6 +1102,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (cloud) Object.assign(receipt, { provider_model: providerModel, endpoint_scope: cloudRoute.scope });
           const ok2xx = upstreamRes.status >= 200 && upstreamRes.status < 300;
           const isRead = ["GET", "HEAD"].includes(req.method);
+          if (raw && ok2xx && isGeminiCacheRead(req.method, req.url)) {
+            const b = safeJson(raw);
+            for (const c of Array.isArray(b?.cachedContents) ? b.cachedContents : [b]) noteCacheExpiry(c);
+          }
           const bgState = raw ? responseState(raw) : { id: tracker?.id ?? null, status: streamCut ? null : tracker?.terminal ?? null };
           const bgPending = bgRead && ok2xx ? findPendingBackground(bgRead.id) : null;
           if (bgPending && !resolvedBackground.has(bgRead.id) && TERMINAL_STATUSES.has(bgState.status) && !(raw ? false : streamCut)) {
@@ -1133,6 +1161,31 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             else if (streamCut) res.destroy();
             else if (!res.destroyed) res.end();
             return;
+          } else if (cacheOp && raw && ok2xx) {
+            // #257: storage billed per token-hour from the response's own times; never $0 when unknown.
+            metered = null;
+            const c = safeJson(raw);
+            const tokens = c?.usageMetadata?.totalTokenCount;
+            const model = stripModelsPrefix(typeof c?.model === "string" && c.model ? c.model : requestedModel) || "unknown";
+            const name = typeof c?.name === "string" ? c.name : null;
+            const end = Date.parse(c?.expireTime);
+            const prev = name ? cacheExpiry.get(name) : undefined;
+            const startIso = cacheOp === "create" ? c?.createTime : prev !== undefined ? new Date(prev).toISOString() : c?.updateTime;
+            const start = Date.parse(startIso);
+            const priced = Number.isFinite(end) && Number.isFinite(start)
+              ? cacheStorageCost(model, tokens, new Date(start).toISOString(), new Date(Math.max(end, start)).toISOString()) : null;
+            Object.assign(receipt, { model, kind: "cache_storage", ...(name && { cache_name: name }), ...(Number.isInteger(tokens) && { cache_tokens: tokens }),
+              ...(cacheOp === "patch" && prev === undefined && { storage_upper_bound: true }) });
+            if (priced) {
+              const { cost_usd, storage_hours, table_version, table_sha256 } = priced;
+              Object.assign(receipt, { cost_usd, storage_hours, table_version, table_sha256, fallback: false });
+              noteCacheExpiry(c);
+              recordSpend(receipt);
+              velocity?.record(receipt.cost_usd);
+            } else {
+              Object.assign(receipt, { cost_usd: null, reason: "cache_storage_unpriced" });
+              failMsg = `Gemini context cache storage for ${model} could not be priced (no cache_storage rate, token count or expiry). Restart only after reconciling this request.`;
+            }
           } else if (isRead && !(raw && ok2xx && batchReadPath(req.method, req.url))) {
             // Retrieves never create spend (#135/#196), even when the body carries usage.
             Object.assign(receipt, { model: requestedModel ?? "unknown", cost_usd: 0, reason: "non_billable_request" });

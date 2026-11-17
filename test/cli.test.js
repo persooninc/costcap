@@ -733,3 +733,39 @@ test("#197 wrap warns once per ignored {discount} on an unpriced model and still
   assert.equal(show.status, 0);
   assert.doesNotMatch(show.stdout, /discount/);
 });
+
+test("#257 wrap --cap 0.15: a Gemini cachedContents create bills storage, the cached generate is refused at the cap", async (t) => {
+  const seen = [];
+  const T0 = "2026-11-16T12:00:00Z";
+  const up = await new Promise((r) => {
+    const s = http.createServer((req, res) => {
+      req.resume();
+      seen.push(`${req.method} ${req.url}`);
+      res.setHeader("content-type", "application/json");
+      res.end(req.url.endsWith("/cachedContents")
+        ? JSON.stringify({ name: "cachedContents/abc123", model: "models/gemini-2.5-flash", createTime: T0, expireTime: "2026-11-16T13:00:00Z", usageMetadata: { totalTokenCount: 200000 } })
+        : '{"modelVersion":"gemini-2.5-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1}}');
+    });
+    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
+  });
+  t.after(() => up.s.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-257-"));
+  const receipts = path.join(dir, "r.jsonl");
+  const script = `
+    const b = process.env.GOOGLE_GEMINI_BASE_URL + "/v1beta";
+    const h = { "x-goog-api-key": "k", "content-type": "application/json" };
+    const a = await fetch(b + "/cachedContents", { method: "POST", headers: h, body: JSON.stringify({ model: "models/gemini-2.5-flash", contents: [], ttl: "3600s" }) });
+    const g = await fetch(b + "/models/gemini-2.5-flash:generateContent", { method: "POST", headers: h, body: JSON.stringify({ cachedContent: "cachedContents/abc123", contents: [] }) });
+    console.log("STATUS", a.status, g.status, (await g.json()).error?.type);`;
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.15", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, GOOGLE_GEMINI_BASE_URL: "https://generativelanguage.googleapis.com", COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "") }));
+  });
+  assert.match(res.out, /^STATUS 200 429 budget_exceeded$/m);
+  assert.deepEqual(seen, ["POST /v1beta/cachedContents"]);
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const r = lines.find((x) => x.kind === "cache_storage");
+  assert.deepEqual([r.cost_usd, r.model, r.cache_name], [0.2, "gemini-2.5-flash", "cachedContents/abc123"]);
+});

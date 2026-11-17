@@ -62,6 +62,8 @@ export function pricingCommand(args, { tablePath } = {}) {
     // Modality rates (#163) print as (audio) / (image) rows; uniform / text-rate notes follow.
     ...Object.entries(r.modalities ?? {}).map(([m, mr]) => `${name} (${m}): input ${fmt(mr.input)}, cached_input ${fmt(mr.cached_input)}, output ${fmt(mr.output)}`),
     ...(r.uniform_modalities ? [`${name}: all input modalities at the input rate`] : []),
+    // #257: Gemini context caching storage.
+    ...(Number.isFinite(r.cache_storage) ? [`${name}: context cache storage ${fmt(r.cache_storage)} per 1M tokens per hour`] : []),
     ...(r.text_rate_modalities?.length ? [`${name}: ${r.text_rate_modalities.join("/")} input at the text rate`] : [])];
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
@@ -89,7 +91,7 @@ export function pricingCommand(args, { tablePath } = {}) {
     if (e.from <= day) continue;
     if (e.billed_as) { lines.push(`from ${e.from}: billed as ${e.billed_as}`); continue; }
     const after = datedRow(table, id, e.from).row;
-    lines.push(`from ${e.from}: input ${fmt(after.input)}, cached_input ${fmt(after.cached_input)}, cache_write ${fmt(after.cache_write)}, cache_write_1h ${fmt(after.cache_write_1h)}, output ${fmt(after.output)}`);
+    lines.push(`from ${e.from}: input ${fmt(after.input)}, cached_input ${fmt(after.cached_input)}, cache_write ${fmt(after.cache_write)}, cache_write_1h ${fmt(after.cache_write_1h)}, output ${fmt(after.output)}${Number.isFinite(after.cache_storage) ? `, cache_storage ${fmt(after.cache_storage)} per 1M tokens per hour` : ""}`);
   }
   return { code: 0, out: [head, ...lines].join("\n"), err: "" };
 }

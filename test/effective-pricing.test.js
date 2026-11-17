@@ -244,3 +244,17 @@ test("AC5: pricing show lists scheduled changes and --at prints the row in effec
   assert.equal(pricingCommand(["show", "gemini-4-carbon", "--at", "2026-99-99"]).code, 2);
   assert.match(pricingCommand(["show", "made-up-9", "--at", "2026-12-01"]).out, /fallback/);
 });
+
+test("#257 cache_storage is a dated component: billed_as rows inherit it, 3.8 Flash doubles on 2027-01-01", async () => {
+  const { cacheStorageCost } = await import("../src/pricing.js");
+  assert.equal(lookupPrice("gemini-2.5-pro", "2026-11-30").cache_storage, 4.5);
+  assert.equal(lookupPrice("gemini-2.5-pro", "2026-12-02").cache_storage, 0.5);
+  assert.equal(lookupPrice("gemini-2.5-flash", "2026-12-02").cache_storage, 1);
+  assert.equal(lookupPrice("gemini-3.8-flash", "2027-01-01").cache_storage, 1);
+  assert.equal(lookupPrice("gemini-3.6-flash", "2026-12-31").cache_storage, 0.5);
+  assert.equal(lookupPrice("gemini-4-carbon", "2026-12-02").cache_storage, undefined);
+  assert.equal(cacheStorageCost("gemini-2.5-pro", 100000, "2026-11-30T12:00:00Z", "2026-11-30T14:00:00Z").cost_usd, 0.9);
+  assert.equal(cacheStorageCost("gemini-2.5-pro", 100000, "2026-12-02T12:00:00Z", "2026-12-02T14:00:00Z").cost_usd, 0.1);
+  assert.equal(cacheStorageCost("gemini-3.8-flash", 1000000, "2026-12-31T23:00:00Z", "2027-01-01T01:00:00Z").cost_usd, 1.5);
+  assert.equal(validateSchedules(JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"))), null);
+});

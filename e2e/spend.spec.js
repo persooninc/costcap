@@ -182,3 +182,36 @@ test("Spend card: receipts at the customer's own prices are labelled", async ({ 
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// #257: a synced Gemini context-cache storage receipt counts in /v1/spend and the Spend card under its model.
+test("Spend card: a cache_storage receipt appears under its model", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-spend-257-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const c = await post("/auth/request", { email: "cache-257@example.invalid", turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes["cache-257@example.invalid"] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", {}, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "cache" }) }).then((r) => r.json());
+    const ts = new Date().toISOString();
+    const synced = await fetch(origin + "/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ receipts: [{ id: "s1", ts, provider: "gemini", cost_usd: 0.2, model: "gemini-2.5-flash", kind: "cache_storage", cache_name: "cachedContents/abc123", cache_tokens: 200000, storage_hours: 1 }] }) });
+    expect(synced.status).toBeLessThan(300);
+    const spend = await fetch(origin + "/v1/spend?group_by=model", { headers: { cookie: owner, origin } }).then((r) => r.json());
+    expect(JSON.stringify(spend)).toContain("gemini-2.5-flash");
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    await expect(page.locator('#spendModels [data-key="gemini-2.5-flash"]')).toContainText("$0.20");
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});

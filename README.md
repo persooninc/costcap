@@ -192,6 +192,24 @@ providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `
   --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
   `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
 
+## Gemini context caching
+
+`costcap wrap` meters the Gemini API's explicit cache (`/v1beta/cachedContents`). A create
+(`POST`) is billed for storage from the response: `usageMetadata.totalTokenCount` × the
+model's `cache_storage` rate (USD per 1M tokens per hour) × hours from `createTime` to
+`expireTime`. A TTL update (`PATCH`) bills only the extension past the last expiry this
+wrapper saw; for a cache it never saw it bills `updateTime → expireTime` with
+`storage_upper_bound: true`, and a shorter TTL is $0 (no refund). `DELETE`, `GET` and list
+are $0. Receipts carry `kind: "cache_storage"`, `cache_name`, `cache_tokens` and
+`storage_hours`, and count toward every cap. The create's `models/{id}` is checked as `{id}`
+by `--models`, `--unknown-models refuse` and `--model-cap`; `--preflight` lets it through
+(`preflight_estimate: false`) and `--downgrade` never rewrites it. Storage rates are dated
+like token rates (a TTL across a price change is split at the boundary); `costcap pricing
+show <model>` prints them. Gemini 4 has no published storage rate, so a create on it, or a
+response without a token count or expiry, is `cache_storage_unpriced` and pauses the run
+until reconciled. Receipts are an upper bound: Google documents no refund for early deletes.
+Vertex `cachedContents` stays unsupported.
+
 ## Claude on Bedrock / Vertex, Gemini on Vertex
 
 `costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and

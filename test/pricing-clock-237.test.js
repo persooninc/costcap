@@ -78,3 +78,11 @@ test("proxy with an injected now() prices at it, not the pin", async (t) => {
   withClock(t, "2026-11-16T12:00:00Z");
   assert.equal(await proxyCost(t, { now: () => Date.parse("2027-02-01T00:00:00Z") }), 1.5);
 });
+
+test("#257 cache storage is priced on the response's own times, never the pinned clock", async (t) => {
+  const { cacheStorageCost } = await import("../src/pricing.js");
+  withClock(t, "2026-11-16T12:00:00Z");
+  assert.equal(cacheStorageCost("gemini-2.5-pro", 100000, "2026-12-02T12:00:00Z", "2026-12-02T14:00:00Z").cost_usd, 0.1);
+  withClock(t, "2027-02-01T00:00:00Z");
+  assert.equal(cacheStorageCost("gemini-2.5-pro", 100000, "2026-11-30T12:00:00Z", "2026-11-30T14:00:00Z").cost_usd, 0.9);
+});

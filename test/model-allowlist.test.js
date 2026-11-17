@@ -295,3 +295,21 @@ test("#188 the allowlist sees the mapped Bedrock path model, not the raw provide
   const raw = await call("meta.llama3-70b-instruct-v1:0");
   assert.equal((await raw.json()).model, "meta.llama3-70b-instruct-v1:0");
 });
+
+test("#257 a cachedContents create's models/{id} is checked as {id} by --models and --unknown-models refuse", async (t) => {
+  const up = await new Promise((r) => {
+    const s = http.createServer((q, res) => { q.resume(); res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ name: "cachedContents/c1", model: "models/gemini-2.5-flash", createTime: "2026-11-16T12:00:00Z", expireTime: "2026-11-16T13:00:00Z", usageMetadata: { totalTokenCount: 1000000 } })); });
+    s.listen(0, "127.0.0.1", () => r({ s, url: `http://127.0.0.1:${s.address().port}` }));
+  });
+  t.after(() => up.s.close());
+  const call = async (opts, model) => {
+    const { server, port } = await startMeteringProxy({ upstreams: { gemini: up.url }, ...opts });
+    t.after(() => server.close());
+    const r = await fetch(`http://127.0.0.1:${port}/gemini/v1beta/cachedContents`, { method: "POST", body: JSON.stringify({ model }) });
+    return [r.status, (await r.json()).model];
+  };
+  assert.deepEqual(await call({ allowedModels: () => ["gemini-2.5-flash"] }, "models/gemini-2.5-flash"), [200, "models/gemini-2.5-flash"]);
+  assert.deepEqual(await call({ unknownModels: "refuse" }, "models/gemini-2.5-flash"), [200, "models/gemini-2.5-flash"]);
+  assert.deepEqual(await call({ allowedModels: () => ["gemini-2.5-pro"] }, "models/gemini-2.5-flash"), [403, "gemini-2.5-flash"]);
+  assert.deepEqual(await call({ unknownModels: "refuse" }, "models/not-a-model"), [403, "not-a-model"]);
+});

@@ -322,3 +322,31 @@ export function requestWebSearchType(req) {
   if (!types.length) return undefined;
   return types.some((t) => t.startsWith("web_search_preview")) ? (types.every((t) => t.startsWith("web_search_preview")) ? "web_search_preview" : undefined) : "web_search";
 }
+
+// #257: Gemini context caching storage, USD per 1M tokens per hour (`cache_storage`, dated via #236).
+// Priced over [start, end) from the provider's own timestamps; a span over a dated change is split at
+// 00:00 UTC of each `from` day. Returns { cost_usd, storage_hours } or null (unknown model, no rate, bad times).
+export function cacheStorageCost(model, tokens, start, end) {
+  assertTableIntegrity();
+  const id = resolveModelId(model);
+  const s = Date.parse(start), e = Date.parse(end);
+  if (id === null || !Number.isInteger(tokens) || tokens < 0 || !Number.isFinite(s) || !Number.isFinite(e)) return null;
+  const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
+  if (e <= s) {
+    const r = datedRow(table, id, dayOf(new Date(s).toISOString())).row;
+    return Number.isFinite(r.cache_storage) ? { cost_usd: 0, storage_hours: 0, ...pin } : null;
+  }
+  const cuts = new Set([s, e]);
+  for (const row of Object.values(table.models)) for (const x of row.effective ?? []) {
+    const t = Date.parse(`${x.from}T00:00:00Z`);
+    if (t > s && t < e) cuts.add(t);
+  }
+  const pts = [...cuts].sort((a, b) => a - b);
+  let cost = 0;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const rate = datedRow(table, id, new Date(pts[i]).toISOString().slice(0, 10)).row.cache_storage;
+    if (!Number.isFinite(rate)) return null;
+    cost += (tokens * rate * (pts[i + 1] - pts[i])) / 3.6e6 / 1e6;
+  }
+  return { cost_usd: Number(cost.toFixed(6)), storage_hours: Number(((e - s) / 3.6e6).toFixed(6)), ...pin };
+}
