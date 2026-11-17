@@ -212,6 +212,29 @@ export function billedAsGrounding(provider, cloud, receipt, metered) {
   return { ...metered, model: receipt.billed_as, toolCalls: { ...metered.toolCalls, google_search: unit === "query" ? metered.groundingQueries : 1 } };
 }
 
+/**
+ * #262: the Gemini tier a call was served at. Priority when Vertex reports trafficType
+ * ON_DEMAND_PRIORITY, when the Gemini API x-gemini-service-tier header says "priority", or when the
+ * request asked for service_tier "priority" and the header does not say "standard" (a missing
+ * header counts as Priority). A header of "standard" is a downgrade: standard rates, with
+ * requested_service_tier recorded. Returns usage with service_tier set (or unchanged).
+ */
+export function geminiServedTier(usage, requestBody, header, { vertex = false } = {}) {
+  if (!usage || typeof usage !== "object") return usage;
+  const out = { ...usage };
+  delete out.service_tier;
+  if (vertex) {
+    if (out.traffic_type === "ON_DEMAND_PRIORITY") out.service_tier = "priority";
+    return out;
+  }
+  const req = requestBody && typeof requestBody === "object" ? requestBody.service_tier ?? requestBody.serviceTier : undefined;
+  const requested = typeof req === "string" ? req.toLowerCase() : null;
+  const served = typeof header === "string" ? header.trim().toLowerCase() : null;
+  if (served === "priority" || (requested === "priority" && served !== "standard")) out.service_tier = "priority";
+  else if (requested === "priority") out.requested_service_tier = "priority";
+  return out;
+}
+
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
 export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
@@ -285,6 +308,8 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     }
     if (provider === "gemini") {
       const u = chunk.usageMetadata;
+      // #262: Vertex reports the served tier as usageMetadata.trafficType (ON_DEMAND_PRIORITY = Priority PayGo).
+      if (typeof u?.trafficType === "string") signal.traffic_type = u.trafficType;
       // Known only with both required counters; {} or partial shapes are unpriceable (never $0).
       if (u && !(isCount(u.promptTokenCount) && isCount(u.candidatesTokenCount))) usage = { unpriceable: NaN };
       // toolUsePromptTokenCount (tool results fed back to the model) is billed as input.
@@ -1120,6 +1145,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             metered = cloudRoute?.converse ? extractConverseUsage(raw.toString("utf8"), requestedModel) : extractUsage(meterAs, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
+          if (meterAs === "gemini" && metered?.usage) {
+            metered = { ...metered, usage: geminiServedTier(metered.usage, parsedBody, upstreamRes.headers.get("x-gemini-service-tier"), { vertex: Boolean(cloud) }) };
+          }
           clearTimeout(timer);
           res.off("close", onClientClose);
           if (cloud) Object.assign(receipt, { provider_model: providerModel, endpoint_scope: cloudRoute.scope });
@@ -1231,6 +1259,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
                 ? { regional: cloudRoute.scope === "regional", vertex: true, at: priceAt }
                 : { regional: cloudRoute.scope === "regional", undated: true })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: priceAt }));
+            // #262: Gemini tier provenance on the receipt (Vertex trafficType, a downgraded Priority request).
+            if (metered.usage.traffic_type !== undefined) receipt.traffic_type = metered.usage.traffic_type;
+            if (metered.usage.requested_service_tier !== undefined) receipt.requested_service_tier = metered.usage.requested_service_tier;
             rateLimit?.record(usageTokens(metered.usage));
             // #235/#242: OpenRouter's exact usage.cost also settles a table gap (cache write / service tier / modality / --price gap).
             if (metered.providerCost !== undefined && (receipt.cost_usd !== null || PROVIDER_COST_SETTLES.has(receipt.reason))) {

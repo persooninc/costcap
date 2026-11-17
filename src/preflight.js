@@ -113,7 +113,9 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   const output_tokens = out.tokens * mult.multiplier;
   // Long-context tier (#151): a prompt estimated over the threshold budgets at the higher rates.
   // Premium speed / service tier (#155): fast or priority requests budget at premium rates.
-  const signal = { ...(typeof req.speed === "string" && { speed: req.speed }), ...(typeof req.service_tier === "string" && { service_tier: req.service_tier }) };
+  // #262: Gemini spells it service_tier or serviceTier, case-insensitive.
+  const tier = provider === "gemini" ? (typeof (req.service_tier ?? req.serviceTier) === "string" ? (req.service_tier ?? req.serviceTier).toLowerCase() : undefined) : req.service_tier;
+  const signal = { ...(typeof req.speed === "string" && { speed: req.speed }), ...(typeof tier === "string" && { service_tier: tier }) };
   const { pricing_tier, rates } = selectRates(price, input_tokens, signal);
   if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
   const tools = toolWorstCase(provider, req, model);

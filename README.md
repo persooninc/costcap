@@ -397,7 +397,15 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   tier on a model with no published premium rate, including fallback models and cache
   components with no premium rate, is never priced at standard: the receipt has
   `cost_usd: null` and `reason: "service_tier_unpriced"`, and the next call gets
-  `accounting_unavailable`. `--preflight` reads `speed` / `service_tier` from
+  `accounting_unavailable`. Gemini Priority inference (#262) prices at the pricing page's Priority
+  column (about 1.8x standard, dated like the standard rates): a Gemini API call is Priority when the
+  request sets `service_tier`/`serviceTier: "priority"` and the `x-gemini-service-tier` response header
+  is not `standard` (a missing header counts as Priority), or when that header says `priority`. A
+  header of `standard` is a downgrade: standard rates, with `requested_service_tier: "priority"` on
+  the receipt. Vertex `usageMetadata.trafficType` is recorded as `traffic_type`; `ON_DEMAND_PRIORITY`
+  has no verified Vertex rate, so it is `service_tier_unpriced`, never standard. Gemini models without
+  a published Priority rate (`gemini-3.6-flash`, `gemini-3.5-flash-lite`) are unpriced at Priority.
+  `--preflight` reads `speed` / `service_tier` from
   the request body and estimates at premium rates (`preflight_unpriced` when
   no premium rate exists). `costcap pricing show` prints `(fast)`, `(priority)` and `(ultrafast)` rows.
 - OpenAI embeddings (`POST /openai/v1/embeddings`, exact path) are metered

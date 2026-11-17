@@ -207,7 +207,9 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
       pricing_tier: "standard", table_version: price.table_version, table_sha256: price.table_sha256, fallback: false, cost_source: "table" };
   }
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
-  const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
+  // #262: Vertex Priority PayGo has no verified published rate: unpriced, never the Gemini API set or standard.
+  const tierPrice = vertex && price.priority ? { ...price, priority: undefined } : price;
+  const tiered = selectRates(tierPrice, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
   const batchM = batch ? batchMultiplier(batch) : null;
   if (batch && batchM === null) throw new Error(`no batch rate for provider ${batch}`);
   // Regional premium stacks with batch and long-context like batch_multiplier (#188).
@@ -223,7 +225,9 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   const tierUnpriced = premium && (!selected || (cached_input_tokens > 0 && rates.cached_input == null) ||
     (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null));
   // A cache write with no published rate is unpriced, not guessed at another rate.
-  const modal = selected ? modalityAdjustment(price, rates, modality_tokens, multiplier ?? 1) : { delta: 0, unpriced: false };
+  // #262: a premium set prices non-text slices from its own `modalities` (Gemini Priority audio), never the standard ones.
+  const modalPrice = premium && tiered.rates?.modalities ? { ...price, modalities: tiered.rates.modalities } : price;
+  const modal = selected ? modalityAdjustment(modalPrice, rates, modality_tokens, multiplier ?? 1) : { delta: 0, unpriced: false };
   const unpriced = tierUnpriced || modal.unpriced || (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
   const cost = unpriced ? 0 :
     (input_tokens * rates.input +
