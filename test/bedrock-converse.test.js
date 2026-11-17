@@ -124,8 +124,8 @@ async function proxyFor(t, upstream, opts = {}) {
   t.after(() => { server.close(); upstream.server.close(); });
   return { base: `http://127.0.0.1:${port}`, port, receipts };
 }
-function signedPost(base, port, pathname, body) {
-  const headers = signRequest({ method: "POST", path: pathname, headers: { "content-type": "application/json" }, body, host: `127.0.0.1:${port}`, region: "us-east-1", service: "bedrock" }, CREDS);
+function signedPost(base, port, pathname, body, region = "us-east-1") {
+  const headers = signRequest({ method: "POST", path: pathname, headers: { "content-type": "application/json" }, body, host: `127.0.0.1:${port}`, region, service: "bedrock" }, CREDS);
   delete headers.host;
   return fetch(`${base}${pathname}`, { method: "POST", headers, body });
 }
@@ -182,12 +182,12 @@ test("AC3 ConverseStream cut before metadata is stream_incomplete (null, never 0
 test("AC4 unpriced Converse model: refused under --unknown-models refuse, else unknown cost (never fallback)", async (t) => {
   const up = await stub(converseHandler);
   const refuse = await proxyFor(t, up, { unknownModels: "refuse" });
-  const r = await signedPost(refuse.base, refuse.port, "/bedrock/model/amazon.nova-pro-v1%3A0/converse", body);
+  const r = await signedPost(refuse.base, refuse.port, "/bedrock/model/meta.unlisted-v1%3A0/converse", body);
   assert.equal(r.status, 403);
   assert.equal(up.hits.length, 0);
   const up2 = await stub(converseHandler);
   const fwd = await proxyFor(t, up2);
-  const r2 = await signedPost(fwd.base, fwd.port, "/bedrock/model/amazon.nova-pro-v1%3A0/converse", body);
+  const r2 = await signedPost(fwd.base, fwd.port, "/bedrock/model/meta.unlisted-v1%3A0/converse", body);
   assert.equal(r2.status, 200);
   assert.equal(up2.hits.length, 1);
   assert.equal(fwd.receipts[0].cost_usd, null);
@@ -263,4 +263,149 @@ test("e2e wrap: a pre-set AWS_ENDPOINT_URL_BEDROCK_RUNTIME is left unchanged wit
     "console.log(process.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME)");
   assert.equal(res.out, "http://example.invalid/x");
   assert.equal(res.err.match(/AWS_ENDPOINT_URL_BEDROCK_RUNTIME is already set/g)?.length, 1);
+});
+
+// ---- #278: non-Anthropic Bedrock models (Nova, Llama, Mistral, DeepSeek, gpt-oss, Qwen) ----
+import { writeFileSync } from "node:fs";
+import { mapCloudModel } from "../src/cloud.js";
+import { bedrockBaseId, bedrockCost, bedrockRate, converseServiceTier, isBedrockThirdParty } from "../src/bedrock-pricing.js";
+import { loadUpstreamPrices } from "../src/upstreams.js";
+import { createModelCaps, parseModelCap } from "../src/model-cap.js";
+
+const NOVA = "amazon.nova-pro-v1:0";
+const TABLE = JSON.parse(readFileSync(path.join(ROOT, "src/pricing-table.json"), "utf8"));
+const novaUsage = { inputTokens: 1000, outputTokens: 500, totalTokens: 1700, cacheReadInputTokens: 200 };
+const novaBody = { ...converseBody, usage: novaUsage };
+const novaFrames = [...streamFrames.slice(0, 4), converseEventFrame("metadata", { usage: novaUsage, metrics: { latencyMs: 5 } })];
+const novaHandler = (req, res) => {
+  if (req.url.endsWith("/converse-stream")) { res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" }).end(Buffer.concat(novaFrames)); return; }
+  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(novaBody));
+};
+const novaCost = (region) => { const r = TABLE.bedrock_models.models[NOVA].regions[region]; return Number(((1000 * r.input + 200 * r.cached_input + 500 * r.output) / 1e6).toFixed(6)); };
+const pricesFile = (doc) => { const f = path.join(mkdtempSync(path.join(tmpdir(), "cc-278-")), "p.json"); writeFileSync(f, JSON.stringify(doc)); return loadUpstreamPrices(f, []); };
+
+test("#278 mapping: geo prefix stripped, listed ids map, ARN / global. / unlisted stay null; Claude unchanged", () => {
+  assert.equal(mapCloudModel("bedrock", NOVA), NOVA);
+  assert.equal(mapCloudModel("bedrock", `us.${NOVA}`), NOVA);
+  assert.equal(mapCloudModel("bedrock", `eu.${NOVA}`), NOVA);
+  assert.equal(mapCloudModel("bedrock", "us.meta.llama4-scout-17b-instruct-v1:0"), "meta.llama4-scout-17b-instruct-v1:0");
+  assert.equal(mapCloudModel("bedrock", "openai.gpt-oss-120b-1:0"), "openai.gpt-oss-120b-1:0");
+  for (const id of ["meta.unlisted-v1:0", `global.${NOVA}`, "arn:aws:bedrock:us-east-1:1:application-inference-profile/x", "meta.llama3-70b-instruct-v1:0"]) assert.equal(mapCloudModel("bedrock", id), null, id);
+  assert.equal(mapCloudModel("bedrock", SONNET_ID), "claude-sonnet-4-5");
+  assert.equal(isBedrockThirdParty(SONNET_ID), false);
+  assert.equal(isBedrockThirdParty(`global.${NOVA}`), true);
+  assert.equal(bedrockBaseId("arn:aws:x"), null);
+});
+
+test("#278 table: every bedrock_models row covers the required families and regions, with a dated AWS source", () => {
+  const rows = TABLE.bedrock_models.models;
+  for (const fam of ["amazon.nova-", "meta.llama", "mistral.", "deepseek.", "openai.gpt-oss-", "qwen."]) assert.ok(Object.keys(rows).some((k) => k.startsWith(fam)), fam);
+  for (const r of ["us-east-1", "us-west-2", "eu-west-1"]) assert.ok(rows[NOVA].regions[r], r);
+  for (const [id, row] of Object.entries(rows)) {
+    assert.match(row.source, /pricing\.us-east-1\.amazonaws\.com\/offers\/v1\.0\/aws\/AmazonBedrock.*retrieved \d{4}-\d{2}-\d{2}/, id);
+    for (const [region, r] of Object.entries(row.regions)) for (const [k, v] of Object.entries(r)) assert.ok(["input", "output", "cached_input", "cache_write"].includes(k) && v > 0, `${id} ${region} ${k}`);
+  }
+  assert.ok(TABLE.sources.some((s) => s.includes("AmazonBedrock")));
+  // AWS Price List us-east-1 NovaPro: $0.0008 / $0.0032 / $0.0002 per 1K tokens.
+  assert.deepEqual(rows[NOVA].regions["us-east-1"], { input: 0.8, output: 3.2, cached_input: 0.2 });
+});
+
+test("#278 bedrockCost: region row, missing component unpriced, discount and absolute overrides", () => {
+  assert.equal(bedrockRate(null, NOVA, "ap-southeast-3"), null);
+  const r = bedrockRate(null, NOVA, "us-east-1");
+  assert.equal(bedrockCost(null, r, NOVA, { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 200 }).cost_usd, novaCost("us-east-1"));
+  const w = bedrockCost(null, r, NOVA, { input_tokens: 1, output_tokens: 1, cache_write_input_tokens: 5 });
+  assert.deepEqual([w.cost_usd, w.reason], [null, "cloud_model_unpriced"]);
+  const llama = bedrockRate(null, "meta.llama3-3-70b-instruct-v1:0", "us-east-1");
+  assert.equal(bedrockCost(null, llama, "x", { input_tokens: 1, output_tokens: 1, cached_input_tokens: 1 }).cost_usd, null);
+  const prices = pricesFile({ version: "v1", upstreams: { bedrock: { "*": { discount: 0.5 }, "meta.llama-x-v1:0": { input: 1, output: 2 } } } });
+  const d = bedrockCost(prices, bedrockRate(prices, NOVA, "us-east-1"), NOVA, { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 200 });
+  assert.deepEqual([d.cost_usd, d.cost_source, d.discount], [Number((novaCost("us-east-1") / 2).toFixed(6)), "user_prices", 0.5]);
+  assert.equal(bedrockRate(prices, NOVA, "ap-southeast-3"), null); // a discount never prices a region without a row
+  const a = bedrockRate(prices, "meta.llama-x-v1:0", "ap-southeast-3");
+  assert.equal(bedrockCost(prices, a, "meta.llama-x-v1:0", { input_tokens: 1e6, output_tokens: 1e6 }).cost_usd, 3);
+  assert.equal(converseServiceTier({ serviceTier: { type: "priority" } }), "priority");
+  assert.equal(converseServiceTier({ serviceTier: { type: "default" } }), null);
+  assert.equal(converseServiceTier(null), null);
+});
+
+test("#278 AC1 Nova Converse + ConverseStream priced at the us-east-1 row; the run continues", async (t) => {
+  const up = await stub(novaHandler);
+  const { base, port, receipts } = await proxyFor(t, up, { cap: createCapEngine({ caps: { run: 10 } }) });
+  const r = await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/converse`, body);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), novaBody);
+  const s = await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/converse-stream`, body);
+  assert.ok(Buffer.from(await s.arrayBuffer()).equals(Buffer.concat(novaFrames)));
+  for (const c of receipts) {
+    assert.deepEqual([c.provider, c.model, c.cost_usd, c.fallback, c.reason, c.regional_multiplier], ["bedrock", NOVA, novaCost("us-east-1"), false, undefined, undefined]);
+  }
+  assert.equal(receipts.length, 2);
+  assert.equal((await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/converse`, body)).status, 200);
+});
+
+test("#278 AC2 geo profile priced at the request region; no row / unlisted / ARN / priority tier are unknown", async (t) => {
+  const up = await stub(novaHandler);
+  const west = await proxyFor(t, up, { cloudEnv: { ...ENV, AWS_REGION: "us-west-2" } });
+  assert.equal((await signedPost(west.base, west.port, `/bedrock/model/${enc(`us.${NOVA}`)}/converse`, body, "us-west-2")).status, 200);
+  assert.equal(west.receipts[0].cost_usd, novaCost("us-west-2"));
+  const eu = await proxyFor(t, await stub(novaHandler));
+  assert.equal((await signedPost(eu.base, eu.port, `/bedrock/model/${enc(`eu.${NOVA}`)}/converse`, body, "eu-west-1")).status, 200);
+  assert.equal(eu.receipts[0].cost_usd, novaCost("eu-west-1"));
+  const cases = [
+    [`us.${NOVA}`, body, "ap-southeast-3", "cloud_model_unpriced"],
+    ["meta.unlisted-v1:0", body, "us-east-1", "cloud_model_unpriced"],
+    ["arn:aws:bedrock:us-east-1:1:inference-profile/us.amazon.nova-pro-v1:0", body, "us-east-1", "cloud_model_unpriced"],
+    [NOVA, JSON.stringify({ messages: [], serviceTier: { type: "priority" } }), "us-east-1", "service_tier_unpriced"],
+  ];
+  for (const [id, b, region, reason] of cases) {
+    const p = await proxyFor(t, await stub(novaHandler));
+    assert.equal((await signedPost(p.base, p.port, `/bedrock/model/${encodeURIComponent(id)}/converse`, b, region)).status, 200, id);
+    assert.deepEqual([p.receipts[0].cost_usd, p.receipts[0].reason, p.receipts[0].fallback ?? false], [null, reason, false], id);
+    assert.equal((await signedPost(p.base, p.port, `/bedrock/model/${encodeURIComponent(id)}/converse`, b, region)).status, 429, id);
+  }
+});
+
+test("#278 AC3 preflight refuses a priced Nova worst case; refuse lets listed through; --model-cap stops only Nova", async (t) => {
+  const up = await stub(novaHandler);
+  const pf = await proxyFor(t, up, { preflight: true, cap: createCapEngine({ caps: { run: 0.01 } }) });
+  const big = await signedPost(pf.base, pf.port, `/bedrock/model/${enc(NOVA)}/converse`, JSON.stringify({ messages: [], inferenceConfig: { maxTokens: 100000 } }));
+  assert.equal(big.status, 429);
+  assert.equal((await big.json()).error.reason, "preflight_estimate");
+  assert.equal(up.hits.length, 0);
+  assert.equal((await signedPost(pf.base, pf.port, `/bedrock/model/${enc(NOVA)}/converse`, body)).status, 200);
+  const up2 = await stub(novaHandler);
+  const ref = await proxyFor(t, up2, { unknownModels: "refuse" });
+  assert.equal((await signedPost(ref.base, ref.port, `/bedrock/model/${enc(`us.${NOVA}`)}/converse`, body)).status, 200);
+  assert.equal((await signedPost(ref.base, ref.port, "/bedrock/model/meta.unlisted-v1%3A0/converse", body)).status, 403);
+  assert.equal(up2.hits.length, 1);
+  const up3 = await stub(novaHandler);
+  const mc = await proxyFor(t, up3, { modelCaps: createModelCaps({ rules: [parseModelCap("amazon.nova-pro-v1:0:day=0.001")] }) });
+  assert.equal((await signedPost(mc.base, mc.port, `/bedrock/model/${enc(NOVA)}/converse`, body)).status, 200);
+  const stopped = await signedPost(mc.base, mc.port, `/bedrock/model/${enc(`us.${NOVA}`)}/converse`, body);
+  assert.equal(stopped.status, 429);
+  assert.equal((await signedPost(mc.base, mc.port, `/bedrock/model/${enc("amazon.nova-lite-v1:0")}/converse`, body)).status, 200);
+});
+
+test("#278 AC4 --upstream-prices bedrock entry prices an unlisted id as user_prices", async (t) => {
+  const prices = pricesFile({ version: "p1", upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 1, output: 2 } }, vertex: { "*": { discount: 0.2 } } } });
+  const up = await stub(novaHandler);
+  const p = await proxyFor(t, up, { userPrices: prices, unknownModels: "refuse" });
+  const r = await signedPost(p.base, p.port, `/bedrock/model/${enc("us.meta.llama-x-v1:0")}/converse`, JSON.stringify({ messages: [] }));
+  assert.equal(r.status, 200);
+  // cacheReadInputTokens without a cached_input rate stays unknown; without it, priced.
+  assert.deepEqual([p.receipts[0].cost_usd, p.receipts[0].reason], [null, "cloud_model_unpriced"]);
+  const up2 = await stub((req, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...converseBody, usage: { inputTokens: 1000, outputTokens: 500 } })));
+  const p2 = await proxyFor(t, up2, { userPrices: prices });
+  assert.equal((await signedPost(p2.base, p2.port, `/bedrock/model/${enc("meta.llama-x-v1:0")}/converse`, body)).status, 200);
+  assert.deepEqual([p2.receipts[0].cost_usd, p2.receipts[0].cost_source, p2.receipts[0].prices_version], [0.002, "user_prices", "p1"]);
+  // A Claude-on-Bedrock receipt is unchanged by a bedrock entry that does not name it.
+  const up3 = await stub(converseHandler);
+  const p3 = await proxyFor(t, up3, { userPrices: prices });
+  const p4 = await proxyFor(t, await stub(converseHandler));
+  await signedPost(p3.base, p3.port, `/bedrock/model/${enc(SONNET_ID)}/converse`, body);
+  await signedPost(p4.base, p4.port, `/bedrock/model/${enc(SONNET_ID)}/converse`, body);
+  const pick = (c) => [c.cost_usd, c.regional_multiplier, c.cost_source, c.prices_sha256, c.model];
+  assert.deepEqual(pick(p3.receipts[0]), pick(p4.receipts[0]));
+  assert.equal(p3.receipts[0].regional_multiplier, 1.1);
 });

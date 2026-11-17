@@ -31,8 +31,12 @@ test("validation: bad built-in entries throw; built-in keys need no --upstream (
   for (const e of bad) assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: { m: e } } }), []), /upstream-prices/, JSON.stringify(e));
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: [] } }), []), /object of models/);
-  // Bedrock/Vertex are out of scope (#188): still rejected as undeclared.
-  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { m: { discount: 0.1 } } } }), []), /not declared/);
+  // #278: bedrock / vertex are built-in override keys with the same validation.
+  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 1, output: 2 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
+  for (const p of ["bedrock", "vertex"]) {
+    assert.throws(() => loadUpstreamPrices(file({ upstreams: { [p]: { m: { input: 0, output: 1 } } } }), []), /never \$0/);
+    assert.throws(() => loadUpstreamPrices(file({ upstreams: { [p]: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
+  }
 });
 
 test("discount scales every tier, including cache and long context (AC1)", () => {
@@ -247,4 +251,24 @@ test("#254 AC4: --prices tools.code_execution prices standalone code execution a
   assert.equal(receipts[0].tool_cost_usd, 0.01);
   assert.equal(receipts[0].cost_source, "user_prices");
   assert.equal(receipts[0].cost_usd, Number((costForUsage("claude-sonnet-4-6", { input_tokens: 10, output_tokens: 5 }).cost_usd + 0.01).toFixed(6)));
+});
+
+test("#278 cloudCostWithOverrides: vertex '*' discount scales a Gemini receipt; no entry is byte-identical", async () => {
+  const { cloudCostWithOverrides } = await import("../src/price-overrides.js");
+  const { costForUsage } = await import("../src/pricing.js");
+  const prices = loadUpstreamPrices(file({ version: "v", upstreams: { vertex: { "*": { discount: 0.2 } }, bedrock: { "anthropic.claude-sonnet-4-5-20250929-v1:0": { discount: 0.5 } } } }), []);
+  const usage = { input_tokens: 1000, output_tokens: 500 };
+  const opts = { regional: false, vertex: true, at: "2026-11-16T12:00:00Z" };
+  const base = costForUsage("gemini-2.5-pro", usage, opts);
+  const d = cloudCostWithOverrides(prices, "vertex", ["google/gemini-2.5-pro", "gemini-2.5-pro"], usage, opts);
+  assert.equal(d.cost_usd, r6(base.cost_usd * 0.8));
+  assert.deepEqual([d.cost_source, d.discount], ["user_prices", 0.2]);
+  assert.deepEqual(cloudCostWithOverrides(null, "vertex", ["google/gemini-2.5-pro", "gemini-2.5-pro"], usage, opts), base);
+  const claude = { regional: true, undated: true };
+  const b = cloudCostWithOverrides(prices, "bedrock", ["us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5"], usage, claude);
+  assert.equal(b.cost_usd, r6(costForUsage("claude-sonnet-4-5", usage, claude).cost_usd * 0.5));
+  assert.deepEqual(cloudCostWithOverrides(prices, "bedrock", ["us.anthropic.claude-haiku-4-5-v1:0", "claude-haiku-4-5"], usage, claude), costForUsage("claude-haiku-4-5", usage, claude));
+  // A cloud key never leaks into the first-party override lookup.
+  const { builtinOverride } = await import("../src/price-overrides.js");
+  assert.equal(builtinOverride(prices, "vertex", "gemini-2.5-pro"), null);
 });

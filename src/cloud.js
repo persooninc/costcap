@@ -3,6 +3,7 @@
 // The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
 // Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
 import { resolveModelId, vertexGeminiModels } from "./pricing.js";
+import { bedrockBaseId, isBedrockThirdParty, isListedBedrockModel } from "./bedrock-pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
 export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
@@ -80,14 +81,16 @@ export function bedrockHost(region) {
 const BEDROCK_GEO = /^(?:global|us|eu|apac|jp|au)\./;
 
 /**
- * Maps a raw Bedrock/Vertex model id to the pricing-table id, or null when it is not an
- * Anthropic model we can price (non-Anthropic, ARN, unlisted). Never the fallback.
+ * Maps a raw Bedrock/Vertex model id to the pricing-table id (#278: or a listed non-Anthropic
+ * Bedrock base id), or null when it is not a model we can price (non-Anthropic, ARN, unlisted). Never the fallback.
  */
 export function mapCloudModel(provider, rawId) {
   if (typeof rawId !== "string" || !rawId) return null;
   let id = rawId;
   if (provider === "bedrock") {
     if (id.startsWith("arn:")) return null;
+    // #278: a listed non-Anthropic model maps to its base id (geo prefix stripped; rates are per region).
+    if (isBedrockThirdParty(id)) { const b = bedrockBaseId(id); return isListedBedrockModel(b) ? b : null; }
     id = id.replace(BEDROCK_GEO, "");
     if (!id.startsWith("anthropic.")) return null;
     id = id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, "");

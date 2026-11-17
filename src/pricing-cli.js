@@ -50,6 +50,9 @@ export function pricingCommand(args, { tablePath } = {}) {
   if (atArg !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(atArg)) return { code: 2, out: "", err: `--at must be YYYY-MM-DD, got ${atArg}` };
   let day;
   try { day = dayOf(atArg === undefined ? undefined : `${atArg}T00:00:00Z`); } catch { return { code: 2, out: "", err: `--at must be a valid date, got ${atArg}` }; }
+  const bedrockTable = table.bedrock_models?.models ?? {};
+  const bedrockRows = (ids = Object.keys(bedrockTable), k = 1, tag = "") => ids.flatMap((id) => Object.entries(bedrockTable[id].regions ?? {})
+    .map(([region, r]) => row(`bedrock/${id} (${region})`, Object.fromEntries(Object.entries(r).map(([c, v]) => [c, v * k])), tag)));
   const head = `pricing table ${table.version} (${table.currency}) sha256 ${v.actual}${v.ok ? "" : " UNVERIFIED"}`;
   const row = (name, r, tag = "") => `${name}${tag}: input ${fmt(r.input)}, cached_input ${fmt(r.cached_input)}, cache_write ${fmt(r.cache_write)}, cache_write_1h ${fmt(r.cache_write_1h)}, output ${fmt(r.output)}`;
   // A long-context tier (#151) prints as a second row for the same model.
@@ -67,7 +70,16 @@ export function pricingCommand(args, { tablePath } = {}) {
     ...(r.text_rate_modalities?.length ? [`${name}: ${r.text_rate_modalities.join("/")} input at the text rate`] : [])];
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
-    return { code: 0, out: [head, ...rows, row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
+    return { code: 0, out: [head, ...rows, ...bedrockRows(), row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
+  }
+  // #278: a non-Anthropic Bedrock id (geo prefix stripped) prints one row per region; a `bedrock` entry in --prices wins.
+  const bedrockId = model.replace(/^(?:us|eu|apac|jp|au|ca|us-gov)\./, "");
+  const bUser = prices?.upstreams?.bedrock;
+  if (bUser && Object.hasOwn(bUser, bedrockId) && !("discount" in bUser[bedrockId])) return { code: 0, out: [head, row(`bedrock/${bedrockId}`, bUser[bedrockId], ` (user_prices ${prices.sha256.slice(0, 8)}, every region)`)].join("\n"), err: "" };
+  if (Object.hasOwn(bedrockTable, bedrockId)) {
+    const d = bUser && Object.hasOwn(bUser, bedrockId) ? bUser[bedrockId].discount : bUser && Object.hasOwn(bUser, "*") ? bUser["*"].discount : undefined;
+    const k = d === undefined ? 1 : 1 - d;
+    return { code: 0, out: [head, ...bedrockRows([bedrockId], k, d === undefined ? "" : ` (discount ${d})`)].join("\n"), err: "" };
   }
   // #189: with --prices, the effective row for the first built-in provider that overrides the model.
   // A model-specific entry wins over another provider's "*" discount.

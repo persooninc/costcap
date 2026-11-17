@@ -27,7 +27,8 @@ import { loadLedgerLines, isSettlement } from "./cap.js";
 import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
-import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
+import { cloudCostWithOverrides, costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
+import { bedrockBaseId, bedrockCost, bedrockPriceRow, bedrockRate, converseServiceTier, isBedrockThirdParty } from "./bedrock-pricing.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { GEMINI_LIVE_PATH, geminiLiveUsage, isExplicitTurn, isTurnInput, setupModel } from "./gemini-live.js";
@@ -892,6 +893,16 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             cloudAuth = { region };
           }
         }
+        // #278: a non-Anthropic Bedrock model is priced from the request region's row (or a
+        // --upstream-prices `bedrock` entry); without one it stays unmapped (cloud_model_unpriced).
+        let bedrock3p = null;
+        if (provider === "bedrock" && isBedrockThirdParty(providerModel)) {
+          const baseId = bedrockBaseId(providerModel);
+          const rate = baseId ? bedrockRate(userPrices, baseId, cloudAuth?.region) : null;
+          bedrock3p = rate ? { baseId, rate } : null;
+          cloudModel = rate ? baseId : null;
+          requestedModel = cloudModel ?? providerModel ?? undefined;
+        }
         const batchCreate = batchCreateProvider(req.method, req.url);
         // #160: an Anthropic batch names its models per request; every one is checked.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
@@ -988,6 +999,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             // #188: cloud preflight prices the mapped path model, with the regional premium.
             const cloudPrice = cloud ? () => {
               if (!cloudModel) return null;
+              if (bedrock3p) return bedrockPriceRow(bedrock3p.rate, cloudModel);
               // #256: Gemini on Vertex is priced at the (pinned) request instant, with its own non-global premium.
               const g = cloudRoute.gemini === true;
               const rm = cloudRoute.scope === "regional" ? (g ? vertexGeminiRegionalMultiplier(cloudModel) : regionalMultiplier(cloudModel)) : null;
@@ -1282,6 +1294,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             recordSpend(receipt);
             velocity?.record(receipt.cost_usd);
             metered = null;
+          } else if (metered && cloudRoute?.converse && converseServiceTier(parsedBody)) {
+            // #278: Converse flex / priority / reserved tiers have no rate; unknown, never standard.
+            Object.assign(receipt, { model: cloudModel ?? providerModel ?? "unknown", cost_usd: null, reason: "service_tier_unpriced", service_tier: converseServiceTier(parsedBody) });
+            recordSpend(receipt);
+            failMsg = `Bedrock serviceTier ${converseServiceTier(parsedBody)} for ${providerModel} has no published rate. Restart only after reconciling this request.`;
           } else if (metered && cloud && !cloudModel) {
             // #188: an unmapped cloud model is unknown, never the fallback rate.
             Object.assign(receipt, { model: providerModel ?? "unknown", cost_usd: null, reason: "cloud_model_unpriced" });
@@ -1290,7 +1307,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (metered) {
             if (cloud) metered.model = cloudModel;
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
-              : cloud ? costForUsage(metered.model, metered.usage, cloudRoute.gemini === true
+              : bedrock3p ? bedrockCost(userPrices, bedrock3p.rate, metered.model, metered.usage)
+              : cloud ? cloudCostWithOverrides(userPrices, provider, [providerModel, metered.model], metered.usage, cloudRoute.gemini === true
                 ? { regional: cloudRoute.scope === "regional", vertex: true, at: priceAt }
                 : { regional: cloudRoute.scope === "regional", undated: true })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: priceAt }));

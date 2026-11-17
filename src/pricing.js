@@ -373,3 +373,9 @@ export function cacheStorageCost(model, tokens, start, end) {
   }
   return { cost_usd: Number(cost.toFixed(6)), storage_hours: Number(((e - s) / 3.6e6).toFixed(6)), ...pin };
 }
+
+// #278: non-Anthropic Bedrock rows ({id: {usagetype, regions: {region: rates}, source}}).
+export function bedrockModels() {
+  assertTableIntegrity();
+  return table.bedrock_models?.models ?? {};
+}
