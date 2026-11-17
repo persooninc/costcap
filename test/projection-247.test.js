@@ -134,3 +134,17 @@ test("regression AC4/AC6: hosted sweep fires team + tag projections once per per
   assert.ok((await listA()).filter((a) => a.kind === "cap_projected").every((a) => !a.active));
   assert.equal(proj().length, firedBefore, "nothing new fires in the fresh period without spend");
 });
+
+// #294 AC3: the /v1/spend forecast and the org cap_projected alert use the same projection.
+test("#294 AC3: spend forecast equals the org cap_projected projected value", async () => {
+  const { evaluateOrgAlerts } = await import("../src/hosted/alerts.js");
+  const { orgBudgetVerdict } = await import("../src/hosted/org-budget.js");
+  const { spendBreakdown } = await import("../src/hosted/spend.js");
+  const receiptsByAgent = { A: [{ id: "1", ts: "2026-11-02T00:00:00Z", cost_usd: 30 }], B: [{ id: "2", ts: "2026-11-05T00:00:00Z", cost_usd: 10 }] };
+  const verdict = orgBudgetVerdict({ budget: { month: 100 }, agentIds: ["A", "B"], receiptsByAgent, nowMs: DAY10 });
+  const alert = evaluateOrgAlerts({ orgId: "o", verdict, nowMs: DAY10 }).find((a) => a.key === "cap_projected:org:o:month");
+  const items = Object.entries(receiptsByAgent).flatMap(([agentId, rs]) => rs.map((receipt) => ({ agentId, receipt })));
+  const b = spendBreakdown(items, { groupBy: "agent", range: "current_month", since: Date.parse("2026-11-01T00:00:00Z"), now: DAY10 });
+  assert.equal(alert.projected, 120);
+  assert.equal(b.forecast.total.projected_usd, alert.projected);
+});

@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
-import { parseSpendQuery, spendBreakdown, spendCsv, NO_TEAM, SPEND_CSV_COLUMNS } from "../src/hosted/spend.js";
+import { parseSpendQuery, rangeStart, spendBreakdown, spendCsv, NO_TEAM, SPEND_CSV_COLUMNS } from "../src/hosted/spend.js";
 
 const DAY = 86_400_000;
 const NOW = Date.parse("2026-11-16T12:00:00Z");
@@ -302,4 +302,106 @@ test("#215 /v1/spend and /v1/spend.csv with range=current_month under an LA/15th
   assert.deepEqual(rows, ["2026-11,team,(no team),(no team),3,2,0,true,0"]);
   assert.equal((await f.request("/v1/spend?range=bogus", undefined, owner)).status, 400);
   assert.equal((await f.request("/v1/spend.csv?range=7d&since=2026-11-01", undefined, owner)).status, 400);
+});
+
+// #294: linear budget-month-end projection on /v1/spend (current budget month only).
+const DAY10 = Date.parse("2026-11-11T00:00:00Z");
+const MONTH = { range: "current_month", since: Date.parse("2026-11-01T00:00:00Z") };
+const FC = [
+  { agentId: "A", receipt: { id: "f1", ts: "2026-11-02T00:00:00Z", model: "m1", cost_usd: 30, tags: { customer: "acme" } } },
+  { agentId: "B", receipt: { id: "f2", ts: "2026-11-05T00:00:00Z", model: "m2", cost_usd: 10 } },
+  { agentId: "B", receipt: { id: "f0", ts: "2026-10-30T00:00:00Z", model: "m2", cost_usd: 500 } },
+];
+const fcOf = (b) => Object.fromEntries(b.buckets.map((r) => [r.key, [r.projected_usd, r.lower_bound]]));
+
+test("#294 AC1: month forecast, per-bucket projection, unknown sets lower_bound, settled counts", () => {
+  const b = spendBreakdown(FC, { ...MONTH, groupBy: "agent", now: DAY10 });
+  assert.equal(b.forecast.method, "linear");
+  assert.equal(b.forecast.period_start, "2026-11-01T00:00:00.000Z");
+  assert.equal(b.forecast.period_end, "2026-12-01T00:00:00.000Z");
+  assert.equal(b.forecast.period_end_local, "2026-12-01");
+  assert.equal(b.forecast.elapsed_fraction, 0.333333);
+  assert.deepEqual(b.forecast.total, { projected_usd: 120, lower_bound: false });
+  assert.equal(b.forecast.reason, null);
+  assert.deepEqual(fcOf(b), { A: [90, false], B: [30, false] });
+  const unk = { agentId: "B", receipt: { id: "u", ts: "2026-11-06T00:00:00Z", model: "m2", cost_usd: null } };
+  const lb = spendBreakdown([...FC, unk], { ...MONTH, groupBy: "agent", now: DAY10 });
+  assert.deepEqual(lb.forecast.total, { projected_usd: 120, lower_bound: true });
+  assert.deepEqual(fcOf(lb), { A: [90, false], B: [30, true] });
+  const st = spendBreakdown([...FC, { ...unk, settlement: { cost_usd: 2 } }], { ...MONTH, groupBy: "agent", now: DAY10 });
+  assert.deepEqual(st.forecast.total, { projected_usd: 126, lower_bound: false });
+  assert.deepEqual(fcOf(st).B, [36, false]);
+});
+
+test("#294 AC2: too_early before 24 h, null for other windows, retention_clamped", () => {
+  const early = Date.parse("2026-11-01T12:00:00Z");
+  const e = spendBreakdown(FC, { ...MONTH, groupBy: "agent", now: early });
+  assert.equal(e.forecast.total.projected_usd, null);
+  assert.equal(e.forecast.reason, "too_early");
+  assert.ok(e.buckets.every((r) => r.projected_usd === null));
+  for (const range of ["7d", "30d"]) assert.equal(spendBreakdown(FC, { groupBy: "agent", range, since: rangeStart(range, DAY10), now: DAY10 }).forecast, null);
+  assert.equal(spendBreakdown(FC, { groupBy: "agent", since: MONTH.since, now: DAY10 }).forecast, null);
+  assert.equal(spendBreakdown(FC, { ...MONTH, until: DAY10, groupBy: "agent", now: DAY10 }).forecast, null);
+  assert.equal(spendBreakdown(FC, { ...MONTH, groupBy: "agent" }).forecast, null);
+  const c = spendBreakdown(FC, { ...MONTH, groupBy: "agent", now: DAY10, cutoff: Date.parse("2026-11-03T00:00:00Z") });
+  assert.equal(c.forecast.reason, "retention_clamped");
+  assert.equal(c.forecast.total, null);
+  assert.ok(c.buckets.every((r) => !("projected_usd" in r)));
+});
+
+test("#294 AC4: LA budget month starting the 15th; team/tag/model buckets project, day/outcome don't", () => {
+  const bp = { timezone: "America/Los_Angeles", monthStartDay: 15 };
+  const now = Date.parse("2026-11-25T08:00:00Z"); // local Nov 25 00:00 PST, 10 of 30 days
+  const items = [
+    { agentId: "A", receipt: { id: "1", ts: "2026-11-16T00:00:00Z", model: "m", cost_usd: 30, tags: { customer: "acme" } } },
+    { agentId: "B", receipt: { id: "2", ts: "2026-11-14T00:00:00Z", model: "m", cost_usd: 99 } }, // local 13th: previous period
+  ];
+  const opts = { range: "current_month", since: rangeStart("current_month", now, bp), budgetPeriod: bp, now };
+  const t = spendBreakdown(items, { ...opts, groupBy: "team", teams: [{ name: "core", agents: ["A"] }] });
+  assert.equal(t.forecast.period_end_local, "2026-12-15");
+  assert.equal(t.forecast.period_start, "2026-11-15T08:00:00.000Z");
+  assert.equal(t.forecast.elapsed_fraction, 0.333333);
+  assert.equal(t.forecast.total.projected_usd, 90);
+  assert.equal(t.buckets.find((r) => r.key === "core").projected_usd, 90);
+  const tag = spendBreakdown(items, { ...opts, groupBy: "tag", tagKey: "customer" });
+  assert.equal(tag.buckets.find((r) => r.key === "acme").projected_usd, 90);
+  assert.equal(spendBreakdown(items, { ...opts, groupBy: "model" }).buckets[0].projected_usd, 90);
+  for (const g of ["day", "outcome"]) {
+    const r = spendBreakdown(items, { ...opts, groupBy: g });
+    assert.equal(r.forecast.total.projected_usd, 90, g);
+    assert.ok(r.buckets.every((x) => !("projected_usd" in x)), g);
+  }
+});
+
+test("#294 GET /v1/spend forecast: viewer sees same values, other orgs don't change them, 7d is null", async (t) => {
+  const f = await serve(t);
+  f.setNow(DAY10);
+  const owner = await f.login("fc-owner@example.invalid");
+  const outsider = await f.login("fc-outsider@example.invalid");
+  const a = await f.agent(owner, "A"), b = await f.agent(owner, "B"), o = await f.agent(outsider, "theirs");
+  await f.request("/v1/receipts", { receipts: [{ id: "f1", ts: "2026-11-02T00:00:00Z", cost_usd: 30, model: "m" }] }, null, a.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "f2", ts: "2026-11-05T00:00:00Z", cost_usd: 10, model: "m" }, { id: "u", ts: "2026-11-06T00:00:00Z", cost_usd: null, model: "m" }] }, null, b.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "x", ts: "2026-11-05T00:00:00Z", cost_usd: 1000, model: "m" }] }, null, o.token);
+  const r = (await f.request("/v1/spend?group_by=agent&range=current_month", undefined, owner)).body;
+  assert.deepEqual(r.forecast.total, { projected_usd: 120, lower_bound: true });
+  assert.equal(r.forecast.period_end, "2026-12-01T00:00:00.000Z");
+  assert.deepEqual(r.buckets.map((x) => [x.label, x.projected_usd, x.lower_bound]), [["A", 90, false], ["B", 30, true]]);
+  await f.request("/v1/receipts/u/settle", { agent_id: b.agentId, cost_usd: 2, source: "manual_evidence", reason: "invoice" }, owner);
+  await f.request("/v1/invitations", { email: "fc-viewer@example.invalid", role: "viewer" }, owner);
+  const viewer = await f.login("fc-viewer@example.invalid");
+  const v = (await f.request("/v1/spend?group_by=agent&range=current_month", undefined, viewer)).body;
+  assert.deepEqual(v.forecast.total, { projected_usd: 126, lower_bound: false });
+  assert.equal((await f.request("/v1/spend?group_by=agent&range=7d", undefined, owner)).body.forecast, null);
+  assert.equal((await f.request("/v1/spend?group_by=agent&since=2026-11-01", undefined, owner)).body.forecast, null);
+});
+
+test("#294 GET /v1/spend forecast is retention_clamped when the plan cuts into the budget month", async (t) => {
+  const f = await serve(t, { enforceEntitlements: true, billingFactory: async () => ({ status: async () => ({ status: "free_beta" }), checkout: async () => ({}), portal: async () => ({}), webhook: async () => ({ received: true }) }) });
+  f.setNow(Date.parse("2026-12-31T12:00:00Z")); // free 30-day retention starts Dec 1 12:00
+  const owner = await f.login("fc-ret@example.invalid");
+  await f.agent(owner, "A");
+  const r = (await f.request("/v1/spend?group_by=agent&range=current_month", undefined, owner)).body;
+  assert.equal(r.retention_clamped, true);
+  assert.equal(r.forecast.reason, "retention_clamped");
+  assert.equal(r.forecast.total, null);
 });

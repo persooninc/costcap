@@ -8,6 +8,8 @@ New emails create separate organizations. Shared email domains are not membershi
 
 Per-model caps (#244): an agent's `modelCaps` (set by API) are enforced fleet-wide for `day` and `month` from the per-model spend that `GET /v1/policy` ships in `agent_spend.models`, in the org budget period. The agent card's "Model caps" line shows fleet spend against each cap (`claude-opus-4-8 day $4.10 / $5`), and the Alerts list shows per-model `cap_approaching`/`cap_hit` entries (`<agent> · model <id> <scope>`). `hour` rules stay local to each host.
 
+Spend forecast (#294): with "This month" selected, the Spend card total adds "Projected by <budget-month end>: $X at the current pace" (`≥` when unknown-cost receipts are unsettled; "Projection available after the first 24 h of the budget month" before then), and agent, team, model and tag rows add "→ $P projected". The figure is a linear estimate from `/v1/spend` `forecast` (the same projection as `cap_projected` alerts), not a bill. "Last 7 days" and "Last 30 days" show no projection.
+
 Receipt-based caps may overshoot by one accepted request. Freeze/resume is policy sync: offline agents retain the last-known policy and cannot receive a new remote freeze until reconnecting. Only proxy-routed traffic is enforced. The dashboard shows synced reported costs and separately counts unknown-cost receipts; it is not a provider bill.
 
 Deployment: retain /opt/costcap/data, apply the completed private env, build/recreate the Docker container, then check /health, /, /ui/config and a real challenge + email-code login. Local test challenges are fixture-only and never enabled by the production launcher.
