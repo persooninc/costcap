@@ -9,8 +9,9 @@ const accept = (key) => createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA
 /**
  * startRealtimeUpstream({ onSession(conn, req) }) -> { url, port, upgrades, requests, sessions, close }.
  * conn.send(obj | Buffer raw) writes server frames; conn.received holds client messages; conn.closed resolves on close.
+ * #273: onMessage(conn, msg) sees each client text message (GPT-Live /v1/live/sessions sessions).
  */
-export async function startRealtimeUpstream({ onSession = () => {}, reject = null } = {}) {
+export async function startRealtimeUpstream({ onSession = () => {}, onMessage = () => {}, reject = null } = {}) {
   const state = { upgrades: 0, requests: 0, sessions: [], handshakes: [] };
   // Plain HTTP calls (e.g. chat completions) get a small metered body so one host serves both.
   const server = http.createServer((req, res) => {
@@ -34,7 +35,7 @@ export async function startRealtimeUpstream({ onSession = () => {}, reject = nul
     socket.on("data", (b) => {
       for (const f of parser.push(b)) {
         conn.frames.push(f);
-        if (f.message?.opcode === 1) conn.received.push(JSON.parse(f.message.data.toString()));
+        if (f.message?.opcode === 1) { const m = JSON.parse(f.message.data.toString()); conn.received.push(m); onMessage(conn, m); }
         if (f.opcode === 8 && !socket.destroyed) socket.end();
       }
     });

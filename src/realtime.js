@@ -3,6 +3,8 @@
 // and complete text messages are parsed to meter `response.done` usage.
 
 export const REALTIME_PATH = /^\/openai\/v1\/realtime\/?$/;
+// #273: GPT-Live WebSocket sessions (exact path; /live/sessions/{id}/fork stays 501).
+export const LIVE_PATH = /^\/openai\/v1\/live\/sessions\/?$/;
 
 import { randomBytes } from "node:crypto";
 

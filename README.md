@@ -109,6 +109,29 @@ A response cut before `response.done`, audio on a model with no audio rate
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
 pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
 
+#### GPT-Live sessions
+
+`wrap` also exports `COSTCAP_OPENAI_LIVE_URL` (`ws://127.0.0.1:PORT/openai/v1/live/sessions`).
+GPT-Live (`gpt-live-1`, $0.05/minute) bills session time per second, silence included.
+
+- **Admission:** the model in the first `session.start` is checked against `--models` and
+  `--unknown-models refuse` before it is forwarded. A refused session gets an `error` event,
+  close `1008` and a `$0` blocked receipt.
+- **Metering:** each `session.usage.updated` snapshot and the final `session.closed` write
+  one receipt for the seconds since the last billed snapshot (`cost_basis: "duration"`,
+  `billed_seconds`, `session_seconds`). A snapshot that goes backwards bills 0. Backend
+  model usage (`response.completed` inside `response.event`) is priced once per response id.
+- **Caps:** after each metered event the caps are re-checked; a 1 s ticker also estimates the
+  session from wall time since the last snapshot (never written as spend). On a hit CostCap
+  sends `session.close` upstream, waits up to 5 s for `session.closed`, bills the final
+  seconds and closes the client with `1008`. `costcap kill` closes the session within 1 s.
+- **Unknowns:** if the client drops, CostCap closes the session itself and bills the final
+  duration. Only a missing `session.closed` records one `session_usage_unconfirmed` receipt
+  with `session_seconds_lower_bound`, which pauses the run until settled.
+
+WebRTC/SIP sessions (`POST /v1/live/sessions`) carry media outside the proxy and stay
+`usage_unavailable`; `/live/sessions/{id}/fork` upgrades get `501`.
+
 ### Other OpenAI-compatible providers
 
 Groq, DeepSeek, Together, Mistral, a self-hosted vLLM/Ollama server or an Azure

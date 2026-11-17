@@ -753,3 +753,15 @@ test("#254 AC1/AC3/AC5: web_fetch is token-only; code_execution is free only wit
     }
   }
 });
+
+// #273 AC7: adding /openai/v1/live/sessions leaves chat-path upgrades on 501 and realtime unchanged.
+test("#273 chat-path upgrade still 501 after GPT-Live support", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream();
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url } });
+  t.after(async () => { server.close(); await up.close(); });
+  const c = await connectRealtime(port, "/openai/v1/chat/completions");
+  assert.equal(c.status, 501);
+  assert.match(c.body.message, /live\/sessions/);
+  assert.equal(up.upgrades, 0);
+});

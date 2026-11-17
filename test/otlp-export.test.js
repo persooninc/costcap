@@ -45,6 +45,7 @@ test("unknown cost omits gen_ai.usage.cost; blocked and >=400 are ERROR", () => 
 
 test("operation names", () => {
   assert.equal(operationName("/v1/embeddings"), "embeddings");
+  assert.equal(operationName("/v1/live/sessions"), "live"); // #273
   assert.equal(operationName("/v1beta/models/gemini:generateContent?key=REDACTED"), "generate_content");
   assert.equal(operationName("/v1/completions"), "text_completion");
   assert.equal(operationName("/v1/messages"), "chat");

@@ -55,6 +55,7 @@ export function operationName(path = "") {
   if (/:(stream)?generateContent$/.test(p)) return "generate_content";
   if (/\/completions$/.test(p)) return "text_completion";
   if (/\/realtime$/.test(p)) return "realtime";
+  if (/\/live\/sessions$/.test(p)) return "live";
   const last = p.split("/").filter(Boolean).pop() ?? "call";
   return last.replace(/^.*:/, "") || "call";
 }

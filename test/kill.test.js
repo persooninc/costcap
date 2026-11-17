@@ -205,3 +205,27 @@ test("#194 kill closes an open Realtime session mid-stream and refuses new hands
   assert.equal(again.status, 429);
   assert.equal(up.upgrades, 1);
 });
+
+test("#273 kill closes a GPT-Live session within 1 s and still bills its final seconds", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream({ onMessage: (conn, m) => {
+    if (m.type === "session.start") conn.send({ type: "session.started", session: { id: "ls", model: "gpt-live-1" } });
+    if (m.type === "session.close") conn.send({ type: "session.closed", usage: { seconds: 6 } });
+  } });
+  const f = join(mkdtempSync(join(tmpdir(), "cc-")), "KILL");
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url }, killCheck: createKillCheck(f), onReceipt: (r) => receipts.push(r) });
+  t.after(async () => { server.close(); await up.close(); });
+  const c = await connectRealtime(port, "/openai/v1/live/sessions");
+  c.send({ type: "session.start", session: { model: "gpt-live-1" } });
+  await c.waitFor((m) => m.type === "session.started");
+  const t0 = Date.now();
+  kill(f, "stop");
+  await c.closed;
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(c.closeCode, 1008);
+  const t1 = Date.now();
+  while (!receipts.some((r) => r.billed_seconds === 6) && Date.now() - t1 < 3000) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(receipts.find((r) => r.billed_seconds === 6).cost_usd, 0.005);
+  assert.ok(receipts.some((r) => r.blocked && r.reason === "killed" && r.path === "/v1/live/sessions"));
+});
