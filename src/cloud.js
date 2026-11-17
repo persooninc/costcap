@@ -69,6 +69,50 @@ export function converseUsage(u) {
     ...(u.cacheWriteInputTokens != null && { cache_creation_input_tokens: u.cacheWriteInputTokens }) };
 }
 
+/**
+ * #288: usage from a non-Anthropic Bedrock InvokeModel response, in Anthropic Messages shape, or null.
+ * Accepts the native body shapes (Nova `usage.inputTokens`, Llama `prompt_token_count`, OpenAI-style
+ * `usage.prompt_tokens` for gpt-oss / DeepSeek / Qwen / Mistral chat), a stream's final
+ * `amazon-bedrock-invocationMetrics`, or the `X-Amzn-Bedrock-*-Token-Count` response headers.
+ */
+const isCount = (v) => Number.isInteger(v) && v >= 0;
+const cacheFields = (read, write) => {
+  if ((read != null && !isCount(read)) || (write != null && !isCount(write))) return undefined;
+  return { ...(read != null && { cache_read_input_tokens: read }), ...(write != null && { cache_creation_input_tokens: write }) };
+};
+export function invocationMetricsUsage(m) {
+  if (!m || typeof m !== "object" || !isCount(m.inputTokenCount) || !isCount(m.outputTokenCount)) return null;
+  const c = cacheFields(m.cacheReadInputTokenCount, m.cacheWriteInputTokenCount);
+  return c ? { input_tokens: m.inputTokenCount, output_tokens: m.outputTokenCount, ...c } : null;
+}
+export function bedrockInvokeBodyUsage(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const u = body.usage;
+  if (u && typeof u === "object" && (u.inputTokens != null || u.outputTokens != null)) {
+    if (!isCount(u.inputTokens) || !isCount(u.outputTokens)) return null;
+    const c = cacheFields(u.cacheReadInputTokenCount ?? u.cacheReadInputTokens, u.cacheWriteInputTokenCount ?? u.cacheWriteInputTokens);
+    return c ? { input_tokens: u.inputTokens, output_tokens: u.outputTokens, ...c } : null;
+  }
+  if (u && typeof u === "object" && (u.prompt_tokens != null || u.completion_tokens != null)) {
+    const cached = u.prompt_tokens_details?.cached_tokens ?? 0;
+    if (!isCount(u.prompt_tokens) || !isCount(u.completion_tokens) || !isCount(cached) || cached > u.prompt_tokens) return null;
+    return { input_tokens: u.prompt_tokens - cached, output_tokens: u.completion_tokens, ...(cached > 0 && { cache_read_input_tokens: cached }) };
+  }
+  if (body.prompt_token_count != null || body.generation_token_count != null) {
+    if (!isCount(body.prompt_token_count) || !isCount(body.generation_token_count)) return null;
+    return { input_tokens: body.prompt_token_count, output_tokens: body.generation_token_count };
+  }
+  return invocationMetricsUsage(body["amazon-bedrock-invocationMetrics"]);
+}
+export function bedrockHeaderUsage(headers) {
+  const get = (k) => { const v = headers?.get?.(k); return v == null || !/^\d+$/.test(v) ? (v == null ? undefined : NaN) : Number(v); };
+  const input = get("x-amzn-bedrock-input-token-count"), output = get("x-amzn-bedrock-output-token-count");
+  if (!isCount(input) || !isCount(output)) return null;
+  const read = get("x-amzn-bedrock-cache-read-input-token-count"), write = get("x-amzn-bedrock-cache-write-input-token-count");
+  const c = cacheFields(read, write);
+  return c ? { input_tokens: input, output_tokens: output, ...c } : null;
+}
+
 /** Real upstream origin for a Vertex location. */
 export function vertexHost(location) {
   return location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;

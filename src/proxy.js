@@ -29,7 +29,7 @@ import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { cloudCostWithOverrides, costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
 import { bedrockBaseId, bedrockCost, bedrockPriceRow, bedrockRate, converseServiceTier, isBedrockThirdParty } from "./bedrock-pricing.js";
-import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
+import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHeaderUsage, bedrockHost, bedrockInvokeBodyUsage, classifyCloudRoute, converseUsage, invocationMetricsUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { GEMINI_LIVE_PATH, geminiLiveUsage, isExplicitTurn, isTurnInput, setupModel } from "./gemini-live.js";
 import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "./live.js";
@@ -555,6 +555,39 @@ export function extractConverseUsage(text, requestedModel) {
   const acc = createUsageAccumulator("anthropic", requestedModel);
   acc.add({ usage: u });
   return acc.result();
+}
+
+/**
+ * #288: a non-Anthropic Bedrock InvokeModel response. Native body usage first, else the
+ * X-Amzn-Bedrock token-count headers; neither is null (usage_unavailable).
+ */
+export function extractBedrockInvokeUsage(text, headers, requestedModel) {
+  let body = null;
+  try { body = JSON.parse(text); } catch { /* fall through to headers */ }
+  const u = bedrockInvokeBodyUsage(body) ?? bedrockHeaderUsage(headers);
+  if (!u) return null;
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  acc.add({ usage: u });
+  return acc.result();
+}
+
+/** #288: invoke-with-response-stream for a non-Anthropic model, priced from the final chunk's invocationMetrics. */
+export function createBedrockInvokeStreamUsageParser(requestedModel) {
+  const acc = createUsageAccumulator("anthropic", requestedModel);
+  let seen = false, bad = false;
+  const decoder = createEventStreamDecoder((event) => {
+    const m = event?.["amazon-bedrock-invocationMetrics"];
+    if (m === undefined) return;
+    const u = invocationMetricsUsage(m);
+    if (!u || seen) { bad = true; return; }
+    seen = true;
+    acc.add({ usage: u });
+  });
+  return {
+    push(bytes) { decoder.push(bytes); },
+    end() { return seen && !bad ? acc.result() : null; },
+    get incomplete() { return decoder.corrupt || decoder.partial || !seen || bad || !acc.result(); },
+  };
 }
 
 // Bedrock/Vertex errors are {message} or {error:{...}} objects with no usage.
@@ -1138,11 +1171,13 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const bgCreate = firstPartyOpenAI && isResponsesCreate(req.method, req.url) && requestsBackground(body);
           const bgRead = firstPartyOpenAI ? responsesReadPath(req.method, req.url) : null;
           const tracker = bgCreate || bgRead ? createResponsesStreamTracker() : null;
+          // #288: non-Anthropic Bedrock InvokeModel bodies are not Anthropic Messages.
+          const bedrockInvokeThirdParty = provider === "bedrock" && !cloudRoute?.converse && isBedrockThirdParty(providerModel);
           const eventStream = cloud && /^application\/vnd\.amazon\.eventstream/i.test(contentType);
           if ((/^text\/event-stream/i.test(contentType) || eventStream) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             // #188: Bedrock eventstream frames are forwarded byte-for-byte and decoded on the side.
-            const parser = eventStream ? (cloudRoute?.converse ? createConverseStreamUsageParser(requestedModel) : createEventStreamUsageParser(requestedModel)) : createSseUsageParser(meterAs, requestedModel, { images: req.method === "POST" && isImagesPath(req.url) });
+            const parser = eventStream ? (cloudRoute?.converse ? createConverseStreamUsageParser(requestedModel) : bedrockInvokeThirdParty ? createBedrockInvokeStreamUsageParser(requestedModel) : createEventStreamUsageParser(requestedModel)) : createSseUsageParser(meterAs, requestedModel, { images: req.method === "POST" && isImagesPath(req.url) });
             const decoder = new TextDecoder();
             arm(streamIdleMs);
             const filter = injected ? createUsageChunkFilter() : null;
@@ -1189,7 +1224,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = cloudRoute?.converse ? extractConverseUsage(raw.toString("utf8"), requestedModel) : extractUsage(meterAs, raw.toString("utf8"), requestedModel,
+            metered = cloudRoute?.converse ? extractConverseUsage(raw.toString("utf8"), requestedModel)
+              : bedrockInvokeThirdParty ? extractBedrockInvokeUsage(raw.toString("utf8"), upstreamRes.headers, requestedModel) ?? extractUsage("anthropic", raw.toString("utf8"), requestedModel) : extractUsage(meterAs, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url), images: req.method === "POST" && isImagesPath(req.url) });
           }
           if (meterAs === "gemini" && metered?.usage) {

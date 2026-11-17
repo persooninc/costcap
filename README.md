@@ -277,7 +277,13 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   List. The rate is the request region's row (the SigV4 region, else `AWS_REGION` /
   `AWS_DEFAULT_REGION`); a geo profile (`us.` / `eu.` / `apac.` …) bills at that source region, and the
   Claude 10% regional premium never applies. `costcap pricing show amazon.nova-pro-v1:0` prints every
-  region. These stay `cloud_model_unpriced` (run pauses, never the fallback): an unlisted id, a region
+  region. InvokeModel (#288) reads the model's native body usage (Nova `usage.inputTokens` /
+  `cacheReadInputTokenCount`, Llama `prompt_token_count` / `generation_token_count`, OpenAI-style
+  `usage.prompt_tokens` for gpt-oss / DeepSeek / Qwen), else the `X-Amzn-Bedrock-Input-Token-Count` /
+  `-Output-Token-Count` response headers (Mistral); `invoke-with-response-stream` is priced from the
+  final chunk's `amazon-bedrock-invocationMetrics`, and a stream cut before it is `stream_incomplete`.
+  An invoke response with neither body usage nor token headers is `usage_unavailable` (run pauses).
+  These stay `cloud_model_unpriced` (run pauses, never the fallback): an unlisted id, a region
   with no row, a `global.` profile, an ARN, or a usage component with no rate (e.g. cache writes).
   A Converse `serviceTier.type` other than `default` is `service_tier_unpriced`.
 - **`bedrock` / `vertex` keys in `--upstream-prices`.** Same rules as the other built-in keys
