@@ -12,7 +12,7 @@ const team = { name: "ops", agents: ["a", "b"], day: 10 };
 test("teamVerdict: a synced pending batch is pending, not unknown; the synced team policy does not refuse", () => {
   const v = teamVerdict({ team, receiptsByAgent: { a: [pb], b: [{ id: "k", ts: pb.ts, cost_usd: 1 }] }, nowMs: NOW });
   assert.equal(v.verdict, "ok");
-  assert.deepEqual(v.spend, { day_usd: 1, month_usd: 1, unknown_count: 0, pending_batch_count: 1, cost_complete: false });
+  assert.deepEqual(v.spend, { day_usd: 1, week_usd: 1, month_usd: 1, unknown_count: 0, pending_batch_count: 1, cost_complete: false });
   const cached = teamPolicy(v, NOW);
   assert.equal(cached.unknown, 0);
   assert.equal(cachedTeamVerdict(cached, [], NOW), null);

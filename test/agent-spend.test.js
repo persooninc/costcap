@@ -24,7 +24,7 @@ test("unit: agentSpendPolicy sums known costs per UTC window, counts unknowns, s
     { id: "f", ts: "2026-10-01T03:00:00Z", cost_usd: null },
     { id: "g", ts: "bogus", cost_usd: 1 }, null,
   ], NOW);
-  assert.deepEqual(p, { spent: { day: 0.5, month: 0.75 }, unknown: 1, pending_batches: 0, as_of: "2026-11-15T12:00:00.000Z" });
+  assert.deepEqual(p, { spent: { day: 0.5, week: 0.75, month: 0.75 }, unknown: 1, pending_batches: 0, as_of: "2026-11-15T12:00:00.000Z" });
   assert.equal(validAgentSpend(p), true);
 });
 
@@ -147,12 +147,12 @@ test("hosted: GET /v1/policy returns org-scoped agent_spend from synced receipts
   await h.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 0.7 }, { id: "r2", ts, cost_usd: 0.5 }, { id: "r3", ts, cost_usd: 3, blocked: true }] }, null, agentA.token);
   await h.request("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 50 }, { id: "rn", ts, cost_usd: null }] }, null, agentB.token);
   const pa = (await h.request("/v1/policy", undefined, null, agentA.token)).body;
-  assert.deepEqual(pa.agent_spend.spent, { day: 1.2, month: 1.2 });
+  assert.deepEqual(pa.agent_spend.spent, { day: 1.2, week: 1.2, month: 1.2 });
   assert.equal(pa.agent_spend.unknown, 0);
   assert.ok(Number.isFinite(Date.parse(pa.agent_spend.as_of)));
   assert.equal(pa.team, null);
   const pb = (await h.request("/v1/policy", undefined, null, agentB.token)).body;
-  assert.deepEqual(pb.agent_spend.spent, { day: 50, month: 50 });
+  assert.deepEqual(pb.agent_spend.spent, { day: 50, week: 50, month: 50 });
   assert.equal(pb.agent_spend.unknown, 1);
 });
 

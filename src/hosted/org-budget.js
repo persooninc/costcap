@@ -3,11 +3,11 @@
 // later and revoked agents' past spend. The verdict reuses teamVerdict (and so
 // the local agent-budget engine): unknown cost (cost_usd: null) makes the
 // verdict accounting_unavailable, never $0; pending batches are pending (#183).
-import { teamVerdict, cachedTotals, TEAM_SCOPES } from "./teams.js";
+import { teamVerdict, cachedTotals } from "./teams.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 const round6 = (n) => Number(n.toFixed(6));
-export const ORG_SCOPES = TEAM_SCOPES;
+export const ORG_SCOPES = Object.freeze(["day", "month"]); // no org week cap yet (#261 Out)
 export const orgScope = (scope) => `org:${scope}`;
 const FIELDS = ["day", "month", "warnFractions"];
 

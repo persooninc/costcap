@@ -3,7 +3,8 @@
 // server schedules and delivers. Unknown cost is never shown as $0: totals that
 // miss unknown-cost receipts carry lower_bound and read "at least $X".
 
-import { normalizeBudgetPeriod, localParts, zonedMidnight, periodBounds } from "../period.js";
+import { normalizeBudgetPeriod, localParts, zonedMidnight, periodBounds, weekLabel, parseWeek, weekBounds, mondayOf } from "../period.js";
+export { weekLabel, parseWeek, weekBounds };
 import { spendBreakdown, NO_TEAM } from "./spend.js";
 import { effectiveCaps } from "./policy.js";
 
@@ -39,43 +40,6 @@ export function resolveDigest(saved, input = {}) {
   return { enabled: base.enabled, weekday: base.weekday, hour: base.hour, channels: DIGEST_CHANNELS.filter((c) => base.channels.includes(c)) };
 }
 
-// ISO week (Monday start) of a local calendar date.
-function isoWeek(year, month, day) {
-  const d = Date.UTC(year, month - 1, day);
-  const dow = (new Date(d).getUTCDay() + 6) % 7;
-  const thursday = new Date(d + (3 - dow) * DAY);
-  const y = thursday.getUTCFullYear();
-  const week = 1 + Math.floor((thursday.getTime() - Date.UTC(y, 0, 1)) / DAY / 7);
-  return `${y}-W${String(week).padStart(2, "0")}`;
-}
-/** ISO week label (YYYY-Www) of instant ms in the timezone. */
-export function weekLabel(ms, timezone = "UTC") {
-  const { year, month, day } = localParts(ms, timezone);
-  return isoWeek(year, month, day);
-}
-// UTC date (ms at 00:00Z) of the Monday of an ISO week.
-function mondayOf(year, week) {
-  const jan4 = Date.UTC(year, 0, 4);
-  return jan4 - ((new Date(jan4).getUTCDay() + 6) % 7) * DAY + (week - 1) * 7 * DAY;
-}
-/** { year, week } for a valid YYYY-Www label, else null. */
-export function parseWeek(label) {
-  const m = /^(\d{4})-W(\d{2})$/.exec(String(label ?? ""));
-  if (!m) return null;
-  const year = Number(m[1]), week = Number(m[2]);
-  if (week < 1 || week > 53) return null;
-  const mon = new Date(mondayOf(year, week));
-  if (isoWeek(mon.getUTCFullYear(), mon.getUTCMonth() + 1, mon.getUTCDate()) !== label) return null;
-  return { year, week };
-}
-/** { weekStart, weekEnd } UTC ms (end exclusive): local Monday midnight to the next, DST-safe. */
-export function weekBounds(label, timezone = "UTC") {
-  const p = parseWeek(label);
-  if (!p) throw Object.assign(new Error("week must be YYYY-Www"), { status: 400 });
-  const mon = new Date(mondayOf(p.year, p.week));
-  const [y, m, d] = [mon.getUTCFullYear(), mon.getUTCMonth() + 1, mon.getUTCDate()];
-  return { weekStart: zonedMidnight(y, m, d, timezone), weekEnd: zonedMidnight(y, m, d + 7, timezone) };
-}
 export const previousWeek = (label, timezone = "UTC") => weekLabel(weekBounds(label, timezone).weekStart - 1, timezone);
 
 // Instant of local wall time y-m-d h:00 (overflowing day normalized).

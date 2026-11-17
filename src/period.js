@@ -71,9 +71,49 @@ function monthStart(ms, bp) {
   return month === 1 ? { year: year - 1, month: 12 } : { year, month: month - 1 };
 }
 
-// "day" -> local YYYY-MM-DD; "month" -> YYYY-MM of the period's start month.
+// Issue #261 (moved from the #224 digest): ISO weeks, Monday start, in the org timezone.
+const DAY_MS = 86_400_000;
+function isoWeek(year, month, day) {
+  const d = Date.UTC(year, month - 1, day);
+  const dow = (new Date(d).getUTCDay() + 6) % 7;
+  const thursday = new Date(d + (3 - dow) * DAY_MS);
+  const y = thursday.getUTCFullYear();
+  const week = 1 + Math.floor((thursday.getTime() - Date.UTC(y, 0, 1)) / DAY_MS / 7);
+  return `${y}-W${pad(week)}`;
+}
+/** ISO week label (YYYY-Www) of instant ms in the timezone. */
+export function weekLabel(ms, timezone = "UTC") {
+  const { year, month, day } = localParts(ms, timezone);
+  return isoWeek(year, month, day);
+}
+export function mondayOf(year, week) {
+  const jan4 = Date.UTC(year, 0, 4);
+  return jan4 - ((new Date(jan4).getUTCDay() + 6) % 7) * DAY_MS + (week - 1) * 7 * DAY_MS;
+}
+/** { year, week } for a valid YYYY-Www label, else null. */
+export function parseWeek(label) {
+  const m = /^(\d{4})-W(\d{2})$/.exec(String(label ?? ""));
+  if (!m) return null;
+  const year = Number(m[1]), week = Number(m[2]);
+  if (week < 1 || week > 53) return null;
+  const mon = new Date(mondayOf(year, week));
+  if (isoWeek(mon.getUTCFullYear(), mon.getUTCMonth() + 1, mon.getUTCDate()) !== label) return null;
+  return { year, week };
+}
+/** { weekStart, weekEnd } UTC ms (end exclusive): local Monday midnight to the next, DST-safe. */
+export function weekBounds(label, timezone = "UTC") {
+  const p = parseWeek(label);
+  if (!p) throw Object.assign(new Error("week must be YYYY-Www"), { status: 400 });
+  const mon = new Date(mondayOf(p.year, p.week));
+  const [y, m, d] = [mon.getUTCFullYear(), mon.getUTCMonth() + 1, mon.getUTCDate()];
+  return { weekStart: zonedMidnight(y, m, d, timezone), weekEnd: zonedMidnight(y, m, d + 7, timezone) };
+}
+
+// "day" -> local YYYY-MM-DD; "week" -> ISO YYYY-Www (#261, monthStartDay ignored);
+// "month" -> YYYY-MM of the period's start month.
 export function periodKey(scope, ms, budgetPeriod) {
   const bp = normalizeBudgetPeriod(budgetPeriod);
+  if (scope === "week") return weekLabel(ms, bp.timezone);
   if (bp === DEFAULT_BUDGET_PERIOD) { const iso = new Date(ms).toISOString(); return scope === "month" ? iso.slice(0, 7) : iso.slice(0, 10); }
   if (scope === "month") { const m = monthStart(ms, bp); return `${m.year}-${pad(m.month)}`; }
   const { year, month, day } = localParts(ms, bp.timezone);
@@ -83,6 +123,7 @@ export function periodKey(scope, ms, budgetPeriod) {
 // { start, end } UTC ms of the day/month period containing ms (end exclusive).
 export function periodBounds(scope, ms, budgetPeriod) {
   const bp = normalizeBudgetPeriod(budgetPeriod);
+  if (scope === "week") { const b = weekBounds(weekLabel(ms, bp.timezone), bp.timezone); return { start: b.weekStart, end: b.weekEnd }; }
   if (scope === "month") {
     const m = monthStart(ms, bp);
     return { start: zonedMidnight(m.year, m.month, bp.monthStartDay, bp.timezone), end: zonedMidnight(m.year, m.month + 1, bp.monthStartDay, bp.timezone) };
@@ -92,3 +133,7 @@ export function periodBounds(scope, ms, budgetPeriod) {
 }
 
 export const samePeriod = (scope, aMs, bMs, budgetPeriod) => periodKey(scope, aMs, budgetPeriod) === periodKey(scope, bMs, budgetPeriod);
+
+// #261: receipts that can count toward any day/week/month window at nowMs. A week
+// can start in the previous month, so this is the current month OR the current week.
+export const inSpendWindow = (tsMs, nowMs, budgetPeriod) => samePeriod("month", tsMs, nowMs, budgetPeriod) || samePeriod("week", tsMs, nowMs, budgetPeriod);

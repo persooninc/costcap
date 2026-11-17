@@ -3,9 +3,9 @@
 // drift. An unknown cost (cost_usd: null) is never treated as $0.
 import { createAgentBudgets, budgetRemaining } from "../agent-budget.js";
 import { effectiveCaps } from "./policy.js";
-import { periodKey } from "../period.js";
+import { inSpendWindow } from "../period.js";
 
-const HOSTED_SCOPES = ["day", "month"];
+const HOSTED_SCOPES = ["day", "week", "month"];
 
 // agent: { id, policy: { caps, killed }, revoked }
 // receipts: stored receipt objects for that agent ({ id, ts, cost_usd, blocked? })
@@ -14,7 +14,6 @@ const HOSTED_SCOPES = ["day", "month"];
 // cap applies first, then the team's shared spend.
 export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team = null, orgBudget = null, budgetPeriod = null }) {
   const nowDate = new Date(nowMs);
-  const month = periodKey("month", nowMs, budgetPeriod);
   const who = { agent_id: agent.id, run_id: runId };
   const limits = {};
   // #208: an active cap raise applies until its expires_at, then the base cap again.
@@ -25,11 +24,11 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};
   // Only receipts in the widest window (this budget-period month, #209) count, unknown ones included.
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && periodKey("month", Date.parse(r.ts), budgetPeriod) === month)
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
   const remaining = budgetRemaining(budgets, who);
-  const budget_remaining = remaining && { day_usd: remaining.day_usd, month_usd: remaining.month_usd };
+  const budget_remaining = remaining && { day_usd: remaining.day_usd, ...("week_usd" in remaining ? { week_usd: remaining.week_usd } : {}), month_usd: remaining.month_usd };
   let hit;
   if (agent.revoked) hit = { verdict: "revoked", reason: "agent_revoked", ...who };
   else if (agent.policy?.killed) hit = { verdict: "killed", reason: "policy_killed", ...who };

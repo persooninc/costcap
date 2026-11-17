@@ -29,7 +29,9 @@ export function verifyToken(token, storedHash) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export const CAP_KEYS = ["run", "hour", "day", "month"];
+export const CAP_KEYS = ["run", "hour", "day", "week", "month"];
+// Scopes a time-boxed cap raise (#208) can target; week raises are out of scope (#261 Out).
+export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "week");
 
 // Issue #208/#212: time-boxed cap raise overlay. policy.raise = { <scope>: [{ amount_usd, expires_at, request_id }, ...] }.
 // Raises stack: the effective cap is computed at evaluation time as current base + sum of
@@ -50,7 +52,7 @@ export function raiseError(raise) {
   if (raise === undefined || raise === null) return null;
   if (typeof raise !== "object" || Array.isArray(raise)) return "raise must be an object";
   for (const [k, v] of Object.entries(raise)) {
-    if (!CAP_KEYS.includes(k)) return `raise.${k} is not a cap scope`;
+    if (!RAISE_KEYS.includes(k)) return `raise.${k} is not a cap scope`;
     if (Array.isArray(v)) {
       if (!v.length) return `raise.${k} must be a non-empty array`;
       for (const r of v) if (raiseEntryError(r) || !(typeof r.amount_usd === "number" && Number.isFinite(r.amount_usd) && r.amount_usd > 0)) return `raise.${k} entries must be { amount_usd, expires_at, request_id }`;
@@ -95,6 +97,9 @@ export function validatePolicy(p) {
   const errors = [];
   if (!p || typeof p !== "object") return ["policy must be an object"];
   if (!Number.isInteger(p.version) || p.version < 1) errors.push("version must be a positive integer");
+  if (p.caps !== undefined && p.caps !== null && (typeof p.caps !== "object" || Array.isArray(p.caps))) errors.push("caps must be an object");
+  // #261: an unknown cap key (e.g. "weekly") is an error, never a silent no-op.
+  else for (const k of Object.keys(p.caps ?? {})) if (!CAP_KEYS.includes(k)) errors.push(`caps.${k} is not a cap scope (${CAP_KEYS.join(", ")})`);
   for (const k of CAP_KEYS) {
     const v = p.caps?.[k];
     if (v !== undefined && !(typeof v === "number" && Number.isFinite(v) && v > 0)) errors.push(`caps.${k} must be a positive number`);

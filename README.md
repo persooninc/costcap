@@ -655,7 +655,9 @@ node src/cli.js wrap --agent release-bot --policy .costcap/policy.json -- node y
 node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 ```
 
-**Per-agent caps on `POST /v1/agents/:id/policy` (#175):** `caps` (`run`, `hour`, `day`, `month`) replaces the whole caps object, so a key you leave out is removed; omitting `caps` keeps the saved caps. The dashboard agent card shows Per run / Per hour / Per day / Per month and its "Save caps" always sends every key, so an API-set `caps.hour` survives a save that only changes models or steps; clearing a field removes that cap.
+**Per-agent caps on `POST /v1/agents/:id/policy` (#175):** `caps` (`run`, `hour`, `day`, `month`) replaces the whole caps object, so a key you leave out is removed; omitting `caps` keeps the saved caps. An unknown key (for example `weekly`) returns `400` instead of being stored and ignored. The dashboard agent card shows Per run / Per hour / Per day / Per week / Per month and its "Save caps" always sends every key, so an API-set `caps.hour` survives a save that only changes models or steps; clearing a field removes that cap.
+
+**Weekly caps (#261):** `caps.week` (agent) and `week` on `POST /v1/teams` set a USD budget per ISO week, reset Monday 00:00 in the org budget-period timezone (`monthStartDay` does not move weeks). A team needs at least one of `day`, `week` or `month`. Enrolled wrappers enforce it fleet-wide from `agent_spend.spent.week` / `team.spent.week` in `/v1/policy` plus their own unsynced receipts, refusing with `budget_exceeded` and `scope: "week"` (agent) or `team:<name>:week`. A week that starts in the previous month counts receipts from both months; the month spend is unchanged. `GET /v1/agents/:id/budget` adds `budget_remaining.week_usd` when a week cap applies, teams report `spend.week_usd`, and the alert sweep raises `cap_approaching`/`cap_hit` for week caps once per week (a blocked `scope: "week"` receipt pages `cap_hit`). Local `wrap --policy` files accept `week` for agents and teams too. Out of scope for now: local `--week-cap`, week tag/model/org caps, week cap raises, week `cap_projected` and `--preflight` against the week remainder.
 
 Enrolled agents can also get a fleet step budget: an admin sets "Max steps per run" in the dashboard (`maxSteps` on `POST /v1/agents/:id/policy`). The wrapper enforces it per run from its cached policy, even offline. A local `--max-steps` can tighten it, never loosen it.
 
@@ -773,7 +775,7 @@ $0 `non_billable_request` on 2xx and do not pause. Only these exact paths are
 exempt; dot segments or percent-encoded paths are not.
 
 Team budgets share one cap across a group of agents:
-`"teams": { "ops": { "agents": ["release-bot", "triage-bot"], "day": 30, "month": 400 } }`.
+`"teams": { "ops": { "agents": ["release-bot", "triage-bot"], "day": 30, "week": 150, "month": 400 } }`.
 Each agent's own cap applies first, then the team's summed spend. A team cap
 blocks with `budget_exceeded` plus `team`. An unknown cost from any teammate
 returns `accounting_unavailable` instead of being counted as $0. An agent can be
@@ -1219,7 +1221,7 @@ The raise applies only while `now < expires_at`: in the hosted verdict, `cap_hit
 
 ### Budget period (hosted, #209)
 
-By default hosted day and month caps reset at UTC midnight on the 1st. An owner or
+By default hosted day and month caps reset at UTC midnight on the 1st, and week caps (#261) at UTC Monday midnight. An owner or
 admin can set the org budget period in the dashboard's **Budget period** card or with
 `POST /v1/budget-period {"timezone":"America/Los_Angeles","monthStartDay":15}`
 (`GET` for any member). `timezone` is an IANA zone and `monthStartDay` is 1-28; a bad

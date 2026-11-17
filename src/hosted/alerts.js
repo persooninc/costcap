@@ -68,12 +68,12 @@ function fractionsFrom(warnFractions, approachFraction) {
   return { fractions: [approachFraction], explicit: false };
 }
 
-// Cap period for a scope: YYYY-MM-DD (day) or YYYY-MM (month), in the org
+// Cap period for a scope: YYYY-MM-DD (day), YYYY-Www (week, #261) or YYYY-MM (month), in the org
 // budget period (#209; UTC and day 1 by default).
 export function capPeriod(scope, nowMs, budgetPeriod = null) {
   // Issue #168: a run-scope period is the run itself ("run:<runId>").
   if (typeof scope === "string" && scope.startsWith("run:")) return scope;
-  return periodKey(scope === "month" ? "month" : "day", nowMs, budgetPeriod);
+  return periodKey(scope === "month" || scope === "week" ? scope : "day", nowMs, budgetPeriod);
 }
 
 // Issue #245: blocked receipts that count toward cap_hit. Only a block with the
@@ -88,7 +88,7 @@ export function blocksInCurrentPeriod(receipts, { reason, nowMs, budgetPeriod = 
     const ts = Date.parse(r.ts);
     if (!Number.isFinite(ts) || ts <= nowMs - lookbackMs) continue;
     const scope = scopeOf(r);
-    if (scope !== "day" && scope !== "month") continue;
+    if (scope !== "day" && scope !== "week" && scope !== "month") continue;
     if (capPeriod(scope, ts, budgetPeriod) !== capPeriod(scope, nowMs, budgetPeriod)) continue;
     out.push(r);
   }
@@ -133,7 +133,7 @@ export function claimWarning(st, alert, fractions) {
 export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, silentAfterMs = DEFAULT_SILENT_AFTER_HOURS * 3600_000, minProjectionMs = 24 * 3600_000, budgetPeriod = null } = {}) {
   const out = [];
   const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
-  for (const scope of ["run", "day", "month"]) {
+  for (const scope of ["run", "day", "week", "month"]) {
     const cap = state.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
     const spent = state.spend?.[scope] ?? 0;
@@ -164,7 +164,7 @@ export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, s
   // A local run cap is not a day or month sum. The proxy records that block
   // as budget_exceeded plus a scope. Page that scope once, without turning
   // every budget block into a loop alert.
-  for (const scope of ["run", "day", "month"]) {
+  for (const scope of ["run", "day", "week", "month"]) {
     if (out.some((alert) => alert.kind === "cap_hit" && alert.scope === scope)) continue;
     if ((state.blockedReasons ?? []).includes(`budget_exceeded:${scope}`)) {
       out.push({ kind: "cap_hit", scope, key: `cap_hit:${state.agentId}:${scope}`, cap: state.caps?.[scope] ?? null, spent: state.spend?.[scope] ?? null });
@@ -228,7 +228,7 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [], nowMs, 
   const out = [];
   const id = `team:${orgId}:${verdict.name}`;
   const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
-  for (const scope of ["day", "month"]) {
+  for (const scope of ["day", "week", "month"]) {
     const cap = verdict.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
     const spent = verdict.spend[`${scope}_usd`];

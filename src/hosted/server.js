@@ -195,7 +195,7 @@ export function applyDeliveryResult(record, result, requested, nowMs) {
 // Windows follow the org budget period (#209; UTC instant, day 1 by default),
 // matching the hosted cap engine. A numeric offset is not a calendar prefix.
 export function spendSummary(receipts, nowMs, budgetPeriod = null) {
-  const cur = { day: periodKey("day", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
+  const cur = { day: periodKey("day", nowMs, budgetPeriod), week: periodKey("week", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
   const fold = (window) => {
     let usd = 0, unknown = 0;
     for (const item of receipts) {
@@ -208,7 +208,7 @@ export function spendSummary(receipts, nowMs, budgetPeriod = null) {
     }
     return { usd, unknown };
   };
-  return { day: fold("day"), month: fold("month"), all: fold("all") };
+  return { day: fold("day"), week: fold("week"), month: fold("month"), all: fold("all") };
 }
 
 // `store` (optional) injects any adapter with the store interface (mode, read, transaction,
@@ -945,7 +945,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const input = parseTeamInput(body, { orgId: u.orgId, orgAgents: Object.values(s.agents).filter((a) => !a.revoked), teams: Object.values(s.teams) });
           const key = teamKey(u.orgId, input.name);
           const current = s.teams[key] ?? null;
-          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, month: t.month ?? null, ...(Array.isArray(t.warnFractions) ? { warnFractions: [...t.warnFractions] } : {}) } : null);
+          const strip = (t) => (t ? { name: t.name, agents: [...t.agents], day: t.day ?? null, ...(t.week != null ? { week: t.week } : {}), month: t.month ?? null, ...(Array.isArray(t.warnFractions) ? { warnFractions: [...t.warnFractions] } : {}) } : null);
           if (input.remove) {
             if (!current) fail(404, "Team not found");
             delete s.teams[key];
@@ -955,10 +955,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             audit(s, u.orgId, u.id, "team.change", input.name, { previous: strip(current), next: null });
             return { removed: true, name: input.name };
           }
-          const { name, agents, day, month } = input;
+          const { name, agents, day, week, month } = input;
           const warnFractions = input.warnFractions === undefined ? current?.warnFractions : input.warnFractions;
           const anomaly = input.anomaly === undefined ? current?.anomaly : input.anomaly;
-          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}), ...(anomaly ? { anomaly } : {}) };
+          s.teams[key] = { orgId: u.orgId, name, agents, ...(day != null ? { day } : {}), ...(week != null ? { week } : {}), ...(month != null ? { month } : {}), ...(Array.isArray(warnFractions) ? { warnFractions } : {}), ...(anomaly ? { anomaly } : {}) };
           if (JSON.stringify(current?.anomaly ?? null) !== JSON.stringify(anomaly ?? null)) audit(s, u.orgId, u.id, "anomaly.change", name, { scope: "team", before: current?.anomaly ?? null, after: anomaly ?? null });
           audit(s, u.orgId, u.id, "team.change", name, { previous: strip(current), next: strip(s.teams[key]) });
           return verdictOf(s, s.teams[key]);
@@ -1203,7 +1203,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     if (!Array.isArray(fractions)) return () => true;
     s.warnArm ??= {};
     const states = {};
-    for (const scope of ["day", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now(), budgetPeriod });
+    for (const scope of ["day", "week", "month"]) states[scope] = armWarnings(s.warnArm, { id, scope, cap: caps?.[scope], spent: spend[scope], nowMs: now(), budgetPeriod });
     return (alert) => alert.kind !== "cap_approaching" || alert.fraction === undefined || !states[alert.scope] || claimWarning(states[alert.scope], alert, fractions);
   }
   // Issue #168: run warnings fire at most once per run (period = run id).
@@ -1259,11 +1259,11 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const blockedReasons = recent.flatMap((r) => {
           // Issue #168: a run block with a run_id pages through the per-run key.
           if (r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id) return [];
-          if (r.reason === "budget_exceeded" && ["run", "day", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
+          if (r.reason === "budget_exceeded" && ["run", "day", "week", "month"].includes(r.scope)) return [`budget_exceeded:${r.scope}`];
           return r.reason ? [r.reason] : [];
         });
         const caps = effectiveCaps(a.policy, now());
-        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
         const runCap = caps.run;
@@ -1290,7 +1290,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
-        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, month: spent.month.usd }, a.policy.warnFractions, bp);
+        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd }, a.policy.warnFractions, bp);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
@@ -1315,7 +1315,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const teamScope = (r) => (typeof r.scope === "string" && r.scope.startsWith(prefix) ? r.scope.slice(prefix.length) : null);
         const blockedScopes = blocksInCurrentPeriod(t.agents.flatMap((id) => agentReceipts(s, id)), { reason: "budget_exceeded", nowMs: now(), budgetPeriod: orgPeriod(s, t.orgId), scopeOf: teamScope }).map(teamScope);
         const verdict = verdictOf(s, t);
-        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, month: verdict.spend.month_usd }, t.warnFractions, orgPeriod(s, t.orgId));
+        const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, week: verdict.spend.week_usd, month: verdict.spend.month_usd }, t.warnFractions, orgPeriod(s, t.orgId));
         const tbp = orgPeriod(s, t.orgId);
         const teamAlerts = stickProjections(s, evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: tbp }, { warnFractions: t.warnFractions }), { orgId: t.orgId, owns: (x) => x.team === t.name, eligible: () => verdict.spend?.unknown_count === 0 && verdict.verdict !== "accounting_unavailable" && typeof verdict.caps?.month === "number", bp: tbp });
         for (const alert of teamAlerts) {

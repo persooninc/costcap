@@ -339,9 +339,11 @@ test("#123 admin creates a team in the dashboard and sees the team spend card", 
     await page.locator("#teamAgents label", { hasText: "release-bot" }).locator("input").check();
     await page.locator("#teamAgents label", { hasText: "triage-bot" }).locator("input").check();
     await page.locator("#teamForm input[name=day]").fill("30");
+    await page.locator("#teamForm input[name=week]").fill("100");
     await page.locator("#teamForm button").click();
     const card = page.locator('#teams [data-team="ops"]');
     await expect(card).toContainText("today $12.50 of $30.00");
+    await expect(card).toContainText("week $12.50 of $100.00 (left $87.50)"); // #261
     await expect(card).toContainText("release-bot, triage-bot");
     await expect(card.locator("strong")).toHaveText("OK");
   } finally {

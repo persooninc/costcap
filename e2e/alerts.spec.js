@@ -77,6 +77,67 @@ test("cap_hit alert shows fired time, can be acknowledged, then resolves on cloc
   }
 });
 
+test("#261 agent week cap reaches cap_hit · week and resolves when the next Monday starts", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const delivered = [];
+  let clock = Date.parse("2026-11-15T10:00:00.000Z");
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-week-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; },
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("week-owner@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await expect(page.locator("#verify")).toBeVisible();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    await page.locator("#enroll input[name=week]").fill("1");
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const ts = new Date(clock).toISOString();
+    const synced = await page.evaluate(async ({ credential, ts }) => {
+      const e = await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "spender" }) });
+      const agent = await e.json();
+      const r = await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "r1", ts, cost_usd: 2, model: "m" }] }) });
+      return r.status;
+    }, { credential: token, ts });
+    expect(synced).toBe(200);
+    await service.evaluateFleetAlerts();
+    expect(delivered.some((a) => a.kind === "cap_hit" && a.scope === "week")).toBe(true);
+    await page.locator("#refresh").click();
+    const hit = page.locator("#alerts .alert-active", { hasText: "cap_hit" });
+    await expect(hit).toBeVisible();
+    await expect(hit).toContainText("cap_hit · week");
+    await expect(page.locator("#agents")).toContainText("week $2.00 of $1.00 (left $0.00)");
+    clock = Date.parse("2026-11-16T09:00:00.000Z"); // Sunday 10:00Z -> Monday: a new UTC ISO week
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    const resolved = page.locator("#alerts .alert-resolved", { hasText: "cap_hit" });
+    await expect(resolved).toBeVisible();
+    await expect(resolved).toContainText("resolved");
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_hit" })).toHaveCount(0);
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});
+
 // Issue #165: per-agent "Warn at (%)" fractions, shown on the card and in the alert list.
 test("Warn at 50, 95 on an agent card fires cap_approaching 50% then 95% once each", async ({ page }) => {
   const port = await freePort();

@@ -3,7 +3,7 @@
 // agent policy (policy.raise[scope] = [{ amount_usd, expires_at, request_id }, ...]); base caps
 // are never edited, raises on one scope stack (#212), and each lapses on its own at expires_at
 // (see effectiveCaps).
-import { CAP_KEYS, raiseEntries } from "./policy.js";
+import { RAISE_KEYS as CAP_KEYS, raiseEntries } from "./policy.js";
 
 export const CAP_REQUEST_STATUSES = ["pending", "approved", "denied", "expired", "all"];
 const MAX_AMOUNT_USD = 100_000;
