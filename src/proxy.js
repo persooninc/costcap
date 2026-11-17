@@ -12,7 +12,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType, pricingAt } from "./pricing.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
@@ -152,6 +152,33 @@ function modalityTokens(buckets) {
 // #214/#254: Anthropic server_tool_use counters CostCap meters; any other counter is unpriced.
 const ANTHROPIC_TOOL_COUNTERS = Object.freeze({ web_search_requests: "web_search", web_fetch_requests: "web_fetch", code_execution_requests: "code_execution" });
 
+/**
+ * #250: billed Grounding with Google Search units from Gemini groundingMetadata (one per candidate).
+ * Per-query families (Gemini 3+) count unique non-empty webSearchQueries across candidates;
+ * per-prompt families (Gemini 2.x) count 1 when any query ran. Never $0: web groundingChunks with
+ * no webSearchQueries, any non-web grounding (Google Maps, enterprise web search, retrieval), or a
+ * model family with no table row is { unpriced: true }.
+ */
+export function geminiGroundingCalls(metadatas, model) {
+  const queries = new Set();
+  let webChunks = false;
+  for (const m of metadatas) {
+    if (!m || typeof m !== "object") continue;
+    if (Array.isArray(m.webSearchQueries)) for (const q of m.webSearchQueries) if (typeof q === "string" && q.trim()) queries.add(q);
+    if (Array.isArray(m.groundingChunks)) for (const c of m.groundingChunks) {
+      if (!c || typeof c !== "object") continue;
+      const kinds = Object.keys(c);
+      if (kinds.some((k) => k !== "web")) return { unpriced: true };
+      if (c.web) webChunks = true;
+    }
+    if ((Array.isArray(m.retrievalQueries) && m.retrievalQueries.length) || m.googleMapsWidgetContextToken) return { unpriced: true };
+  }
+  if (!queries.size) return webChunks ? { unpriced: true } : { unpriced: false, calls: 0 };
+  const unit = googleSearchBilling(model);
+  if (!unit) return { unpriced: true };
+  return { unpriced: false, calls: unit === "query" ? queries.size : 1 };
+}
+
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
 export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
@@ -170,6 +197,9 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   // #214: per-call tool counts priced from the table's `tools` section (Responses items by id; Anthropic counters).
   const responsesTools = new Map();
   let anthropicTools = {};
+  // #250: Gemini candidates[].groundingMetadata by candidate index (Grounding with Google Search).
+  const grounding = new Map();
+  let groundingUnpriced = false;
   // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
   // Absent/invalid values are ignored so pricing falls back to the table; it is never trusted on other routes.
   let providerCost;
@@ -203,6 +233,10 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     }
     if (provider === "gemini" && Array.isArray(chunk.candidates)) {
       geminiStream = true;
+      // #250: streams repeat or update groundingMetadata; the last one seen per candidate wins.
+      chunk.candidates.forEach((c, i) => {
+        if (c && c.groundingMetadata && typeof c.groundingMetadata === "object") grounding.set(Number.isInteger(c.index) ? c.index : i, c.groundingMetadata);
+      });
       if (chunk.candidates.some((c) => c && typeof c.finishReason === "string")) geminiFinished = true;
     }
     if (provider === "gemini" && chunk.promptFeedback?.blockReason) geminiFinished = true;
@@ -298,7 +332,12 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
     const toolCalls = provider === "anthropic" ? { ...anthropicTools } : {};
     for (const tool of responsesTools.values()) toolCalls[tool] = (toolCalls[tool] ?? 0) + 1;
-    return { model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
+    if (provider === "gemini" && grounding.size) {
+      const g = geminiGroundingCalls([...grounding.values()], model);
+      if (g.unpriced) toolUseUnpriced = groundingUnpriced = true;
+      else if (g.calls > 0) toolCalls.google_search = g.calls;
+    }
+    return { ...(groundingUnpriced && { unpricedTool: "Gemini grounding" }), model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A stream that never reached its provider's terminal event (or errored first) is incomplete.
   return { add, result, get incomplete() {
@@ -1122,7 +1161,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
             else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
-            const unpricedTool = receipt.unpriced_tool;
+            const unpricedTool = receipt.unpriced_tool ?? metered.unpricedTool;
             delete receipt.unpriced_tool;
             recordSpend(receipt);
             if (receipt.reason === "tool_use_unpriced") failMsg = `A provider-side tool (${unpricedTool ?? "unknown server tool counter"}) was billed with no published rate for this tool or model. Restart only after reconciling this request.`;

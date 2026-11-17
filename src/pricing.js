@@ -264,14 +264,33 @@ export function toolRowRate(row, model, { requestTools } = {}) {
   }
   const ok = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null);
   if (row.families && typeof row.families === "object") {
-    const id = (resolveModelId(model) ?? (typeof model === "string" ? model.replace(SNAPSHOT_SUFFIX, "") : "")).replace(FIRST_PARTY_PREFIX, "");
-    let best = null;
-    for (const fam of Object.keys(row.families)) {
-      if ((id === fam || id.startsWith(`${fam}-`) || id.startsWith(`${fam}.`)) && (!best || fam.length > best.length)) best = fam;
-    }
+    const best = familyOf(row.families, model);
     return best === null ? null : ok(row.families[best]);
   }
   return ok(row.usd_per_call);
+}
+
+function familyOf(families, model) {
+  const id = (resolveModelId(model) ?? (typeof model === "string" ? model.replace(SNAPSHOT_SUFFIX, "") : "")).replace(FIRST_PARTY_PREFIX, "");
+  let best = null;
+  for (const fam of Object.keys(families)) {
+    if ((id === fam || id.startsWith(`${fam}-`) || id.startsWith(`${fam}.`)) && (!best || fam.length > best.length)) best = fam;
+  }
+  return best;
+}
+
+/**
+ * #250: how Grounding with Google Search bills for a Gemini model: "query" (Gemini 3+, per
+ * unique non-empty search query) or "prompt" (Gemini 2.x, once per grounded prompt).
+ * null when the table has no row for the model family (then grounding is unpriced, never $0).
+ * The Gemini API row decides the unit; the rate comes from the route's own table row.
+ */
+export function googleSearchBilling(model, provider = "gemini") {
+  const billing = table.tools?.[provider]?.google_search?.billing;
+  if (!billing || typeof billing !== "object") return null;
+  const fam = familyOf(billing, model);
+  const unit = fam === null ? null : billing[fam];
+  return unit === "query" || unit === "prompt" ? unit : null;
 }
 
 export function toolCallCost(provider, model, toolCalls, { webSearchType, userTools, requestTools } = {}) {

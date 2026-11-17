@@ -702,7 +702,7 @@ does the higher rate apply (#219). With `--preflight`, an Anthropic or Vertex Cl
 that sets `max_uses` adds `max_uses × rate` to the worst case. Override a rate
 with a top-level `tools` map in the `--prices` / `--upstream-prices` file, for
 example `{"tools": {"web_search": 0.008}}` (keys `web_search`,
-`web_search_preview`, `file_search`, `code_execution`; USD per call, > 0); such receipts are
+`web_search_preview`, `file_search`, `code_execution`, `google_search`; USD per call, > 0); such receipts are
 marked `cost_source: "user_prices"`. Claude web fetch (`web_fetch_requests`) is
 free on the Anthropic route: receipts keep `tool_calls.web_fetch` with
 `tool_cost_usd: 0` (#254). Claude code execution (`code_execution_requests`) is
@@ -716,8 +716,28 @@ tool. Any other per-call counter, a model family the table does not list, or a t
 route without a rate (OpenRouter, Bedrock, Vertex, custom upstreams) is still
 recorded as `cost_usd: null`, `reason: "tool_use_unpriced"`, and the run pauses
 until you reconcile it. Gemini
-`toolUsePromptTokenCount` is counted as input tokens. The free token-count
-endpoints (`POST /anthropic/v1/messages/count_tokens`, Gemini
+`toolUsePromptTokenCount` is counted as input tokens.
+
+Gemini Grounding with Google Search is priced too (#250), on the Gemini API and
+Vertex AI, non-stream and streamed (the last `groundingMetadata` per candidate
+wins). Gemini 3 and newer bill per search query: the count is the number of
+unique non-empty `webSearchQueries` across candidates, at $14 per 1,000. Gemini
+2.5 / 2.0 (and Vertex Gemini 2.5) bill per grounded prompt: 1 when any query
+ran, at $35 per 1,000. The receipt gets `tool_calls: {"google_search": N}` and
+`tool_cost_usd`. Grounding metadata with no queries adds $0. Web
+`groundingChunks` with no `webSearchQueries`, Grounding with Google Maps,
+enterprise web search or any other grounding source, and a Gemini family with
+no row (for example Gemini 3 on Vertex) are `tool_use_unpriced`. Google's free
+allowances (5,000 queries a month on Gemini 3+, 1,500 grounded prompts a day on
+2.5) are **not** subtracted, so caps are a conservative upper bound and
+`bill-check` may show a small `over_metered` while you are inside the free
+tier. With `--preflight`, a per-prompt family that declares `googleSearch` /
+`google_search` / `googleSearchRetrieval` adds 1 × rate to the worst case;
+per-query families add nothing because the query count is unbounded (like
+Anthropic web search without `max_uses`). `google_search` is also a valid
+`tools` key in `--prices`.
+
+The free token-count endpoints (`POST /anthropic/v1/messages/count_tokens`, Gemini
 `models/<model>:countTokens`, `POST /openai/v1/responses/input_tokens`) record a
 $0 `non_billable_request` on 2xx and do not pause. Only these exact paths are
 exempt; dot segments or percent-encoded paths are not.

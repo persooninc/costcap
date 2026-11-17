@@ -125,7 +125,7 @@ export function withToolCost(c, prices, provider, metered, req, res = null) {
     ...(t.user_prices && pin(prices)) };
 }
 
-export const TOOL_OVERRIDE_KEYS = Object.freeze(["web_search", "web_search_preview", "file_search", "code_execution"]);
+export const TOOL_OVERRIDE_KEYS = Object.freeze(["web_search", "web_search_preview", "file_search", "code_execution", "google_search"]);
 
 /** Validates the optional top-level `tools` map of a prices file: {tool: usd_per_call > 0}. */
 export function validateToolPrices(path, tools) {

@@ -6,11 +6,19 @@
 // published rate and never at the fallback: an unknown model is refused as
 // preflight_unpriced.
 import { geminiBatchRequests } from "./batch.js";
-import { lookupPrice, selectRates, batchMultiplier, toolRate, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+import { lookupPrice, selectRates, batchMultiplier, toolRate, googleSearchBilling, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
 
 // #214: Anthropic web search with max_uses caps billed searches per request; the worst case adds
 // max_uses x the per-search rate. Without max_uses the search count is unbounded and not added.
 export function toolWorstCase(provider, req, model) {
+  // #250: Gemini Google Search grounding: a per-prompt family (2.x) bills at most once per request;
+  // per-query families (3+) have an unbounded query count and add nothing (like web search without max_uses).
+  if (provider === "gemini") {
+    const decl = Array.isArray(req?.tools) && req.tools.some((t) => t && typeof t === "object" && (t.googleSearch || t.google_search || t.googleSearchRetrieval || t.google_search_retrieval));
+    if (!decl || googleSearchBilling(model) !== "prompt") return { ok: true, usd: 0, calls: 0 };
+    const rate = toolRate("gemini", "google_search", model);
+    return rate === null ? { ok: false } : { ok: true, usd: rate, calls: 1 };
+  }
   // #222: Claude on Vertex AI bills web search at the same per-search rate (tools.vertex, Claude only).
   if ((provider !== "anthropic" && provider !== "vertex") || !Array.isArray(req?.tools)) return { ok: true, usd: 0, calls: 0 };
   let calls = 0;
