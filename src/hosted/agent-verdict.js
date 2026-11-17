@@ -26,7 +26,7 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   // #265: a total cap counts every receipt since the beginning (unknown ones included).
   const lifetime = limits.total != null;
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod)))
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod, limits.week != null)))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
   const remaining = budgetRemaining(budgets, who);

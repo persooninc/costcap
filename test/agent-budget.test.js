@@ -162,3 +162,13 @@ test("wrap enforces a policy and agent-status exits by verdict", async (t) => {
   assert.equal(status().status, 2);
   assert.equal(spawnSync(process.execPath, [...base, "--", "true"], { encoding: "utf8" }).status, 2);
 });
+
+test("#267 agent verdict: Nov 30 unknown does not refuse a month-only agent on Dec 2, a week-capped one it does", async () => {
+  const { hostedAgentVerdict } = await import("../src/hosted/agent-verdict.js");
+  const nowMs = Date.parse("2026-12-02T10:00:00Z");
+  const receipts = [{ id: "u", ts: "2026-11-30T10:00:00Z", cost_usd: null }];
+  assert.equal(hostedAgentVerdict({ agent: { id: "a", policy: { version: 1, caps: { month: 100 } } }, receipts, nowMs }).verdict, "ok");
+  const v = hostedAgentVerdict({ agent: { id: "a", policy: { version: 1, caps: { week: 50 } } }, receipts, nowMs });
+  assert.equal(v.verdict, "accounting_unavailable");
+  assert.equal(v.reason, "unreconciled_receipt");
+});

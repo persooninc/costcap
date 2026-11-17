@@ -110,6 +110,16 @@ export function nextRaiseExpiry(policy, nowMs = Date.now()) {
   return t.length ? Math.min(...t) : null;
 }
 
+// #267: drop cap keys stored before #261 rejected them (e.g. "weekly"). Returns the
+// cleaned policy (same object when nothing changed) and the dropped key names.
+export function dropLegacyCapKeys(p) {
+  const caps = p?.caps;
+  if (!caps || typeof caps !== "object" || Array.isArray(caps)) return { policy: p, dropped: [] };
+  const dropped = Object.keys(caps).filter((k) => !CAP_KEYS.includes(k));
+  if (!dropped.length) return { policy: p, dropped };
+  return { policy: { ...p, caps: Object.fromEntries(Object.entries(caps).filter(([k]) => CAP_KEYS.includes(k))) }, dropped };
+}
+
 export function validatePolicy(p) {
   const errors = [];
   if (!p || typeof p !== "object") return ["policy must be an object"];
@@ -164,6 +174,7 @@ export function validatePolicy(p) {
 // A cap raise (#208) applies only while nowMs < expires_at, so an offline wrapper on a
 // cached policy falls back to the base caps at expiry without fetching anything.
 export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, nowMs = Date.now() }) {
+  lastKnown = lastKnown && dropLegacyCapKeys(lastKnown).policy;
   if (lastKnown && validatePolicy(lastKnown).length) throw new Error("Invalid cached fleet policy; refusing to loosen enforcement");
   for (const k of CAP_KEYS) if (local[k] != null && (!Number.isFinite(local[k]) || local[k] <= 0)) throw new Error(`Invalid local cap ${k}`);
   if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");

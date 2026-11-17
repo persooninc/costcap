@@ -350,3 +350,24 @@ test("#244 modelCheck: cached agent_spend.models plus unsynced receipts; invalid
   assert.equal((await client.sync()).online, true);
   assert.equal(client.modelCheck(["claude-opus-4-8"]), null, "older server: no models, no fleet verdict");
 });
+
+test("#267 a legacy caps key in a cached enrollment is dropped, known caps still enforced", async (t) => {
+  const { resolvePolicy, validatePolicy } = await import("../src/hosted/policy.js");
+  const f = await setup(t);
+  const data = JSON.parse(readFileSync(f.path, "utf8"));
+  data.policy = { ...data.policy, caps: { day: 5, weekly: 50 } };
+  writeFileSync(f.path, JSON.stringify(data));
+  const loaded = loadEnrollment(f.path);
+  assert.deepEqual(loaded.policy.caps, { day: 5 });
+  assert.equal(resolvePolicy({ lastKnown: { version: 1, caps: { day: 5, weekly: 50 } } }).caps.day, 5);
+  // New writes with caps.weekly are still rejected.
+  assert.match(validatePolicy({ version: 1, caps: { weekly: 50 } }).join(), /caps\.weekly is not a cap scope/);
+});
+
+test("#267 wrapper agent_spend counts last month's unknown only when a week is capped", async () => {
+  const { agentSpendPolicy } = await import("../src/hosted/teams.js");
+  const nowMs = Date.parse("2026-12-02T10:00:00Z");
+  const r = [{ id: "u", ts: "2026-11-30T10:00:00Z", cost_usd: null }];
+  assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: false }).unknown, 0);
+  assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: true }).unknown, 1);
+});

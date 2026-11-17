@@ -4,7 +4,7 @@ import { budgetPeriodError } from "../period.js";
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { validatePolicy, resolvePolicy, raiseWeekError } from "./policy.js";
+import { validatePolicy, resolvePolicy, raiseWeekError, dropLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
 import { cachedFleetModelVerdict, validWeekModelCaps } from "./model-caps.js";
@@ -30,6 +30,8 @@ export function loadEnrollment(path) {
   if (!existsSync(path)) throw new Error("Enrollment not found. Use costcap enroll first.");
   const data = JSON.parse(readFileSync(path, "utf8"));
   serviceUrl(data.url);
+  // #267: a cache written before #261 may hold a legacy caps key; enforce the known caps.
+  if (data.policy) data.policy = dropLegacyCapKeys(data.policy).policy;
   if (!data.token || !data.agentId || validatePolicy(data.policy).length) throw new Error("Invalid enrollment cache; refusing to run");
   return data;
 }

@@ -1784,3 +1784,27 @@ test("#268 week scopes: org/tag/model validation, audit, restart, policy split, 
   const recs = (list.alerts ?? list).filter((a) => a.scope === "week");
   assert.ok(recs.length >= 3 && recs.every((a) => !a.active), "week alerts resolve at the next Monday");
 });
+
+test("#267 a stored legacy caps.weekly key is migrated away with an audit row; kill switch works", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("legacy-caps@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "legacy" }, null, enrollment.body.token)).body;
+  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+  raw.agents[agent.agentId].policy.caps = { day: 5, weekly: 50 };
+  writeFileSync(f.storePath, JSON.stringify(raw));
+  await f.restart();
+  const pol = await f.request("/v1/policy", undefined, null, agent.token);
+  assert.equal(pol.status, 200);
+  assert.deepEqual(pol.body.caps, { day: 5 });
+  const one = await f.request(`/v1/agents/${agent.agentId}`, undefined, owner.cookie);
+  assert.doesNotMatch(JSON.stringify(one.body), /weekly/);
+  const stored = JSON.parse(readFileSync(f.storePath, "utf8"));
+  const row = stored.audit.find((a) => a.action === "policy.legacy_cap_keys_dropped");
+  assert.ok(row);
+  assert.deepEqual(row.detail.dropped, ["weekly"]);
+  const killed = await f.request(`/v1/agents/${agent.agentId}/policy`, { killed: true }, owner.cookie);
+  assert.equal(killed.status, 200);
+  assert.equal((await f.request("/v1/policy", undefined, null, agent.token)).body.killed, true);
+  assert.equal((await f.request(`/v1/agents/${agent.agentId}/policy`, { caps: { weekly: 50 } }, owner.cookie)).status, 400);
+});

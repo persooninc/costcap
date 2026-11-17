@@ -143,4 +143,5 @@ export const samePeriod = (scope, aMs, bMs, budgetPeriod) => periodKey(scope, aM
 
 // #261: receipts that can count toward any day/week/month window at nowMs. A week
 // can start in the previous month, so this is the current month OR the current week.
-export const inSpendWindow = (tsMs, nowMs, budgetPeriod) => samePeriod("month", tsMs, nowMs, budgetPeriod) || samePeriod("week", tsMs, nowMs, budgetPeriod);
+// #267: the previous-month part of the week only counts when the entity caps a week.
+export const inSpendWindow = (tsMs, nowMs, budgetPeriod, includeWeek = true) => samePeriod("month", tsMs, nowMs, budgetPeriod) || (includeWeek && samePeriod("week", tsMs, nowMs, budgetPeriod));

@@ -80,7 +80,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
       // #261: current month OR current week (a week can start in the previous month).
-      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod))) continue;
+      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod, def.week != null))) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
@@ -161,8 +161,9 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 // this identity), from settled-aware stored receipts. Pure.
 // #244: modelCaps adds `models`, the same totals split per capped model.
 // #265: { total: true } (the agent has caps.total) counts every receipt since the
-// beginning into spent.total; unknown cost anywhere in that history then refuses.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false } = {}) {
+// beginning into spent.total;
+// #267: { week: false } (no week cap) skips the previous-month part of the current week; unknown cost anywhere in that history then refuses.
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false, week: includeWeek = true } = {}) {
   const now = new Date(nowMs).toISOString();
   const month = periodKey("month", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const spent = { day: 0, week: 0, month: 0, total: 0 };
@@ -172,7 +173,7 @@ export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     const tsMs = Date.parse(r.ts);
     const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
-    if (!inMonth && !inWeek && !lifetime) continue; // #261: a week can start in the previous month
+    if (!inMonth && !(includeWeek && inWeek) && !lifetime) continue; // #261: a week can start in the previous month
     if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     spent.total += r.cost_usd;
