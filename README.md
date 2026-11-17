@@ -746,13 +746,18 @@ until you reconcile it. Gemini
 Gemini Grounding with Google Search is priced too (#250), on the Gemini API and
 Vertex AI, non-stream and streamed (the last `groundingMetadata` per candidate
 wins). Gemini 3 and newer bill per search query: the count is the number of
-unique non-empty `webSearchQueries` across candidates, at $14 per 1,000. Gemini
-2.5 / 2.0 (and Vertex Gemini 2.5) bill per grounded prompt: 1 when any query
-ran, at $35 per 1,000. The receipt gets `tool_calls: {"google_search": N}` and
+unique non-empty `webSearchQueries` across candidates, at $14 per 1,000; this
+includes Gemini 3 and Gemini 4 on Vertex AI (#260), where the regional ×1.1
+multiplier applies to tokens only, never to grounding. Gemini 2.5 / 2.0 (and
+Vertex Gemini 2.5) bill per grounded prompt: 1 when any query ran, at $35 per
+1,000. From 2026-12-01 a Gemini API `gemini-2.5-pro` / `gemini-2.5-flash` call
+is billed as `gemini-3.8-flash` / `gemini-3.5-flash-lite`, and its grounding is
+too: per query at $14 per 1,000 (Vertex keeps its own per-prompt 2.5 rows). The
+receipt gets `tool_calls: {"google_search": N}` and
 `tool_cost_usd`. Grounding metadata with no queries adds $0. Web
 `groundingChunks` with no `webSearchQueries`, Grounding with Google Maps,
 enterprise web search or any other grounding source, and a Gemini family with
-no row (for example Gemini 3 on Vertex) are `tool_use_unpriced`. Google's free
+no row (for example Gemini 1.5) are `tool_use_unpriced`. Google's free
 allowances (5,000 queries a month on Gemini 3+, 1,500 grounded prompts a day on
 2.5) are **not** subtracted, so caps are a conservative upper bound and
 `bill-check` may show a small `over_metered` while you are inside the free

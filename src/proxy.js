@@ -174,6 +174,16 @@ const ANTHROPIC_TOOL_COUNTERS = Object.freeze({ web_search_requests: "web_search
  * model family with no table row is { unpriced: true }.
  */
 export function geminiGroundingCalls(metadatas, model) {
+  const q = groundingQueries(metadatas);
+  if (q.unpriced) return { unpriced: true };
+  if (!q.queries) return q.webChunks ? { unpriced: true } : { unpriced: false, calls: 0 };
+  const unit = googleSearchBilling(model);
+  if (!unit) return { unpriced: true };
+  return { unpriced: false, calls: unit === "query" ? q.queries : 1 };
+}
+
+// Unique non-empty webSearchQueries across candidates; { unpriced: true } on any non-web grounding.
+function groundingQueries(metadatas) {
   const queries = new Set();
   let webChunks = false;
   for (const m of metadatas) {
@@ -187,10 +197,19 @@ export function geminiGroundingCalls(metadatas, model) {
     }
     if ((Array.isArray(m.retrievalQueries) && m.retrievalQueries.length) || m.googleMapsWidgetContextToken) return { unpriced: true };
   }
-  if (!queries.size) return webChunks ? { unpriced: true } : { unpriced: false, calls: 0 };
-  const unit = googleSearchBilling(model);
-  if (!unit) return { unpriced: true };
-  return { unpriced: false, calls: unit === "query" ? queries.size : 1 };
+  return { unpriced: false, queries: queries.size, webChunks };
+}
+
+/**
+ * #260: on the Gemini API, a request whose dated row is `billed_as` another model (e.g. gemini-2.5-pro
+ * -> gemini-3.8-flash from 2026-12-01) bills grounding at that model's unit and rate. Vertex keeps its
+ * own rows (#256), so cloud routes are returned unchanged.
+ */
+export function billedAsGrounding(provider, cloud, receipt, metered) {
+  if (cloud || provider !== "gemini" || !receipt?.billed_as || !metered?.groundingQueries || !metered.toolCalls?.google_search) return metered;
+  const unit = googleSearchBilling(receipt.billed_as);
+  if (!unit) return metered;
+  return { ...metered, model: receipt.billed_as, toolCalls: { ...metered.toolCalls, google_search: unit === "query" ? metered.groundingQueries : 1 } };
 }
 
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
@@ -346,12 +365,13 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
     const toolCalls = provider === "anthropic" ? { ...anthropicTools } : {};
     for (const tool of responsesTools.values()) toolCalls[tool] = (toolCalls[tool] ?? 0) + 1;
+    let queryCount = 0;
     if (provider === "gemini" && grounding.size) {
       const g = geminiGroundingCalls([...grounding.values()], model);
       if (g.unpriced) toolUseUnpriced = groundingUnpriced = true;
-      else if (g.calls > 0) toolCalls.google_search = g.calls;
+      else if (g.calls > 0) { toolCalls.google_search = g.calls; queryCount = groundingQueries([...grounding.values()]).queries; }
     }
-    return { ...(groundingUnpriced && { unpricedTool: "Gemini grounding" }), model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
+    return { ...(groundingUnpriced && { unpricedTool: "Gemini grounding" }), model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(queryCount && { groundingQueries: queryCount }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A stream that never reached its provider's terminal event (or errored first) is incomplete.
   return { add, result, get incomplete() {
@@ -1218,7 +1238,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             }
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
-            else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
+            else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, billedAsGrounding(provider, cloud, receipt, metered), parsedBody));
             const unpricedTool = receipt.unpriced_tool ?? metered.unpricedTool;
             delete receipt.unpriced_tool;
             recordSpend(receipt);

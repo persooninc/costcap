@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.20",
+  "version": "2026-11-16.21",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -35,6 +35,8 @@
     "https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool (#254: no code execution charge when web_search_20260209+ or web_fetch_20260209+ is in the request; otherwise per container-hour, not priced; retrieved 2026-11-16)",
     "https://ai.google.dev/gemini-api/docs/pricing and https://ai.google.dev/gemini-api/docs/google-search#pricing (#250: Grounding with Google Search: Gemini 3 and newer $14 per 1,000 search queries the model executes, empty queries not billed; Gemini 2.5 / 2.0 $35 per 1,000 grounded prompts; free allowances not subtracted; retrieved 2026-11-16)",
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (#250: Vertex AI Gemini 2.5 Grounding with Google Search $35 per 1,000 grounded prompts, a prompt with several queries is one charge; retrieved 2026-11-16)",
+    "https://cloud.google.com/vertex-ai/generative-ai/pricing (#260: Vertex AI Gemini 3 and Gemini 4 Grounding with Google Search $14 per 1,000 grounding queries, one global price with no regional uplift; retrieved 2026-11-16)",
+    "https://aistudio.google.com/docs/pricing (#260: from 2026-12-01 gemini-2.5-pro / gemini-2.5-flash route to and bill as gemini-3.8-flash / gemini-3.5-flash-lite, grounding included, per search query; retrieved 2026-11-16)",
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (#256, Standard, retrieved 2026-11-16: Gemini 4 Carbon/Argon/Hydrogen, 3.8/3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview global rates equal the Gemini API rows, including their dated changes; non-global endpoints cost 1.1x global for GA Gemini 3+ from 2026-07-01; 3.1 Pro Preview has a Global row only; Gemini 2.5 has no region split)",
     "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
@@ -45,7 +47,7 @@
       "web_fetch": { "usd_per_call": 0, "free": true },
       "code_execution": { "usd_per_call": 0, "free": true, "free_with_tools": ["web_search", "web_fetch"], "free_since": "20260209" }
     },
-    "vertex": { "web_search": { "families": { "claude": 0.01 } }, "google_search": { "families": { "gemini-2.5": 0.035 }, "billing": { "gemini-2.5": "prompt" } } },
+    "vertex": { "web_search": { "families": { "claude": 0.01 } }, "google_search": { "families": { "gemini-2.5": 0.035, "gemini-3": 0.014, "gemini-4": 0.014 }, "billing": { "gemini-2.5": "prompt", "gemini-3": "query", "gemini-4": "query" } } },
     "gemini": { "google_search": { "families": { "gemini-2.0": 0.035, "gemini-2.5": 0.035, "gemini-3": 0.014, "gemini-4": 0.014 }, "billing": { "gemini-2.0": "prompt", "gemini-2.5": "prompt", "gemini-3": "query", "gemini-4": "query" } } },
     "openai": {
       "web_search": { "families": { "gpt-6": 0.01, "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.01, "gpt-4.1": 0.01 } },

@@ -29,7 +29,7 @@ test("table: gemini and vertex google_search rows, billing unit per family", () 
   assert.equal(toolRate("gemini", "google_search", "gemini-2.5-pro"), 0.035);
   assert.equal(toolRate("gemini", "google_search", "gemini-2.0-flash"), 0.035);
   assert.equal(toolRate("vertex", "google_search", "gemini-2.5-flash"), 0.035);
-  assert.equal(toolRate("vertex", "google_search", "gemini-3.8-flash"), null);
+  assert.equal(toolRate("vertex", "google_search", "gemini-3.8-flash"), 0.014);
   assert.equal(googleSearchBilling("gemini-3.8-flash"), "query");
   assert.equal(googleSearchBilling("gemini-2.5-pro"), "prompt");
   assert.equal(googleSearchBilling("gemini-1.5-pro"), null);
