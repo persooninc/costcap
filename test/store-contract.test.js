@@ -82,6 +82,8 @@ async function contract(open, mode) {
   });
   await reopened.flush();
   assert.deepEqual((await policyOf(reopened, "ag1-token")).agent_spend.spent.day, 0.4);
+  // #265 AC3: team spend is org-scoped too; the planted org-B receipt ($99) never counts.
+  assert.equal((await policyOf(reopened, "ag1-token")).team.spent.day, 0.4);
   // #129: an agent settlement never reaches a receipt row stored under another org.
   reopened.transaction((s) => { s.receipts["ag1:foreign-unk"] = { orgId: ORG_B, agentId: "ag1", receipt: { id: "foreign-unk", ts: day, cost_usd: null } }; });
   await reopened.flush();

@@ -298,7 +298,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       return out;
     });
   }
-  const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), budgetPeriod: orgPeriod(s, team.orgId), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, agentReceipts(s, id)])) });
+  const verdictOf = (s, team) => teamVerdict({ team, nowMs: now(), budgetPeriod: orgPeriod(s, team.orgId), receiptsByAgent: Object.fromEntries(team.agents.map((id) => [id, orgAgentReceipts(s, team.orgId, id)])) }); // #265 AC3: org-scoped
   // Issue #240: the org-wide budget over every agent of the org (revoked ones' spend included).
   const orgBudgetOfOrg = (s, orgId) => {
     const budget = orgBudgetOf(s.orgs?.[orgId]);
