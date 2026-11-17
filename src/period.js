@@ -117,6 +117,8 @@ export function weekBounds(label, timezone = "UTC") {
 // "day" -> local YYYY-MM-DD; "week" -> ISO YYYY-Www (#261, monthStartDay ignored);
 // "month" -> YYYY-MM of the period's start month.
 export function periodKey(scope, ms, budgetPeriod) {
+  // #265: the lifetime total never resets, so every instant shares one period.
+  if (scope === "total") return "total";
   const bp = normalizeBudgetPeriod(budgetPeriod);
   if (scope === "week") return weekLabel(ms, bp.timezone);
   if (bp === DEFAULT_BUDGET_PERIOD) { const iso = new Date(ms).toISOString(); return scope === "month" ? iso.slice(0, 7) : iso.slice(0, 10); }

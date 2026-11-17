@@ -27,7 +27,7 @@ function renderCard(policy) {
 
 test("#175 card renders an Hour field pre-filled from policy.caps.hour and round-trips it", () => {
   const card = renderCard({ caps: { hour: 5, day: 50 } });
-  assert.deepEqual(card.inputs.map((i) => i.name), ["run", "hour", "day", "week", "month", "maxSteps"]);
+  assert.deepEqual(card.inputs.map((i) => i.name), ["run", "hour", "day", "week", "month", "total", "maxSteps"]);
   assert.equal(card.form.elements.hour.value, 5);
   card.form.elements.hour.value = String(card.form.elements.hour.value); // as a browser input reports it
   card.form.elements.day.value = String(card.form.elements.day.value);
@@ -91,4 +91,13 @@ test("#175 integration: a models-only dashboard Save keeps an API-set caps.hour 
   assert.deepEqual(cleared.body.caps, { day: 50 });
   // Omitting caps keeps them.
   assert.deepEqual((await f.request(policyUrl, { killed: false }, owner)).body.caps, { day: 50 });
+});
+
+test("#265 card renders a Total (never resets) field and round-trips caps.total", () => {
+  const card = renderCard({ caps: { total: 200 } });
+  const total = card.inputs.find((i) => i.name === "total");
+  assert.equal(total.value, 200);
+  assert.equal(card.form.children[0].children.find((l) => l.children[0] === total).text, "Total (never resets)");
+  total.value = String(total.value);
+  assert.deepEqual(card.save(), { total: 200 });
 });

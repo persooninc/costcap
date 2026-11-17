@@ -351,3 +351,74 @@ test("#123 admin creates a team in the dashboard and sees the team spend card", 
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+test("#265 total (never resets) on an agent card and a team form, spanning two months, refused and alerted", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const clock = { now: Date.parse("2026-10-20T12:00:00Z") };
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-total-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock.now,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    deliverAlert: async () => [{ status: "accepted" }],
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    const signIn = async () => {
+      await page.goto(origin);
+      await expect(page.locator("#requestButton")).toBeEnabled();
+      await page.locator("#email").fill("total-admin@example.invalid");
+      await page.locator("#requestButton").click();
+      await page.locator("#code").fill(codes.at(-1).code);
+      await page.locator("#verify button[type=submit]").click();
+      await expect(page.locator("#workspace")).toBeVisible();
+    };
+    await signIn();
+    const agents = await page.evaluate(async (base) => {
+      const out = [];
+      for (const name of ["research-bot", "pilot-a", "pilot-b"]) {
+        const t = await (await fetch("/v1/enrollment-tokens", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+        out.push(await (await fetch(base + "/v1/enroll", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + t.token }, body: JSON.stringify({ name }) })).json());
+      }
+      return out;
+    }, origin);
+    const sync = (agent, receipts) => page.request.post(`${origin}/v1/receipts`, { headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, data: { receipts } });
+    await sync(agents[0], [{ id: "oct", ts: "2026-10-20T11:00:00Z", cost_usd: 6 }]);
+    await sync(agents[1], [{ id: "oct", ts: "2026-10-20T11:00:00Z", cost_usd: 8 }]);
+    // November: the month changes, the total does not reset.
+    clock.now = Date.parse("2026-11-16T12:00:00Z");
+    await signIn();
+    await sync(agents[0], [{ id: "nov", ts: "2026-11-16T11:00:00Z", cost_usd: 3 }]);
+    await sync(agents[2], [{ id: "nov", ts: "2026-11-16T11:00:00Z", cost_usd: 7.1 }]);
+    const card = page.locator("#agents .agent").filter({ hasText: "research-bot" });
+    await card.locator("input[name=total]").fill("10");
+    await card.locator("button[type=submit]").click();
+    await expect(card).toContainText("total $9.00 of $10.00 (left $1.00)");
+    // Another $1.20 call syncs: the next call is refused with scope total, no Retry-After hint.
+    await sync(agents[0], [{ id: "more", ts: "2026-11-16T11:30:00Z", cost_usd: 1.2 }]);
+    const verdict = await page.evaluate(async (id) => (await fetch(`/v1/agents/${id}/budget`)).json(), agents[0].agentId);
+    expect([verdict.verdict, verdict.scope, verdict.cap_usd, "retry_after_s" in verdict]).toEqual(["budget_exceeded", "total", 10, false]);
+    // Team form: Total (never resets).
+    await page.locator("#teamForm input[name=name]").fill("pilot");
+    await page.locator("#teamAgents label", { hasText: "pilot-a" }).locator("input").check();
+    await page.locator("#teamAgents label", { hasText: "pilot-b" }).locator("input").check();
+    await page.locator("#teamForm input[name=total]").fill("15");
+    await page.locator("#teamForm button").click();
+    const team = page.locator('#teams [data-team="pilot"]');
+    await expect(team).toContainText("total $15.10 of $15.00 (left $0.00)");
+    await expect(team.locator("strong")).toHaveText("OVER CAP");
+    // The alert sweep pages cap_hit for the total.
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_hit · total" }).first()).toBeVisible();
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

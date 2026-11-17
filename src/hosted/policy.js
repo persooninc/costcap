@@ -29,9 +29,10 @@ export function verifyToken(token, storedHash) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export const CAP_KEYS = ["run", "hour", "day", "week", "month"];
-// Scopes a time-boxed cap raise (#208) can target; week raises are out of scope (#261 Out).
-export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "week");
+// #265: total is a lifetime cap that never resets.
+export const CAP_KEYS = ["run", "hour", "day", "week", "month", "total"];
+// Scopes a time-boxed cap raise (#208) can target; week and total raises are out of scope (#261, #265 Out).
+export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "week" && k !== "total");
 
 // Issue #208/#212: time-boxed cap raise overlay. policy.raise = { <scope>: [{ amount_usd, expires_at, request_id }, ...] }.
 // Raises stack: the effective cap is computed at evaluation time as current base + sum of

@@ -49,8 +49,23 @@ export function isExpired(item, cutoffMs, floorMs) {
   return true;
 }
 
-/** Keys of `receipts` (store map) belonging to `orgId` that a sweep would delete. */
-export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs) {
+/**
+ * Keys of `receipts` (store map) belonging to `orgId` that a sweep would delete.
+ * #265: receipts of agents in `keepAgents` (a Set of agent ids whose own or team
+ * total cap counts every receipt) are never deleted.
+ */
+export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs, keepAgents = null) {
   if (cutoffMs === null) return [];
-  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
+  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !keepAgents?.has(item.agentId) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
+}
+
+/**
+ * #265: agent ids of an org whose receipts count toward a configured total cap:
+ * the agent's own caps.total, or the total of the team it belongs to.
+ */
+export function totalCapAgents(agents, teams, orgId) {
+  const out = new Set();
+  for (const a of agents ?? []) if (a?.orgId === orgId && a.policy?.caps?.total != null) out.add(a.id);
+  for (const t of teams ?? []) if (t?.orgId === orgId && t.total != null) for (const id of t.agents ?? []) out.add(id);
+  return out;
 }

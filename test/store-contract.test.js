@@ -87,6 +87,19 @@ async function contract(open, mode) {
   await reopened.flush();
   assert.equal(await settleOf(reopened, "ag1-token", { receipt_id: "foreign-unk", cost_usd: 1 }), 404);
   assert.equal(reopened.read((s) => s.receipts["ag1:foreign-unk"].settlement), undefined);
+  // #265: caps.total and a team total survive a restart; spent.total counts every org-A receipt, however old.
+  reopened.transaction((s) => {
+    s.agents.ag1.policy = { version: 2, caps: { day: 1, total: 5 }, killed: false };
+    s.teams[`${ORG_A}:pilot`] = { orgId: ORG_A, name: "pilot", agents: ["ag3"], total: 50 };
+    s.receipts["ag1:old"] = { orgId: ORG_A, agentId: "ag1", receipt: { id: "old", ts: "2025-01-01T00:00:00Z", cost_usd: 0.6 } };
+    delete s.receipts["ag1:foreign-unk"];
+  });
+  await reopened.flush();
+  const again = await open();
+  assert.deepEqual(again.read((s) => s.teams[`${ORG_A}:pilot`]), { orgId: ORG_A, name: "pilot", agents: ["ag3"], total: 50 });
+  assert.equal(again.read((s) => s.agents.ag1.policy.caps.total), 5);
+  const totalPolicy = await policyOf(again, "ag1-token");
+  assert.deepEqual([totalPolicy.caps.total, totalPolicy.agent_spend.spent.total], [5, 1.25]);
   return { store, reopened };
 }
 

@@ -6,10 +6,18 @@ import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // using the shared ledger's rows for that agent.
 
 export const UNKNOWN_AGENT = "unknown";
-export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month"]);
+// #265: total is a lifetime cap (never resets).
+export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month", "total"]);
 const HOUR_MS = 60 * 60 * 1000;
 
 const round6 = (n) => Number(n.toFixed(6));
+
+// #265: a total (lifetime) cap refusal says it never resets; it has no retry hint.
+export function totalCapMessage(scope, cap) {
+  return scope === "total" || String(scope ?? "").endsWith(":total")
+    ? { message: `CostCap: total budget of $${cap} is used up. A total budget does not reset; raise the cap to continue. The upstream call was not made.` }
+    : {};
+}
 
 function assertLimits(limits, label) {
   for (const scope of SCOPES) {
@@ -108,7 +116,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     const nowMs = nowDate.getTime();
     // #209: day/month windows follow the org budget period (UTC/day 1 by default).
     const today = { day: periodKey("day", nowMs, budgetPeriod), week: periodKey("week", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
-    const out = { run: 0, hour: 0, day: 0, week: 0, month: 0, steps: 0, unknown: 0 };
+    const out = { run: 0, hour: 0, day: 0, week: 0, month: 0, total: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
       if (r.cost_usd === null && !isPendingBatch(r)) out.unknown += 1;
@@ -119,6 +127,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       if (periodKey("day", tsMs, budgetPeriod) === today.day) out.day += cost;
       if (periodKey("week", tsMs, budgetPeriod) === today.week) out.week += cost;
       if (periodKey("month", tsMs, budgetPeriod) === today.month) out.month += cost;
+      out.total += cost;
       if (r.run_id === runId) { out.run += cost; out.steps += 1; }
     }
     return out;
@@ -165,13 +174,13 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       for (const scope of SCOPES) {
         const cap = limits?.[scope];
         if (cap != null && s[scope] >= cap) {
-          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, cap_usd: cap, spent_usd: round6(s[scope]), ...hourHint(scope, [agentId], s[scope], cap), ...who };
+          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, cap_usd: cap, spent_usd: round6(s[scope]), ...hourHint(scope, [agentId], s[scope], cap), ...totalCapMessage(scope, cap), ...who };
         }
       }
       for (const scope of SCOPES) {
         const cap = team?.[scope];
         if (cap != null && ts[scope] >= cap) {
-          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, team: team.team, cap_usd: cap, spent_usd: round6(ts[scope]), ...hourHint(scope, team.agents, ts[scope], cap), ...who };
+          return { verdict: "budget_exceeded", reason: "budget_exceeded", scope, team: team.team, cap_usd: cap, spent_usd: round6(ts[scope]), ...hourHint(scope, team.agents, ts[scope], cap), ...totalCapMessage(scope, cap), ...who };
         }
       }
       if (limits?.maxSteps != null && s.steps >= limits.maxSteps) {
@@ -216,6 +225,7 @@ export function budgetRemaining(budgets, who) {
   const models = budgets.modelsFor?.(who.agent_id) ?? null;
   const hour = tight("hour");
   const week = tight("week");
+  const total = tight("total");
   // hour_usd (#172) appears only when an hour cap applies, so existing consumers see no new null field.
-  return { run_usd: tight("run"), ...(hour != null ? { hour_usd: hour } : {}), day_usd: tight("day"), ...(week != null ? { week_usd: week } : {}), month_usd: tight("month"), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
+  return { run_usd: tight("run"), ...(hour != null ? { hour_usd: hour } : {}), day_usd: tight("day"), ...(week != null ? { week_usd: week } : {}), month_usd: tight("month"), ...(total != null ? { total_usd: total } : {}), steps: left(limits?.maxSteps, s.steps), ...(models ? { models } : {}) };
 }
