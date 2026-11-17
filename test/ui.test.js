@@ -119,3 +119,15 @@ test('#169 Spend card has a By tag key field wired to group_by=tag', () => {
   assert.match(js, /group_by=tag&tag_key='\+encodeURIComponent\(k\)/);
   assert.doesNotThrow(() => new Script(js));
 });
+
+test('#258 Alert destinations card has default kinds and an alert routes editor', () => {
+  const body = uiResponse('/').body;
+  assert.match(body, /id="defaultKinds"/);
+  for (const k of ['cap_approaching', 'cap_hit', 'loop_detected', 'agent_silent', 'cap_projected', 'spend_anomaly']) {
+    assert.match(body, new RegExp(`name="kind" type="checkbox" value="${k}"`));
+    assert.match(body, new RegExp(`name="rkind" type="checkbox" value="${k}"`));
+  }
+  assert.match(body, /<h3>Alert routes<\/h3>/);
+  assert.match(body, /id="routeForm" hidden/);
+  assert.match(body, /id="alertRoutes"/);
+});
