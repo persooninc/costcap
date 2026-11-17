@@ -280,6 +280,12 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   region. These stay `cloud_model_unpriced` (run pauses, never the fallback): an unlisted id, a region
   with no row, a `global.` profile, an ARN, or a usage component with no rate (e.g. cache writes).
   A Converse `serviceTier.type` other than `default` is `service_tier_unpriced`.
+  InvokeModel (#288) reads each model's native usage (Nova `usage.inputTokens/outputTokens` and
+  `cacheReadInputTokenCount`, Llama `prompt_token_count/generation_token_count`, OpenAI-style
+  `usage.prompt_tokens/completion_tokens`), else the `X-Amzn-Bedrock-Input-Token-Count` /
+  `-Output-Token-Count` headers; `invoke-with-response-stream` is priced from the final chunk's
+  `amazon-bedrock-invocationMetrics` (cut before it: `stream_incomplete`). No usage at all stays
+  `usage_unavailable`.
 - **`bedrock` / `vertex` keys in `--upstream-prices`.** Same rules as the other built-in keys
   (#189): `{discount}` scales table rows, absolute rates price an unlisted Bedrock id in any region,
   `"*"` takes a discount only, rates must be > 0. Bedrock keys are the base id without geo prefix

@@ -409,3 +409,80 @@ test("#278 AC4 --upstream-prices bedrock entry prices an unlisted id as user_pri
   assert.deepEqual(pick(p3.receipts[0]), pick(p4.receipts[0]));
   assert.equal(p3.receipts[0].regional_multiplier, 1.1);
 });
+
+// ---- #288: non-Anthropic InvokeModel / InvokeModelWithResponseStream metering ----
+import { bedrockInvokeUsage, bedrockChunkFrame } from "../src/cloud.js";
+import { createBedrockInvokeStreamUsageParser, extractBedrockInvokeUsage } from "../src/proxy.js";
+
+const LLAMA = "meta.llama3-3-70b-instruct-v1:0";
+const rowCost = (id, i, o, cr = 0) => { const r = TABLE.bedrock_models.models[id].regions["us-east-1"]; return Number(((i * r.input + cr * (r.cached_input ?? 0) + o * r.output) / 1e6).toFixed(6)); };
+const novaInvoke = { output: { message: { role: "assistant", content: [{ text: "hi" }] } }, stopReason: "end_turn",
+  usage: { inputTokens: 1000, outputTokens: 500, totalTokens: 1700, cacheReadInputTokenCount: 200 } };
+const metricsFrames = (m) => [bedrockChunkFrame({ contentBlockDelta: { delta: { text: "hi" } } }), bedrockChunkFrame({ messageStop: { stopReason: "end_turn" }, "amazon-bedrock-invocationMetrics": m })];
+
+test("#288 bedrockInvokeUsage: Nova, Llama, OpenAI-style, invocationMetrics, headers; nothing -> null", () => {
+  assert.deepEqual(bedrockInvokeUsage(novaInvoke), { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 200 });
+  assert.deepEqual(bedrockInvokeUsage({ generation: "x", prompt_token_count: 10, generation_token_count: 20 }), { input_tokens: 10, output_tokens: 20 });
+  assert.deepEqual(bedrockInvokeUsage({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } }), { input_tokens: 7, output_tokens: 3 });
+  assert.deepEqual(bedrockInvokeUsage({ "amazon-bedrock-invocationMetrics": { inputTokenCount: 4, outputTokenCount: 5 } }), { input_tokens: 4, output_tokens: 5 });
+  const h = new Headers({ "X-Amzn-Bedrock-Input-Token-Count": "11", "X-Amzn-Bedrock-Output-Token-Count": "22" });
+  assert.deepEqual(bedrockInvokeUsage({ outputs: [{ text: "x" }] }, h), { input_tokens: 11, output_tokens: 22 });
+  assert.deepEqual(bedrockInvokeUsage(null, h), { input_tokens: 11, output_tokens: 22 });
+  assert.equal(bedrockInvokeUsage({ outputs: [] }, new Headers({ "X-Amzn-Bedrock-Input-Token-Count": "1" })), null);
+  assert.equal(bedrockInvokeUsage({ outputs: [] }, new Headers()), null);
+  assert.equal(bedrockInvokeUsage({ usage: { inputTokens: -1, outputTokens: 1 } }), null);
+  assert.equal(extractBedrockInvokeUsage("not json", new Headers(), "m"), null);
+  assert.deepEqual(extractBedrockInvokeUsage("not json", h, "m").usage.input_tokens, 11);
+});
+
+test("#288 invoke stream parser: priced from invocationMetrics; cut before it or corrupt is incomplete", () => {
+  const all = Buffer.concat(metricsFrames({ inputTokenCount: 10, outputTokenCount: 20 }));
+  const p = createBedrockInvokeStreamUsageParser("m");
+  for (let i = 0; i < all.length; i += 5) p.push(all.subarray(i, i + 5));
+  assert.equal(p.incomplete, false);
+  assert.deepEqual([p.end().usage.input_tokens, p.end().usage.output_tokens], [10, 20]);
+  const cut = createBedrockInvokeStreamUsageParser("m");
+  cut.push(metricsFrames({ inputTokenCount: 10, outputTokenCount: 20 })[0]);
+  assert.equal(cut.incomplete, true); assert.equal(cut.end(), null);
+  const partial = createBedrockInvokeStreamUsageParser("m");
+  partial.push(all.subarray(0, all.length - 2));
+  assert.equal(partial.incomplete, true);
+});
+
+test("#288 AC1-4 Nova / Llama / header-only invoke priced, stream priced, cut stream and no usage are null", async (t) => {
+  const handler = (req, res) => {
+    if (req.url.includes("nova") && req.url.endsWith("/invoke")) return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(novaInvoke));
+    if (req.url.includes("nova") && req.url.endsWith("/invoke-with-response-stream")) return res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" }).end(Buffer.concat(metricsFrames({ inputTokenCount: 1000, outputTokenCount: 500 })));
+    if (req.url.includes("llama") && req.url.endsWith("/invoke-with-response-stream")) return res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" }).end(metricsFrames({ inputTokenCount: 1, outputTokenCount: 1 })[0]);
+    if (req.url.includes("llama")) return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ generation: "hi", prompt_token_count: 1000, generation_token_count: 500 }));
+    if (req.url.includes("mistral")) return res.writeHead(200, { "content-type": "application/json", "x-amzn-bedrock-input-token-count": "1000", "x-amzn-bedrock-output-token-count": "500" }).end(JSON.stringify({ outputs: [{ text: "hi" }] }));
+    return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ outputs: [{ text: "hi" }] }));
+  };
+  const MISTRAL = Object.keys(TABLE.bedrock_models.models).find((k) => k.startsWith("mistral.") && TABLE.bedrock_models.models[k].regions["us-east-1"]);
+  const QWEN = Object.keys(TABLE.bedrock_models.models).find((k) => k.startsWith("qwen.") && TABLE.bedrock_models.models[k].regions["us-east-1"]);
+  {
+    const { base, port, receipts } = await proxyFor(t, await stub(handler), { cap: createCapEngine({ caps: { run: 10 } }) });
+    assert.equal((await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/invoke`, body)).status, 200);
+    const s = await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/invoke-with-response-stream`, body); await s.arrayBuffer();
+    assert.equal((await signedPost(base, port, `/bedrock/model/${enc(LLAMA)}/invoke`, body)).status, 200);
+    assert.equal((await signedPost(base, port, `/bedrock/model/${enc(MISTRAL)}/invoke`, body)).status, 200);
+    assert.deepEqual(receipts.map((c) => [c.model, c.cost_usd, c.reason]), [
+      [NOVA, novaCost("us-east-1"), undefined],
+      [NOVA, rowCost(NOVA, 1000, 500), undefined],
+      [LLAMA, rowCost(LLAMA, 1000, 500), undefined],
+      [MISTRAL, rowCost(MISTRAL, 1000, 500), undefined],
+    ]);
+    // Same Nova cost as the equivalent Converse call; the run continues.
+    assert.equal((await signedPost(base, port, `/bedrock/model/${enc(NOVA)}/invoke`, body)).status, 200);
+  }
+  {
+    const { base, port, receipts } = await proxyFor(t, await stub(handler), { cap: createCapEngine({ caps: { run: 10 } }) });
+    assert.equal((await signedPost(base, port, `/bedrock/model/${enc(QWEN)}/invoke`, body)).status, 200);
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"]);
+  }
+  {
+    const { base, port, receipts } = await proxyFor(t, await stub(handler), { cap: createCapEngine({ caps: { run: 10 } }) });
+    const s = await signedPost(base, port, `/bedrock/model/${enc(LLAMA)}/invoke-with-response-stream`, body); await s.arrayBuffer();
+    assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "stream_incomplete"]);
+  }
+});

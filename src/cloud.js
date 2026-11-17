@@ -229,3 +229,37 @@ export function createEventStreamDecoder(onEvent, { converse = false } = {}) {
     get partial() { return pending.length > 0; },
   };
 }
+
+/**
+ * #288: usage from a non-Anthropic Bedrock InvokeModel response, in Anthropic Messages shape, or null.
+ * Native body fields first (Nova `usage.inputTokens/outputTokens` + `cacheRead/WriteInputTokenCount`;
+ * Llama `prompt_token_count/generation_token_count`; OpenAI-style `usage.prompt_tokens/completion_tokens`
+ * (Mistral, DeepSeek, gpt-oss, Qwen); a stream chunk's `amazon-bedrock-invocationMetrics`), then the
+ * `X-Amzn-Bedrock-Input-Token-Count` / `-Output-Token-Count` response headers.
+ */
+export function bedrockInvokeUsage(body, headers = null) {
+  const ok = (v) => Number.isInteger(v) && v >= 0;
+  const shape = (i, o, cr, cw) => (ok(i) && ok(o) ? { input_tokens: i, output_tokens: o,
+    ...(ok(cr) && cr > 0 && { cache_read_input_tokens: cr }), ...(ok(cw) && cw > 0 && { cache_creation_input_tokens: cw }) } : null);
+  if (body && typeof body === "object") {
+    const m = body["amazon-bedrock-invocationMetrics"];
+    if (m && typeof m === "object") {
+      const r = shape(m.inputTokenCount, m.outputTokenCount, m.cacheReadInputTokenCount, m.cacheWriteInputTokenCount);
+      if (r) return r;
+    }
+    const u = body.usage;
+    if (u && typeof u === "object") {
+      const r = shape(u.inputTokens, u.outputTokens, u.cacheReadInputTokenCount ?? u.cacheReadInputTokens, u.cacheWriteInputTokenCount ?? u.cacheWriteInputTokens)
+        ?? shape(u.prompt_tokens, u.completion_tokens);
+      if (r) return r;
+    }
+    const r = shape(body.prompt_token_count, body.generation_token_count);
+    if (r) return r;
+  }
+  if (headers && typeof headers.get === "function") {
+    const n = (k) => { const v = headers.get(k); return v != null && /^\d+$/.test(v.trim()) ? Number(v.trim()) : null; };
+    return shape(n("x-amzn-bedrock-input-token-count"), n("x-amzn-bedrock-output-token-count"),
+      n("x-amzn-bedrock-cache-read-input-token-count"), n("x-amzn-bedrock-cache-write-input-token-count"));
+  }
+  return null;
+}
