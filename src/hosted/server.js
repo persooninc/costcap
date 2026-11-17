@@ -4,7 +4,7 @@ import http from "node:http";
 import { uiResponse } from "./ui.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
-import { hashToken, validatePolicy, effectiveCaps } from "./policy.js";
+import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise } from "./policy.js";
 import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
@@ -489,10 +489,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId);
           // #268: week scopes travel in additive fields (org_budget_v2, tag_caps_v2,
           // model_caps_week) so a pre-#268 wrapper keeps accepting the policy.
-          const { modelCaps: allModelCaps, ...rest } = a.policy;
+          // #271: week raises travel in raise_week, never under raise (a pre-#271 validator rejects raise.week).
+          const { policy: legacyPolicy, raise_week: raiseWeek } = splitWeekRaise(a.policy);
+          const { modelCaps: allModelCaps, ...rest } = legacyPolicy;
           const mc = splitWeekModelCaps(allModelCaps);
           const org = orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now());
-          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), budget_period: { ...bp } }; });
+          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), ...(raiseWeek ? { raise_week: raiseWeek } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -1239,15 +1241,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   // period. An active occurrence stays active while the run rate dips (until
   // cap_hit, removal or rollover); a resolved one does not re-fire this period.
   // eligible(record) says whether the scope still has known cost and a rule.
+  // #271: keyed by scope, so a week projection sticks to its ISO week and a month one to its month.
   function stickProjections(s, alerts, { orgId, owns, eligible, bp }) {
-    const period = capPeriod("month", now(), bp);
-    const hits = new Set(alerts.filter((a) => a.kind === "cap_hit" && a.scope === "month").map((a) => a.key));
+    const hits = new Set(alerts.filter((a) => a.kind === "cap_hit" && (a.scope === "month" || a.scope === "week")).map((a) => a.key));
     const hitOf = (key) => `cap_hit:${key.slice("cap_projected:".length)}`;
-    const records = Object.values(s.alerts).filter((x) => x.kind === "cap_projected" && x.orgId === orgId && owns(x) && x.period === period);
+    const scopeOf = (x) => x.scope ?? "month";
+    const records = Object.values(s.alerts).filter((x) => x.kind === "cap_projected" && x.orgId === orgId && owns(x) && x.period === capPeriod(scopeOf(x), now(), bp));
     const out = alerts.filter((a) => a.kind !== "cap_projected" || (!hits.has(hitOf(a.key)) && !records.some((x) => x.key === a.key && !x.active && !records.some((y) => y.key === a.key && y.active))));
     for (const x of records) {
       if (!x.active || out.some((a) => a.key === x.key) || hits.has(hitOf(x.key)) || !eligible(x)) continue;
-      out.push({ kind: "cap_projected", key: x.key, scope: "month", cap: x.cap, spent: x.spent, projected: x.projected, ...(x.team ? { team: x.team } : {}), ...(x.tag ? { tag: x.tag } : {}) });
+      out.push({ kind: "cap_projected", key: x.key, scope: scopeOf(x), cap: x.cap, spent: x.spent, projected: x.projected, ...(x.team ? { team: x.team } : {}), ...(x.tag ? { tag: x.tag } : {}) });
     }
     return out;
   }
@@ -1271,7 +1274,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return r.reason ? [r.reason] : [];
         });
         const caps = effectiveCaps(a.policy, now());
-        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: spent.all.usd }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: spent.all.usd }, unknown: { month: spent.month.unknown, week: spent.week.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
         const runCap = caps.run;
@@ -1311,8 +1314,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             if (ok) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...(alert.scope === "hour" ? {} : { period: capPeriod(alert.scope, now(), bp) }) }, { nowMs: now(), id: randomUUID() })) });
             continue;
           }
+          // #271: a week cap_projected fires once per ISO week: a new week resolves last week's and re-arms.
+          const weekProj = alert.kind === "cap_projected" && alert.scope === "week";
+          if (weekProj && prior && prior[1].period !== capPeriod("week", now(), bp)) { resolveAlert(prior[1], now()); out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, period: capPeriod("week", now(), bp) }, { nowMs: now(), id: randomUUID() })) }); continue; }
+          if (weekProj && !prior && Object.values(s.alerts).some((x) => x.key === alert.key && x.period === capPeriod("week", now(), bp))) continue;
           if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
-          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert, bp) }, { nowMs: now(), id: randomUUID() })) });
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert, bp), ...(weekProj ? { period: capPeriod("week", now(), bp) } : {}) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }
@@ -1325,12 +1332,12 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         const verdict = verdictOf(s, t);
         const warnOk = gateWarnings(s, `team:${t.orgId}:${t.name}`, verdict.caps, { day: verdict.spend.day_usd, week: verdict.spend.week_usd, month: verdict.spend.month_usd, total: verdict.spend.total_usd }, t.warnFractions, orgPeriod(s, t.orgId));
         const tbp = orgPeriod(s, t.orgId);
-        const teamAlerts = stickProjections(s, evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: tbp }, { warnFractions: t.warnFractions }), { orgId: t.orgId, owns: (x) => x.team === t.name, eligible: () => verdict.spend?.unknown_count === 0 && verdict.verdict !== "accounting_unavailable" && typeof verdict.caps?.month === "number", bp: tbp });
+        const teamAlerts = stickProjections(s, evaluateTeamAlerts({ orgId: t.orgId, verdict, blockedScopes, nowMs: now(), budgetPeriod: tbp }, { warnFractions: t.warnFractions }), { orgId: t.orgId, owns: (x) => x.team === t.name, eligible: (x) => verdict.spend?.unknown_count === 0 && verdict.verdict !== "accounting_unavailable" && typeof verdict.caps?.[x.scope ?? "month"] === "number", bp: tbp });
         for (const alert of teamAlerts) {
           teamKeys.add(alert.key);
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior && !warnOk(alert)) continue;
-          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert, tbp), ...(alert.kind === "cap_projected" ? { period: capPeriod("month", now(), tbp) } : {}) }, { nowMs: now(), id: randomUUID() })) });
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: t.orgId, agentId: null, ...warnExtra(alert, tbp), ...(alert.kind === "cap_projected" ? { period: capPeriod(alert.scope, now(), tbp) } : {}) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
         // Issue #223: team-scoped anomaly on the members' summed daily spend.
@@ -1343,7 +1350,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           else queueRetry(prior, out);
         }
       }
-      for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && (!teamKeys.has(x.key) || (x.kind === "cap_projected" && x.period && x.period !== capPeriod("month", now(), orgPeriod(s, x.orgId)))))) resolveAlert(prior, now());
+      for (const prior of Object.values(s.alerts).filter((x) => x.team && x.active && (!teamKeys.has(x.key) || (x.kind === "cap_projected" && x.period && x.period !== capPeriod(x.scope ?? "month", now(), orgPeriod(s, x.orgId)))))) resolveAlert(prior, now());
       // Issue #240: org-wide budget alerts, keyed per org; resolved once the condition clears.
       const orgKeys = new Set();
       for (const orgId of Object.keys(s.orgs ?? {})) {

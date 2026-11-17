@@ -46,7 +46,7 @@ const ask = { scope: "day", amount_usd: 20, duration_hours: 4, reason: "finish n
 
 test("unit: parseCapRequest validates scope, amount, duration and reason", () => {
   assert.deepEqual(parseCapRequest({ ...ask, reason: "  r " }), { ...ask, reason: "r" });
-  for (const bad of [{ ...ask, scope: "week" }, { ...ask, amount_usd: 0 }, { ...ask, amount_usd: -1 }, { ...ask, amount_usd: "20" }, { ...ask, amount_usd: Infinity }, { ...ask, amount_usd: 100_001 },
+  for (const bad of [{ ...ask, scope: "total" }, { ...ask, amount_usd: 0 }, { ...ask, amount_usd: -1 }, { ...ask, amount_usd: "20" }, { ...ask, amount_usd: Infinity }, { ...ask, amount_usd: 100_001 },
     { ...ask, duration_hours: 0 }, { ...ask, duration_hours: 169 }, { ...ask, duration_hours: 1.5 }, { ...ask, reason: "" }, { ...ask, reason: "x".repeat(501) }, undefined]) {
     assert.throws(() => parseCapRequest(bad), (e) => e.status === 400, JSON.stringify(bad));
   }
@@ -76,7 +76,7 @@ test("unit: overlay applies only before expires_at and only raises a base cap", 
   assert.equal(resolvePolicy({ lastKnown: policy, nowMs: T0 }).raiseExpiresAt, T0 + HOUR);
   assert.equal(resolvePolicy({ lastKnown: { ...policy, killed: true }, nowMs: T0 }).killed, true);
   // Invalid overlays are refused like any invalid policy.
-  for (const bad of [[], "x", { week: { cap: 1, expires_at: "2026-11-16T00:00:00Z", request_id: "r" } }, { day: { cap: -1, expires_at: "2026-11-16T00:00:00Z", request_id: "r" } }, { day: { cap: 1, expires_at: "nope", request_id: "r" } }, { day: null }]) assert.ok(raiseError(bad), JSON.stringify(bad));
+  for (const bad of [[], "x", { total: { cap: 1, expires_at: "2026-11-16T00:00:00Z", request_id: "r" } }, { day: { cap: -1, expires_at: "2026-11-16T00:00:00Z", request_id: "r" } }, { day: { cap: 1, expires_at: "nope", request_id: "r" } }, { day: null }]) assert.ok(raiseError(bad), JSON.stringify(bad));
   assert.equal(raiseError(null), null);
 });
 

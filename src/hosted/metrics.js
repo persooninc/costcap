@@ -9,7 +9,8 @@ import { ALERT_KINDS } from "./alerts.js";
 
 export const METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 export const MAX_SERIES = 5000;
-export const METRIC_WINDOWS = ["day", "month"];
+// #271: week (ISO, org timezone) appended last so the day/month series keep their order.
+export const METRIC_WINDOWS = ["day", "month", "week"];
 
 const HELP = {
   costcap_spend_usd: "Known spend in USD for the current budget period window (settled unknown costs at their settled value).",

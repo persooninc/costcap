@@ -15,7 +15,7 @@ import { modelSpendPolicy, validModelSpend } from "./model-caps.js";
 export const TEAM_SCOPES = Object.freeze(["day", "week", "month", "total"]);
 // Scopes an old (pre-#261) wrapper or snapshot always carries; week is optional (missing = 0).
 const REQUIRED_SPENT = ["day", "month"];
-// #195 --preflight remainders stay day/month (week preflight is out of scope).
+// #195 --preflight remainders: day/month always, week (#271) only when a week cap applies.
 const REMAINING_SCOPES = ["day", "month"];
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
 const round6 = (n) => Number(n.toFixed(6));
@@ -208,10 +208,11 @@ export function cachedAgentVerdict(spend, caps, pending, nowMs, budgetPeriod = n
 // Returns { day, month } (null = no cap on that window), or null when nothing applies.
 // Unknown-cost receipts make the verdict functions refuse already; here they add 0.
 function cachedRemaining(entry, caps, pending, nowMs, budgetPeriod = null) {
-  if (!entry || !REMAINING_SCOPES.some((s) => caps?.[s] != null)) return null;
+  if (!entry || ![...REMAINING_SCOPES, "week"].some((s) => caps?.[s] != null)) return null;
   const { total } = cachedTotals(entry, pending, nowMs, budgetPeriod);
   const left = {};
   for (const s of REMAINING_SCOPES) left[s] = caps[s] == null ? null : round6(Math.max(0, caps[s] - total[s]));
+  if (caps.week != null) left.week = round6(Math.max(0, caps.week - (total.week ?? 0)));
   return left;
 }
 

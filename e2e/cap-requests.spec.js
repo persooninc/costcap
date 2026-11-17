@@ -88,3 +88,41 @@ test("agent requests a raise, admin approves in the dashboard, raise expires", a
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// Issue #271: a week raise is requested, approved in the dashboard and shown as ACTIVE.
+test("#271 week raise is requested, approved in the dashboard and shown as ACTIVE", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-capreq-week-e2e-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {},
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  try {
+    const c = await post("/auth/request", { email: "capreq-week@example.invalid", turnstileToken: "x" }).then((r) => r.json());
+    const owner = (await post("/auth/verify", { challengeId: c.challengeId, code: codes["capreq-week@example.invalid"] })).headers.get("set-cookie").split(";")[0];
+    const token = await post("/v1/enrollment-tokens", { caps: { week: 10 } }, { cookie: owner }).then((r) => r.json());
+    const agent = await fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "week-agent" }) }).then((r) => r.json());
+    const asAgent = { authorization: `Bearer ${agent.token}` };
+    await post("/v1/receipts", { receipts: [{ id: "w-1", ts: new Date().toISOString(), cost_usd: 9.5, model: "m" }] }, asAgent);
+    expect((await post(`/v1/agents/${agent.agentId}/cap-requests`, { scope: "week", amount_usd: 20, duration_hours: 24, reason: "weekly backfill" }, asAgent)).status).toBe(201);
+    await page.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "window.turnstile={render(){return 1},reset(){}}" }));
+    await page.context().addCookies([{ name: "costcap_session", value: owner.split("=")[1], url: origin }]);
+    await page.goto(origin);
+    const card = page.locator("#capRequests .cap-request").first();
+    await expect(card).toContainText("week-agent · week +$20.00 for 24h · weekly backfill");
+    await card.getByRole("button", { name: "Approve" }).click();
+    await expect(card).toContainText("ACTIVE until");
+    const verdict = await fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: asAgent }).then((r) => r.json());
+    expect(verdict.budget_remaining.week_usd).toBe(20.5);
+    const pol = await fetch(`${origin}/v1/policy`, { headers: asAgent }).then((r) => r.json());
+    expect(pol.raise?.week).toBeUndefined();
+    expect(pol.raise_week).toHaveLength(1);
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});

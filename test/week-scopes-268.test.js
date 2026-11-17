@@ -42,7 +42,7 @@ test("#268 AC1: org week in America/Los_Angeles starts Monday 00:00 local", () =
   // Next Monday the synced week spend no longer counts.
   assert.equal(cachedOrgVerdict(orgBudgetPolicy(over, now), [], now + 7 * 86_400_000, LA), null);
   // Preflight remainders stay day/month (week preflight is out of scope).
-  assert.deepEqual(cachedOrgRemaining(full, [], now, LA), { day: null, month: null });
+  assert.deepEqual(cachedOrgRemaining(full, [], now, LA), { day: null, month: null, week: 6 }); // #271: week remainder
   // No agents yet: week spend is 0.
   assert.equal(orgBudgetVerdict({ budget: { week: 1 }, agentIds: [], receiptsByAgent: {}, nowMs: now }).spend.week_usd, 0);
 });
@@ -59,7 +59,8 @@ test("#268 AC6: org week cap_approaching at 50% and cap_hit at the cap", () => {
   const now = Date.parse("2026-11-18T12:00:00Z");
   const verdict = (spent) => orgBudgetVerdict({ budget: { week: 10, warnFractions: [0.5] }, agentIds: ["a"], receiptsByAgent: { a: [r("1", "2026-11-17T12:00:00Z", spent)] }, nowMs: now });
   const half = evaluateOrgAlerts({ orgId: "o", verdict: verdict(5), nowMs: now }, { warnFractions: [0.5] });
-  assert.deepEqual(half.map((a) => [a.kind, a.scope]), [["cap_approaching", "week"]]);
+  // #271: $5 by Wednesday noon projects past $10, so the week also projects.
+  assert.deepEqual(half.map((a) => [a.kind, a.scope]), [["cap_approaching", "week"], ["cap_projected", "week"]]);
   const hit = evaluateOrgAlerts({ orgId: "o", verdict: verdict(10), nowMs: now }, { warnFractions: [0.5] });
   assert.deepEqual(hit.map((a) => [a.kind, a.key]), [["cap_hit", "cap_hit:org:o:week"]]);
   const blocked = evaluateOrgAlerts({ orgId: "o", verdict: verdict(1), blockedScopes: ["week"], nowMs: now }, { warnFractions: [0.5] });

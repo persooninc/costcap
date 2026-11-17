@@ -11,7 +11,7 @@ const round6 = (n) => Number(n.toFixed(6));
 export const ORG_SCOPES = Object.freeze(["day", "week", "month"]);
 // What a pre-#268 wrapper accepts in org_budget; week travels in org_budget_v2.
 export const LEGACY_ORG_SCOPES = Object.freeze(["day", "month"]);
-// #195 --preflight remainders stay day/month (week preflight is out of scope).
+// #195 --preflight remainders: day/month always, week (#271) when an org week cap is set.
 const REMAINING_SCOPES = ["day", "month"];
 export const orgScope = (scope) => `org:${scope}`;
 const FIELDS = ["day", "week", "month", "warnFractions"];
@@ -119,5 +119,6 @@ export function cachedOrgRemaining(org, pending, nowMs, budgetPeriod = null) {
   const { total } = cachedTotals(asEntry(org), pending, nowMs, budgetPeriod);
   const left = {};
   for (const s of REMAINING_SCOPES) left[s] = org.caps?.[s] == null ? null : round6(Math.max(0, org.caps[s] - total[s]));
+  if (org.caps?.week != null) left.week = round6(Math.max(0, org.caps.week - (total.week ?? 0)));
   return left;
 }

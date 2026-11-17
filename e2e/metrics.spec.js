@@ -50,11 +50,14 @@ test("metrics: viewer key scrapes spend, cap headroom and unknown-cost honesty",
     };
     const a = await enroll("a", { day: 5 });
     const b = await enroll("b", {});
+    const w = await enroll("w", { week: 10 }); // #271: week-capped agent
     const ts = new Date().toISOString();
     expect((await post("/v1/receipts", { receipts: [{ id: "r1", ts, cost_usd: 1.25, model: "m" }] }, { authorization: `Bearer ${a.token}` })).status()).toBe(200);
     expect((await post("/v1/receipts", { receipts: [{ id: "r2", ts, cost_usd: 0.5, model: "m" }, { id: "r3", ts, cost_usd: null, model: "m" }] }, { authorization: `Bearer ${b.token}` })).status()).toBe(200);
     const team = await post("/v1/teams", { name: "t", agents: [a.agentId, b.agentId], month: 100 });
     expect(team.status(), await team.text()).toBe(200);
+    expect((await post("/v1/receipts", { receipts: [{ id: "w1", ts, cost_usd: 4, model: "m" }] }, { authorization: `Bearer ${w.token}` })).status()).toBe(200);
+    expect((await post("/v1/teams", { name: "wk", agents: [w.agentId], week: 5 })).status()).toBe(200);
 
     await page.reload();
     await expect(page.locator("#apiKeysCard")).toBeVisible();
@@ -75,6 +78,12 @@ test("metrics: viewer key scrapes spend, cap headroom and unknown-cost honesty",
     expect(body).toContain('costcap_spend_complete{agent="b",window="day"} 0');
     expect(body).toContain('costcap_unknown_cost_receipts{agent="b"} 1');
     expect(body).toContain('costcap_cap_remaining_usd{scope="team",name="t",window="month"} 98.25');
+    // #271: week series.
+    expect(body).toContain('costcap_spend_usd{agent="a",team="t",window="week"} 1.25');
+    expect(body).toContain('costcap_cap_usd{scope="agent",name="w",window="week"} 10');
+    expect(body).toContain('costcap_cap_remaining_usd{scope="agent",name="w",window="week"} 6');
+    expect(body).toContain('costcap_cap_usd{scope="team",name="wk",window="week"} 5');
+    expect(body).toContain('costcap_cap_remaining_usd{scope="team",name="wk",window="week"} 1');
   } finally {
     service.server.closeAllConnections();
     service.server.close();

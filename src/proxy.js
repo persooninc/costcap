@@ -622,7 +622,7 @@ function batchIdOf(raw) {
 function reserveLeft(left, reserved) {
   if (!left || !reserved) return left;
   const out = { ...left };
-  for (const k of ["run_usd", "hour_usd", "day_usd", "month_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
+  for (const k of ["run_usd", "hour_usd", "day_usd", "week_usd", "month_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
   return out;
 }
 
@@ -978,7 +978,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (preflightEst && !preflightEst.pass) {
               const est = preflightEst.estimate_usd;
               const left = agentBudgets?.limitsFor ? reserveLeft(budgetRemaining(agentBudgets, who), reservedUsd()) : null;
-              const agentScope = left && ["run", "hour", "day", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
+              const agentScope = left && ["run", "hour", "day", "week", "month"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
               if (agentScope) {
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
                 return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
@@ -987,9 +987,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
               const fr = fleetRemaining?.();
               const resv = reservedUsd();
-              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "month"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
+              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "week", "month"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
               for (const [kind, left] of [["agent", fleetLeft(fr?.agent)], ["team", fleetLeft(fr?.team)], ["org", fleetLeft(fr?.org)]]) {
-                const sc = left && ["day", "month"].find((x) => left[x] != null && est > left[x]);
+                const sc = left && ["day", "week", "month"].find((x) => left[x] != null && est > left[x]);
                 if (!sc) continue;
                 const isTeam = kind === "team", isOrg = kind === "org";
                 const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, fleet: true,

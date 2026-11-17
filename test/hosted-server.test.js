@@ -1770,7 +1770,8 @@ test("#268 week scopes: org/tag/model validation, audit, restart, policy split, 
   await f.service().evaluateFleetAlerts();
   await f.service().evaluateFleetAlerts();
   const weekAlerts = () => f.delivery.filter((a) => a.scope === "week");
-  assert.deepEqual(weekAlerts().map((a) => a.kind), ["cap_approaching", "cap_approaching", "cap_approaching"]);
+  // #271: the org week budget now also projects (cap_projected) like month.
+  assert.deepEqual(weekAlerts().filter((a) => a.kind !== "cap_projected").map((a) => a.kind), ["cap_approaching", "cap_approaching", "cap_approaching"]);
   await f.request("/v1/receipts", { receipts: [{ id: "w2", ts: new Date(clock).toISOString(), cost_usd: 5, model: "gpt-4o", tags: { customer: "acme" } }] }, null, agent.token);
   await f.service().evaluateFleetAlerts();
   await f.service().evaluateFleetAlerts();

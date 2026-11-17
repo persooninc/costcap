@@ -381,6 +381,52 @@ test("team mid-month run rate shows cap_projected · team ops month · projected
   }
 });
 
+// Issue #271: a team week cap projects like month. Wednesday 12:00 UTC, $40 of $70: 40 * 7 / 2.5 = $112.
+test("#271 team week run rate shows cap_projected · team ops week · projected $112.00", async ({ page }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  let clock = Date.parse("2026-11-18T00:00:00.000Z");
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-proj-week-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", now: () => clock,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); }, sendInvite: async () => {},
+    deliverAlert: async () => [{ status: "accepted" }],
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  try {
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await page.goto(origin);
+    await page.locator("#email").fill("proj-week-owner@example.invalid");
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const ok = await page.evaluate(async ({ credential, ts }) => {
+      const agent = await (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "ops-bot" }) })).json();
+      const team = await fetch("/v1/teams", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "ops", agents: [agent.agentId], week: 70 }) });
+      const r = await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "p1", ts, cost_usd: 40, model: "m" }] }) });
+      return [team.status, r.status];
+    }, { credential: token, ts: "2026-11-17T10:00:00.000Z" });
+    expect(ok).toEqual([200, 200]);
+    clock = Date.parse("2026-11-18T12:00:00.000Z");
+    await service.evaluateFleetAlerts();
+    await page.locator("#refresh").click();
+    await expect(page.locator("#alerts .alert-active", { hasText: "cap_projected · week · team ops week · projected $112.00" })).toBeVisible();
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});
+
 // Issue #259: "Send test alert" on the Alert destinations card. Fixture receiver only.
 for (const viewport of [{ name: "desktop", width: 1280, height: 800 }, { name: "mobile", width: 390, height: 844 }]) {
   test(`admin sends a test alert and sees per-channel results; viewer has no button (${viewport.name})`, async ({ page }) => {

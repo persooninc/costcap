@@ -31,8 +31,24 @@ export function verifyToken(token, storedHash) {
 
 // #265: total is a lifetime cap that never resets.
 export const CAP_KEYS = ["run", "hour", "day", "week", "month", "total"];
-// Scopes a time-boxed cap raise (#208) can target; week and total raises are out of scope (#261, #265 Out).
-export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "week" && k !== "total");
+// Scopes a time-boxed cap raise (#208) can target; week joined in #271, total raises are out of scope (#265 Out).
+export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "total");
+// What a pre-#271 wrapper accepts under policy.raise; week raises travel in the additive `raise_week` field.
+export const LEGACY_RAISE_KEYS = Object.freeze(RAISE_KEYS.filter((k) => k !== "week"));
+
+// #271: split a stored policy for GET /v1/policy so an old wrapper never sees raise.week.
+export function splitWeekRaise(policy) {
+  const { raise, ...rest } = policy ?? {};
+  if (!raise || !("week" in raise)) return { policy: policy ?? {}, raise_week: null };
+  const { week, ...legacy } = raise;
+  return { policy: { ...rest, ...(Object.keys(legacy).length ? { raise: legacy } : {}) }, raise_week: raiseEntries(week) };
+}
+
+// #271: validates the additive raise_week field (null = no week raises).
+export function raiseWeekError(v) {
+  if (v === null || v === undefined) return null;
+  return raiseError({ week: v });
+}
 
 // Issue #208/#212: time-boxed cap raise overlay. policy.raise = { <scope>: [{ amount_usd, expires_at, request_id }, ...] }.
 // Raises stack: the effective cap is computed at evaluation time as current base + sum of

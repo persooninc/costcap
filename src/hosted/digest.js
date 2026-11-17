@@ -102,14 +102,14 @@ export function buildDigest(state, orgId, { week, nowMs, dashboardUrl = null } =
   const last = spendBreakdown(items, { ...range(prev.weekStart, prev.weekEnd), groupBy: "agent" }).total;
   const total = byAgent.total;
   const delta = round6(total.usd_known - last.usd_known);
-  // Cap headroom in the current budget period (month cap first, then day).
+  // Cap headroom in the current budget period (month cap first, then day, then week #271).
   const headroom = [];
   const spentSince = (agentIds, start) => spendBreakdown(items.filter((r) => agentIds.includes(r.agentId)), { since: start, until: nowMs, budgetPeriod: bp }).total;
   const room = (base, scope, cap, ids) => {
     const t = spentSince(ids, periodBounds(scope, nowMs, bp).start);
     headroom.push({ ...base, scope, cap_usd: cap, spent_usd: t.usd_known, headroom_usd: round6(cap - t.usd_known), unknown_count: t.unknown_count, lower_bound: t.unknown_count > 0 });
   };
-  const capScope = (caps) => (Number.isFinite(caps?.month) ? "month" : Number.isFinite(caps?.day) ? "day" : null);
+  const capScope = (caps) => (Number.isFinite(caps?.month) ? "month" : Number.isFinite(caps?.day) ? "day" : Number.isFinite(caps?.week) ? "week" : null);
   for (const a of [...agents].filter((x) => !x.revoked).sort((x, y) => String(x.name).localeCompare(String(y.name)))) {
     const caps = effectiveCaps(a.policy ?? {}, nowMs);
     const scope = capScope(caps);

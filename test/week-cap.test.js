@@ -100,7 +100,7 @@ test("#261 AC1: hosted verdict and the wrapper's cached verdict split the week a
   // UTC: both receipts fall in the UTC week starting Monday 00:00Z, so 10 already.
   assert.equal(hostedAgentVerdict({ agent, receipts, nowMs: MON_1AM }).scope, "week");
   // Preflight remainders stay day/month (week preflight is out of scope).
-  assert.equal(cachedAgentRemaining(snap, caps, [], MON_1AM, LA), null);
+  assert.deepEqual(cachedAgentRemaining(snap, caps, [], MON_1AM, LA), { day: null, month: null, week: 6 }); // #271: week preflight remainder
 });
 
 test("#261 AC2: a week that starts in the previous month counts both months; month spend stays $3", () => {
@@ -138,15 +138,16 @@ test("#261 AC3: team week cap, synced + unsynced spend, POST validation", () => 
   assert.equal(cachedTeamVerdict(cached, [], ms("2026-11-23T00:00:01Z")), null);
 });
 
-test("#261 AC4: caps.week validation; unknown cap keys are rejected; week is not a raise scope", () => {
+test("#261 AC4 (#271: week is now a raise scope): caps.week validation; unknown cap keys are rejected", () => {
   assert.deepEqual(validatePolicy({ version: 1, caps: { week: 50 } }), []);
   for (const bad of [0, -1, "5"]) assert.deepEqual(validatePolicy({ version: 1, caps: { week: bad } }), ["caps.week must be a positive number"]);
   assert.match(validatePolicy({ version: 1, caps: { weekly: 5 } }).join(), /caps.weekly is not a cap scope/);
   assert.match(validatePolicy({ version: 1, caps: [] }).join(), /caps must be an object/);
   assert.equal(resolvePolicy({ fetched: { version: 1, caps: { week: 50, day: 9 } } }).caps.week, 50);
   assert.equal(resolvePolicy({ local: { week: 20 }, fetched: { version: 1, caps: { week: 50 } } }).caps.week, 20);
-  assert.match(raiseError({ week: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), /not a cap scope/);
-  assert.throws(() => parseCapRequest({ scope: "week", amount_usd: 20, duration_hours: 4, reason: "x" }), /scope must be one of/);
+  assert.equal(raiseError({ week: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), null);
+  assert.match(raiseError({ total: [{ amount_usd: 1, expires_at: "2026-12-01T00:00:00Z", request_id: "r" }] }), /not a cap scope/);
+  assert.equal(parseCapRequest({ scope: "week", amount_usd: 20, duration_hours: 4, reason: "x" }).scope, "week");
   // An old snapshot (no spent.week) is still a valid policy response and counts week from 0 + pending.
   const old = { spent: { day: 1, month: 2 }, unknown: 0, pending_batches: 0, as_of: "2026-11-18T00:00:00Z" };
   assert.equal(validAgentSpend(old), true);

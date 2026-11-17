@@ -14,10 +14,17 @@ export { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 // by the elapsed share of the UTC month. Returns null before minElapsedMs so a
 // first-hour burst does not page. Unknown-cost receipts are not counted as
 // zero; the caller reports them and the projection is then a lower bound.
-export function projectMonthSpend(spent, nowMs, { minElapsedMs = 24 * 3600_000, budgetPeriod = null } = {}) {
+export function projectMonthSpend(spent, nowMs, opts = {}) {
+  return projectSpend("month", spent, nowMs, opts);
+}
+
+// #271: the same linear projection over any budget period ("month" or the ISO "week").
+// The 24 h floor is kept for weeks too: a 7-day period projected from less than a
+// day of spend (one burst) would page on noise, and a day is 1/7 of the week.
+export function projectSpend(scope, spent, nowMs, { minElapsedMs = 24 * 3600_000, budgetPeriod = null } = {}) {
   if (typeof spent !== "number" || !Number.isFinite(spent) || !Number.isFinite(nowMs)) return null;
-  // #209: the elapsed share of the configured month period (UTC, day 1 by default).
-  const { start, end } = periodBounds("month", nowMs, budgetPeriod);
+  // #209: the elapsed share of the configured period (UTC, day 1 by default).
+  const { start, end } = periodBounds(scope, nowMs, budgetPeriod);
   const elapsed = nowMs - start;
   if (elapsed < minElapsedMs) return null;
   return spent * ((end - start) / elapsed);
@@ -145,12 +152,14 @@ export function evaluateAlerts(state, { approachFraction = 0.8, warnFractions, s
       if (warn) out.push(warn);
     }
   }
-  const monthCap = state.caps?.month;
-  if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month")) {
-    const projected = projectMonthSpend(state.spend?.month, state.nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
-    if (projected !== null && projected >= monthCap) {
-      const unknown = state.unknown?.month ?? 0;
-      out.push({ kind: "cap_projected", scope: "month", key: `cap_projected:${state.agentId}:month`, cap: monthCap, spent: state.spend.month, projected: Number(projected.toFixed(6)), lowerBound: unknown > 0 });
+  // #271: week caps project like month caps (month stays first so month-only output is unchanged).
+  for (const scope of ["month", "week"]) {
+    const pcap = state.caps?.[scope];
+    if (typeof pcap !== "number" || !Number.isFinite(pcap) || out.some((a) => a.scope === scope)) continue;
+    const projected = projectSpend(scope, state.spend?.[scope], state.nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+    if (projected !== null && projected >= pcap) {
+      const unknown = state.unknown?.[scope] ?? 0;
+      out.push({ kind: "cap_projected", scope, key: `cap_projected:${state.agentId}:${scope}`, cap: pcap, spent: state.spend[scope], projected: Number(projected.toFixed(6)), lowerBound: unknown > 0 });
     }
   }
   // Step budget is the third shipped loop guardrail, with spiral and velocity.
@@ -242,10 +251,11 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [], nowMs, 
     }
   }
   // Issue #247: team month cap_projected, same rule as the org (#240).
-  const monthCap = verdict.caps?.month;
-  if (typeof monthCap === "number" && Number.isFinite(monthCap) && !out.some((a) => a.scope === "month" && a.kind === "cap_hit")) {
-    const projected = projectMonthSpend(verdict.spend.month_usd, nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
-    if (projected !== null && projected >= monthCap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, team: verdict.name, scope: "month", cap: monthCap, spent: verdict.spend.month_usd, projected: Number(projected.toFixed(6)) });
+  for (const scope of ["month", "week"]) {
+    const pcap = verdict.caps?.[scope];
+    if (typeof pcap !== "number" || !Number.isFinite(pcap) || out.some((a) => a.scope === scope && a.kind === "cap_hit")) continue;
+    const projected = projectSpend(scope, verdict.spend[`${scope}_usd`], nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+    if (projected !== null && projected >= pcap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:${scope}`, team: verdict.name, scope, cap: pcap, spent: verdict.spend[`${scope}_usd`], projected: Number(projected.toFixed(6)) });
   }
   return out;
 }
@@ -270,10 +280,11 @@ export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, b
       if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, ...(explicit ? { fraction: warn.fraction } : {}) });
     }
   }
-  const monthCap = verdict.caps?.month;
-  if (typeof monthCap === "number" && !out.some((a) => a.scope === "month" && a.kind === "cap_hit")) {
-    const projected = projectMonthSpend(verdict.spend.month_usd, nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
-    if (projected !== null && projected >= monthCap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, org: true, scope: "month", cap: monthCap, spent: verdict.spend.month_usd, projected: Number(projected.toFixed(6)), lowerBound: false });
+  for (const scope of ["month", "week"]) {
+    const pcap = verdict.caps?.[scope];
+    if (typeof pcap !== "number" || out.some((a) => a.scope === scope && a.kind === "cap_hit")) continue;
+    const projected = projectSpend(scope, verdict.spend[`${scope}_usd`], nowMs, { minElapsedMs: minProjectionMs, budgetPeriod });
+    if (projected !== null && projected >= pcap) out.push({ kind: "cap_projected", key: `cap_projected:${id}:${scope}`, org: true, scope, cap: pcap, spent: verdict.spend[`${scope}_usd`], projected: Number(projected.toFixed(6)), lowerBound: false });
   }
   return out;
 }
