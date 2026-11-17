@@ -1717,10 +1717,21 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         if (!v) delegModel = dm;
         return v;
       };
+      let pendFrags = null;
       const fromClient = (bytes) => {
         if (finished) return;
         for (const frame of up.push(bytes)) {
           if (admitted) {
+            // #290: data frames are vetted per complete message. Fragments are held until FIN and
+            // forwarded together only if the assembled message passes; a stray continuation (or a
+            // new data frame inside an open fragmented message) is a protocol error (1002).
+            let raw = frame.raw;
+            if (frame.opcode <= 0x2) {
+              const stray = frame.opcode === 0x0 ? pendFrags === null : pendFrags !== null;
+              if (stray) { pendFrags = null; startClose(1002, "protocol_error", { clientNow: true }); return; }
+              if (!frame.fin) { (pendFrags ??= []).push(frame.raw); continue; }
+              if (pendFrags) { pendFrags.push(frame.raw); raw = Buffer.concat(pendFrags); pendFrags = null; }
+            }
             // #281: a session.update switching to a disallowed delegation model is not forwarded.
             if (frame.message?.opcode === 0x1) {
               let u = null;
@@ -1735,7 +1746,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               }
               if (v) { try { emit({ ...base, blocked: true, cost_usd: 0, model, session_id: sessionId, reason: v.reason, outcome: "blocked_model" }); } catch { /* ledger */ } clientError(v.reason, v.message); continue; }
             }
-            toUpstream(frame.raw); continue;
+            toUpstream(raw); continue;
           }
           held.push(frame.raw);
           if (!frame.message) { if (frame.opcode === 0x8) { toUpstream(Buffer.concat(held)); held = []; } continue; }
