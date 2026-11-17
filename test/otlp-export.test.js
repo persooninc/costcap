@@ -1,6 +1,7 @@
 // #239 unit: receipt -> OTLP span mapping, trace ids, request shape, headers, URLs, batching bounds.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createOtlpExporter, encodeRequest, operationName, parseOtlpHeaders, parseOtlpUrl, receiptToSpan, runSpan, traceIdFor } from "../src/otlp.js";
 
 const get = (span, key) => { const a = span.attributes.find((x) => x.key === key); return a && Object.values(a.value)[0]; };
@@ -140,4 +141,17 @@ test("interval timer drains the queue", async () => {
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(n, 1);
   await ex.finish({}, { startMs: 0 });
+});
+
+test("finish() settles at the deadline even when nothing else keeps the event loop alive", () => {
+  // A hung post with no socket/timer of its own: an unref'd deadline would let the process exit with finish() pending.
+  const src = new URL("../src/otlp.js", import.meta.url).href;
+  const code = `import { createOtlpExporter } from ${JSON.stringify(src)};
+const ex = createOtlpExporter({ url: "http://x", runId: "R", onWarning: () => {}, post: () => new Promise(() => {}), intervalMs: 60000 });
+ex.add(${JSON.stringify(base)});
+const c = await ex.finish({}, { startMs: 0, deadlineMs: 50 });
+console.log(JSON.stringify(c));`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim()), { spans_exported: 0, spans_dropped: 2 });
 });

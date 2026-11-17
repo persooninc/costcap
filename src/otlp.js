@@ -173,8 +173,10 @@ export function createOtlpExporter({ url, headers = {}, runId, onWarning = (l) =
       clearInterval(timer);
       push(runSpan(summary, { startMs, endMs, traceId, spanId: rootSpanId }));
       drain();
+      // The deadline timer stays ref'd: a post that holds no handle (or a hung one) must not let the
+      // event loop drain with finish() still pending, which would skip the caller's run summary/exit.
       let t;
-      await Promise.race([Promise.allSettled([...inflight.keys()]), new Promise((r) => { t = setTimeout(r, deadlineMs); t.unref?.(); })]);
+      await Promise.race([Promise.allSettled([...inflight.keys()]), new Promise((r) => { t = setTimeout(r, deadlineMs); })]);
       clearTimeout(t);
       if (inflight.size) warn(new Error("final flush timed out"));
       frozen = counts();
