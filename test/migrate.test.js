@@ -1,4 +1,5 @@
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -70,4 +71,15 @@ test("regression: postgres readiness wait is a deadline, not a fixed attempt cou
   process.env.COSTCAP_PG_READY_MS = "1";
   t.after(() => { if (prev === undefined) delete process.env.COSTCAP_PG_READY_MS; else process.env.COSTCAP_PG_READY_MS = prev; });
   await assert.rejects(startPostgres(t), /did not finish its restart/);
+});
+
+test("regression: stopping the test postgres removes its anonymous data volume", { skip: skipUnlessDocker() }, async (t) => {
+  const { container, stop } = await startPostgres(t, { autoStop: false });
+  t.after(stop);
+  const volumes = spawnSync("docker", ["inspect", container, "--format", "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}"], { encoding: "utf8" }).stdout.trim().split(/\s+/).filter(Boolean);
+  assert.ok(volumes.length > 0, "postgres image should mount an anonymous data volume");
+  stop();
+  for (const v of volumes) {
+    assert.notEqual(spawnSync("docker", ["volume", "inspect", v]).status, 0, `volume ${v} leaked after stop()`);
+  }
 });

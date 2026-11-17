@@ -9,7 +9,10 @@ export async function startPostgres(t, { publish = false, autoStop = true } = {}
   const started = spawnSync("docker", [...args, "postgres:16-alpine"], { encoding: "utf8" });
   if (started.status !== 0) throw new Error(started.stderr);
   // With autoStop: false the caller closes its clients first, then calls stop().
-  const stop = () => spawnSync("docker", ["rm", "-f", container]);
+  // `-v` is required: an explicit `rm -f` pre-empts `--rm` auto-removal, so
+  // without it the image's anonymous /var/lib/postgresql/data volume is left
+  // dangling (~2k leaked volumes/day on the shared dev-home-01 runner host).
+  const stop = () => spawnSync("docker", ["rm", "-f", "-v", container]);
   if (autoStop) t.after(stop);
   // Deadline, not an attempt count: on a loaded shared runner the image init
   // restart can take well over 30 s (CI run 43774011703).
