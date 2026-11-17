@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startMeteringProxy, baseUrlOverrides } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
+import { createModelCaps } from "../src/model-cap.js";
 import { createKillCheck, kill } from "../src/kill.js";
 import { operationName } from "../src/otlp.js";
 import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "../src/live.js";
@@ -322,6 +323,82 @@ test("#281 AC4 delegation model vetted by --models and --unknown-models refuse; 
     assert.equal(ups[0].session.delegation.responses.model, "gpt-5.4-mini");
     c.close();
   }
+});
+
+
+// #289: --model-cap / modelCaps apply to the GPT-Live delegation model.
+const delStart = (model) => ({ type: "session.start", session: { model: "gpt-live-1", delegation: { responses: { model } } } });
+const big = (id) => ({ type: "response.event", event: { type: "response.completed", response: { id, model: "gpt-5.4", usage: { input_tokens: 100000, output_tokens: 20000 } } } });
+const spent = (rules, model = "gpt-5.4", cost = 1) => { const mc = createModelCaps({ rules }); mc.record({ model, cost_usd: cost, ts: new Date().toISOString() }); return mc; };
+
+test("#289 AC1 spent delegation model cap refuses session.start before upstream; other delegation model admitted", async (t) => {
+  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
+  const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(delStart("gpt-5.4"));
+  const err = await c.waitFor((m) => m.type === "error");
+  assert.equal(err.error.code, "model_budget_exceeded");
+  await c.closed;
+  assert.equal(c.closeCode, 1008);
+  await sleep(30);
+  assert.equal(up.sessions[0]?.received.length ?? 0, 0);
+  const b = live(receipts).find((r) => r.blocked);
+  assert.equal(b.cost_usd, 0);
+  assert.equal(b.reason, "model_budget_exceeded");
+  const c2 = await connectRealtime(port, PATH);
+  c2.send(delStart("gpt-5.4-mini"));
+  await c2.waitFor((m) => m.type === "session.started");
+  c2.close();
+});
+
+test("#289 AC2 backend response.completed reaching the delegation cap closes the session 1008", async (t) => {
+  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 0.5 }] });
+  const { up, port, receipts } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: (conn) => { conn.send(snap(1)); for (let i = 1; i <= 5; i++) conn.send(big(`r${i}`)); } }), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(delStart("gpt-5.4"));
+  const err = await c.waitFor((m) => m.type === "error");
+  assert.equal(err.error.code, "model_budget_exceeded");
+  await c.closed;
+  assert.equal(c.closeCode, 1008);
+  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
+  await until(() => billed(receipts).length >= 2);
+  const c2 = await connectRealtime(port, PATH);
+  c2.send(delStart("gpt-5.4"));
+  assert.equal((await c2.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
+});
+
+test("#289 AC3 session.update to a spent delegation model is not forwarded", async (t) => {
+  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
+  const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(delStart("gpt-5.4-mini"));
+  await c.waitFor((m) => m.type === "session.started");
+  c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } });
+  const err = await c.waitFor((m) => m.type === "error");
+  assert.equal(err.error.code, "model_budget_exceeded");
+  c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4-mini" } } } });
+  await until(() => up.sessions[0].received.filter((m) => m.type === "session.update").length === 1);
+  await sleep(30);
+  const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
+  assert.equal(ups.length, 1);
+  assert.equal(ups[0].session.delegation.responses.model, "gpt-5.4-mini");
+  c.close();
+});
+
+test("#289 AC4 hosted scopes (week/month/total) and unknown-cost delegation receipt refuse", async (t) => {
+  for (const scope of ["week", "month", "total"]) {
+    const modelCaps = spent([{ model: "gpt-5.4", scope, cap: 0.5 }]);
+    const { port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
+    const c = await connectRealtime(port, PATH);
+    c.send(delStart("gpt-5.4"));
+    assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded", scope);
+  }
+  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 5 }] });
+  modelCaps.record({ id: "u1", model: "gpt-5.4", cost_usd: null, ts: new Date().toISOString() });
+  const { port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(delStart("gpt-5.4"));
+  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "accounting_unavailable");
 });
 
 test("AC7 /live/sessions/x/fork and chat-path upgrades still get 501", async (t) => {

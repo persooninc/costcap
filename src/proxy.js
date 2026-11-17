@@ -1441,7 +1441,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
   // metered and the gate re-checked between responses; kill closes open sessions.
   const sessions = new Set();
   let killTimer = null;
-  const sessionGate = (model, tags) => {
+  const sessionGate = (model, tags, extraModels = []) => {
     const killed = killCheck?.();
     if (killed) return { status: 429, reason: "killed", detail: killed, body: { error: "killed", ...killed } };
     const accountingFailure = accountingFailureNow();
@@ -1455,7 +1455,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const tagHit = tagCaps?.check(tags);
     if (tagHit?.verdict === "accounting_unavailable") return { status: 429, reason: "accounting_unavailable", detail: tagHit, body: { error: "accounting_unavailable", ...tagHit } };
     if (tagHit) return { status: 429, reason: "tag_budget_exceeded", detail: tagHit, body: tagBudgetExceededBody(tagHit) };
-    const modelHit = model ? modelCaps?.check([model]) : null;
+    const capList = [model, ...extraModels].filter(Boolean);
+    const modelHit = capList.length ? modelCaps?.check(capList) : null;
     if (modelHit?.verdict === "accounting_unavailable") return { status: 429, reason: "accounting_unavailable", detail: modelHit, body: { error: "accounting_unavailable", ...modelHit } };
     if (modelHit) { const { rule_model: _rm, ...d } = modelHit; return { status: 429, reason: "model_budget_exceeded", detail: d, body: modelBudgetExceededBody(modelHit) }; }
     return null;
@@ -1683,13 +1684,16 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           try { metered = onEvent(ev); } catch { hardFailure = "Receipt ledger unavailable."; closing = { code: 1011, reason: "accounting_unavailable" }; clientError("accounting_unavailable", "accounting_unavailable"); finish(); return; }
           if (ev.type === "session.closed" && gotClosed) { if (closing) finish(); continue; }
           if (!metered || closing) continue;
-          const g = guarded(() => sessionGate(model, reqTags));
+          const g = guarded(() => sessionGate(model, reqTags, delegModel ? [delegModel] : []));
           if (g) gateHit(g);
         }
         if (down.corrupt) { closing = closing ?? { code: 1009, reason: "frame_too_large" }; finish(); }
       };
       // Client frames are held until the first complete message so session.start can be vetted.
       // #281: session.delegation.responses.model (the Responses backend) is vetted like session.model.
+      // #289: model caps also apply to the delegation model, at admission, on update and mid-session.
+      let delegModel = null;
+      const delegationModelOf = (ev) => { const d = ev?.session?.delegation?.responses; return d && typeof d === "object" && typeof d.model === "string" && d.model ? d.model : null; };
       const vetDelegation = (ev) => {
         const d = ev?.session?.delegation?.responses;
         if (!d || typeof d !== "object" || d.model === undefined) return null;
@@ -1708,7 +1712,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         if (allow && (!m || !allow.includes(m))) v = { reason: "model_not_allowed", message: `model "${m ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made` };
         else if (unknownModels === "refuse" && (!m || !(userPrices ? isPricedWithOverrides(userPrices, "openai", m) : isPricedModel(m)))) v = { reason: "model_unpriced", message: `model "${m ?? "(none)"}" has no published rate and --unknown-models refuse is set. The upstream call was not made` };
         if (!v) v = vetDelegation(ev);
-        if (!v) { const g = guarded(() => sessionGate(m, reqTags)); if (g) v = { reason: g.reason, message: `${g.reason}. The upstream call was not made`, detail: g.detail }; }
+        const dm = delegationModelOf(ev);
+        if (!v) { const g = guarded(() => sessionGate(m, reqTags, dm ? [dm] : [])); if (g) v = { reason: g.reason, message: `${g.reason}. The upstream call was not made`, detail: g.detail }; }
+        if (!v) delegModel = dm;
         return v;
       };
       const fromClient = (bytes) => {
@@ -1719,7 +1725,14 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (frame.message?.opcode === 0x1) {
               let u = null;
               try { u = JSON.parse(frame.message.data.toString("utf8")); } catch { /* not JSON */ }
-              const v = u?.type === "session.update" ? vetDelegation(u) : null;
+              let v = u?.type === "session.update" ? vetDelegation(u) : null;
+              const dm = !v && u?.type === "session.update" ? delegationModelOf(u) : null;
+              if (dm) {
+                let g;
+                try { g = guarded(() => sessionGate(null, reqTags, [dm])); } catch { g = { reason: "accounting_unavailable", detail: {} }; }
+                if (g && g.reason !== "killed" && (g.reason === "model_budget_exceeded" || g.detail?.model === dm)) v = { reason: g.reason, message: `${g.reason}: delegation model "${dm}". The update was not forwarded`, detail: g.detail };
+                else if (!g) delegModel = dm;
+              }
               if (v) { try { emit({ ...base, blocked: true, cost_usd: 0, model, session_id: sessionId, reason: v.reason, outcome: "blocked_model" }); } catch { /* ledger */ } clientError(v.reason, v.message); continue; }
             }
             toUpstream(frame.raw); continue;
