@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-16.29");
+  assert.equal(TABLE_VERSION, "2026-11-17.1");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {

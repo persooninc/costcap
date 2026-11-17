@@ -180,14 +180,18 @@ test("AC3 ConverseStream cut before metadata is stream_incomplete (null, never 0
 });
 
 test("AC4 unpriced Converse model: refused under --unknown-models refuse, else unknown cost (never fallback)", async (t) => {
+  // #278: Nova Pro is now priced (us-east-1 row); an unlisted id keeps the #216 behaviour.
+  const nova = await proxyFor(t, await stub(converseHandler));
+  await signedPost(nova.base, nova.port, "/bedrock/model/amazon.nova-pro-v1%3A0/converse", body);
+  assert.deepEqual([nova.receipts[0].model, nova.receipts[0].cost_usd, nova.receipts[0].fallback], ["amazon.nova-pro-v1:0", Number(((1000 * 0.8 + 500 * 3.2 + 200 * 0.2) / 1e6).toFixed(6)), false]);
   const up = await stub(converseHandler);
   const refuse = await proxyFor(t, up, { unknownModels: "refuse" });
-  const r = await signedPost(refuse.base, refuse.port, "/bedrock/model/amazon.nova-pro-v1%3A0/converse", body);
+  const r = await signedPost(refuse.base, refuse.port, "/bedrock/model/meta.unlisted-v1%3A0/converse", body);
   assert.equal(r.status, 403);
   assert.equal(up.hits.length, 0);
   const up2 = await stub(converseHandler);
   const fwd = await proxyFor(t, up2);
-  const r2 = await signedPost(fwd.base, fwd.port, "/bedrock/model/amazon.nova-pro-v1%3A0/converse", body);
+  const r2 = await signedPost(fwd.base, fwd.port, "/bedrock/model/meta.unlisted-v1%3A0/converse", body);
   assert.equal(r2.status, 200);
   assert.equal(up2.hits.length, 1);
   assert.equal(fwd.receipts[0].cost_usd, null);

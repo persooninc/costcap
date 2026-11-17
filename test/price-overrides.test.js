@@ -31,8 +31,10 @@ test("validation: bad built-in entries throw; built-in keys need no --upstream (
   for (const e of bad) assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: { m: e } } }), []), /upstream-prices/, JSON.stringify(e));
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: [] } }), []), /object of models/);
-  // Bedrock/Vertex are out of scope (#188): still rejected as undeclared.
-  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { m: { discount: 0.1 } } } }), []), /not declared/);
+  // #278: bedrock/vertex are built-in override keys (no --upstream needed); validated like the others.
+  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { "amazon.nova-pro-v1:0": { discount: 0.1 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { m: { input: 0, output: 1 } } } }), []), /never \$0/);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { vertex: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
 });
 
 test("discount scales every tier, including cache and long context (AC1)", () => {
