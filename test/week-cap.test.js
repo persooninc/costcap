@@ -207,6 +207,9 @@ async function fixture(t, clock) {
   const storePath = join(mkdtempSync(join(tmpdir(), "cc-261-")), "store.json");
   const origin = "http://localhost";
   const service = createHostedServer({ storePath, origin, secureCookies: false, stripeEnv: {}, now: () => clock.now, verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {}, deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; } });
+  // Regression: on loaded runners undici reused a socket the server had just
+  // idle-closed (5s default) and fetch failed mid-test. Outlive the client.
+  service.server.keepAliveTimeout = 60_000;
   await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
   t.after(() => { service.server.closeAllConnections(); service.server.close(); });
   const request = async (path, body, cookie, auth, method) => {

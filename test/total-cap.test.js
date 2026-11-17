@@ -187,7 +187,9 @@ async function fixture(t, clock) {
   const origin = "http://localhost";
   const opts = { storePath, origin, secureCookies: false, stripeEnv: {}, now: () => clock.now, verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {}, deliverAlert: async (a) => { delivered.push(a); return [{ status: "accepted" }]; } };
   let service = createHostedServer(opts);
-  const listen = async () => { await new Promise((r) => service.server.listen(0, "127.0.0.1", r)); };
+  // Regression: on loaded runners undici reused a socket the server had just
+  // idle-closed (5s default) and fetch failed mid-test. Outlive the client.
+  const listen = async () => { service.server.keepAliveTimeout = 60_000; await new Promise((r) => service.server.listen(0, "127.0.0.1", r)); };
   await listen();
   t.after(() => { service.server.closeAllConnections(); service.server.close(); });
   const request = async (path, body, cookie, auth, method) => {
