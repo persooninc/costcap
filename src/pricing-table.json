@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.16",
+  "version": "2026-11-16.17",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -30,11 +30,17 @@
     "https://platform.claude.com/docs/en/about-claude/pricing (#234: claude-fable-5-2 / claude-mythos-5-2 $8/$40, cache hit $0.20, 5m $10, 1h $16; claude-mythos-5-1 $10/$50 hit $0.25; claude-mythos-5 $10/$50 hit $1; claude-opus-4-8 / 4-7 $5/$25 hit $0.50; claude-haiku-5-5 $0.10/$0.50 <=100K prompt tokens, $0.50/$2.50 >100K; fast mode $16/$80 on Fable 5.2 and Mythos 5.2, $10/$50 on Opus 4.8; retrieved 2026-11-16)",
     "https://platform.claude.com/docs/en/about-claude/model-deprecations (#234: Fable 5.2, Mythos 5.2/5.1/5, Opus 4.8/4.7, Haiku 5.5 Active; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/models/gpt-6-astra (#232: >272K input tokens: 2x input/cache, 1.5x output; Fast is 2x the applicable rates; retrieved 2026-11-16)",
+    "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool (#254: web fetch has no additional charges beyond standard token costs; batch priced the same; retrieved 2026-11-16)",
+    "https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool (#254: no code execution charge when web_search_20260209+ or web_fetch_20260209+ is in the request; otherwise per container-hour, not priced; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
   "tools": {
     "unit": "usd_per_call",
-    "anthropic": { "web_search": { "usd_per_call": 0.01 } },
+    "anthropic": {
+      "web_search": { "usd_per_call": 0.01 },
+      "web_fetch": { "usd_per_call": 0, "free": true },
+      "code_execution": { "usd_per_call": 0, "free": true, "free_with_tools": ["web_search", "web_fetch"], "free_since": "20260209" }
+    },
     "vertex": { "web_search": { "families": { "claude": 0.01 } } },
     "openai": {
       "web_search": { "families": { "gpt-6": 0.01, "gpt-5": 0.01, "o1": 0.01, "o3": 0.01, "o4": 0.01, "gpt-4o": 0.01, "gpt-4.1": 0.01 } },

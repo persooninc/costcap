@@ -149,6 +149,9 @@ function modalityTokens(buckets) {
   return Object.fromEntries(Object.entries(buckets).map(([k, b]) => [k, b ?? null]));
 }
 
+// #214/#254: Anthropic server_tool_use counters CostCap meters; any other counter is unpriced.
+const ANTHROPIC_TOOL_COUNTERS = Object.freeze({ web_search_requests: "web_search", web_fetch_requests: "web_fetch", code_execution_requests: "code_execution" });
+
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
 export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
   let model = requestedModel ?? "unknown";
@@ -242,7 +245,8 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
           const next = {};
           for (const [k, v] of Object.entries(stu)) {
             if (!k.endsWith("_requests") || typeof v !== "number" || !(v > 0)) continue;
-            if (k === "web_search_requests" && Number.isInteger(v)) next.web_search = v;
+            const key = Number.isInteger(v) ? ANTHROPIC_TOOL_COUNTERS[k] : undefined;
+            if (key) next[key] = v; // #254: web_fetch / code_execution are priced (or refused) by the table
             else toolUseUnpriced = true; // an unknown per-call tool (or a non-integer count) is never $0
           }
           anthropicTools = next;
@@ -1105,8 +1109,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced", ...(metered.toolCalls && { tool_calls: metered.toolCalls }) });
             else if (metered.toolCalls) Object.assign(receipt, withToolCost(receipt, userPrices, provider, metered, parsedBody));
+            const unpricedTool = receipt.unpriced_tool;
+            delete receipt.unpriced_tool;
             recordSpend(receipt);
-            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate for this tool or model. Restart only after reconciling this request.";
+            if (receipt.reason === "tool_use_unpriced") failMsg = `A provider-side tool (${unpricedTool ?? "unknown server tool counter"}) was billed with no published rate for this tool or model. Restart only after reconciling this request.`;
             else if (receipt.reason === "upstream_model_unpriced") failMsg = `Model ${receipt.model} on custom upstream ${provider} has no rate in --upstream-prices. Restart only after reconciling this request.`;
             else if (receipt.reason === "user_price_unpriced") failMsg = `Model ${receipt.model} was billed for a component (cache write, long context, premium tier or non-text tokens) your --upstream-prices entry does not price. Restart only after reconciling this request.`;
             else if (receipt.reason === "modality_unpriced") failMsg = `Non-text (audio/image/video) tokens were billed for ${receipt.model} with no published modality rate. Restart only after reconciling this request.`;

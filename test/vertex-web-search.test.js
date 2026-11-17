@@ -108,3 +108,16 @@ test("AC2: preflight adds max_uses x $0.01 on Vertex Claude and refuses over the
   assert.equal((await post(VPATH("global"), JSON.stringify(noTools))).status, 200);
   assert.equal(up.hits.length, 1);
 });
+
+test("#254 AC5: Vertex Claude with web_fetch_requests is tool_use_unpriced (no Vertex web_fetch row) and the next call pauses", async (t) => {
+  const saved = usage.server_tool_use;
+  usage.server_tool_use = { web_fetch_requests: 1 };
+  t.after(() => { usage.server_tool_use = saved; });
+  const { post, receipts, up } = await proxyFor(t);
+  assert.equal((await post(VPATH("global"))).status, 200);
+  await settle();
+  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason, receipts[0].tool_calls], [null, "tool_use_unpriced", { web_fetch: 1 }]);
+  assert.equal((await post(VPATH("global"))).status, 429);
+  assert.equal(up.hits.length, 1);
+  assert.deepEqual(toolCallCost("bedrock", "claude-sonnet-4-5", { web_fetch: 1 }), { unpriced: true, tool: "web_fetch" });
+});

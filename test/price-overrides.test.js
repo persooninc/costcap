@@ -231,3 +231,20 @@ test("#197 proxy: --unknown-models refuse still 403s a discount-only unpriced mo
   assert.equal(up.seen.length, 0);
   assert.equal((await p.call("/openai/v1/chat/completions", { model: "gpt-4o", max_tokens: 10, messages: [] })).status, 200);
 });
+
+test("#254 AC4: --prices tools.code_execution prices standalone code execution as user_prices; 0 and web_fetch are rejected", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-ce-"));
+  const file = (doc) => { const p = path.join(dir, `${Math.random()}.json`); writeFileSync(p, JSON.stringify(doc)); return p; };
+  assert.throws(() => loadUpstreamPrices(file({ tools: { code_execution: 0 } }), []), /> 0/);
+  assert.throws(() => loadUpstreamPrices(file({ tools: { web_fetch: 0 } }), []), /unknown tool/);
+  const up = http.createServer((q, res) => { q.resume(); res.end(JSON.stringify({ model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { code_execution_requests: 2 } } })); });
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const receipts = [];
+  const p = await startMeteringProxy({ upstreams: { anthropic: `http://127.0.0.1:${up.address().port}` }, userPrices: loadUpstreamPrices(file({ tools: { code_execution: 0.005 } }), []), onReceipt: (r) => receipts.push(r) });
+  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
+  const res = await fetch(`http://127.0.0.1:${p.port}/anthropic/v1/messages`, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-6", tools: [{ type: "code_execution_20260521" }] }) });
+  assert.equal(res.status, 200);
+  assert.equal(receipts[0].tool_cost_usd, 0.01);
+  assert.equal(receipts[0].cost_source, "user_prices");
+  assert.equal(receipts[0].cost_usd, Number((costForUsage("claude-sonnet-4-6", { input_tokens: 10, output_tokens: 5 }).cost_usd + 0.01).toFixed(6)));
+});

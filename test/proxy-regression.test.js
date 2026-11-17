@@ -278,7 +278,7 @@ test("#142/#214 tool-use detection: known per-call tools are counted, unknown co
   assert.deepEqual([a.toolCalls, a.toolUseUnpriced], [{ web_search: 2 }, undefined]);
   const zero = extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_search_requests: 0 } } }));
   assert.deepEqual([zero.toolCalls, zero.toolUseUnpriced], [undefined, undefined]);
-  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { web_fetch_requests: 1 } } })).toolUseUnpriced, true);
+  assert.equal(extractUsage("anthropic", JSON.stringify({ model: "m", usage: { input_tokens: 1, output_tokens: 1, server_tool_use: { bogus_requests: 1 } } })).toolUseUnpriced, true);
   for (const [type, tool] of [["web_search_call", "web_search"], ["file_search_call", "file_search"]])
     assert.deepEqual(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type }, { type: "message" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolCalls, { [tool]: 1 });
   assert.equal(extractUsage("openai", JSON.stringify({ model: "m", output: [{ type: "web_search_call", status: "failed" }], usage: { input_tokens: 1, output_tokens: 1 } })).toolCalls, undefined);
@@ -304,7 +304,7 @@ async function multi(t, handler) {
 
 test("#142/#214 unknown tools or model families → tool_use_unpriced and the next call is paused", async (t) => {
   for (const [path, body] of [
-    ["/anthropic/v1/messages", { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_fetch_requests: 2 } } }],
+    ["/anthropic/v1/messages", { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { bogus_requests: 2 } } }],
     ["/openai/v1/responses", { model: "gpt-3.5-turbo", output: [{ type: "web_search_call", status: "completed" }], usage: { input_tokens: 10, output_tokens: 5 } }],
   ]) {
     let hits = 0;
@@ -718,4 +718,38 @@ test("#200 AC4 gemini-embedding-2 prices each modality; a modality with no rate 
   const r = costForUsage("gemini-embedding-2", { input_tokens: 4_000_000, modality_tokens: mt({ text: 1_000_000, image: 1_000_000, audio: 1_000_000, video: 1_000_000 }) });
   assert.equal(r.cost_usd, Number((0.20 + 0.45 + 6.50 + 12.00).toFixed(6)));
   assert.equal(costForUsage("gemini-embedding-001", { input_tokens: 1_000_000 }).cost_usd, 0.15);
+});
+
+// #254: web fetch and code execution through the real proxy.
+test("#254 AC1/AC3/AC5: web_fetch is token-only; code_execution is free only with a 20260209+ search/fetch tool", async (t) => {
+  const usage = { input_tokens: 10, output_tokens: 5 };
+  const tokens = costForUsage("claude-sonnet-4-6", usage).cost_usd;
+  const cases = [
+    [{ web_fetch_requests: 2 }, { model: "claude-sonnet-4-6" }, { web_fetch: 2 }, null],
+    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_fetch_20260209" }] }, { code_execution: 2 }, null],
+    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_search_20260318" }] }, { code_execution: 2 }, null],
+    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "code_execution_20260521" }] }, { code_execution: 2 }, "code_execution"],
+    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_search_20250305" }] }, { code_execution: 2 }, "code_execution"],
+    [{ bogus_requests: 1 }, { model: "claude-sonnet-4-6" }, undefined, "unknown server tool counter"],
+    [{ web_fetch_requests: 1.5 }, { model: "claude-sonnet-4-6" }, undefined, "unknown server tool counter"],
+  ];
+  for (const [stu, req, calls, unpriced] of cases) {
+    let hits = 0;
+    const { post, receipts } = await multi(t, (q, res) => { hits++; q.resume(); res.end(JSON.stringify({ model: "claude-sonnet-4-6", usage: { ...usage, server_tool_use: stu } })); });
+    assert.equal((await post("/anthropic/v1/messages", req)).status, 200);
+    const r = receipts[0];
+    assert.deepEqual(r.tool_calls, calls, JSON.stringify(stu));
+    const next = await post("/anthropic/v1/messages", req);
+    if (unpriced) {
+      assert.deepEqual([r.cost_usd, r.reason], [null, "tool_use_unpriced"]);
+      assert.equal(r.unpriced_tool, undefined);
+      assert.equal(next.status, 429);
+      assert.match((await next.json()).message, new RegExp(`\\(${unpriced}\\)`));
+      assert.equal(hits, 1);
+    } else {
+      assert.deepEqual([r.cost_usd, r.tool_cost_usd, r.reason], [tokens, 0, undefined]);
+      assert.equal(next.status, 200);
+      assert.equal(hits, 2);
+    }
+  }
 });

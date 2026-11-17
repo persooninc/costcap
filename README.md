@@ -702,9 +702,17 @@ does the higher rate apply (#219). With `--preflight`, an Anthropic or Vertex Cl
 that sets `max_uses` adds `max_uses × rate` to the worst case. Override a rate
 with a top-level `tools` map in the `--prices` / `--upstream-prices` file, for
 example `{"tools": {"web_search": 0.008}}` (keys `web_search`,
-`web_search_preview`, `file_search`; USD per call, > 0); such receipts are
-marked `cost_source: "user_prices"`. Any other per-call counter (for example
-`web_fetch_requests`), a model family the table does not list, or a tool on a
+`web_search_preview`, `file_search`, `code_execution`; USD per call, > 0); such receipts are
+marked `cost_source: "user_prices"`. Claude web fetch (`web_fetch_requests`) is
+free on the Anthropic route: receipts keep `tool_calls.web_fetch` with
+`tool_cost_usd: 0` (#254). Claude code execution (`code_execution_requests`) is
+free only when the request's `tools` include `web_search_*` or `web_fetch_*`
+dated `20260209` or later; standalone code execution is billed per
+container-hour, which the response does not report, so it stays unpriced
+unless you set your own `tools.code_execution` rate (an Anthropic batch line
+with code execution is `batch_unpriced` without that override, since result
+lines do not echo the request's tools). The pause message names the unpriced
+tool. Any other per-call counter, a model family the table does not list, or a tool on a
 route without a rate (OpenRouter, Bedrock, Vertex, custom upstreams) is still
 recorded as `cost_usd: null`, `reason: "tool_use_unpriced"`, and the run pauses
 until you reconcile it. Gemini

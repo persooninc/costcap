@@ -246,9 +246,22 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
 // priced by the request's tool type (webSearchType "web_search" | "web_search_preview");
 // when that is unknown (e.g. a batch line) the higher of the two rates is used.
 // userTools ({tool: usd_per_call}) overrides the table rate for that tool key.
-export function toolRate(provider, tool, model) {
-  const row = table.tools?.[provider]?.[tool];
+// #254: a row flagged `free: true` with usd_per_call 0 is $0 (a bare 0 stays unpriced). A free row with
+// `free_with_tools` is free only when the request's tools[] has one of those types dated >= `free_since`.
+export function toolRate(provider, tool, model, opts = {}) {
+  return toolRowRate(table.tools?.[provider]?.[tool], model, opts);
+}
+
+export function toolRowRate(row, model, { requestTools } = {}) {
   if (!row || typeof row !== "object") return null;
+  if (row.free === true && row.usd_per_call === 0) {
+    if (!Array.isArray(row.free_with_tools)) return 0;
+    const types = (Array.isArray(requestTools) ? requestTools : []).map((t) => t?.type);
+    return types.some((t) => {
+      const m = typeof t === "string" ? /^([a-z_]+)_(\d{8})$/.exec(t) : null;
+      return m && row.free_with_tools.includes(m[1]) && m[2] >= row.free_since;
+    }) ? 0 : null;
+  }
   const ok = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null);
   if (row.families && typeof row.families === "object") {
     const id = (resolveModelId(model) ?? (typeof model === "string" ? model.replace(SNAPSHOT_SUFFIX, "") : "")).replace(FIRST_PARTY_PREFIX, "");
@@ -261,13 +274,13 @@ export function toolRate(provider, tool, model) {
   return ok(row.usd_per_call);
 }
 
-export function toolCallCost(provider, model, toolCalls, { webSearchType, userTools } = {}) {
+export function toolCallCost(provider, model, toolCalls, { webSearchType, userTools, requestTools } = {}) {
   assertTableIntegrity();
   let usd = 0, user = false;
   const rateFor = (key) => {
     const u = userTools?.[key];
     if (typeof u === "number" && Number.isFinite(u) && u > 0) { user = true; return u; }
-    return toolRate(provider, key, model);
+    return toolRate(provider, key, model, { requestTools });
   };
   for (const [tool, n] of Object.entries(toolCalls ?? {})) {
     if (!(n > 0)) continue;

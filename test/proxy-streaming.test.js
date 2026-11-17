@@ -185,7 +185,7 @@ test("#138 a streamed final chunk with usage: {} is unknown (usage_unavailable),
 // #142: tool billing in streams.
 test("#142/#214 Anthropic stream with an unknown server_tool_use counter in message_delta → tool_use_unpriced, next call paused", async (t) => {
   const events = [ANTHROPIC_EVENTS[0], ANTHROPIC_EVENTS[1],
-    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"web_fetch_requests":1}}}\n\n', ANTHROPIC_EVENTS[3]];
+    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"bogus_requests":1}}}\n\n', ANTHROPIC_EVENTS[3]];
   const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
   const { res } = await streamCall(proxy, "/anthropic/v1/messages");
   assert.equal(res.status, 200);
@@ -350,4 +350,21 @@ test("#214 Anthropic SSE stream with web_search_requests is priced and the cap t
   assert.equal(next.status, 429);
   await tick();
   assert.equal(receipts.at(-1).reason, "budget_exceeded");
+});
+
+test("#254 AC2: Anthropic stream with web_search 1 + web_fetch 3 → tokens + $0.01", async (t) => {
+  const events = [ANTHROPIC_EVENTS[0], ANTHROPIC_EVENTS[1],
+    'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":20,"server_tool_use":{"web_search_requests":1,"web_fetch_requests":3}}}\n\n', ANTHROPIC_EVENTS[3]];
+  const parser = createSseUsageParser("anthropic", "claude-sonnet-4-6");
+  for (const e of events) parser.push(e);
+  const m = parser.end();
+  const { proxy, receipts } = await setup(t, events, { gapMs: 5 });
+  const { res } = await streamCall(proxy, "/anthropic/v1/messages");
+  assert.equal(res.status, 200);
+  await tick();
+  const r = receipts[0];
+  assert.deepEqual(r.tool_calls, { web_search: 1, web_fetch: 3 });
+  assert.equal(r.tool_cost_usd, 0.01);
+  assert.equal(r.cost_usd, Number((costForUsage(m.model, m.usage).cost_usd + 0.01).toFixed(6)));
+  assert.equal(r.reason, undefined);
 });

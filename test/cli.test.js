@@ -270,14 +270,14 @@ test("#138 wrap: a text-format transcription (no usage) pauses the run, check ex
   assert.equal(after.status, 0, after.stdout + after.stderr);
 });
 
-test("#142 wrap: count-tokens then a normal call both succeed; an unpriced Anthropic server tool (web_fetch) pauses the run (check exits 1)", async (t) => {
+test("#142 wrap: count-tokens then a normal call both succeed; #254 a free web_fetch call continues; an unknown server tool counter pauses the run (check exits 1)", async (t) => {
   const seen = [];
   const up = await new Promise((r) => {
     const s = http.createServer((q, res) => {
       seen.push(q.url); q.resume();
       const body = q.url.endsWith("/count_tokens") ? { input_tokens: 42 }
-        : seen.length === 2 ? { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5 } }
-        : { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_fetch_requests: 2 } } };
+        : seen.length === 2 ? { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { web_fetch_requests: 2 } } }
+        : { model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 5, server_tool_use: { bogus_requests: 1 } } };
       res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
     });
     s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
@@ -301,6 +301,10 @@ test("#142 wrap: count-tokens then a normal call both succeed; an unpriced Anthr
   const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
   assert.deepEqual(rows.slice(0, 3).map((r) => [r.cost_usd === null ? null : r.cost_usd > 0, r.reason ?? null]),
     [[false, "non_billable_request"], [true, null], [null, "tool_use_unpriced"]]);
+  assert.deepEqual([rows[1].tool_calls, rows[1].tool_cost_usd], [{ web_fetch: 2 }, 0]);
+  const freeOnly = path.join(dir, "free.jsonl");
+  writeFileSync(freeOnly, rows.slice(0, 2).map((r) => JSON.stringify(r)).join("\n") + "\n");
+  assert.equal(spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", freeOnly], { encoding: "utf8" }).status, 0);
   const check = spawnSync(process.execPath, ["src/cli.js", "check", "--cap", "1", "--receipts", receipts], { encoding: "utf8" });
   assert.equal(check.status, 1);
   assert.equal(JSON.parse(check.stdout).hit.scope, "accounting");

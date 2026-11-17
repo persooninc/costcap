@@ -119,13 +119,13 @@ export function withToolCost(c, prices, provider, metered, req, res = null) {
   const toolCalls = metered?.toolCalls;
   if (!toolCalls || !Object.keys(toolCalls).length) return c;
   if (c.cost_usd === null || c.cost_usd === undefined) return { ...c, tool_calls: toolCalls };
-  const t = toolCallCost(provider, metered.model, toolCalls, { webSearchType: requestWebSearchType(req) ?? requestWebSearchType(res), userTools: prices?.tools });
-  if (t.unpriced) return { ...c, cost_usd: null, reason: "tool_use_unpriced", tool_calls: toolCalls };
+  const t = toolCallCost(provider, metered.model, toolCalls, { webSearchType: requestWebSearchType(req) ?? requestWebSearchType(res), userTools: prices?.tools, requestTools: req?.tools });
+  if (t.unpriced) return { ...c, cost_usd: null, reason: "tool_use_unpriced", tool_calls: toolCalls, unpriced_tool: t.tool };
   return { ...c, cost_usd: Number((c.cost_usd + t.tool_cost_usd).toFixed(6)), tool_calls: toolCalls, tool_cost_usd: t.tool_cost_usd,
     ...(t.user_prices && pin(prices)) };
 }
 
-export const TOOL_OVERRIDE_KEYS = Object.freeze(["web_search", "web_search_preview", "file_search"]);
+export const TOOL_OVERRIDE_KEYS = Object.freeze(["web_search", "web_search_preview", "file_search", "code_execution"]);
 
 /** Validates the optional top-level `tools` map of a prices file: {tool: usd_per_call > 0}. */
 export function validateToolPrices(path, tools) {

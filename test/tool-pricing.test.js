@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { toolRate, toolCallCost, requestWebSearchType, costForUsage, loadPricingTable } from "../src/pricing.js";
+import { toolRate, toolRowRate, toolCallCost, requestWebSearchType, costForUsage, loadPricingTable } from "../src/pricing.js";
 import { withToolCost, validateToolPrices } from "../src/price-overrides.js";
 import { loadUpstreamPrices } from "../src/upstreams.js";
 import { foldBatchResults } from "../src/batch.js";
@@ -48,7 +48,7 @@ test("toolCallCost: known tools priced, unknown type uses the higher rate, unkno
   assert.deepEqual(toolCallCost("openai", "gpt-4o", { web_search: 2, file_search: 1 }, { webSearchType: "web_search" }), { unpriced: false, tool_cost_usd: 0.0225, user_prices: false });
   assert.equal(toolCallCost("openai", "gpt-4o", { web_search: 2 }).tool_cost_usd, 0.05);
   assert.equal(toolCallCost("openai", "gpt-4o", { web_search: 0 }).tool_cost_usd, 0);
-  assert.deepEqual(toolCallCost("anthropic", "claude-opus-4-6", { web_fetch: 1 }), { unpriced: true, tool: "web_fetch" });
+  assert.deepEqual(toolCallCost("anthropic", "claude-opus-4-6", { bogus: 1 }), { unpriced: true, tool: "bogus" });
   assert.equal(toolCallCost("openai", "gpt-3.5-turbo", { web_search: 1 }, { webSearchType: "web_search" }).unpriced, true);
 });
 
@@ -91,7 +91,7 @@ test("AC4: batch lines bill tool calls at 100% and tokens at 50%", () => {
   const tokens = costForUsage("claude-sonnet-4-6", { input_tokens: 1000, output_tokens: 100 }, { batch: "anthropic" }).cost_usd;
   assert.equal(r.ok, true);
   assert.equal(r.cost_usd, Number((tokens + 0.04).toFixed(6)));
-  const unknown = JSON.stringify({ custom_id: "b", result: { type: "succeeded", message: { ...msg, usage: { ...msg.usage, server_tool_use: { web_fetch_requests: 1 } } } } });
+  const unknown = JSON.stringify({ custom_id: "b", result: { type: "succeeded", message: { ...msg, usage: { ...msg.usage, server_tool_use: { bogus_requests: 1 } } } } });
   assert.equal(foldBatchResults("anthropic", unknown).ok, false);
   const oai = JSON.stringify({ response: { status_code: 200, body: { model: "gpt-3.5-turbo", output: [{ type: "web_search_call" }], usage: { input_tokens: 1, output_tokens: 1 } } } });
   assert.equal(foldBatchResults("openai", oai).ok, false);
@@ -114,7 +114,7 @@ test("AC6: preflight adds max_uses x rate and refuses a call that would not fit"
 test("AC7: costcap pricing verify passes with the new digest", () => {
   const r = pricingCommand(["verify"]);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /2026-11-16\.16/);
+  assert.match(r.out, /2026-11-16\.17/);
 });
 
 test("#232 gpt-6 family web_search / web_search_preview at $0.01", async () => {
@@ -124,4 +124,41 @@ test("#232 gpt-6 family web_search / web_search_preview at $0.01", async () => {
     assert.equal(toolRate("openai", "web_search_preview", m), 0.01, m);
   }
   assert.deepEqual(toolCallCost("openai", "gpt-6-astra", { web_search: 1 }), { unpriced: false, tool_cost_usd: 0.01, user_prices: false });
+});
+
+// #254: Claude web fetch is free; code execution is free only alongside web_search/web_fetch dated >= 20260209.
+test("#254 free rows: web_fetch $0, code_execution $0 only with a 20260209+ search/fetch tool, bare 0 stays unpriced", () => {
+  assert.equal(toolRate("anthropic", "web_fetch", "claude-sonnet-4-6"), 0);
+  assert.deepEqual(toolCallCost("anthropic", "claude-sonnet-4-6", { web_fetch: 2 }), { unpriced: false, tool_cost_usd: 0, user_prices: false });
+  for (const type of ["web_fetch_20260209", "web_search_20260318"])
+    assert.deepEqual(toolCallCost("anthropic", "claude-sonnet-4-6", { code_execution: 2 }, { requestTools: [{ type }] }).tool_cost_usd, 0, type);
+  for (const tools of [[{ type: "code_execution_20260521" }], [{ type: "web_search_20250305" }], [{ type: "web_fetch_2026020" }], [], undefined, [null]])
+    assert.deepEqual(toolCallCost("anthropic", "claude-sonnet-4-6", { code_execution: 2 }, { requestTools: tools }), { unpriced: true, tool: "code_execution" });
+  assert.equal(toolCallCost("anthropic", "claude-sonnet-4-6", { code_execution: 2 }, { requestTools: [{ type: "code_execution_20260521" }], userTools: { code_execution: 0.005 } }).tool_cost_usd, 0.01);
+  // Vertex / Bedrock list no web_fetch row: never $0.
+  assert.equal(toolRate("vertex", "web_fetch", "claude-sonnet-4-5"), null);
+  assert.equal(toolCallCost("bedrock", "claude-sonnet-4-5", { web_fetch: 1 }).unpriced, true);
+});
+
+test("#254 AC5: a table row with usd_per_call 0 but no free flag is unpriced", () => {
+  assert.equal(toolRowRate({ usd_per_call: 0 }, "claude-sonnet-4-6"), null);
+  assert.equal(toolRowRate({ usd_per_call: 0, free: "yes" }, "claude-sonnet-4-6"), null);
+  assert.equal(toolRowRate({ usd_per_call: 0, free: true }, "claude-sonnet-4-6"), 0);
+  assert.equal(toolRowRate({ usd_per_call: 0.5, free: true }, "claude-sonnet-4-6"), 0.5);
+  assert.equal(toolRowRate(undefined, "claude-sonnet-4-6"), null);
+});
+
+test("#254 AC4/AC6: overrides accept code_execution > 0 only; batch web_fetch adds $0, code_execution is batch_unpriced unless overridden", () => {
+  assert.doesNotThrow(() => validateToolPrices("p", { code_execution: 0.005 }));
+  assert.throws(() => validateToolPrices("p", { code_execution: 0 }), /> 0/);
+  assert.throws(() => validateToolPrices("p", { web_fetch: 0 }), /unknown tool/);
+  const msg = (stu) => JSON.stringify({ custom_id: "a", result: { type: "succeeded", message: { model: "claude-sonnet-4-6", usage: { input_tokens: 1000, output_tokens: 100, server_tool_use: stu } } } });
+  const tokens = costForUsage("claude-sonnet-4-6", { input_tokens: 1000, output_tokens: 100 }, { batch: "anthropic" }).cost_usd;
+  const fetchLine = foldBatchResults("anthropic", msg({ web_fetch_requests: 1 }));
+  assert.equal(fetchLine.ok, true);
+  assert.equal(fetchLine.cost_usd, tokens);
+  const ce = foldBatchResults("anthropic", msg({ code_execution_requests: 1 }));
+  assert.deepEqual([ce.ok, ce.reason], [false, "batch_unpriced"]);
+  const prices = loadUpstreamPrices(pricesFile({ tools: { code_execution: 0.005 } }), []);
+  assert.equal(foldBatchResults("anthropic", msg({ code_execution_requests: 1 }), prices).cost_usd, Number((tokens + 0.005).toFixed(6)));
 });
