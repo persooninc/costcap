@@ -311,7 +311,8 @@ test("frame codec: masked, 16/64-bit lengths, oversize marks corrupt", () => {
   assert.equal(small.corrupt, true);
   assert.deepEqual(small.push(Buffer.from([1])), []);
   const frag = createFrameParser({ maxMessageBytes: 4 });
-  frag.push(Buffer.concat([encodeFrame(1, "abc", { fin: false }), encodeFrame(0, "def")]));
+  // #295: the overflowing fragment is not surfaced, so nothing of the message can be forwarded.
+  assert.deepEqual(frag.push(Buffer.concat([encodeFrame(1, "abc", { fin: false }), encodeFrame(0, "def")])).map((f) => f.opcode), [1]);
   assert.equal(frag.corrupt, true);
   assert.equal(createFrameParser().pending, 0);
 });

@@ -73,7 +73,8 @@ export function createFrameParser({ maxMessageBytes = 16 * 1024 * 1024 } = {}) {
         if (fragOpcode !== null) {
           frags.push(payload);
           fragSize += payload.length;
-          if (fragSize > maxMessageBytes) { corrupt = true; frames.push(frame); break; }
+          // #295: the overflowing frame is never surfaced (no message, nothing to forward).
+          if (fragSize > maxMessageBytes) { corrupt = true; frags = []; break; }
           if (fin) { frame.message = { opcode: fragOpcode, data: Buffer.concat(frags) }; fragOpcode = null; frags = []; fragSize = 0; }
         }
       }

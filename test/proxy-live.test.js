@@ -508,6 +508,53 @@ test("#290 fragmented session.update to a disallowed delegation model never reac
   c.close();
 });
 
+// #295: a fragmented client message past the 16 MB limit is never forwarded; the client is closed 1009.
+for (const kind of ["text", "binary"]) {
+  test(`#295 oversized fragmented (${kind}) session.update to a disallowed model never reaches upstream; client closed 1009`, { timeout: 180000 }, async (t) => {
+    const { encodeFrame: ef } = await import("../src/realtime.js");
+    const { up, port, receipts } = await setup(t, { upstream: { ...liveUpstream(), maxMessageBytes: 64 * 1024 * 1024 }, proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
+    const c = await connectRealtime(port, PATH);
+    c.send(START);
+    await c.waitFor((m) => m.type === "session.started", 30000);
+    const json = Buffer.from(JSON.stringify({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } }));
+    const f1 = Buffer.concat([json, Buffer.alloc(16 * 1024 * 1024 - 10 - json.length, 0x20)]);
+    c.socket.write(Buffer.concat([ef(kind === "text" ? 1 : 2, f1, { fin: false, mask: true }), ef(0, Buffer.alloc(1024, 0x20), { mask: true })]));
+    await until(() => c.closeCode !== null, 60000);
+    assert.equal(c.closeCode, 1009);
+    // AC3: later client frames are not silently swallowed by an open session.
+    c.socket.write(ef(1, JSON.stringify({ type: "x" }), { mask: true }));
+    await until(() => up.sessions[0].received.some((m) => m.type === "session.close"), 60000);
+    await sleep(50);
+    const rec = up.sessions[0].received;
+    assert.ok(!rec.some((m) => m.type === "session.update" || m.type === "x"));
+    assert.ok(up.sessions[0].frames.every((f) => f.payload.length < 1024 * 1024), "no fragment of the oversized message reached upstream");
+    assert.ok(!live(receipts).some((r) => r.blocked && r.reason === "model_not_allowed"));
+    c.close();
+  });
+}
+
+test("#295 a fragmented session.update just under the limit is still vetted whole", { timeout: 180000 }, async (t) => {
+  const { encodeFrame: ef } = await import("../src/realtime.js");
+  const { up, port } = await setup(t, { upstream: { ...liveUpstream(), maxMessageBytes: 64 * 1024 * 1024 }, proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
+  const c = await connectRealtime(port, PATH);
+  c.send(START);
+  await c.waitFor((m) => m.type === "session.started", 30000);
+  const big = (model) => { const j = Buffer.from(JSON.stringify({ type: "session.update", session: { delegation: { responses: { model } } } })); return Buffer.concat([j, Buffer.alloc(16 * 1024 * 1024 - 2048 - j.length, 0x20)]); };
+  const frags = (b) => [ef(1, b.subarray(0, 1024), { fin: false, mask: true }), ef(0, b.subarray(1024), { mask: true })];
+  c.socket.write(Buffer.concat(frags(big("gpt-5.4"))));
+  const err = await c.waitFor((m) => m.type === "error", 60000);
+  assert.equal(err.error.code, "model_not_allowed");
+  const ok = big("gpt-5.4-mini");
+  const okFrames = frags(ok);
+  c.socket.write(Buffer.concat(okFrames));
+  await until(() => up.sessions[0].received.some((m) => m.type === "session.update"), 60000);
+  const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
+  assert.deepEqual(ups.map((u) => u.session.delegation.responses.model), ["gpt-5.4-mini"]);
+  assert.ok(Buffer.concat(up.sessions[0].frames.slice(-2).map((x) => x.raw)).equals(Buffer.concat(okFrames)), "forwarded byte-identical");
+  assert.equal(c.closeCode, null);
+  c.close();
+});
+
 test("#290 a new data frame inside an open fragmented message closes 1002 and nothing partial is forwarded", async (t) => {
   const { encodeFrame: ef } = await import("../src/realtime.js");
   const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });

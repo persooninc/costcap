@@ -119,7 +119,7 @@ get `501 websocket_unsupported`.
 `wrap` also exports `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions`.
 Sessions are billed per second at $0.05/min from each `session.usage.updated` snapshot (only
 the growth since the last snapshot is billed) and the final `session.closed`. The model in
-`session.start`, and its `session.delegation.responses.model` backend, are checked against `--models` and `--unknown-models refuse` before it reaches Fragmented client messages are held until their final fragment and vetted whole; a stray continuation frame closes the session with 1002.
+`session.start`, and its `session.delegation.responses.model` backend, are checked against `--models` and `--unknown-models refuse` before it reaches Fragmented client messages are held until their final fragment and vetted whole; a stray continuation frame closes the session with 1002, and a client message over the 16 MB limit is never forwarded (the client is closed with 1009 `frame_too_large`).
 OpenAI. Caps are re-checked after every metered event and by a 1 s wall-clock estimate; on a hit
 the proxy sends `session.close`, bills the final duration and closes the client with `1008`.
 `costcap kill` closes a session within 1 s. Backend `response.completed` usage is priced once per

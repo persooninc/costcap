@@ -1804,6 +1804,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           admitted = true; started = true; lastSnapAt = now();
           toUpstream(Buffer.concat(held)); held = [];
         }
+        // #295: a client message over the size limit is never forwarded (not even fragments held for
+        // vetting); the client is closed 1009 and the upstream session is closed.
+        if (up.corrupt && !finished && !closing) {
+          pendFrags = null; held = [];
+          startClose(1009, "frame_too_large", { clientNow: true, errorCode: "frame_too_large" });
+        }
       };
       if (upHead?.length) fromUpstream(upHead);
       upSocket.on("data", fromUpstream);

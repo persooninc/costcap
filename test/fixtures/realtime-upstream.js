@@ -10,7 +10,7 @@ const accept = (key) => createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA
  * startRealtimeUpstream({ onSession(conn, req) }) -> { url, port, upgrades, requests, sessions, close }.
  * conn.send(obj | Buffer raw) writes server frames; conn.received holds client messages; conn.closed resolves on close.
  */
-export async function startRealtimeUpstream({ onSession = () => {}, onMessage = () => {}, reject = null } = {}) {
+export async function startRealtimeUpstream({ onSession = () => {}, onMessage = () => {}, reject = null, maxMessageBytes } = {}) {
   const state = { upgrades: 0, requests: 0, sessions: [], handshakes: [] };
   // Plain HTTP calls (e.g. chat completions) get a small metered body so one host serves both.
   const server = http.createServer((req, res) => {
@@ -24,7 +24,7 @@ export async function startRealtimeUpstream({ onSession = () => {}, onMessage = 
     state.upgrades++;
     socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade",
       `Sec-WebSocket-Accept: ${accept(req.headers["sec-websocket-key"])}`, "", ""].join("\r\n"));
-    const parser = createFrameParser();
+    const parser = createFrameParser(maxMessageBytes ? { maxMessageBytes } : {});
     let resolveClosed;
     const conn = {
       socket, received: [], frames: [], req,
