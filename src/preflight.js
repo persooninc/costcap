@@ -170,7 +170,7 @@ export function checkEstimate(cap, est, onFit, reserved = 0) {
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = { ...(cap?.remaining?.() ?? {}) };
   if (reserved > 0) for (const k of Object.keys(remaining)) if (typeof remaining[k] === "number") remaining[k] = Number(Math.max(remaining[k] - reserved, 0).toFixed(6));
-  for (const scope of ["run", "hour", "day", "month"]) {
+  for (const scope of ["run", "hour", "day", "week", "month"]) {
     if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
       return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,
         input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier, ...(est.batch_entries && { batch_entries: est.batch_entries }) };

@@ -17,6 +17,9 @@ inputs:
   day-cap:
     description: Optional UTC day cap in estimated USD
     required: false
+  week-cap:
+    description: Optional ISO week cap in estimated USD (UTC, resets Monday 00:00 UTC)
+    required: false
   month-cap:
     description: Optional UTC month cap in estimated USD
     required: false
@@ -57,6 +60,9 @@ outputs:
   day-spent-usd:
     description: Estimated USD for the current UTC day; empty when any cost is unknown
     value: ${{ steps.check.outputs.day-spent-usd }}
+  week-spent-usd:
+    description: Estimated USD for the current ISO week (UTC, Monday start); empty when any cost is unknown
+    value: ${{ steps.check.outputs.week-spent-usd }}
   month-spent-usd:
     description: Estimated USD for the current UTC month; empty when any cost is unknown
     value: ${{ steps.check.outputs.month-spent-usd }}
@@ -103,6 +109,7 @@ runs:
         COSTCAP_CAP: ${{ inputs.cap }}
         COSTCAP_HOUR_CAP: ${{ inputs.hour-cap }}
         COSTCAP_DAY_CAP: ${{ inputs.day-cap }}
+        COSTCAP_WEEK_CAP: ${{ inputs.week-cap }}
         COSTCAP_MONTH_CAP: ${{ inputs.month-cap }}
         COSTCAP_RUN_ID: ${{ inputs.run-id }}
         COSTCAP_TAG_CAPS: ${{ inputs.tag-caps }}
@@ -116,6 +123,7 @@ runs:
         args=(check --receipts "$COSTCAP_RECEIPTS" --cap "$COSTCAP_CAP" --github-output)
         if [ -n "$COSTCAP_HOUR_CAP" ]; then args+=(--hour-cap "$COSTCAP_HOUR_CAP"); fi
         if [ -n "$COSTCAP_DAY_CAP" ]; then args+=(--day-cap "$COSTCAP_DAY_CAP"); fi
+        if [ -n "$COSTCAP_WEEK_CAP" ]; then args+=(--week-cap "$COSTCAP_WEEK_CAP"); fi
         if [ -n "$COSTCAP_MONTH_CAP" ]; then args+=(--month-cap "$COSTCAP_MONTH_CAP"); fi
         if [ -n "$COSTCAP_RUN_ID" ]; then args+=(--run-id "$COSTCAP_RUN_ID"); fi
         for rule in $COSTCAP_TAG_CAPS; do args+=(--tag-cap "$rule"); done

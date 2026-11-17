@@ -86,6 +86,11 @@ export function weekLabel(ms, timezone = "UTC") {
   const { year, month, day } = localParts(ms, timezone);
   return isoWeek(year, month, day);
 }
+/** #264: UTC ISO week label without Intl, for the local wrapper's per-receipt hot path. */
+export function utcWeekLabel(ms) {
+  const d = new Date(ms);
+  return isoWeek(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+}
 export function mondayOf(year, week) {
   const jan4 = Date.UTC(year, 0, 4);
   return jan4 - ((new Date(jan4).getUTCDay() + 6) % 7) * DAY_MS + (week - 1) * 7 * DAY_MS;

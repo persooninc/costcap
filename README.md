@@ -49,6 +49,7 @@ any receipt has unknown cost):
     receipts: .costcap/receipts.jsonl
     cap: "5"
     day-cap: "10"   # optional, UTC day
+    # week-cap: "25" # optional, ISO week (UTC, Monday start)
     month-cap: "50" # optional, UTC month
     run-id: ${{ env.RUN_ID }} # optional: cap only this run's receipts
 ```
@@ -666,7 +667,7 @@ node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 
 **Per-agent caps on `POST /v1/agents/:id/policy` (#175):** `caps` (`run`, `hour`, `day`, `month`) replaces the whole caps object, so a key you leave out is removed; omitting `caps` keeps the saved caps. An unknown key (for example `weekly`) returns `400` instead of being stored and ignored. The dashboard agent card shows Per run / Per hour / Per day / Per week / Per month and its "Save caps" always sends every key, so an API-set `caps.hour` survives a save that only changes models or steps; clearing a field removes that cap.
 
-**Weekly caps (#261):** `caps.week` (agent) and `week` on `POST /v1/teams` set a USD budget per ISO week, reset Monday 00:00 in the org budget-period timezone (`monthStartDay` does not move weeks). A team needs at least one of `day`, `week` or `month`. Enrolled wrappers enforce it fleet-wide from `agent_spend.spent.week` / `team.spent.week` in `/v1/policy` plus their own unsynced receipts, refusing with `budget_exceeded` and `scope: "week"` (agent) or `team:<name>:week`. A week that starts in the previous month counts receipts from both months; the month spend is unchanged. `GET /v1/agents/:id/budget` adds `budget_remaining.week_usd` when a week cap applies, teams report `spend.week_usd`, and the alert sweep raises `cap_approaching`/`cap_hit` for week caps once per week (a blocked `scope: "week"` receipt pages `cap_hit`). Local `wrap --policy` files accept `week` for agents and teams too. Out of scope for now: local `--week-cap`, week tag/model/org caps, week cap raises, week `cap_projected` and `--preflight` against the week remainder.
+**Weekly caps (#261):** `caps.week` (agent) and `week` on `POST /v1/teams` set a USD budget per ISO week, reset Monday 00:00 in the org budget-period timezone (`monthStartDay` does not move weeks). A team needs at least one of `day`, `week` or `month`. Enrolled wrappers enforce it fleet-wide from `agent_spend.spent.week` / `team.spent.week` in `/v1/policy` plus their own unsynced receipts, refusing with `budget_exceeded` and `scope: "week"` (agent) or `team:<name>:week`. A week that starts in the previous month counts receipts from both months; the month spend is unchanged. `GET /v1/agents/:id/budget` adds `budget_remaining.week_usd` when a week cap applies, teams report `spend.week_usd`, and the alert sweep raises `cap_approaching`/`cap_hit` for week caps once per week (a blocked `scope: "week"` receipt pages `cap_hit`). Local `wrap --policy` files accept `week` for agents and teams too. **Local `--week-cap USD` (#264)** on `wrap`, `check` and `mcp` (and the Action `week-cap` input / `week-spent-usd` output) caps the whole ledger per ISO week in UTC (Monday 00:00 UTC reset), refusing with 429 `budget_exceeded`, `scope: "week"` and no `Retry-After`; `--warn-at` dedupes week warnings on `YYYY-Www`, `--preflight` compares against the week remainder, and an enrolled wrapper uses min(local, fleet `caps.week`). Out of scope for now: week tag/model/org caps, week cap raises, week `cap_projected` and `--preflight` against the week remainder.
 
 Enrolled agents can also get a fleet step budget: an admin sets "Max steps per run" in the dashboard (`maxSteps` on `POST /v1/agents/:id/policy`). The wrapper enforces it per run from its cached policy, even offline. A local `--max-steps` can tighten it, never loosen it.
 
@@ -916,7 +917,7 @@ node src/cli.js mcp --receipts .costcap/receipts.jsonl --day-cap 10
 
 `check` returns JSON and exits 0 below the budget, 1 at/above it or with unknown
 cost, and 2 for missing/malformed evidence. `--cap` sums the entire selected
-receipt file, not one reconstructed run. `--day-cap` and `--month-cap` use UTC. `--hour-cap USD` is a rolling 60-minute window (spend with `now - 60min < ts <= now`): it never latches, a refusal is a 429 `budget_exceeded` with `scope: "hour"`, `retry_after_s` and a `Retry-After` header, and policy files (`hour` on `default`, agents, teams) and fleet `caps.hour` accept it too (a policy `hour` refusal also carries `retry_after_s` and `Retry-After`, from the agent's or the team's pooled spend; #177); the tighter of local and fleet wins.
+receipt file, not one reconstructed run. `--day-cap`, `--week-cap` (ISO week, Monday start) and `--month-cap` use UTC. `--hour-cap USD` is a rolling 60-minute window (spend with `now - 60min < ts <= now`): it never latches, a refusal is a 429 `budget_exceeded` with `scope: "hour"`, `retry_after_s` and a `Retry-After` header, and policy files (`hour` on `default`, agents, teams) and fleet `caps.hour` accept it too (a policy `hour` refusal also carries `retry_after_s` and `Retry-After`, from the agent's or the team's pooled spend; #177); the tighter of local and fleet wins.
 ### Cost attribution tags
 
 Label spend for chargeback with `costcap wrap --tag feature=search --tag env=prod -- <command>`
@@ -1023,7 +1024,7 @@ With `--github-output`, `check` also appends step outputs to `$GITHUB_OUTPUT`
 `$GITHUB_STEP_SUMMARY`, before it exits. The Action does this automatically and
 exposes the outputs `verdict` (`ok`, `budget_exceeded`, `accounting_unavailable`),
 `spent-usd` (empty, never `0`, when any cost is unknown), `cap-usd`,
-`day-spent-usd`, `month-spent-usd`, `unknown-receipts` and `receipts-count`:
+`day-spent-usd`, `week-spent-usd`, `month-spent-usd`, `unknown-receipts` and `receipts-count`:
 
 ```yaml
 - id: budget

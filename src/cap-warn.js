@@ -4,8 +4,10 @@
 // block. Unknown cost is never counted as $0: spend that excludes unknown-cost
 // receipts is reported as a lower bound.
 
+import { utcWeekLabel } from "./period.js";
+
 export const DEFAULT_WARN_AT = Object.freeze([0.8]);
-export const SCOPES = Object.freeze(["run", "day", "month"]);
+export const SCOPES = Object.freeze(["run", "day", "week", "month"]);
 
 // "--warn-at F[,F...]": 0 < F < 1, distinct; "off" disables warnings.
 export function parseWarnAt(v) {
@@ -21,11 +23,12 @@ export function parseWarnAt(v) {
   return out.sort((a, b) => a - b);
 }
 
-// Period key a warning is deduped on: run_id for run, UTC day or month otherwise.
+// Period key a warning is deduped on: run_id for run, UTC day, ISO week (YYYY-Www, #264) or month otherwise.
 export function periodKey(scope, { runId, now = new Date() } = {}) {
   const iso = new Date(now).toISOString();
   if (scope === "run") return String(runId ?? "");
   if (scope === "day") return iso.slice(0, 10);
+  if (scope === "week") return utcWeekLabel(new Date(now).getTime());
   if (scope === "month") return iso.slice(0, 7);
   throw new Error(`unknown scope ${scope}`);
 }

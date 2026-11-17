@@ -67,7 +67,7 @@ test("integration 1+4: under cap writes ok, spend, cap and summary; exits 0", ()
   const p = run(["check", "--receipts", t.r, "--cap", "5", "--day-cap", "10", "--github-output"], { GITHUB_OUTPUT: t.out, GITHUB_STEP_SUMMARY: t.sum });
   assert.equal(p.status, 0, p.stderr);
   const o = parseOutputFile(readFileSync(t.out, "utf8"));
-  assert.deepEqual(o, { verdict: "ok", "spent-usd": "0.75", "cap-usd": "5", "hour-spent-usd": "0.75", "day-spent-usd": "0.75", "month-spent-usd": "0.75", "unknown-receipts": "0", "receipts-count": "2", warnings: "" });
+  assert.deepEqual(o, { verdict: "ok", "spent-usd": "0.75", "cap-usd": "5", "hour-spent-usd": "0.75", "day-spent-usd": "0.75", "week-spent-usd": "0.75", "month-spent-usd": "0.75", "unknown-receipts": "0", "receipts-count": "2", warnings: "" });
   const s = readFileSync(t.sum, "utf8");
   assert.match(s, /\| verdict \| ok \|/); assert.match(s, /\| spent-usd \| 0\.75 \|/); assert.match(s, /estimates/);
 });

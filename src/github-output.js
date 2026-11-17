@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { formatDiffMarkdown } from "./cost-diff.js";
 
-export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id", "tag-caps", "model-caps"]);
+export const OUTPUT_NAMES = Object.freeze(["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "week-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings", "run-id", "tag-caps", "model-caps"]);
 export const DIFF_OUTPUT_NAMES = Object.freeze(["delta-usd", "delta-pct", "baseline-usd", "diff-markdown"]);
 
 const usd = (n) => (n == null ? "" : String(Number(Number(n).toFixed(6))));
@@ -20,6 +20,7 @@ export function checkOutputs(result, caps = {}) {
     "cap-usd": usd(caps.run),
     "hour-spent-usd": ledgerUnknown ? "" : usd(result.spend?.hour),
     "day-spent-usd": ledgerUnknown ? "" : usd(result.spend?.day),
+    "week-spent-usd": ledgerUnknown ? "" : usd(result.spend?.week),
     "month-spent-usd": ledgerUnknown ? "" : usd(result.spend?.month),
     "unknown-receipts": String(result.unknown_cost_count),
     "receipts-count": String(result.receipt_count),

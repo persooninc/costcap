@@ -4,6 +4,7 @@
 // traffic that flows through the proxy.
 
 import { readFileSync, existsSync } from "node:fs";
+import { utcWeekLabel } from "./period.js";
 
 function loadLines(path) {
   if (!path || !existsSync(path)) return [];
@@ -84,10 +85,10 @@ export function loadEvents(path) {
   return loadLines(path).filter((r) => r.event);
 }
 
-export const CAP_SCOPES = Object.freeze(["run", "hour", "day", "month"]);
+export const CAP_SCOPES = Object.freeze(["run", "hour", "day", "week", "month"]);
 export const HOUR_MS = 60 * 60 * 1000;
 
-// caps: { run, hour, day, month } in USD; any may be undefined.
+// caps: { run, hour, day, week, month } in USD; week (#264) is the ISO week, UTC Monday start; any may be undefined.
 // hour (#172) is a rolling window: spend with now - 60min < ts <= now. It never latches.
 // runId (#178): this wrapper's run id; a settlement of a receipt with that run_id
 // also counts toward the run cap.
@@ -112,6 +113,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   // Spend is bucketed by UTC day and month key once, at record time, so check()
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
   const byDay = new Map();
+  const byWeek = new Map();
   const byMonth = new Map();
   // Rolling hour window: time-ordered [ms, cost] entries, evicted from the front,
   // so check() stays amortised O(1). Entries stamped after now (clock skew) count
@@ -133,6 +135,8 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     const d = new Date(ts);
     const key = d.toISOString();
     byDay.set(key.slice(0, 10), (byDay.get(key.slice(0, 10)) ?? 0) + cost);
+    const wk = utcWeekLabel(d.getTime());
+    byWeek.set(wk, (byWeek.get(wk) ?? 0) + cost);
     byMonth.set(key.slice(0, 7), (byMonth.get(key.slice(0, 7)) ?? 0) + cost);
     addWindow(d.getTime(), cost);
   };
@@ -148,7 +152,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
   function spend() {
     const d = now();
     const n = d.toISOString();
-    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown, pending_batches: pendingBatches.size + anonPending };
+    return { run, hour: Number(hourSpend(d.getTime()).toFixed(9)), day: byDay.get(n.slice(0, 10)) ?? 0, week: byWeek.get(utcWeekLabel(d.getTime())) ?? 0, month: byMonth.get(n.slice(0, 7)) ?? 0, unknown, pending_batches: pendingBatches.size + anonPending };
   }
 
   // Seconds until hour spend falls below cap (spend ages out from the oldest entry).

@@ -55,7 +55,7 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     else { total += r.cost_usd; if (b.cost_usd !== null) b.cost_usd = r6(b.cost_usd + r.cost_usd); }
   }
   const capsOut = {};
-  for (const scope of ["run", "day", "month"]) {
+  for (const scope of ["run", "day", "week", "month"]) {
     if (caps[scope] != null) capsOut[scope] = { limit_usd: caps[scope], spent_usd: r6(spend[scope] ?? 0) };
   }
   // #225: stop reason and outcome (success|failure|killed) for hosted run-end sync.

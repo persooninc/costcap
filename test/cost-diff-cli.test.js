@@ -64,7 +64,7 @@ test("AC4: check --github-output --baseline writes diff outputs; summary-out is 
   assert.match(readFileSync(join(d, "out2"), "utf8"), /verdict<<(\S+)\nok\n/);
   const plain = cli(base, env(3));
   const keys = (f) => [...readFileSync(f, "utf8").matchAll(/^([a-z-]+)<</gm)].map((m) => m[1]);
-  assert.deepEqual(keys(join(d, "out3")), ["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings"]);
+  assert.deepEqual(keys(join(d, "out3")), ["verdict", "spent-usd", "cap-usd", "hour-spent-usd", "day-spent-usd", "week-spent-usd", "month-spent-usd", "unknown-receipts", "receipts-count", "warnings"]);
   assert.doesNotMatch(readFileSync(join(d, "sum3"), "utf8"), /cost diff/);
   assert.equal(plain.status, 0);
   assert.equal(cli([...base, "--max-increase-pct", "5"]).status, 2);
