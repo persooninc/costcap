@@ -373,3 +373,42 @@ export function cacheStorageCost(model, tokens, start, end) {
   }
   return { cost_usd: Number(cost.toFixed(6)), storage_hours: Number(((e - s) / 3.6e6).toFixed(6)), ...pin };
 }
+
+// #278: non-Anthropic Bedrock models (Nova, Llama, Mistral, DeepSeek, gpt-oss, Qwen), priced
+// per region from the AWS Price List (table.bedrock_models). The Claude regional multiplier
+// never applies. A region with no row, a non-default service tier, or a usage component with no
+// published rate is unknown (cost_usd null), never the fallback and never $0.
+export function bedrockModels() {
+  return Object.keys(table.bedrock_models ?? {});
+}
+
+export const isBedrockTableModel = (model) => typeof model === "string" && Object.hasOwn(table.bedrock_models ?? {}, model);
+
+/** The on-demand standard row for a Bedrock model in a region, or null. */
+export function bedrockPrice(model, region) {
+  if (!isBedrockTableModel(model) || typeof region !== "string") return null;
+  const r = table.bedrock_models[model].regions?.[region];
+  return r && Number.isFinite(r.input) && Number.isFinite(r.output) ? { ...r } : null;
+}
+
+/** Receipt fields for a non-Anthropic Bedrock call. opts.scale: a user discount (1 - d). */
+export function costForBedrock(model, region, usage = {}, { scale } = {}) {
+  assertTableIntegrity();
+  const { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = usage;
+  const r = bedrockPrice(model, region);
+  const base = { model, input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens, pricing_tier: "standard",
+    ...(typeof region === "string" && { region }), ...(modality_tokens && { modality_tokens }),
+    table_version: table.version, table_sha256: TABLE_SHA256, fallback: false, cost_source: "table" };
+  const hasModality = modality_tokens && typeof modality_tokens === "object" && Object.values(modality_tokens).some((s) => s && Object.values(s).some((n) => n > 0));
+  const reason = !r ? "cloud_model_unpriced"
+    : premiumTier({ speed, service_tier }) ? "service_tier_unpriced"
+    : hasModality ? "modality_unpriced"
+    : cached_input_tokens > 0 && !Number.isFinite(r.cached_input) ? "cache_read_unpriced"
+    : (cache_write_input_tokens > 0 && !Number.isFinite(r.cache_write)) || (cache_write_1h_input_tokens > 0 && !Number.isFinite(r.cache_write_1h)) ? "cache_write_unpriced"
+    : null;
+  if (reason) return { ...base, cost_usd: null, reason };
+  const m = scale ?? 1;
+  const cost = (input_tokens * r.input + cached_input_tokens * (r.cached_input ?? 0) + cache_write_input_tokens * (r.cache_write ?? 0) +
+    cache_write_1h_input_tokens * (r.cache_write_1h ?? 0) + output_tokens * r.output) * m / 1_000_000;
+  return { ...base, cost_usd: Number(cost.toFixed(6)) };
+}

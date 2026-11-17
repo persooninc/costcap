@@ -266,7 +266,23 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `cacheWriteInputTokens`) and ConverseStream from the final `metadata` event; a stream cut
   before `metadata` is `stream_incomplete` (unknown cost, never $0). Preflight reads
   `inferenceConfig.maxTokens`. If `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` is already set, wrap leaves
-  it alone and warns once. Non-Anthropic Converse models (Nova, Llama, …) are unpriced.
+  it alone and warns once.
+- Non-Anthropic Bedrock models (#278): Amazon Nova (micro, lite, pro, premier, 2 lite), Meta Llama
+  3 / 3.1 / 3.2 / 3.3 / 4 (Scout, Maverick), Mistral (7B, Small, Large), DeepSeek R1, OpenAI gpt-oss
+  (20b, 120b) and Qwen3 (32B, Coder 30B) are priced from the table's `bedrock_models` section
+  (AWS Price List on-demand standard rates, per region: us-east-1, us-west-2, eu-west-1 where AWS
+  lists the model). The rate comes from the request's region (the SigV4 region, else `AWS_REGION` /
+  `AWS_DEFAULT_REGION`); a `us.`/`eu.`/`apac.` geo profile is stripped and billed at that region's
+  row. The Claude 10% regional premium never applies to these rows. An unlisted id, a region with no
+  row, a `global.` profile, an inference-profile ARN, a cache write, or a usage component with no rate
+  stays `cloud_model_unpriced` (or `cache_*_unpriced`) and pauses the run, never the fallback rate.
+  A Converse `serviceTier.type` other than `default` records `service_tier_unpriced`.
+  `costcap pricing show us.amazon.nova-pro-v1:0` prints the per-region rows.
+- `--upstream-prices` accepts `bedrock` and `vertex` override keys (no `--upstream` needed), with the
+  same rules as the first-party keys: `{discount}` scales table rows, absolute rates price an
+  unlisted id, `"*"` takes a discount only. Bedrock keys are the base model id without the geo
+  prefix (`amazon.nova-pro-v1:0`, `meta.llama-x-v1:0`); Vertex keys are the model id
+  (`gemini-2.5-pro`, `claude-sonnet-4-5`). Overridden receipts carry `cost_source: "user_prices"`.
   Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
   `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
 - **Gemini on Vertex.** wrap also sets `GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex`

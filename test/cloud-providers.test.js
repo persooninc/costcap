@@ -96,7 +96,8 @@ test("model mapping: geo/anthropic prefixes and version suffix stripped; non-Ant
   assert.equal(mapCloudModel("bedrock", "global.anthropic.claude-haiku-4-5-20251001-v1:0"), "claude-haiku-4-5");
   assert.equal(mapCloudModel("bedrock", "anthropic.claude-opus-4-5-20251101-v1"), "claude-opus-4-5");
   for (const g of ["eu", "apac", "jp", "au"]) assert.equal(mapCloudModel("bedrock", `${g}.anthropic.claude-sonnet-4-5-20250929-v1:0`), "claude-sonnet-4-5");
-  assert.equal(mapCloudModel("bedrock", "meta.llama3-70b-instruct-v1:0"), null);
+  assert.equal(mapCloudModel("bedrock", "meta.llama3-70b-instruct-v1:0"), "meta.llama3-70b-instruct-v1:0"); // #278: listed
+  assert.equal(mapCloudModel("bedrock", "meta.unlisted-v1:0"), null);
   assert.equal(mapCloudModel("bedrock", "arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0"), null);
   assert.equal(mapCloudModel("bedrock", "anthropic.claude-unlisted-9-v1:0"), null);
   assert.equal(mapCloudModel("bedrock", "anthropic.titan-v1"), null);
@@ -333,7 +334,7 @@ test("AC4 count-tokens is free on both clouds; multi-region Vertex and AC6 infer
 });
 
 test("AC5 unpriced cloud models record cloud_model_unpriced and pause; never the fallback", async (t) => {
-  for (const id of ["meta.llama3-70b-instruct-v1:0", "arn:aws:bedrock:us-east-1:1:inference-profile/x", "anthropic.claude-unlisted-9-v1:0"]) {
+  for (const id of ["meta.unlisted-v1:0", "arn:aws:bedrock:us-east-1:1:inference-profile/x", "anthropic.claude-unlisted-9-v1:0"]) {
     const up = await fakeCloud(jsonReply(message));
     const { base, port, receipts } = await proxyFor(t, up);
     const p = `/bedrock/model/${encodeURIComponent(id)}/invoke`;
@@ -347,7 +348,7 @@ test("AC5 unpriced cloud models record cloud_model_unpriced and pause; never the
 test("AC5 --unknown-models refuse, --models and --preflight use the mapped path model", async (t) => {
   const up = await fakeCloud(jsonReply(message));
   const refuse = await proxyFor(t, up, { unknownModels: "refuse" });
-  const llama = await signedPost(refuse.base, refuse.port, "/bedrock/model/meta.llama3-70b-instruct-v1%3A0/invoke", "{}");
+  const llama = await signedPost(refuse.base, refuse.port, "/bedrock/model/meta.unlisted-v1%3A0/invoke", "{}");
   assert.equal(llama.status, 403);
   assert.equal((await llama.json()).error, "model_unpriced");
   assert.equal((await signedPost(refuse.base, refuse.port, `/bedrock/model/${enc(SONNET_ID)}/invoke`, "{}")).status, 200);

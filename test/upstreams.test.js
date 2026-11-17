@@ -3,6 +3,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { isRouteNotFound, startMeteringProxy } from "../src/proxy.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { loadUpstreamPrices, parseUpstreamFlag } from "../src/upstreams.js";
 
 const listen = (s) => new Promise((r) => s.listen(0, "127.0.0.1", () => r(s.address().port)));
 
@@ -48,4 +52,14 @@ test("#190 a broken onWarning never breaks the proxied response", async (t) => {
   t.after(() => { up.close(); server.close(); });
   const r = await fetch(`http://127.0.0.1:${port}/u/a/x`, { method: "POST", body: "{}" });
   assert.equal(r.status, 404);
+});
+
+test("#278 bedrock / vertex are override keys in --upstream-prices, not --upstream names", () => {
+  assert.throws(() => parseUpstreamFlag("bedrock=https://x.example"), /built-in provider/);
+  const f = path.join(mkdtempSync(path.join(tmpdir(), "cc-up-")), "p.json");
+  writeFileSync(f, JSON.stringify({ upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 1, output: 2 } }, vertex: { "*": { discount: 0.2 } } } }));
+  const p = loadUpstreamPrices(f, []);
+  assert.deepEqual(Object.keys(p.upstreams), ["bedrock", "vertex"]);
+  writeFileSync(f, JSON.stringify({ upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 0, output: 2 } } } }));
+  assert.throws(() => loadUpstreamPrices(f, []), /never \$0/);
 });
