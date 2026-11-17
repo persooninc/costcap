@@ -77,7 +77,7 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 | Provider | Variables set for the child |
 | --- | --- |
-| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` and `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` and `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions` |
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
@@ -107,7 +107,35 @@ then close `1008`. `costcap kill` closes open sessions within a second.
 A response cut before `response.done`, audio on a model with no audio rate
 (`gpt-realtime-mini` is text only here) and a billed input transcription are recorded as
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
-pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
+pause the run until reconciled. Upgrades on any other path (including
+`/v1/live/sessions/{id}/fork`) get `501 websocket_unsupported`.
+
+### GPT-Live
+
+GPT-Live voice sessions (`gpt-live-1`, `/v1/live/sessions` WebSocket) are proxied at
+`COSTCAP_OPENAI_LIVE_URL` and billed per second of session time, silence included, at
+$0.05/minute. Kill, agent/team, tag and spend caps run before the `101`. The model is read
+from the client's `session.start`. If it fails `--models` or `--unknown-models refuse`, that
+frame is never forwarded: the client gets an `error` event and close `1008`, and a `$0`
+blocked receipt is written.
+
+- **Metering:** each `session.usage.updated` and the final `session.closed` writes one
+  receipt for the seconds since the last billed snapshot (`cost_basis: "duration"`,
+  `billed_seconds` = delta, `session_seconds` = cumulative). A snapshot that goes backwards
+  bills 0. Backend model usage (`response.completed` inside `response.event`) is priced like a
+  Responses call, once per response id.
+- **Caps mid-session:** after each metered event the caps are re-checked. A 1 s ticker also
+  estimates the unbilled time since the last snapshot and closes early when it could pass the
+  smallest remaining cap; estimates are never written as spend. On a hit the client gets
+  `error` with the reason, CostCap sends `session.close` upstream, waits up to 5 s for
+  `session.closed`, bills the final seconds and closes the client with `1008`. `costcap kill`
+  closes the client within a second.
+- **Unknowns:** if the client drops, CostCap closes the session itself and still bills the
+  final seconds. Only a missing `session.closed` (upstream drop or the 5 s timeout) is
+  recorded as `cost_usd: null`, `reason: "session_usage_unconfirmed"` with
+  `session_seconds_lower_bound`, which pauses the run until settled.
+- **Not proxied:** WebRTC/SIP (`POST /v1/live/sessions` stays `usage_unavailable`, since the
+  media never passes through CostCap) and a hardcoded `wss://api.openai.com`.
 
 ### Other OpenAI-compatible providers
 

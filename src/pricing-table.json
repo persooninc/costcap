@@ -1,6 +1,7 @@
 {
-  "version": "2026-11-16.25",
+  "version": "2026-11-17.1",
   "sources": [
+    "https://developers.openai.com/api/docs/pricing (#273 GPT-Live: gpt-live-1 $0.05/minute of session time, billed per second without rounding; backend model usage billed separately; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
     "https://openai.com/api/pricing/",
@@ -133,6 +134,7 @@
     "gpt-realtime-mini": { "input": 0.60, "cached_input": 0.06, "output": 2.40 },
     "whisper-1": { "per_minute": 0.006 },
     "gpt-transcribe": { "per_minute": 0.0045 },
+    "gpt-live-1": { "per_minute": 0.05 },
     "tts-1": { "per_million_characters": 15.00 },
     "tts-1-hd": { "per_million_characters": 30.00 },
     "gpt-4o-transcribe": { "input": 2.50, "cached_input": 2.50, "output": 10.00, "uniform_modalities": true },

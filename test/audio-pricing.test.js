@@ -97,6 +97,9 @@ test("pricing show prints per-minute and per-character units", () => {
   const all = pricingCommand(["show"]).out;
   assert.match(all, /whisper-1: \$0\.006 per minute of audio/);
   assert.match(all, /tts-1-hd: \$30 per 1M characters of input text/);
+  // #273: GPT-Live bills session time per second at $0.05/minute.
+  assert.match(all, /gpt-live-1: \$0\.05 per minute of session time/);
+  assert.equal(isPricedModel("gpt-live-1"), true);
   assert.match(pricingCommand(["show", "gpt-4o-mini-transcribe"]).out, /input \$1\.25, .*output \$5/);
 });
 

@@ -720,6 +720,47 @@ test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered an
   assert.match(runs.stdout, /0\.1076/);
 });
 
+// #273: a real `costcap wrap` child reads COSTCAP_OPENAI_LIVE_URL; its GPT-Live session is metered per
+// second, closed at the cap through session.close, and `costcap runs` shows the spend.
+test("#273 wrap exports COSTCAP_OPENAI_LIVE_URL; GPT-Live session metered and closed at the cap", async (t) => {
+  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream({ onSession: (conn) => {
+    conn.closeSeconds = () => 31;
+    conn.socket.on("data", () => {
+      if (!conn.sent && conn.received.some((m) => m.type === "session.start")) {
+        conn.sent = true;
+        conn.send({ type: "session.started", session: { id: "sess_cli", model: "gpt-live-1" } });
+        conn.send({ type: "session.usage.updated", usage: { seconds: 30 } });
+      }
+    });
+  } });
+  t.after(() => up.close());
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-live-cli-"));
+  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
+  const script = `
+    import { connectRealtime } from ${JSON.stringify(fixture)};
+    const u = new URL(process.env.COSTCAP_OPENAI_LIVE_URL);
+    const c = await connectRealtime(Number(u.port), u.pathname);
+    c.send({ type: "session.start", session: { model: "gpt-live-1" } });
+    await c.closed;
+    console.log(u.protocol, u.pathname, c.status, c.messages.find((m) => m.type === "error").error.code, c.closeCode);`;
+  const receipts = path.join(dir, "r.jsonl");
+  const res = await new Promise((resolve) => {
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.02", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
+    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
+    c.on("exit", (code) => resolve({ code, out }));
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.out.trim(), "ws: /openai/v1/live/sessions 101 budget_exceeded 1008");
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.cost_basis === "duration");
+  assert.deepEqual(lines.map((r) => [r.billed_seconds, r.cost_usd]), [[30, 0.025], [1, 0.000833]]);
+  assert.ok(lines.every((r) => r.run_id && r.model === "gpt-live-1"));
+  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
+  assert.equal(runs.status, 0);
+  assert.match(runs.stdout, /0\.025833/);
+});
+
 test("#197 wrap warns once per ignored {discount} on an unpriced model and still starts", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
   const f = path.join(dir, "p.json");

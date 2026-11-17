@@ -645,7 +645,8 @@ test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hit
   const up = await startRealtimeUpstream();
   const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url, anthropic: up.url } });
   t.after(async () => { server.close(); await up.close(); });
-  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages"]) {
+  // #273 AC7: GPT-Live forks stay unsupported.
+  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages", "/openai/v1/live/sessions/sess_1/fork"]) {
     const c = await connectRealtime(port, p);
     assert.equal(c.status, 501);
     assert.equal(c.body.error, "websocket_unsupported");
@@ -654,6 +655,26 @@ test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hit
   const r = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) });
   assert.equal(r.status, 200);
   assert.equal(server.accountingFailure(), null);
+});
+
+// #273 AC7: /openai/v1/realtime receipts are unchanged by the GPT-Live route; wrap exports the live URL.
+test("#273 realtime receipt shape unchanged; baseUrlOverrides exports COSTCAP_OPENAI_LIVE_URL", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const usage = { input_tokens: 10, output_tokens: 5 };
+  const up = await startRealtimeUpstream({ onSession: (c) => c.send({ type: "response.done", response: { id: "r1", usage } }) });
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url }, onReceipt: (r) => receipts.push(r) });
+  t.after(async () => { server.close(); await up.close(); });
+  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime");
+  await c.waitFor((m) => m.type === "response.done");
+  while (!receipts.length) await new Promise((r) => setTimeout(r, 10));
+  const r = receipts[0];
+  assert.equal(r.path, "/v1/realtime?model=gpt-realtime");
+  assert.equal(r.cost_usd, 0.00012);
+  for (const k of ["cost_basis", "billed_seconds", "session_seconds"]) assert.equal(k in r, false);
+  c.close();
+  const { baseUrlOverrides } = await import("../src/proxy.js");
+  assert.ok(baseUrlOverrides(8080).includes("COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:8080/openai/v1/live/sessions"));
 });
 
 test("#196 a GET whose body carries usage is $0 non_billable_request and never pauses", async (t) => {

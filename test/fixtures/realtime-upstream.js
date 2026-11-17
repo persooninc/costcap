@@ -9,6 +9,7 @@ const accept = (key) => createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA
 /**
  * startRealtimeUpstream({ onSession(conn, req) }) -> { url, port, upgrades, requests, sessions, close }.
  * conn.send(obj | Buffer raw) writes server frames; conn.received holds client messages; conn.closed resolves on close.
+ * #273: serves /v1/live/sessions too; set conn.closeSeconds = () => n to answer session.close with session.closed.
  */
 export async function startRealtimeUpstream({ onSession = () => {}, reject = null } = {}) {
   const state = { upgrades: 0, requests: 0, sessions: [], handshakes: [] };
@@ -34,7 +35,15 @@ export async function startRealtimeUpstream({ onSession = () => {}, reject = nul
     socket.on("data", (b) => {
       for (const f of parser.push(b)) {
         conn.frames.push(f);
-        if (f.message?.opcode === 1) conn.received.push(JSON.parse(f.message.data.toString()));
+        if (f.message?.opcode === 1) {
+          const msg = JSON.parse(f.message.data.toString());
+          conn.received.push(msg);
+          // #273: a GPT-Live upstream answers session.close with session.closed (usage.seconds).
+          if (msg.type === "session.close" && typeof conn.closeSeconds === "function") {
+            const s = conn.closeSeconds();
+            if (s != null) conn.send({ type: "session.closed", session: { id: conn.sessionId ?? "sess_live" }, usage: { seconds: s } });
+          }
+        }
         if (f.opcode === 8 && !socket.destroyed) socket.end();
       }
     });
