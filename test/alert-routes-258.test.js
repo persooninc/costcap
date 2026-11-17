@@ -138,7 +138,13 @@ test("API + worker: roles, isolation, validation, masking, retry/gave_up, dedupe
   let s1Status = 500;
   const posts = [];
   const router = createOrgAlertRouter({ lookup, fetchImpl: async (url) => { posts.push(url); const st = url === S1 ? s1Status : 200; return { ok: st < 300, status: st }; } });
-  const f = await fixture(t, { now: () => Date.now() + skew, deliverAlert: router });
+  // Pin the clock to 01:00 UTC today: the retry loop below skews up to ~21h, and an
+  // unpinned clock that crosses UTC midnight opens a new cap period, which fires a
+  // second cap_hit to S0 (this failed whenever the suite ran after ~19:00 UTC).
+  const base = Math.floor(Date.now() / 86_400_000) * 86_400_000 + 3_600_000;
+  const started = Date.now();
+  const clock = () => base + (Date.now() - started) + skew;
+  const f = await fixture(t, { now: clock, deliverAlert: router });
   const owner = await f.login("owner@w.invalid");
   const other = await f.login("owner@x.invalid");
   for (const [email, role] of [["viewer@w.invalid", "viewer"], ["admin@w.invalid", "admin"], ["f@w.invalid", "viewer"], ["pending@w.invalid", "viewer"]])
@@ -182,7 +188,7 @@ test("API + worker: roles, isolation, validation, masking, retry/gave_up, dedupe
   assert.equal((await f.request("/v1/alert-settings", undefined, other.cookie)).body.routes, undefined);
   assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, other.cookie)).status, 400);
   // AC4: S1 fails, S0 succeeds; only route:R1:slack retries, then gives up after 10.
-  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts: new Date().toISOString(), cost_usd: 2 }] }, null, a1.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts: new Date(clock()).toISOString(), cost_usd: 2 }] }, null, a1.token);
   await f.service().evaluateFleetAlerts();
   assert.deepEqual(posts.filter((u) => u !== S1).sort(), [S0]); // a1 day cap_hit: defaults (cap_hit allowed) + R1
   assert.equal(posts.filter((u) => u === S1).length, 1);
