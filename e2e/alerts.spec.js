@@ -573,3 +573,73 @@ test("alert routes: admin adds a payments route, team cap alert goes only to its
     await new Promise((resolve) => service.server.close(resolve));
   }
 });
+
+// Issue #282: native PagerDuty / Teams / Discord destinations. Fake fetchImpl receiver; nothing leaves the host.
+test("#282 admin saves PagerDuty, Teams and Discord, sees masked values, test send lists all three; viewer read-only", async ({ page }) => {
+  const { createOrgAlertRouter } = await import("../src/hosted/delivery.js");
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const received = [];
+  const PD = "E2eRoutingKey0123456789abcdefXYZ";
+  const TEAMS = "https://prod-01.westus.logic.azure.com/workflows/e2e/triggers/manual/paths/invoke?sig=e2eTeamsSigQ7";
+  const DISCORD = "https://discord.com/api/webhooks/1234567890/e2eDiscordTokenZ9";
+  const resolveHost = async () => [{ address: "93.184.216.34", family: 4 }];
+  const deliverAlert = createOrgAlertRouter({ lookup: resolveHost, dashboardUrl: origin, fetchImpl: async (url, o) => { received.push({ url, body: JSON.parse(o.body) }); return { ok: true, status: url.includes("discord") ? 204 : 202 }; } });
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-282-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", resolveHost,
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); },
+    sendInvite: async () => {},
+    deliverAlert,
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  const signIn = async (email) => {
+    await page.goto(origin);
+    await page.locator("#email").fill(email);
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await expect(page.locator("#verify")).toBeVisible();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+  };
+  try {
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await signIn("native-owner@example.invalid");
+    const form = page.locator("#alertForm");
+    await form.locator("input[name=pdKey]").fill(PD);
+    await form.locator("select[name=pdRegion]").selectOption("eu");
+    await form.locator("input[name=teamsHook]").fill(TEAMS);
+    await form.locator("input[name=discordHook]").fill(DISCORD);
+    await form.locator("button.primary").click();
+    await expect(page.locator("#status")).toContainText("Alert destinations saved.");
+    await expect(page.locator("#alertPagerDuty")).toHaveText(`key …${PD.slice(-4)} · eu · kinds: all`);
+    await expect(page.locator("#alertTeams")).toHaveText("https://prod-01.westus.logic.azure.com/…");
+    await expect(page.locator("#alertDiscord")).toHaveText(`https://discord.com/api/webhooks/…${DISCORD.slice(-4)}`);
+    await page.locator("#testAlert").click();
+    for (const ch of ["pagerduty", "teams", "discord"]) await expect(page.locator(`#testAlertResults li[data-channel=${ch}]`)).toHaveAttribute("data-status", "accepted");
+    expect(received.map((r) => r.url)).toEqual(["https://events.eu.pagerduty.com/v2/enqueue", TEAMS, DISCORD]);
+    expect(received[0].body.payload.severity).toBe("info");
+    for (const html of [await page.content()]) for (const s of [PD, "e2eTeamsSigQ7", "e2eDiscordTokenZ9"]) expect(html).not.toContain(s);
+    // Viewer: masked values, no edit fields.
+    await page.locator("#invite input[name=email]").fill("native-viewer@example.invalid");
+    await page.locator("#invite button").click();
+    await expect(page.locator("#invites")).toContainText("native-viewer@example.invalid");
+    await page.locator("#logout").click();
+    await signIn("native-viewer@example.invalid");
+    await expect(page.locator("#alertTeams")).toHaveText("https://prod-01.westus.logic.azure.com/…");
+    await expect(page.locator("#alertForm")).toBeHidden();
+    await expect(page.locator("#testAlert")).toBeHidden();
+    const html = await page.content();
+    for (const s of [PD, "e2eTeamsSigQ7", "e2eDiscordTokenZ9"]) expect(html).not.toContain(s);
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

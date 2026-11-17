@@ -5,7 +5,7 @@ import { createTransactionalEmail } from "./email.js";
 import { digestText, digestHtml, digestSlack, digestWebhookPayload, digestSubject } from "./digest.js";
 // Hosted delivery adapter. The caller authorizes recipients and supplies secrets.
 // Tests pass a fake fetch. This module does not send by itself.
-export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook, webhook, kinds = null, routes = [], dashboardUrl, lookup = dnsLookup, fetchImpl = fetch, nowMs = () => Date.now() } = {}) {
+export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook, webhook, pagerduty, teamsWebhook, discordWebhook, kinds = null, routes = [], dashboardUrl, lookup = dnsLookup, fetchImpl = fetch, nowMs = () => Date.now() } = {}) {
   if (slackWebhook) {
     const url = new URL(slackWebhook);
     if (url.protocol !== "https:" || url.hostname !== "hooks.slack.com" || !url.pathname.startsWith("/services/")) throw new Error("Slack webhook must use hooks.slack.com/services over HTTPS");
@@ -47,6 +47,19 @@ export function createAlertDelivery({ emailKey, emailFrom, emailTo, slackWebhook
         results.push({ channel: "webhook", status: "accepted" });
       } catch (err) { results.push({ channel: "webhook", status: "failed", error: err.message }); }
     } else results.push({ channel: "webhook", status: "unconfigured" });
+    // Issue #282: native PagerDuty (own kinds filter), Teams and Discord (default kinds).
+    const scrubbed = (err) => [pagerduty?.routingKey, teamsWebhook, discordWebhook].filter(Boolean).reduce((m, v) => m.split(v).join("[redacted]"), String(err?.message ?? err));
+    const native = [
+      ["pagerduty", validPagerDuty(pagerduty) && pagerDutyKindOn(pagerduty, alert.kind), () => post(pagerDutyUrl(pagerduty.region), {}, pagerDutyPayload(alert, { routingKey: pagerduty.routingKey, text, dashboardUrl }))],
+      ["teams", defaultsOn && Boolean(teamsWebhook) && !teamsWebhookProblem(teamsWebhook), () => post(teamsWebhook, {}, teamsPayload(alert, { text, dashboardUrl }))],
+      ["discord", defaultsOn && Boolean(discordWebhook) && !discordWebhookProblem(discordWebhook), () => post(discordWebhook, {}, discordPayload(alert, { text }))],
+    ];
+    for (const [channel, on, send] of native) {
+      if (!want(channel)) continue;
+      if (!on) { if (Array.isArray(channels)) results.push({ channel, status: "unconfigured" }); continue; } // Unrequested + unset: no row, so legacy result shapes are unchanged.
+      try { await send(); results.push({ channel, status: "accepted" }); }
+      catch (err) { results.push({ channel, status: "failed", error: scrubbed(err) }); }
+    }
     // Issue #258: additive routes. Defaults first, then routes in order; an
     // address or Slack URL already covered in this occurrence is not sent again.
     for (const route of matchingRoutes(routes, alert)) {
@@ -97,8 +110,79 @@ export function maskWebhook(value) {
   if (typeof value !== "string" || !value) return null;
   return `https://hooks.slack.com/services/…${value.slice(-4)}`;
 }
+// Issue #282: native PagerDuty Events v2, Microsoft Teams (Workflows) and Discord destinations.
+export const PAGERDUTY_REGIONS = ["us", "eu"];
+export const pagerDutyUrl = (region) => (region === "eu" ? "https://events.eu.pagerduty.com/v2/enqueue" : "https://events.pagerduty.com/v2/enqueue");
+export const validRoutingKey = (k) => typeof k === "string" && /^[A-Za-z0-9]{32}$/.test(k);
+const validPagerDuty = (pd) => Boolean(pd && validRoutingKey(pd.routingKey) && PAGERDUTY_REGIONS.includes(pd.region ?? "us"));
+const pagerDutyKindOn = (pd, kind) => kind === "test" || kindMatches(pd.kinds, kind); // A test send always reaches a configured PagerDuty.
+/** Shape check for a submitted PagerDuty object. Returns an error string or null. */
+export function pagerDutyProblem(pd, allKinds) {
+  if (!pd || typeof pd !== "object" || Array.isArray(pd)) return "pagerduty must be an object with routingKey, region and kinds";
+  if (!validRoutingKey(pd.routingKey)) return "PagerDuty routing key must be a 32-character Events v2 integration key";
+  if (pd.region !== undefined && !PAGERDUTY_REGIONS.includes(pd.region)) return "PagerDuty region must be us or eu";
+  if (pd.kinds !== undefined && pd.kinds !== null && (!Array.isArray(pd.kinds) || pd.kinds.some((k) => !allKinds.includes(k)))) return `PagerDuty kinds must be null or a list of: ${allKinds.join(", ")}`;
+  return null;
+}
+export function teamsWebhookProblem(value) {
+  if (typeof value !== "string" || value.length > 2000) return "Teams webhook must be an https URL";
+  let u;
+  try { u = new URL(value); } catch { return "Teams webhook must be an https URL"; }
+  if (u.protocol !== "https:") return "Teams webhook must use https";
+  if (u.username || u.password) return "Teams webhook must not contain credentials";
+  if (u.port && u.port !== "443") return "Teams webhook must use port 443";
+  const host = u.hostname.toLowerCase();
+  if (host === "webhook.office.com" || host.endsWith(".webhook.office.com")) return "Office 365 connector webhooks are retired; use a Workflows webhook";
+  if (!host.endsWith(".logic.azure.com") && !host.endsWith(".api.powerplatform.com")) return "Teams webhook must be a Workflows URL (*.logic.azure.com or *.api.powerplatform.com)";
+  return null;
+}
+const DISCORD_PATH = /^\/api\/webhooks\/\d{1,25}\/[A-Za-z0-9_-]{1,100}$/;
+export function discordWebhookProblem(value) {
+  const msg = "Discord webhook must be https://discord.com/api/webhooks/<id>/<token>";
+  if (typeof value !== "string" || value.length > 500 || value.includes("?") || value.includes("#")) return msg;
+  let u;
+  try { u = new URL(value); } catch { return msg; }
+  if (u.protocol !== "https:" || !["discord.com", "discordapp.com"].includes(u.hostname) || u.port || u.username || u.password || !DISCORD_PATH.test(u.pathname)) return msg;
+  return null;
+}
+export const maskRoutingKey = (k) => (typeof k === "string" && k ? `…${k.slice(-4)}` : null);
+export function maskTeamsWebhook(value) {
+  if (typeof value !== "string" || !value) return null;
+  try { return `${new URL(value).origin}/…`; } catch { return "https://invalid/…"; }
+}
+export const maskDiscordWebhook = (value) => (typeof value === "string" && value ? `https://discord.com/api/webhooks/…${value.slice(-4)}` : null);
+export function maskPagerDuty(pd) {
+  if (!pd?.routingKey) return null;
+  return { routingKey: maskRoutingKey(pd.routingKey), region: pd.region ?? "us", kinds: Array.isArray(pd.kinds) ? [...pd.kinds] : null };
+}
+export const PAGERDUTY_SEVERITY = { cap_hit: "critical", loop_detected: "error", agent_silent: "error", test: "info" };
+export const pagerDutySeverity = (kind) => PAGERDUTY_SEVERITY[kind] ?? "warning";
+const alertComponent = (alert) => (alert.org ? "org" : alert.tag ? `tag:${alert.tag.key}=${alert.tag.value}` : alert.team ? alert.team : alert.agentName ?? alert.agentId ?? (alert.kind === "test" ? "test" : "unknown"));
+export function pagerDutyPayload(alert, { routingKey, text, dashboardUrl } = {}) {
+  const group = alert.team ?? alert.routeTeam ?? null;
+  return {
+    routing_key: routingKey, event_action: "trigger", dedup_key: `costcap:${alert.id}`,
+    payload: { summary: String(text ?? "").slice(0, 1024), source: "costcap", severity: pagerDutySeverity(alert.kind), class: alert.kind, component: alertComponent(alert), ...(group ? { group } : {}), ...(alert.fired_at ? { timestamp: alert.fired_at } : {}), custom_details: webhookPayload(alert, { dashboardUrl }) },
+    ...(dashboardUrl ? { links: [{ href: dashboardUrl, text: "CostCap dashboard" }] } : {}),
+  };
+}
+export function teamsPayload(alert, { text, dashboardUrl } = {}) {
+  const facts = [{ title: "Kind", value: alert.kind }, { title: "Target", value: alertComponent(alert) }];
+  if (alert.scope) facts.push({ title: "Scope", value: String(alert.scope) });
+  if (num(alert.spent) !== null || num(alert.cap) !== null) facts.push({ title: "Spent / cap", value: `$${fmt(alert.spent)} / $${fmt(alert.cap)}` });
+  if (alert.kind === "cap_projected" && num(alert.projected) !== null) facts.push({ title: "Projected", value: `$${fmt(alert.projected)}` });
+  if (alert.kind === "spend_anomaly") facts.push({ title: "Today vs baseline", value: `$${fmt(alert.today)} vs $${fmt(alert.baseline)} (${fmt(alert.multiplier)}x)` });
+  const card = {
+    $schema: "http://adaptivecards.io/schemas/adaptive-card.json", type: "AdaptiveCard", version: "1.4",
+    body: [{ type: "TextBlock", size: "Medium", weight: "Bolder", text: alert.kind === "test" ? "CostCap test alert" : `CostCap ${alert.kind}: ${alertComponent(alert)}`, wrap: true }, { type: "TextBlock", text: String(text ?? ""), wrap: true }, { type: "FactSet", facts }],
+    ...(dashboardUrl ? { actions: [{ type: "Action.OpenUrl", title: "Open dashboard", url: dashboardUrl }] } : {}),
+  };
+  return { type: "message", attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", contentUrl: null, content: card }] };
+}
+export const discordPayload = (alert, { text } = {}) => ({ content: String(text ?? "").slice(0, 2000), username: "CostCap", allowed_mentions: { parse: [] } });
+export const hasDestination = (s) => Boolean(s && (s.emails?.length || s.slackWebhook || s.webhook?.url || s.routes?.length || s.pagerduty?.routingKey || s.teamsWebhook || s.discordWebhook));
 export function maskAlertSettings(settings) {
-  return { emails: [...(settings?.emails ?? [])], slackWebhook: maskWebhook(settings?.slackWebhook), webhook: maskSignedWebhook(settings?.webhook), ...(Array.isArray(settings?.kinds) ? { kinds: [...settings.kinds] } : {}), ...(settings?.routes?.length ? { routes: settings.routes.map(maskRoute) } : {}), configured: Boolean(settings?.emails?.length || settings?.slackWebhook || settings?.webhook?.url || settings?.routes?.length) };
+  return { emails: [...(settings?.emails ?? [])], slackWebhook: maskWebhook(settings?.slackWebhook), webhook: maskSignedWebhook(settings?.webhook), ...(settings?.pagerduty?.routingKey ? { pagerduty: maskPagerDuty(settings.pagerduty) } : {}), ...(settings?.teamsWebhook ? { teamsWebhook: maskTeamsWebhook(settings.teamsWebhook) } : {}), ...(settings?.discordWebhook ? { discordWebhook: maskDiscordWebhook(settings.discordWebhook) } : {}), ...(Array.isArray(settings?.kinds) ? { kinds: [...settings.kinds] } : {}), ...(settings?.routes?.length ? { routes: settings.routes.map(maskRoute) } : {}), configured: hasDestination(settings) };
 }
 
 // Issue #199: signed generic webhook. One HTTPS endpoint per org receives
@@ -208,8 +292,7 @@ export async function assertWebhookTarget(value, lookup = dnsLookup) {
 export function createOrgAlertRouter({ emailKey, emailFrom, fetchImpl = fetch, fallback, dashboardUrl, lookup = dnsLookup, nowMs } = {}) {
   const fallbackDelivery = fallback?.orgId ? createAlertDelivery({ emailKey, emailFrom, emailTo: fallback.emailTo, slackWebhook: fallback.slackWebhook, fetchImpl }) : null;
   return async (alert, settings, opts) => {
-    const has = settings && (settings.emails?.length || settings.slackWebhook || settings.webhook?.url || settings.routes?.length);
-    if (has) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, kinds: settings.kinds ?? null, routes: settings.routes ?? [], dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
+    if (hasDestination(settings)) return createAlertDelivery({ emailKey, emailFrom, emailTo: settings.emails, slackWebhook: settings.slackWebhook || undefined, webhook: settings.webhook ?? undefined, pagerduty: settings.pagerduty ?? undefined, teamsWebhook: settings.teamsWebhook || undefined, discordWebhook: settings.discordWebhook || undefined, kinds: settings.kinds ?? null, routes: settings.routes ?? [], dashboardUrl, lookup, fetchImpl, nowMs })(alert, opts);
     if (fallbackDelivery && alert.orgId === fallback.orgId) return fallbackDelivery(alert, opts);
     return [{ status: "unconfigured" }];
   };

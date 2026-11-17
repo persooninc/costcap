@@ -22,7 +22,7 @@ import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
-import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook, MAX_ALERT_ROUTES } from "./delivery.js";
+import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook, MAX_ALERT_ROUTES, pagerDutyProblem, teamsWebhookProblem, discordWebhookProblem, maskRoutingKey, maskTeamsWebhook, maskDiscordWebhook } from "./delivery.js";
 import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy, fleetTagCapsPayload } from "./tag-caps.js";
@@ -735,6 +735,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           await assertWebhookTarget(body.webhook, resolveHost);
         }
         if (body.rotateWebhookSecret !== undefined && typeof body.rotateWebhookSecret !== "boolean") fail(400, "rotateWebhookSecret must be a boolean");
+        // Issue #282: native PagerDuty / Teams / Discord destinations. null removes; omitted keeps.
+        if (body.pagerduty !== undefined && body.pagerduty !== null) { const p = pagerDutyProblem(body.pagerduty, ALERT_KINDS); if (p) fail(400, p); }
+        if (body.teamsWebhook !== undefined && body.teamsWebhook !== null && body.teamsWebhook !== "") { const p = teamsWebhookProblem(body.teamsWebhook); if (p) fail(400, p); }
+        if (body.discordWebhook !== undefined && body.discordWebhook !== null && body.discordWebhook !== "") { const p = discordWebhookProblem(body.discordWebhook); if (p) fail(400, p); }
         // Issue #258: default kinds filter and per-team/per-kind routes (shape checks; membership checks below).
         const kindsOk = (k) => k === null || (Array.isArray(k) && k.every((x) => ALERT_KINDS.includes(x)));
         if (body.kinds !== undefined && !kindsOk(body.kinds)) fail(400, `kinds must be null or a list of: ${ALERT_KINDS.join(", ")}`);
@@ -794,7 +798,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
               return { id, name: r.name.trim(), kinds: r.kinds == null ? null : [...new Set(r.kinds)], teams, emails: routeEmails, slackWebhook: hook };
             });
           }
-          const next = { emails, slackWebhook, ...(webhook ? { webhook } : {}), ...(kinds ? { kinds } : {}), ...(routes.length ? { routes } : {}) };
+          const pagerduty = body.pagerduty === undefined ? (current.pagerduty ?? null) : body.pagerduty === null ? null : { routingKey: body.pagerduty.routingKey, region: body.pagerduty.region ?? "us", kinds: body.pagerduty.kinds == null ? null : [...new Set(body.pagerduty.kinds)] };
+          const teamsWebhook = body.teamsWebhook === undefined ? (current.teamsWebhook ?? null) : (body.teamsWebhook || null);
+          const discordWebhook = body.discordWebhook === undefined ? (current.discordWebhook ?? null) : (body.discordWebhook || null);
+          const next = { emails, slackWebhook, ...(webhook ? { webhook } : {}), ...(kinds ? { kinds } : {}), ...(routes.length ? { routes } : {}), ...(pagerduty ? { pagerduty } : {}), ...(teamsWebhook ? { teamsWebhook } : {}), ...(discordWebhook ? { discordWebhook } : {}) };
           org.alertSettings = next;
           audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next), ...(issued ? { webhookSecret: "issued" } : {}) });
           return { ...maskAlertSettings(next), canEdit: true, ...(issued ? { webhookSecret: issued } : {}) };
@@ -805,16 +812,17 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       // as an alert (no /v1/alerts row, no retry), audited with masked results only.
       if (path === "/v1/alert-settings/test" && req.method === "POST") {
         sessionOnly(req);
-        const CHANNELS = ["email", "slack", "webhook"];
-        if (body.channels !== undefined && (!Array.isArray(body.channels) || !body.channels.length || body.channels.some((c) => !CHANNELS.includes(c)))) fail(400, "channels must be a list of email, slack, webhook");
-        const channels = body.channels === undefined ? CHANNELS : CHANNELS.filter((c) => body.channels.includes(c));
+        const CHANNELS = ["email", "slack", "webhook", "pagerduty", "teams", "discord"];
+        if (body.channels !== undefined && (!Array.isArray(body.channels) || !body.channels.length || body.channels.some((c) => !CHANNELS.includes(c)))) fail(400, `channels must be a list of ${CHANNELS.join(", ")}`);
         const { u, settings } = store.read((s) => {
           const u = admin(s, req);
           const saved = s.orgs[u.orgId]?.alertSettings;
           if (!saved) return { u, settings: null };
           const members = new Set(Object.values(s.users).filter((m) => m.orgId === u.orgId && m.verified).map((m) => m.email));
-          return { u, settings: { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null } };
+          return { u, settings: { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null, ...(saved.pagerduty ? { pagerduty: saved.pagerduty } : {}), ...(saved.teamsWebhook ? { teamsWebhook: saved.teamsWebhook } : {}), ...(saved.discordWebhook ? { discordWebhook: saved.discordWebhook } : {}) } };
         });
+        // #282: without an explicit list, the new native channels are tested only when set.
+        const channels = body.channels === undefined ? CHANNELS.filter((c) => (c === "pagerduty" ? settings?.pagerduty : c === "teams" ? settings?.teamsWebhook : c === "discord" ? settings?.discordWebhook : true)) : CHANNELS.filter((c) => body.channels.includes(c));
         if (testRate.size > 10000) testRate.clear();
         const recent = (testRate.get(u.orgId) ?? []).filter((ts) => ts > now() - ALERT_TEST_WINDOW_MS);
         if (recent.length >= ALERT_TEST_LIMIT) {
@@ -827,8 +835,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         try { raw = deliverAlert ? await deliverAlert(alert, settings, { channels }) : []; }
         catch (err) { raw = channels.map((channel) => ({ channel, status: "failed", error: err.message })); }
         const masked = maskAlertSettings(settings);
-        const destination = { email: settings?.emails?.length ? settings.emails : null, slack: masked.slackWebhook, webhook: masked.webhook?.url ?? null };
-        const secrets = [settings?.slackWebhook, settings?.webhook?.url, settings?.webhook?.secret].filter(Boolean);
+        const destination = { email: settings?.emails?.length ? settings.emails : null, slack: masked.slackWebhook, webhook: masked.webhook?.url ?? null, pagerduty: maskRoutingKey(settings?.pagerduty?.routingKey), teams: maskTeamsWebhook(settings?.teamsWebhook), discord: maskDiscordWebhook(settings?.discordWebhook) };
+        const secrets = [settings?.slackWebhook, settings?.webhook?.url, settings?.webhook?.secret, settings?.pagerduty?.routingKey, settings?.teamsWebhook, settings?.discordWebhook].filter(Boolean);
         const scrub = (msg) => secrets.reduce((m, v) => m.split(v).join("[redacted]"), String(msg));
         const byChannel = new Map((Array.isArray(raw) ? raw : []).filter((r) => r?.channel).map((r) => [r.channel, r]));
         const results = channels.map((channel) => {
@@ -1445,7 +1453,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const saved = s.orgs[a.orgId]?.alertSettings;
           if (!saved) return null;
           const members = new Set(Object.values(s.users).filter((m) => m.orgId === a.orgId && m.verified).map((m) => m.email));
-          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null, ...(saved.kinds ? { kinds: saved.kinds } : {}), ...(saved.routes?.length ? { routes: saved.routes.map((r) => ({ ...r, emails: (r.emails ?? []).filter((e) => members.has(e)) })) } : {}) };
+          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null, ...(saved.pagerduty ? { pagerduty: saved.pagerduty } : {}), ...(saved.teamsWebhook ? { teamsWebhook: saved.teamsWebhook } : {}), ...(saved.discordWebhook ? { discordWebhook: saved.discordWebhook } : {}), ...(saved.kinds ? { kinds: saved.kinds } : {}), ...(saved.routes?.length ? { routes: saved.routes.map((r) => ({ ...r, emails: (r.emails ?? []).filter((e) => members.has(e)) })) } : {}) };
         });
         const { agentName, routeTeam } = a.agentId ? store.read((s) => ({ agentName: s.agents[a.agentId]?.name ?? null, routeTeam: teamFor(Object.values(s.teams ?? {}), a.orgId, a.agentId)?.name ?? null })) : { agentName: null, routeTeam: null };
         result = deliverAlert ? await deliverAlert({ ...a, agentName, ...(routeTeam ? { routeTeam } : {}) }, settings, requested ? { channels: requested } : undefined) : [{ status: "unconfigured" }]; }
