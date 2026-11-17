@@ -77,7 +77,7 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 | Provider | Variables set for the child |
 | --- | --- |
-| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` and `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1`, `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` and `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions` |
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
@@ -108,6 +108,20 @@ A response cut before `response.done`, audio on a model with no audio rate
 (`gpt-realtime-mini` is text only here) and a billed input transcription are recorded as
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
 pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
+
+#### GPT-Live (`gpt-live-1`)
+
+`wrap` also exports `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions`.
+Sessions are billed per second at $0.05/min from each `session.usage.updated` snapshot (only
+the growth since the last snapshot is billed) and the final `session.closed`. The model in
+`session.start` is checked against `--models` and `--unknown-models refuse` before it reaches
+OpenAI. Caps are re-checked after every metered event and by a 1 s wall-clock estimate; on a hit
+the proxy sends `session.close`, bills the final duration and closes the client with `1008`.
+`costcap kill` closes a session within 1 s. Backend `response.completed` usage is priced once per
+response id. A session that ends without `session.closed` is recorded as
+`session_usage_unconfirmed` (with `session_seconds_lower_bound`) and pauses the run until
+settled. WebRTC/SIP (`POST /live/sessions`) stays `usage_unavailable`; `/live/sessions/{id}/fork`
+stays `501`.
 
 ### Other OpenAI-compatible providers
 
