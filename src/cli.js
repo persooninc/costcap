@@ -256,11 +256,12 @@ export async function wrap(argv) {
     clearTimeout(raiseTimer);
     if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
     downgradeConfig = mergeDowngrade(p.downgrade ?? null, localDowngrade);
-    // #274: the fleet week cap is not min-merged into the local UTC week; it runs on the org clock.
-    const resolved = resolvePolicy({ local: { ...caps, week: undefined, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
-    const { week: fleetWeekCap, ...nonWeek } = resolved.caps;
-    cap.updateCaps({ ...nonWeek, ...(caps.week != null ? { week: caps.week } : {}) });
-    cap.setFleetWeek({ cap: fleetWeekCap ?? null, budgetPeriod: fleet?.budgetPeriod() ?? null });
+    // #274/#280: fleet day/week/month caps are not min-merged into the local UTC buckets; they run on the org clock.
+    const resolved = resolvePolicy({ local: { ...caps, day: undefined, week: undefined, month: undefined, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
+    const { day: fleetDay, week: fleetWeekCap, month: fleetMonth, ...rest } = resolved.caps;
+    const own = Object.fromEntries(["day", "week", "month"].filter((k) => caps[k] != null).map((k) => [k, caps[k]]));
+    cap.updateCaps({ ...rest, ...own });
+    cap.setFleetPeriod({ caps: { day: fleetDay ?? null, week: fleetWeekCap ?? null, month: fleetMonth ?? null }, budgetPeriod: fleet?.budgetPeriod() ?? null });
     checkWarnings();
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
@@ -291,7 +292,7 @@ export async function wrap(argv) {
   const exporter = otlp ? createOtlpExporter({ url: otlp.url, headers: otlpHeaders, runId: summaryRunId }) : null;
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
-  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
+  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null, periodFor: (scope, at) => cap.fleetWindow(scope, at.getTime()) });
   // #207: trigger order: local caps, --policy agent and team budgets, enrolled fleet agent and team caps.
   const downgradeUsage = () => {
     const rows = scopeUsage(cap.limits(), cap.spend());

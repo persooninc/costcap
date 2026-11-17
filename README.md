@@ -1339,7 +1339,10 @@ value returns `400`, a viewer gets `403`, and every change is audited as
 tag caps, `cap_approaching`/`cap_hit` periods, `cap_projected` (elapsed share of the
 configured month), `/v1/spend` day buckets and the agent cards. Enrolled wrappers get
 it as `budget_period` in `/v1/policy`, so offline enforcement rolls synced spend over
-on the same clock. Days follow local midnight across DST (a fall-back day has 25
+on the same clock: the fleet `caps.day`, `caps.week` and `caps.month` are enforced by
+`wrap --enrollment` and `check --enrollment` on the org day, week and period month
+(#274, #280), next to any local cap of the same scope on UTC (the stricter verdict wins),
+and their warnings read e.g. `(2026-11-15..2026-12-14 org)`. Days follow local midnight across DST (a fall-back day has 25
 hours). Out of scope: local `--day-cap`/`--month-cap` (still UTC), per-agent zones,
 non-midnight resets.
 

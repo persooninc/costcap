@@ -65,14 +65,16 @@ export function currentWarnings({ caps = {}, spend = {}, fractions = DEFAULT_WAR
 
 const dedupeKey = (scope, fraction, period) => `${scope}|${fraction}|${period}`;
 
-export function warningLine({ scope, fraction, cap, spent_usd: spent, period, lower_bound: lb }) {
-  const when = scope === "run" ? `run ${period}` : `${period} UTC`;
+// #280: a fleet day/week/month cap on the org clock carries its org window label.
+export function warningLine({ scope, fraction, cap, spent_usd: spent, period, lower_bound: lb, window }) {
+  const when = scope === "run" ? `run ${period}` : window ?? `${period} UTC`;
   return `costcap: warning: ${scope} spend ${lb ? "(lower bound) " : ""}$${spent.toFixed(4)} is ${Math.round(fraction * 100)}% of $${cap} cap (${when})`;
 }
 
 // Stateful warner used by the proxy. `seen` is rebuilt from existing cap_warning
 // events so a second wrap in the same period does not warn again.
-export function createCapWarner({ fractions = DEFAULT_WARN_AT, events = [], runId = null, agentId = null, now = () => new Date() } = {}) {
+// periodFor (#280): (scope, Date) -> { period, label } | null; the org window of a fleet cap.
+export function createCapWarner({ fractions = DEFAULT_WARN_AT, events = [], runId = null, agentId = null, now = () => new Date(), periodFor = null } = {}) {
   const seen = new Set();
   for (const e of events) if (e?.event === "cap_warning") seen.add(dedupeKey(e.scope, e.fraction, e.period));
   const emitted = [];
@@ -81,11 +83,12 @@ export function createCapWarner({ fractions = DEFAULT_WARN_AT, events = [], runI
     const at = now();
     const out = [];
     for (const { scope, fraction } of pairs) {
-      const period = periodKey(scope, { runId, now: at });
+      const org = scope !== "run" ? periodFor?.(scope, at) ?? null : null;
+      const period = org?.period ?? periodKey(scope, { runId, now: at });
       const k = dedupeKey(scope, fraction, period);
       if (seen.has(k)) continue;
       seen.add(k);
-      const ev = { event: "cap_warning", scope, fraction, cap: caps[scope], spent_usd: Number(spend[scope].toFixed(6)), period, run_id: runId, agent_id: agentId, lower_bound: !!lowerBound };
+      const ev = { event: "cap_warning", scope, fraction, cap: caps[scope], spent_usd: Number(spend[scope].toFixed(6)), period, run_id: runId, agent_id: agentId, lower_bound: !!lowerBound, ...(org ? { window: org.label } : {}) };
       out.push(ev);
       emitted.push(ev);
     }
