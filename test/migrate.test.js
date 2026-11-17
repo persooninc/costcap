@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
 import { applyFile, psql } from "../scripts/db-migrate.mjs";
 import { skipUnlessDocker } from "./support/docker.js";
-import { startPostgres } from "./support/postgres.js";
+import { startPostgres, runLabel } from "./support/postgres.js";
 
 const root = new URL("..", import.meta.url);
 const file = (name) => new URL(name, root);
@@ -78,6 +78,11 @@ test("regression: stopping the test postgres removes its anonymous data volume",
   t.after(stop);
   const volumes = spawnSync("docker", ["inspect", container, "--format", "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}"], { encoding: "utf8" }).stdout.trim().split(/\s+/).filter(Boolean);
   assert.ok(volumes.length > 0, "postgres image should mount an anonymous data volume");
+  for (const v of volumes) {
+    const labels = spawnSync("docker", ["volume", "inspect", v, "--format", "{{json .Labels}}"], { encoding: "utf8" }).stdout;
+    const [k, val] = runLabel().split("=");
+    assert.equal(JSON.parse(labels)[k], val, `volume ${v} must carry the per-run label`);
+  }
   stop();
   for (const v of volumes) {
     assert.notEqual(spawnSync("docker", ["volume", "inspect", v]).status, 0, `volume ${v} leaked after stop()`);

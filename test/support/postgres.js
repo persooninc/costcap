@@ -2,9 +2,16 @@
 import { spawnSync } from "node:child_process";
 import { psql } from "../../scripts/db-migrate.mjs";
 
+// Per-run label (CI sets COSTCAP_RUN_LABEL to the run/attempt/matrix id). The
+// container AND its data volume carry it, so the CI leak guard can assert on
+// this job's own volumes instead of the host-wide dangling count.
+export const RUN_LABEL_KEY = "costcap.ci-run";
+export const runLabel = () => `${RUN_LABEL_KEY}=${process.env.COSTCAP_RUN_LABEL || "local"}`;
+
 export async function startPostgres(t, { publish = false, autoStop = true } = {}) {
   const container = `cc-pg-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  const args = ["run", "-d", "--rm", "--name", container, "-e", "POSTGRES_HOST_AUTH_METHOD=trust"];
+  const args = ["run", "-d", "--rm", "--name", container, "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+    "--label", runLabel(), "--mount", `type=volume,dst=/var/lib/postgresql/data,volume-label=${runLabel()}`];
   if (publish) args.push("-p", "127.0.0.1::5432");
   const started = spawnSync("docker", [...args, "postgres:16-alpine"], { encoding: "utf8" });
   if (started.status !== 0) throw new Error(started.stderr);
