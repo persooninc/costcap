@@ -140,8 +140,8 @@ test("#268 AC3: hosted model week rules; the local --model-cap flag still reject
   assert.ok(modelCapsError([{ model: "gpt-4o", scope: "week", usd: 1 }, { model: "gpt-4o", scope: "week", usd: 2 }]));
   assert.throws(() => parseModelCap("claude-opus-4-8:week=5"), (e) => e.code === "invalid_model_cap");
   const rules = [{ model: "claude-opus-4-8", scope: "week", usd: 5 }, { model: "gpt-4o", scope: "day", usd: 1 }];
-  assert.deepEqual(splitWeekModelCaps(rules), { legacy: [rules[1]], week: [rules[0]] });
-  assert.deepEqual(splitWeekModelCaps(undefined), { legacy: [], week: [] });
+  assert.deepEqual(splitWeekModelCaps(rules), { legacy: [rules[1]], week: [rules[0]], total: [] });
+  assert.deepEqual(splitWeekModelCaps(undefined), { legacy: [], week: [], total: [] });
   assert.deepEqual(fleetModelRules(rules), [rules[1]], "the local fallback engine never gets week rules");
   assert.equal(validWeekModelCaps(null), true);
   assert.equal(validWeekModelCaps([rules[0]]), true);

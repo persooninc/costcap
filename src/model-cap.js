@@ -1,3 +1,4 @@
+import { totalCapMessage } from "./agent-budget.js";
 // Issue #238: per-model spend caps. `--model-cap claude-opus-4-8:day=20` refuses
 // Opus once its UTC-day spend reaches $20 while every other model keeps going.
 // A refusal never latches. Models are normalized the way pricing resolves them
@@ -68,7 +69,8 @@ export function parseModelCaps(list) {
 }
 
 // #268: hosted modelCaps also take week (fleet-enforced only); the local --model-cap flag does not (#264).
-export const HOSTED_MODEL_CAP_SCOPES = Object.freeze(["hour", "day", "week", "month"]);
+// #286: total (lifetime, fleet-enforced, travels in model_caps_total).
+export const HOSTED_MODEL_CAP_SCOPES = Object.freeze(["hour", "day", "week", "month", "total"]);
 
 /** Hosted `modelCaps: [{model, scope, usd}]`: an error string or null. */
 export function modelCapsError(list) {
@@ -77,7 +79,7 @@ export function modelCapsError(list) {
   for (const r of list) {
     if (!r || typeof r !== "object" || Array.isArray(r) || Object.keys(r).some((k) => !["model", "scope", "usd"].includes(k))) return "modelCaps entries are {model, scope, usd}";
     if (typeof r.model !== "string" || !MODEL_ID.test(r.model)) return "modelCaps model must be a model id";
-    if (!HOSTED_MODEL_CAP_SCOPES.includes(r.scope)) return "modelCaps scope must be hour, day, week or month";
+    if (!HOSTED_MODEL_CAP_SCOPES.includes(r.scope)) return "modelCaps scope must be hour, day, week, month or total";
     if (!(typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0)) return "modelCaps usd must be a positive number";
     const id = `${normalizeModel(r.model)}:${r.scope}`;
     if (seen.has(id)) return `duplicate modelCaps rule ${r.model}:${r.scope}`;
@@ -207,6 +209,7 @@ export function modelBudgetExceededBody(hit) {
     return { error: "model_budget_exceeded", ...rest,
       message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit model ${hit.model}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.` };
   }
+  if (hit.scope === "total") return { error: "model_budget_exceeded", ...rest, ...totalCapMessage("total", hit.cap_usd) }; // #286
   return { error: "model_budget_exceeded", ...rest,
     message: `CostCap: model ${hit.model} reached its ${hit.scope} cap of $${hit.cap_usd} ($${hit.spend_usd} spent). Other models keep working. The upstream call was not made.` };
 }

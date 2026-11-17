@@ -32,11 +32,14 @@ export function modelSpendPolicy(receipts, rules, nowMs, budgetPeriod = null) {
   const models = cappedModels(rules);
   if (!models.length) return null;
   const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod);
-  const acc = Object.fromEntries(models.map((m) => [m, { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 }]));
+  // #286: a total rule adds lifetime total/unknown_total to the models it names (only then).
+  const lifetime = new Set(rules.filter((r) => r?.scope === "total").map((r) => normalizeModel(r.model)));
+  const acc = Object.fromEntries(models.map((m) => [m, { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0, ...(lifetime.has(m) ? { total: 0, unknown_total: 0 } : {}) }]));
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r)) continue;
     const e = acc[normalizeModel(r.model)];
     if (!e) continue;
+    if (e.total !== undefined) { if (r.cost_usd === null || r.cost_usd === undefined) e.unknown_total += 1; else e.total += r.cost_usd; }
     const tsMs = Date.parse(r.ts);
     const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
     if (!inMonth && !inWeek) continue;
@@ -45,14 +48,45 @@ export function modelSpendPolicy(receipts, rules, nowMs, budgetPeriod = null) {
     if (inWeek) e.week += r.cost_usd;
     if (periodKey("day", tsMs, budgetPeriod) === day) e.day += r.cost_usd;
   }
-  for (const e of Object.values(acc)) { e.day = round6(e.day); e.week = round6(e.week); e.month = round6(e.month); }
+  for (const e of Object.values(acc)) { e.day = round6(e.day); e.week = round6(e.week); e.month = round6(e.month); if (e.total !== undefined) e.total = round6(e.total); }
   return acc;
 }
 
 /** #268: hosted modelCaps split into what a pre-#268 wrapper accepts and the week rules. */
 export function splitWeekModelCaps(rules) {
   const list = Array.isArray(rules) ? rules : [];
-  return { legacy: list.filter((r) => r.scope !== "week"), week: list.filter((r) => r.scope === "week") };
+  return { legacy: list.filter((r) => r.scope !== "week" && r.scope !== "total"), week: list.filter((r) => r.scope === "week"), total: list.filter((r) => r.scope === "total") };
+}
+
+/** #286: model_caps_total from GET /v1/policy: null/undefined or 1-20 total rules. */
+export function validTotalModelCaps(list) {
+  if (list === null || list === undefined) return true;
+  return Array.isArray(list) && list.length > 0 && list.length <= MAX_FLEET_MODELS && list.every((r) => r && r.scope === "total" && typeof r.model === "string" && r.model
+    && typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0);
+}
+
+/**
+ * #286: offline lifetime model verdict: agent_spend.models[norm].total plus every
+ * unsynced receipt of that model on this host. Unknown cost refuses (never $0).
+ */
+export function cachedFleetModelTotalVerdict(spend, rules, models, pending) {
+  if (!spend?.models || !rules?.length) return null;
+  for (const m of models ?? []) {
+    const norm = normalizeModel(m);
+    const rs = rules.filter((r) => r.scope === "total" && normalizeModel(r.model) === norm);
+    if (!rs.length) continue;
+    const e = spend.models[norm];
+    // A server that did not send this model's lifetime spend cannot be enforced: refuse, never $0.
+    let total = e?.total ?? 0, unknown = e && typeof e.total === "number" ? e.unknown_total ?? 0 : 1;
+    for (const r of pending) {
+      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
+      if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
+    }
+    if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", model: m, scope: "total", unknown_receipts: unknown, fleet: true,
+      message: `CostCap: model "${m}" has a fleet model cap and ${unknown} receipt(s) with unknown cost. Reconcile it before calling this model again.` };
+    for (const r of rs) if (total >= r.usd) return { model: m, rule_model: r.model, scope: "total", spend_usd: round6(total), cap_usd: r.usd, fleet: true };
+  }
+  return null;
 }
 
 /** model_caps_week from GET /v1/policy: null/undefined or 1-20 week rules. */
@@ -68,7 +102,9 @@ export function validModelSpend(m) {
   return Object.values(m).every((e) => e && typeof e === "object" && Number.isInteger(e.unknown) && e.unknown >= 0
     && REQUIRED_SPEND.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0)
     && (e.week === undefined || (typeof e.week === "number" && Number.isFinite(e.week) && e.week >= 0))
-    && (e.unknown_week === undefined || (Number.isInteger(e.unknown_week) && e.unknown_week >= 0)));
+    && (e.unknown_week === undefined || (Number.isInteger(e.unknown_week) && e.unknown_week >= 0))
+    && (e.total === undefined || (typeof e.total === "number" && Number.isFinite(e.total) && e.total >= 0))
+    && (e.unknown_total === undefined || (Number.isInteger(e.unknown_total) && e.unknown_total >= 0)));
 }
 
 /** Hosted rules the local fallback engine covers (day/month); hour rules stay local, week is fleet-only. */
@@ -165,8 +201,8 @@ export function modelCapStatus(receipts, rules, nowMs, budgetPeriod = null) {
   const spend = modelSpendPolicy(receipts, rules, nowMs, budgetPeriod) ?? {};
   return (rules ?? []).map((r) => {
     const e = spend[normalizeModel(r.model)];
-    const unknown = (r.scope === "week" ? e?.unknown_week : e?.unknown) ?? 0;
-    const spent = r.scope === "hour" || !e ? null : unknown > 0 ? null : e[r.scope];
+    const unknown = (r.scope === "week" ? e?.unknown_week : r.scope === "total" ? e?.unknown_total : e?.unknown) ?? 0;
+    const spent = r.scope === "hour" || !e ? null : unknown > 0 ? null : e[r.scope] ?? null;
     return { model: r.model, scope: r.scope, usd: r.usd, spent, unknown };
   });
 }

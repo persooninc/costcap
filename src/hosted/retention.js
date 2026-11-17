@@ -3,6 +3,7 @@
 // which synced receipts a sweep may delete.
 import { periodBounds } from "../period.js";
 import { PENDING_REASONS } from "../cap.js";
+import { normalizeModel } from "../model-cap.js";
 
 export const RETENTION_MIN_DAYS = 7;
 export const RETENTION_DEFAULT_MAX_DAYS = 365;
@@ -56,7 +57,27 @@ export function isExpired(item, cutoffMs, floorMs) {
  */
 export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs, keepAgents = null) {
   if (cutoffMs === null) return [];
-  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !keepAgents?.has(item.agentId) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
+  // #286: keepAgents may also be a predicate over the stored item (org, tag and model totals).
+  const kept = typeof keepAgents === "function" ? keepAgents : (item) => Boolean(keepAgents?.has(item.agentId));
+  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !kept(item) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
+}
+
+/**
+ * #286: predicate over stored receipt items that count toward any configured
+ * total: the agent/team totals (#265), an org total (every org receipt), a fleet
+ * tag total rule (every receipt has a value for its key, UNTAGGED included) and a
+ * hosted model total (that agent's receipts of that model).
+ */
+export function totalCapKeep({ agents, teams, org, orgId }) {
+  const byAgent = totalCapAgents(agents, teams, orgId);
+  const all = org?.orgBudget?.total != null || (org?.tagCaps ?? []).some((r) => r?.scope === "total");
+  const models = new Map();
+  for (const a of agents ?? []) {
+    if (a?.orgId !== orgId) continue;
+    const ms = (a.policy?.modelCaps ?? []).filter((r) => r?.scope === "total").map((r) => normalizeModel(r.model));
+    if (ms.length) models.set(a.id, new Set(ms));
+  }
+  return (item) => all || byAgent.has(item?.agentId) || Boolean(models.get(item?.agentId)?.has(normalizeModel((item?.receipt ?? item)?.model)));
 }
 
 /**

@@ -1,3 +1,4 @@
+import { totalCapMessage } from "./agent-budget.js";
 // Issue #191: per-tag spend caps. `--tag-cap customer:day=5` gives every value
 // of the `customer` tag its own $5 UTC-day cap. A request without the key counts
 // in the "(untagged)" bucket, which has the same cap, so a missing header never
@@ -188,6 +189,7 @@ export function tagBudgetExceededBody(hit) {
     return { error: "tag_budget_exceeded", ...hit,
       message: `CostCap preflight estimate: worst case $${hit.estimate_usd} does not fit ${hit.tag_key}=${hit.tag_value}'s remaining ${hit.scope} budget ($${hit.remaining_usd}). This is an estimate. The upstream call was not made.` };
   }
+  if (hit.scope === "total") return { error: "tag_budget_exceeded", ...hit, ...totalCapMessage("total", hit.cap_usd) }; // #286
   return { error: "tag_budget_exceeded", ...hit,
     message: `CostCap: ${hit.tag_key}=${hit.tag_value} reached its ${hit.scope} cap of $${hit.cap_usd} ($${hit.spend_usd} spent). The upstream call was not made.` };
 }

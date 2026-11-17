@@ -6,6 +6,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHostedServer } from "../src/hosted/server.js";
+import { cachedFleetTagTotalVerdict } from "../src/hosted/tag-caps.js";
+import { tagBudgetExceededBody } from "../src/tag-cap.js";
 
 const fixtureToken = "fixture-" + "pass";
 const freePort = () => new Promise((resolve, reject) => {
@@ -77,6 +79,24 @@ test("Tag caps card: owner adds and removes a rule, viewer is disabled", async (
     await service.evaluateFleetAlerts();
     await page.reload();
     await expect(page.locator("#alerts")).toContainText("cap_hit · week · tag customer=acme week");
+    // #286: a Total (never resets) rule counts every month; the wrapper refusal has no Retry-After hint.
+    await form.locator("input[name=key]").fill("customer");
+    await form.locator("select[name=scope]").selectOption("total");
+    await form.locator("input[name=usd]").fill("2");
+    await page.locator("#tagCapAdd").click();
+    const old = new Date(Date.now() - 62 * 86_400_000).toISOString();
+    expect((await fetch(`${origin}/v1/receipts`, { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "t0", ts: old, cost_usd: 0.9, model: "test", tags: { customer: "acme" } }] }) })).status).toBe(200);
+    await page.reload();
+    await expect(page.locator('#tagCaps li[data-rule="customer:total"]')).toContainText("acme total $2.1 of $2");
+    const pol = await (await fetch(`${origin}/v1/policy`, { headers: { authorization: `Bearer ${agent.token}` } })).json();
+    const hit = cachedFleetTagTotalVerdict(pol.tag_caps_total, { customer: "acme" }, []);
+    const body = tagBudgetExceededBody(hit);
+    expect([body.error, body.scope, body.retry_after_s]).toEqual(["tag_budget_exceeded", "total", undefined]);
+    expect(body.message).toContain("does not reset");
+    expect(cachedFleetTagTotalVerdict(pol.tag_caps_total, { customer: "beta" }, [])).toBeNull();
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#alerts")).toContainText("cap_hit · total · tag customer=acme total");
 
     await page.locator("#invite input[name=email]").fill("tags-viewer@example.invalid");
     await page.locator("#invite button").click();

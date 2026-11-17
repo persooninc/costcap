@@ -6,10 +6,10 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy, raiseWeekError, dropLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
-import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining } from "./tag-caps.js";
-import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps } from "./model-caps.js";
+import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict } from "./tag-caps.js";
+import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
-import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
+import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining, validOrgTotalPolicy, cachedOrgTotalVerdict } from "./org-budget.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -152,9 +152,11 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     orgBudget: () => data.orgBudget ?? null,
     // Org-wide budget (#240): the org's synced spend plus this host's unsynced spend.
     orgCheck(nowMs = Date.now()) {
-      if (!data.orgBudget) return null;
+      if (!data.orgBudget && !data.orgTotal) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedOrgVerdict(data.orgBudget, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      // #286: then the lifetime org total (every unsynced receipt counts).
+      return (data.orgBudget ? cachedOrgVerdict(data.orgBudget, pending, nowMs, data.budgetPeriod) : null) ?? cachedOrgTotalVerdict(data.orgTotal ?? null, pending);
     },
     // Agent caps, then team, then org (#240): the narrowest hit is reported with its own scope.
     fleetCheck(nowMs = Date.now()) {
@@ -185,7 +187,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     modelCheck(models, nowMs = Date.now()) {
       if (!data.agentSpend?.models) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod)
+        ?? cachedFleetModelTotalVerdict(data.agentSpend, data.modelCapsTotal ?? [], models, pending); // #286
     },
     // #272: fleet model remainders for --preflight (hosted day/month plus model_caps_week rules).
     modelRemaining(models, nowMs = Date.now()) {
@@ -204,9 +208,11 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
     // #204: fleet tag caps against the org's synced per-value spend plus this host's
     // unsynced receipts; local --tag-cap rules tighten a matching fleet rule.
     tagCheck(tags, localRules = [], nowMs = Date.now()) {
-      if (!data.tagCaps) return null;
+      if (!data.tagCaps && !data.tagCapsTotal) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetTagVerdict(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
+      return (data.tagCaps ? cachedFleetTagVerdict(data.tagCaps, localRules, tags, pending, nowMs, data.budgetPeriod) : null)
+        ?? cachedFleetTagTotalVerdict(data.tagCapsTotal ?? null, tags, pending); // #286
     },
     revoked: () => revoked,
     pendingRunEnds: () => [...(data.pendingRunEnds ?? [])],
@@ -246,16 +252,18 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
         // #268: week scopes arrive in additive fields; a pre-#268 server omits them (day/month enforced as before).
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, raise_week: raiseWeek = null, ...serverPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, model_caps_total: modelCapsTotal = null, tag_caps_total: tagCapsTotal = null, org_budget_total: orgTotal = null, raise_week: raiseWeek = null, ...serverPolicy } = fetched ?? {};
         // #271: active week raises arrive in raise_week and are folded back under raise.week.
         if (raiseWeekError(raiseWeek)) throw new Error("Invalid fleet policy response");
         const fetchedPolicy = raiseWeek ? { ...serverPolicy, raise: { ...(serverPolicy.raise ?? {}), week: raiseWeek } } : serverPolicy;
         const tagCaps = tagCapsV2 ?? legacyTagCaps, orgBudget = orgBudgetV2 ?? legacyOrgBudget;
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(legacyTagCaps) || !validFleetTagCaps(tagCapsV2) || !validOrgBudgetPolicy(legacyOrgBudget) || !validOrgBudgetPolicy(orgBudgetV2) || !validWeekModelCaps(modelCapsWeek) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(legacyTagCaps) || !validFleetTagCaps(tagCapsV2) || !validOrgBudgetPolicy(legacyOrgBudget) || !validOrgBudgetPolicy(orgBudgetV2) || !validWeekModelCaps(modelCapsWeek) || !validTotalModelCaps(modelCapsTotal) || !validFleetTagTotal(tagCapsTotal) || !validOrgTotalPolicy(orgTotal) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
         if (JSON.stringify(modelCapsWeek) !== JSON.stringify(data.modelCapsWeek ?? null)) { data.modelCapsWeek = modelCapsWeek; saveEnrollment(path, data); }
+        // #286: lifetime caps (model, tag, org) refresh on every poll; null lifts them.
+        for (const [k, v] of [["modelCapsTotal", modelCapsTotal], ["tagCapsTotal", tagCapsTotal], ["orgTotal", orgTotal]]) if (JSON.stringify(v) !== JSON.stringify(data[k] ?? null)) { data[k] = v; saveEnrollment(path, data); }
         // #204: rules and spend refresh on every poll; a removed rule set (null) lifts enforcement.
         if (JSON.stringify(tagCaps) !== JSON.stringify(data.tagCaps ?? null)) { data.tagCaps = tagCaps; saveEnrollment(path, data); }
         // #209: the org budget period, so offline windows roll over on the org's clock.

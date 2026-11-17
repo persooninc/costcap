@@ -21,14 +21,17 @@ const round6 = (n) => Number(n.toFixed(6));
 const valueOf = (tags, key) => (tags && typeof tags === "object" && typeof tags[key] === "string" ? tags[key] : UNTAGGED);
 
 /** Validate a PUT body's `tagCaps`; returns the normalized rules or an error string. */
-export function parseFleetTagCaps(input) {
+// #286: what PUT /v1/tag-caps accepts; total rules travel only in tag_caps_total.
+export const STORED_TAG_SCOPES = Object.freeze([...FLEET_TAG_SCOPES, "total"]);
+
+export function parseFleetTagCaps(input, { total = false } = {}) {
   if (!Array.isArray(input)) return { error: "tagCaps must be a list" };
   if (input.length > MAX_FLEET_TAG_RULES) return { error: `At most ${MAX_FLEET_TAG_RULES} tag cap rules` };
   const seen = new Set();
   const rules = [];
   for (const r of input) {
     if (!r || typeof r !== "object" || typeof r.key !== "string" || !TAG_KEY.test(r.key)) return { error: "Each rule key must match [a-z0-9_.-]{1,32}" };
-    if (!FLEET_TAG_SCOPES.includes(r.scope)) return { error: "Each rule scope must be day, week or month" };
+    if (!(total ? STORED_TAG_SCOPES : FLEET_TAG_SCOPES).includes(r.scope)) return { error: total ? "Each rule scope must be day, week, month or total" : "Each rule scope must be day, week or month" };
     if (!(typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0)) return { error: "Each rule usd must be a positive number" };
     const id = `${r.key}:${r.scope}`;
     if (seen.has(id)) return { error: `Duplicate rule ${id}` };
@@ -94,12 +97,83 @@ export function fleetTagCapsPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES,
  * plus week spend and is present only when a week rule exists.
  */
 export function fleetTagCapsPayload(rules, receipts, nowMs, budgetPeriod = null) {
-  const all = Array.isArray(rules) ? rules : [];
+  const stored = Array.isArray(rules) ? rules : [];
+  const all = stored.filter((r) => r.scope !== "total");
+  const totals = stored.filter((r) => r.scope === "total");
   const legacy = all.filter((r) => LEGACY_TAG_SCOPES.includes(r.scope));
   return {
     tag_caps: fleetTagCapsPolicy(legacy, receipts, nowMs, MAX_TAG_VALUES, budgetPeriod),
     tag_caps_v2: all.some((r) => r.scope === "week") ? fleetTagCapsPolicy(all, receipts, nowMs, MAX_TAG_VALUES, budgetPeriod, { week: true }) : null,
+    // #286: lifetime rules in an additive block, only when one exists (byte-identical otherwise).
+    ...(totals.length ? { tag_caps_total: fleetTagTotalPolicy(totals, receipts, nowMs) } : {}),
   };
+}
+
+/**
+ * #286: lifetime per-value spend for total rules. spend[key][value] = {total, unknown}
+ * over every receipt ever; at most `max` values per key (unknown first, then highest).
+ */
+export function fleetTagTotalPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES) {
+  const totals = (rules ?? []).filter((r) => r.scope === "total");
+  if (!totals.length) return null;
+  const keys = [...new Set(totals.map((r) => r.key))];
+  const acc = Object.fromEntries(keys.map((k) => [k, new Map()]));
+  for (const r of receipts) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r)) continue;
+    for (const key of keys) {
+      const v = valueOf(r.tags, key);
+      const e = acc[key].get(v) ?? { total: 0, unknown: 0 };
+      acc[key].set(v, e);
+      if (r.cost_usd === null || r.cost_usd === undefined) e.unknown += 1; else e.total += r.cost_usd;
+    }
+  }
+  let truncated = false;
+  const spend = {};
+  for (const key of keys) {
+    const sorted = [...acc[key]].sort((a, b) => (b[1].unknown > 0) - (a[1].unknown > 0) || b[1].total - a[1].total || (a[0] < b[0] ? -1 : 1));
+    if (sorted.length > max) truncated = true;
+    spend[key] = Object.fromEntries(sorted.slice(0, max).map(([v, e]) => [v, { total: round6(e.total), unknown: e.unknown }]));
+  }
+  return { rules: totals.map((r) => ({ ...r })), spend, truncated, as_of: new Date(nowMs).toISOString() };
+}
+
+export function validFleetTagTotal(t) {
+  if (t === null || t === undefined) return true;
+  if (typeof t !== "object" || typeof t.truncated !== "boolean" || !Number.isFinite(Date.parse(t.as_of))) return false;
+  if (!Array.isArray(t.rules) || !t.rules.length || t.rules.some((r) => r?.scope !== "total") || parseFleetTagCaps(t.rules, { total: true }).error) return false;
+  if (!t.spend || typeof t.spend !== "object") return false;
+  for (const values of Object.values(t.spend)) {
+    if (!values || typeof values !== "object") return false;
+    for (const e of Object.values(values)) if (!e || !Number.isInteger(e.unknown) || e.unknown < 0 || !(typeof e.total === "number" && Number.isFinite(e.total) && e.total >= 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * #286: offline lifetime tag verdict. Synced lifetime spend of the request's value
+ * (an unlisted value of a truncated list counts at the lowest listed known total)
+ * plus every unsynced receipt on this host with that value.
+ */
+export function cachedFleetTagTotalVerdict(policy, tags, pending) {
+  if (!policy?.rules?.length) return null;
+  for (const rule of policy.rules) {
+    const value = valueOf(tags, rule.key);
+    const values = policy.spend?.[rule.key] ?? {};
+    let e = values[value];
+    if (!e) {
+      const known = Object.values(values).filter((x) => x.unknown === 0);
+      e = !policy.truncated ? { total: 0, unknown: 0 } : known.length ? { total: Math.min(...known.map((x) => x.total)), unknown: 0 } : { total: 0, unknown: Object.keys(values).length ? 1 : 0 };
+    }
+    let total = e.total, unknown = e.unknown;
+    for (const r of pending) {
+      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
+      if (r.cost_usd === null || r.cost_usd === undefined) unknown += 1; else total += r.cost_usd;
+    }
+    if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", tag_key: rule.key, tag_value: value, scope: "total", unknown_receipts: unknown, fleet: true,
+      message: `CostCap: ${rule.key}=${value} has ${unknown} receipt(s) with unknown cost, so its fleet tag cap cannot be enforced. The upstream call was not made.` };
+    if (total >= rule.usd) return { verdict: "tag_budget_exceeded", tag_key: rule.key, tag_value: value, scope: "total", spend_usd: round6(total), cap_usd: rule.usd, fleet: true };
+  }
+  return null;
 }
 
 export function validFleetTagCaps(t) {

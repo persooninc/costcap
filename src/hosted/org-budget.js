@@ -4,6 +4,8 @@
 // the local agent-budget engine): unknown cost (cost_usd: null) makes the
 // verdict accounting_unavailable, never $0; pending batches are pending (#183).
 import { teamVerdict, cachedTotals } from "./teams.js";
+import { isPendingBatch } from "../cap.js";
+import { totalCapMessage } from "../agent-budget.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
 const round6 = (n) => Number(n.toFixed(6));
@@ -14,12 +16,15 @@ export const LEGACY_ORG_SCOPES = Object.freeze(["day", "month"]);
 // #195 --preflight remainders: day/month always, week (#271) when an org week cap is set.
 const REMAINING_SCOPES = ["day", "month"];
 export const orgScope = (scope) => `org:${scope}`;
-const FIELDS = ["day", "week", "month", "warnFractions"];
+const FIELDS = ["day", "week", "month", "total", "warnFractions"];
+// #286: a lifetime org cap (never resets). It travels in the additive org_budget_total
+// block; org_budget and org_budget_v2 keep their pre-#286 shape.
+export const ORG_CAP_FIELDS = Object.freeze([...ORG_SCOPES, "total"]);
 
 // The saved org budget, or null when no cap is set.
 export function orgBudgetOf(org) {
   const b = org?.orgBudget;
-  return b && ORG_SCOPES.some((s) => b[s] != null) ? b : null;
+  return b && ORG_CAP_FIELDS.some((s) => b[s] != null) ? b : null;
 }
 
 // Validates a PUT /v1/org-budget body and merges it onto the saved budget.
@@ -30,7 +35,7 @@ export function parseOrgBudget(body, current = null) {
   if (!body || typeof body !== "object" || Array.isArray(body)) bad("Org budget body required");
   for (const key of Object.keys(body)) if (!FIELDS.includes(key)) bad(`Unknown org budget field ${key}`);
   const next = { ...(current ?? {}) };
-  for (const scope of ORG_SCOPES) {
+  for (const scope of ORG_CAP_FIELDS) {
     const v = body[scope];
     if (v === undefined) continue;
     if (v === null) { delete next[scope]; continue; }
@@ -43,7 +48,19 @@ export function parseOrgBudget(body, current = null) {
     if (err) bad(err);
     next.warnFractions = sortWarnFractions(body.warnFractions);
   }
-  return ORG_SCOPES.some((s) => next[s] != null) ? next : null;
+  return ORG_CAP_FIELDS.some((s) => next[s] != null) ? next : null;
+}
+
+// #286: lifetime spend of settled-aware receipts (every receipt since the beginning).
+export function lifetimeSpend(receipts) {
+  let usd = 0, unknown = 0, pending = 0;
+  for (const r of receipts ?? []) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
+    if (isPendingBatch(r)) { pending += 1; continue; }
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    usd += r.cost_usd;
+  }
+  return { usd: round6(usd), unknown, pending };
 }
 
 // budget: { day?, month?, warnFractions? }; agentIds: every agent of the org
@@ -51,9 +68,21 @@ export function parseOrgBudget(body, current = null) {
 // receipts of this org only.
 export function orgBudgetVerdict({ budget, agentIds, receiptsByAgent, nowMs, budgetPeriod = null }) {
   if (!budget) return null;
-  const caps = Object.fromEntries(ORG_SCOPES.filter((s) => budget[s] != null).map((s) => [s, budget[s]]));
-  const extra = Array.isArray(budget.warnFractions) ? { warnFractions: [...budget.warnFractions] } : {};
-  if (!agentIds.length) return { caps, spend: { day_usd: 0, week_usd: 0, month_usd: 0, unknown_count: 0, pending_batch_count: 0, cost_complete: true }, verdict: "ok", ...extra };
+  const periodic = Object.fromEntries(ORG_SCOPES.filter((s) => budget[s] != null).map((s) => [s, budget[s]]));
+  const base = orgPeriodicVerdict({ caps: periodic, agentIds, receiptsByAgent, nowMs, budgetPeriod, extra: Array.isArray(budget.warnFractions) ? { warnFractions: [...budget.warnFractions] } : {} });
+  if (budget.total == null) return base;
+  // #286: the lifetime cap counts every receipt of the org (revoked agents included).
+  const life = lifetimeSpend(agentIds.flatMap((id) => receiptsByAgent[id] ?? []));
+  const out = { ...base, caps: { ...base.caps, total: budget.total }, spend: { ...base.spend, total_usd: life.usd, total_unknown_count: life.unknown } };
+  if (base.verdict !== "ok") return out;
+  if (life.unknown > 0) return { ...out, verdict: "accounting_unavailable", scope: orgScope("total"), unknown_receipts: life.unknown };
+  if (life.usd >= budget.total) return { ...out, verdict: "budget_exceeded", scope: orgScope("total"), cap_usd: budget.total, spent_usd: life.usd };
+  return out;
+}
+
+function orgPeriodicVerdict({ caps, agentIds, receiptsByAgent, nowMs, budgetPeriod, extra }) {
+  const empty = { caps, spend: { day_usd: 0, week_usd: 0, month_usd: 0, unknown_count: 0, pending_batch_count: 0, cost_complete: true }, verdict: "ok", ...extra };
+  if (!agentIds.length || !Object.keys(caps).length) return empty;
   const v = teamVerdict({ team: { name: "org", agents: agentIds, ...caps }, receiptsByAgent, nowMs, budgetPeriod });
   const scope = v.scope ? orgScope(v.scope.split(":").pop()) : null;
   return {
@@ -69,7 +98,11 @@ export function orgBudgetVerdict({ budget, agentIds, receiptsByAgent, nowMs, bud
 // cap is set; org_budget keeps the day/month shape a pre-#268 wrapper accepts.
 export function orgBudgetPolicy(verdict, nowMs) {
   if (!verdict) return null;
-  return { caps: { ...verdict.caps }, spend: { day_usd: verdict.spend.day_usd, week_usd: verdict.spend.week_usd ?? 0, month_usd: verdict.spend.month_usd, unknown_count: verdict.spend.unknown_count }, verdict: verdict.verdict, as_of: new Date(nowMs).toISOString() };
+  const { total: _t, ...caps } = verdict.caps;
+  if (!Object.keys(caps).length) return null;
+  // #286: a total-only hit is not a day/week/month verdict for these blocks.
+  const periodicHit = verdict.verdict !== "ok" && !String(verdict.scope ?? "").endsWith(":total");
+  return { caps, spend: { day_usd: verdict.spend.day_usd, week_usd: verdict.spend.week_usd ?? 0, month_usd: verdict.spend.month_usd, unknown_count: verdict.spend.unknown_count }, verdict: periodicHit ? verdict.verdict : "ok", as_of: new Date(nowMs).toISOString() };
 }
 
 /** The pre-#268 org_budget block: day/month caps only, null when only week is capped. */
@@ -82,6 +115,33 @@ export function legacyOrgBudgetPolicy(full) {
 
 /** The additive org_budget_v2 block: present only when a week cap is set. */
 export const weekOrgBudgetPolicy = (full) => (full?.caps?.week != null ? full : null);
+
+/** #286: the additive org_budget_total block, present only when an org total is set. */
+export function totalOrgBudgetPolicy(verdict, nowMs) {
+  if (verdict?.caps?.total == null) return null;
+  return { cap: verdict.caps.total, spend_usd: verdict.spend.total_usd, unknown_count: verdict.spend.total_unknown_count, as_of: new Date(nowMs).toISOString() };
+}
+
+export function validOrgTotalPolicy(o) {
+  if (o === null || o === undefined) return true;
+  return typeof o === "object" && typeof o.cap === "number" && Number.isFinite(o.cap) && o.cap > 0
+    && typeof o.spend_usd === "number" && Number.isFinite(o.spend_usd) && o.spend_usd >= 0
+    && Number.isInteger(o.unknown_count) && o.unknown_count >= 0 && Number.isFinite(Date.parse(o.as_of));
+}
+
+/**
+ * #286: offline lifetime org check in the wrapper: synced lifetime spend plus every
+ * unsynced receipt on this host. Unknown cost refuses (never $0); no retry hint.
+ */
+export function cachedOrgTotalVerdict(t, pending) {
+  if (!t) return null;
+  const extra = lifetimeSpend(pending);
+  const unknown = t.unknown_count + extra.unknown;
+  if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", scope: orgScope("total"), org: true, unknown_receipts: unknown };
+  const spent = round6(t.spend_usd + extra.usd);
+  if (spent >= t.cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: orgScope("total"), org: true, cap_usd: t.cap, spent_usd: spent, ...totalCapMessage("total", t.cap) };
+  return null;
+}
 
 export function validOrgBudgetPolicy(o) {
   if (o === null || o === undefined) return true;

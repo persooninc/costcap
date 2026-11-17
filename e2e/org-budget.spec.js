@@ -73,6 +73,20 @@ test("Org budget card: admin sets the cap, seeded spend shows verdict and alert,
     await page.locator("#orgBudgetSave").click();
     await expect(page.locator("#orgBudgetState")).not.toContainText("day:");
     expect((await (await fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: { cookie: (await page.context().cookies()).map((c) => c.name + "=" + c.value).join("; ") } })).json()).scope).toBe("org:week");
+    // #286: a total (never resets) counts receipts from earlier months too.
+    const old = new Date(Date.now() - 62 * 86_400_000).toISOString();
+    expect((await fetch(`${origin}/v1/receipts`, { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "s0", ts: old, cost_usd: 0.5, model: "test" }] }) })).status).toBe(200);
+    await page.locator("#orgBudgetWeek").fill("");
+    await page.locator("#orgBudgetTotal").fill("1.5");
+    await page.locator("#orgBudgetSave").click();
+    await expect(page.locator("#orgBudgetState")).toContainText("total $1.7 of $1.5");
+    await expect(page.locator("#orgBudgetState")).toHaveAttribute("data-verdict", "budget_exceeded");
+    const pol = await (await fetch(`${origin}/v1/policy`, { headers: { authorization: `Bearer ${agent.token}` } })).json();
+    expect([pol.org_budget, pol.org_budget_total.cap, pol.org_budget_total.spend_usd]).toEqual([null, 1.5, 1.7]);
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#alerts")).toContainText("org budget total");
+    await expect(page.locator("#orgBudgetTotal")).toHaveValue("1.5");
 
     await page.locator("#invite input[name=email]").fill("org-viewer@example.invalid");
     await page.locator("#invite button").click();

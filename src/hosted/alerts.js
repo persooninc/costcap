@@ -268,7 +268,7 @@ export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, b
   const out = [];
   const id = `org:${orgId}`;
   const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
-  for (const scope of ["day", "week", "month"]) {
+  for (const scope of ["day", "week", "month", "total"]) {
     const cap = verdict.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
     const spent = verdict.spend[`${scope}_usd`];
@@ -303,8 +303,8 @@ export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits =
     const names = new Set([...Object.keys(values), ...blocked]);
     for (const value of [...names].sort()) {
       const e = values[value] ?? { day: 0, week: 0, month: 0, unknown: 0 };
-      // #268: a week rule looks at unknown cost inside its own week only.
-      if ((rule.scope === "week" ? e.unknown_week ?? 0 : e.unknown) > 0) continue;
+      // #268: a week rule looks at unknown cost inside its own week only (#286: total, lifetime).
+      if ((rule.scope === "week" ? e.unknown_week ?? 0 : rule.scope === "total" ? e.unknown_total ?? 0 : e.unknown) > 0) continue;
       const spent = e[rule.scope];
       if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
       const id = `tag:${orgId}:${rule.key}=${value}`;
@@ -389,7 +389,7 @@ export function evaluateModelAlerts({ agentId, rules = [], spend = {}, blockedHi
     seen.add(key);
     const e = spend?.[model];
     const blocked = blockedHits.some((h) => normalize(h?.model) === model && h?.scope === rule.scope);
-    const unknown = (rule.scope === "week" ? e?.unknown_week : e?.unknown) ?? 0;
+    const unknown = (rule.scope === "week" ? e?.unknown_week : rule.scope === "total" ? e?.unknown_total : e?.unknown) ?? 0;
     const spent = rule.scope === "hour" ? null : e && unknown === 0 ? e[rule.scope] ?? null : null;
     const base = { model, scope: rule.scope, cap: rule.usd, spent };
     if (blocked || (spent !== null && spent >= rule.usd)) { out.push({ kind: "cap_hit", key: `cap_hit:${key}`, ...base }); continue; }
