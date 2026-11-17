@@ -30,6 +30,7 @@ import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
 import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
 import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
+import { GEMINI_LIVE_PATH, geminiLiveUsage, isTurnInput, setupModel } from "./gemini-live.js";
 import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "./live.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
@@ -62,6 +63,8 @@ export function baseUrlOverrides(port, providers = Object.keys(PROVIDERS)) {
     // GEMINI_BASE_URL is kept for backward compatibility.
     lines.push(`GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
     lines.push(`GEMINI_BASE_URL=http://127.0.0.1:${port}/gemini`);
+    // #277: Gemini Live API (BidiGenerateContent) over WebSocket.
+    lines.push(`COSTCAP_GEMINI_LIVE_URL=ws://127.0.0.1:${port}/gemini/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`);
   }
   // #188: read by Claude Code (CLAUDE_CODE_USE_BEDROCK / _VERTEX) and the Anthropic Bedrock/Vertex SDKs.
   if (providers.includes("bedrock")) lines.push(`ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:${port}/bedrock`);
@@ -1682,6 +1685,206 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     });
     upReq.end();
   };
+  // #277: Gemini Live API (BidiGenerateContent / BidiGenerateContentConstrained) over WebSocket.
+  // Admission runs before 101 and on the first `setup` message (model). Each server message with
+  // usageMetadata is one receipt; caps are re-checked after each; a close with an unanswered
+  // client turn, unpriced modality, cache read or grounding is an honest unknown.
+  const handleGeminiLive = (req, socket, head, reqAt, url, rawPathname, upstream) => {
+    let reqTags = null;
+    try { reqTags = mergeTags(wrapperTags, parseTagHeader(req.headers[TAG_HEADER])); } catch (e) {
+      writeHttpJson(socket, 400, { error: "invalid_tags", message: `CostCap: ${e.message}. The upstream call was not made.` });
+      return;
+    }
+    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, reqAt);
+    const upstreamPath = rawPathname.replace(/^\/gemini/, "");
+    const base = { provider: "gemini", path: receiptPath(upstreamPath, url.search), transport: "websocket" };
+    let model = "unknown";
+    try {
+      const g = guarded(() => sessionGate(null, reqTags));
+      if (g) {
+        emit({ ...base, blocked: true, cost_usd: 0, model, ...g.detail, reason: g.reason });
+        writeHttpJson(socket, g.status, g.body, g.detail?.retry_after_s != null ? { "retry-after": String(g.detail.retry_after_s) } : {});
+        return;
+      }
+    } catch {
+      writeHttpJson(socket, 503, { error: "receipt_ledger_unavailable" });
+      return;
+    }
+    const target = new URL(`${upstream}${upstreamPath}${url.search}`);
+    const headers = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (k === "host" || k.startsWith("x-costcap-") || k === "sec-websocket-extensions") continue;
+      headers[k] = v;
+    }
+    headers.host = target.host;
+    const upReq = (target.protocol === "https:" ? https : http).request(target, { method: "GET", headers });
+    let settledHandshake = false;
+    const handshakeTimer = setTimeout(() => upReq.destroy(new Error("upstream_timeout")), timeoutMs);
+    handshakeTimer.unref?.();
+    const noUpgrade = (status, body, reason) => {
+      if (settledHandshake) return;
+      settledHandshake = true;
+      clearTimeout(handshakeTimer);
+      try { emit({ ...base, status, blocked: false, model, cost_usd: 0, reason }); } catch { /* surfaces on the next call */ }
+      writeHttpJson(socket, status, body);
+    };
+    upReq.on("error", () => noUpgrade(502, { error: "upstream_unreachable", message: "CostCap could not open the Gemini Live WebSocket upstream." }, "upstream_handshake_failed"));
+    upReq.on("response", (res) => {
+      const parts = [];
+      res.on("data", (c) => parts.push(c));
+      res.on("end", () => {
+        let body;
+        try { body = JSON.parse(Buffer.concat(parts).toString("utf8")); } catch { body = { error: "upstream_handshake_rejected" }; }
+        noUpgrade(res.statusCode, body, "upstream_rejected");
+      });
+      res.on("error", () => noUpgrade(502, { error: "upstream_handshake_rejected" }, "upstream_rejected"));
+    });
+    upReq.on("upgrade", (upRes, upSocket, upHead) => {
+      settledHandshake = true;
+      clearTimeout(handshakeTimer);
+      upSocket.on("error", () => {});
+      if (socket.destroyed) { upSocket.destroy(); return; }
+      const lines = ["HTTP/1.1 101 Switching Protocols"];
+      for (let i = 0; i < upRes.rawHeaders.length; i += 2) {
+        if (upRes.rawHeaders[i].toLowerCase() === "sec-websocket-extensions") continue;
+        lines.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
+      }
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+      let closed = false, admitted = false, pendingTurn = false, grounded = false;
+      let held = [];
+      const down = createFrameParser(), up = createFrameParser(), upTap = createFrameParser();
+      const rcpt = (extra) => ({ ...base, status: 101, blocked: false, model, ...extra });
+      const latch = (receipt, msg) => {
+        const done = emit(receipt);
+        failures.set(done.id, msg);
+        recordSpend(done);
+        flushWarnings();
+        return done;
+      };
+      const shutdown = (code, reason) => {
+        if (closed) return;
+        closed = true;
+        sessions.delete(session);
+        try { socket.write(encodeFrame(0x8, closePayload(code, `costcap: ${reason}`))); } catch { /* client gone */ }
+        socket.end();
+        try { upSocket.write(encodeFrame(0x8, closePayload(1000, "costcap"), { mask: true })); } catch { /* upstream gone */ }
+        upSocket.end();
+        setTimeout(() => { socket.destroy(); upSocket.destroy(); }, 1000).unref?.();
+      };
+      const finishIncomplete = () => {
+        if (!pendingTurn) return;
+        pendingTurn = false;
+        try { latch(rcpt({ cost_usd: null, reason: "stream_incomplete" }), "A Gemini Live turn was cut before its usage arrived. Restart only after reconciling this session."); } catch { hardFailure = "Receipt ledger unavailable."; }
+      };
+      const onMessage = (msg) => {
+        if (!msg || typeof msg !== "object") return false;
+        if (msg.serverContent?.groundingMetadata && typeof msg.serverContent.groundingMetadata === "object") grounded = true;
+        if (!msg.usageMetadata || typeof msg.usageMetadata !== "object") return false;
+        pendingTurn = false;
+        const usage = geminiLiveUsage(msg.usageMetadata);
+        const wasGrounded = grounded;
+        grounded = false;
+        if (!usage) {
+          latch(rcpt({ cost_usd: null, reason: "usage_unavailable" }), "A Gemini Live turn reported no usable token usage. Restart only after reconciling this session.");
+          return true;
+        }
+        const priced = costWithOverrides(userPrices, "gemini", model, usage, { at: pinPrices ? pricingAt(now()) : now() });
+        const receipt = rcpt(priced);
+        rateLimit?.record(usageTokens(usage));
+        if (wasGrounded && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
+        if (receipt.cost_usd === null) {
+          latch(receipt, receipt.reason === "tool_use_unpriced"
+            ? "A Gemini Live turn used Grounding with Google Search, which has no published Live rate. Restart only after reconciling this session."
+            : `A Gemini Live turn on ${model} has no published rate (${receipt.reason ?? "unpriced"}). Restart only after reconciling this session.`);
+        } else {
+          const done = emit(receipt);
+          recordSpend(done);
+          velocity?.record(done.cost_usd);
+          flushWarnings();
+        }
+        return true;
+      };
+      const session = {
+        terminate(reason, detail) {
+          if (closed) return;
+          try { emit({ ...base, blocked: true, reason, cost_usd: 0, model, ...detail }); } catch { /* ledger */ }
+          finishIncomplete();
+          shutdown(1008, reason);
+        },
+        close() { finishIncomplete(); shutdown(1001, "proxy_closed"); },
+      };
+      sessions.add(session);
+      ensureKillTimer();
+      const fromUpstream = (bytes) => {
+        if (closed) return;
+        for (const frame of down.push(bytes)) {
+          if (closed) return;
+          socket.write(frame.raw);
+          if (!frame.message) continue;
+          let msg;
+          try { msg = JSON.parse(frame.message.data.toString("utf8")); } catch { continue; }
+          let metered;
+          try { metered = onMessage(msg); } catch { hardFailure = "Receipt ledger unavailable."; shutdown(1011, "accounting_unavailable"); return; }
+          if (!metered) continue;
+          const g = guarded(() => sessionGate(model, reqTags));
+          if (g) { if (g.reason === "killed") session.terminate("killed", g.detail); else { finishIncomplete(); shutdown(1008, g.reason); } return; }
+        }
+        if (down.corrupt) { finishIncomplete(); shutdown(1009, "frame_too_large"); }
+      };
+      // Client frames are held until the first complete message, which must be `setup`.
+      const admitSetup = (msg) => {
+        const m = setupModel(msg);
+        model = m ?? "unknown";
+        const allow = allowedModels?.() ?? null;
+        if (allow && (!m || !allow.includes(m))) return { reason: "model_not_allowed" };
+        if (unknownModels === "refuse" && (!m || !(userPrices ? isPricedWithOverrides(userPrices, "gemini", m) : isPricedModel(m)))) return { reason: "model_unpriced" };
+        const g = guarded(() => sessionGate(m, reqTags));
+        return g ? { reason: g.reason, detail: g.detail } : null;
+      };
+      const tapClient = (frames) => {
+        for (const f of frames) {
+          if (!f.message) continue;
+          try { if (isTurnInput(JSON.parse(f.message.data.toString("utf8")))) pendingTurn = true; } catch { /* not JSON */ }
+        }
+      };
+      const fromClient = (bytes) => {
+        if (closed) return;
+        if (admitted) { upSocket.write(bytes); tapClient(upTap.push(bytes)); return; }
+        for (const frame of up.push(bytes)) {
+          if (admitted) { upSocket.write(frame.raw); tapClient([frame]); continue; }
+          held.push(frame.raw);
+          if (!frame.message) { if (frame.opcode === 0x8) { closed = true; sessions.delete(session); socket.end(); upSocket.destroy(); } continue; }
+          let msg = null;
+          try { msg = JSON.parse(frame.message.data.toString("utf8")); } catch { /* not JSON */ }
+          let v;
+          if (!msg?.setup) v = { reason: "setup_required" };
+          else { try { v = admitSetup(msg); } catch { hardFailure = "Receipt ledger unavailable."; v = { reason: "accounting_unavailable" }; } }
+          if (v) {
+            held = [];
+            try { emit({ ...base, blocked: true, cost_usd: 0, model, ...(v.detail ?? {}), reason: v.reason, ...(v.detail ? {} : { outcome: "blocked_model" }) }); } catch { /* ledger */ }
+            shutdown(1008, v.reason);
+            return;
+          }
+          admitted = true;
+          upSocket.write(Buffer.concat(held)); held = [];
+        }
+      };
+      if (upHead?.length) fromUpstream(upHead);
+      upSocket.on("data", fromUpstream);
+      socket.on("data", fromClient);
+      if (head?.length) fromClient(head);
+      const onEnd = () => {
+        if (closed) return;
+        closed = true;
+        sessions.delete(session);
+        finishIncomplete();
+        socket.end(); upSocket.end();
+        setTimeout(() => { socket.destroy(); upSocket.destroy(); }, 1000).unref?.();
+      };
+      for (const s of [socket, upSocket]) { s.on("end", onEnd); s.on("close", onEnd); }
+    });
+    upReq.end();
+  };
   server.on("upgrade", (req, socket, head) => {
     const reqAt = now();
     socket.on("error", () => {});
@@ -1689,8 +1892,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     const rawPathname = req.url.split(/[?#]/, 1)[0];
     const upstream = upstreams.openai;
     if (LIVE_PATH.test(rawPathname) && upstream) { handleLive(req, socket, head, reqAt, url, upstream); return; }
+    if (GEMINI_LIVE_PATH.test(rawPathname) && upstreams.gemini) { handleGeminiLive(req, socket, head, reqAt, url, rawPathname, upstreams.gemini); return; }
     if (!REALTIME_PATH.test(rawPathname) || !upstream) {
-      writeHttpJson(socket, 501, { error: "websocket_unsupported", message: "CostCap proxies WebSocket upgrades only on /openai/v1/realtime and /openai/v1/live/sessions. The upstream call was not made." });
+      writeHttpJson(socket, 501, { error: "websocket_unsupported", message: "CostCap proxies WebSocket upgrades only on /openai/v1/realtime, /openai/v1/live/sessions and /gemini/ws/...BidiGenerateContent (Gemini Live). The upstream call was not made." });
       return;
     }
     let reqTags = null;

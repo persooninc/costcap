@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.28",
+  "version": "2026-11-16.29",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-4o",
     "https://developers.openai.com/api/docs/models/gpt-4o-mini",
@@ -42,6 +42,7 @@
     "https://cloud.google.com/vertex-ai/generative-ai/pricing (#256, Standard, retrieved 2026-11-16: Gemini 4 Carbon/Argon/Hydrogen, 3.8/3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview global rates equal the Gemini API rows, including their dated changes; non-global endpoints cost 1.1x global for GA Gemini 3+ from 2026-07-01; 3.1 Pro Preview has a Global row only; Gemini 2.5 has no region split)",
     "https://developers.openai.com/api/docs/pricing (#269 Images: gpt-image-2.6-sunburst / gpt-image-2.6-flare text $5 / cached $1.25, image input $8 / cached $2 / output $30; gpt-image-2.5-* listed only in the Batch table, so left unknown; retrieved 2026-11-16)",
     "https://ai.google.dev/gemini-api/docs/pricing (#269: gemini-3.1-flash-image $0.50 in / $3 text out / $60 image out; gemini-3.1-flash-lite-image $0.25 / $1.50 / $30; gemini-3-pro-image $2 / $12 / $120; gemini-2.5-flash-image $0.30 / $2.50 / $30; no cached rate published, so cached input stays unknown; retrieved 2026-11-16)",
+    "https://ai.google.dev/gemini-api/docs/pricing (#277: Gemini Live API per 1M tokens, Standard: gemini-3.8-live, gemini-3.8-live-extended-thinking and gemini-3.1-flash-live-preview input text $0.75, audio $3.00, image/video $1.00, output text $4.50, audio $12.00 (thinking included); gemini-2.5-flash-native-audio-preview-12-2025 input text $0.50, audio/video $3.00, output text $2.00, audio $12.00; no context-caching rate; retrieved 2026-11-17)",
     "https://ai.google.dev/gemini-api/docs/pricing (#270: Gemini TTS text input / audio output per 1M tokens, Standard: gemini-3.8-flash-tts $0.50/$9.00 then $1.00/$18.00 from 2027-01-01, gemini-3.8-flash-lite-tts $0.50/$6.00 then $1.00/$12.00, gemini-3.1-flash-tts-preview $1/$20, gemini-2.5-flash-preview-tts $0.50/$10, gemini-2.5-pro-preview-tts $1/$20; Batch half; Priority 1.8x on the 3.8 rows only; no context-caching rate; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/guides/prompt-caching and https://developers.openai.com/api/docs/guides/fast-mode and https://developers.openai.com/api/docs/guides/ultrafast-mode (#232; retrieved 2026-11-16)"
   ],
@@ -122,6 +123,10 @@
     "gemini-3.5-flash-lite": { "cache_storage": 1.00, "input": 0.30, "cached_input": 0.03, "output": 2.50, "uniform_modalities": true, "priority": { "input": 0.54, "cached_input": 0.05, "output": 4.50 } },
     "gemini-3.8-flash-tts": { "no_cache_rate": true, "input": 0.50, "output": 9.00, "modalities": { "audio": { "output": 9.00 } }, "priority": { "input": 0.90, "output": 16.20, "modalities": { "audio": { "output": 16.20 } } }, "effective": [{ "from": "2027-01-01", "input": 1.00, "output": 18.00, "modalities": { "audio": { "output": 18.00 } }, "priority": { "input": 1.80, "output": 32.40, "modalities": { "audio": { "output": 32.40 } } } }] },
     "gemini-3.8-flash-lite-tts": { "no_cache_rate": true, "input": 0.50, "output": 6.00, "modalities": { "audio": { "output": 6.00 } }, "priority": { "input": 0.90, "output": 10.80, "modalities": { "audio": { "output": 10.80 } } }, "effective": [{ "from": "2027-01-01", "input": 1.00, "output": 12.00, "modalities": { "audio": { "output": 12.00 } }, "priority": { "input": 1.80, "output": 21.60, "modalities": { "audio": { "output": 21.60 } } } }] },
+    "gemini-3.8-live": { "no_cache_rate": true, "input": 0.75, "output": 4.50, "modalities": { "audio": { "input": 3.00, "output": 12.00 }, "image": { "input": 1.00 }, "video": { "input": 1.00 } } },
+    "gemini-3.8-live-extended-thinking": { "no_cache_rate": true, "input": 0.75, "output": 4.50, "modalities": { "audio": { "input": 3.00, "output": 12.00 }, "image": { "input": 1.00 }, "video": { "input": 1.00 } } },
+    "gemini-3.1-flash-live-preview": { "no_cache_rate": true, "input": 0.75, "output": 4.50, "modalities": { "audio": { "input": 3.00, "output": 12.00 }, "image": { "input": 1.00 }, "video": { "input": 1.00 } } },
+    "gemini-2.5-flash-native-audio-preview-12-2025": { "no_cache_rate": true, "input": 0.50, "output": 2.00, "modalities": { "audio": { "input": 3.00, "output": 12.00 }, "video": { "input": 3.00 } } },
     "gemini-3.1-flash-tts-preview": { "no_cache_rate": true, "input": 1.00, "output": 20.00, "modalities": { "audio": { "output": 20.00 } } },
     "gemini-2.5-flash-preview-tts": { "no_cache_rate": true, "input": 0.50, "output": 10.00, "modalities": { "audio": { "output": 10.00 } } },
     "gemini-2.5-pro-preview-tts": { "no_cache_rate": true, "input": 1.00, "output": 20.00, "modalities": { "audio": { "output": 20.00 } } },

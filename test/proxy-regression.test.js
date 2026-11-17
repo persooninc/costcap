@@ -645,7 +645,7 @@ test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hit
   const up = await startRealtimeUpstream();
   const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url, anthropic: up.url } });
   t.after(async () => { server.close(); await up.close(); });
-  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages"]) {
+  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages", "/gemini/v1beta/models/x:streamGenerateContent"]) {
     const c = await connectRealtime(port, p);
     assert.equal(c.status, 501);
     assert.equal(c.body.error, "websocket_unsupported");

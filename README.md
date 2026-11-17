@@ -111,7 +111,8 @@ read is `cache_read_unpriced`).
 
 A response cut before `response.done`, audio on a model with no audio rate and a billed input transcription are recorded as
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
-pause the run until reconciled. Upgrades on any other path get `501 websocket_unsupported`.
+pause the run until reconciled. Upgrades on any path other than Realtime, GPT-Live and Gemini Live
+get `501 websocket_unsupported`.
 
 #### GPT-Live (`gpt-live-1`)
 
@@ -126,6 +127,25 @@ response id. A session that ends without `session.closed` is recorded as
 `session_usage_unconfirmed` (with `session_seconds_lower_bound`) and pauses the run until
 settled. WebRTC/SIP (`POST /live/sessions`) stays `usage_unavailable`; `/live/sessions/{id}/fork`
 stays `501`.
+
+#### Gemini Live API
+
+`wrap` also exports `COSTCAP_GEMINI_LIVE_URL=ws://127.0.0.1:<port>/gemini/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`.
+`@google/genai`'s `ai.live.connect()` works as is: it derives `ws://…/gemini/ws/…BidiGenerateContent`
+(or `…Constrained?access_token=` for ephemeral tokens) from `GOOGLE_GEMINI_BASE_URL`. Python
+`google-genai` forces `wss:` and is unsupported, like OpenAI's Node SDK.
+
+Admission (kill, agent/team, run, tag and model caps) runs before `101`; client frames are held
+until the first `setup` message, whose `model` is checked against `--models`, `--unknown-models
+refuse` and `--model-cap` before anything reaches Google. Each server message carrying
+`usageMetadata` is one receipt priced at the Live modality rates (`gemini-3.8-live`,
+`-extended-thinking`, `gemini-3.1-flash-live-preview`, `gemini-2.5-flash-native-audio-preview-12-2025`);
+thinking tokens bill as text output. Caps are re-checked after each turn: on a hit the message is
+forwarded, then the client is closed `1008` (`costcap: <reason>`). `costcap kill` closes a session
+within 1 s. A close after client input but before that turn's usage (`stream_incomplete`), a
+modality with no rate (`modality_unpriced`), a cache read (`cache_read_unpriced`) and a grounded
+turn (`tool_use_unpriced`) are unknown cost and pause the run until settled. Live on Vertex AI stays
+`404 cloud_route_unsupported`.
 
 ### Other OpenAI-compatible providers
 

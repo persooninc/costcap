@@ -58,6 +58,9 @@ test("live.js helpers: path, rate, snapshot meter, backend envelope", () => {
   assert.equal(backendResponse({ type: "response.event", event: { type: "response.created", response: r } }), null);
   assert.equal(operationName("/v1/live/sessions"), "live");
   assert.ok(baseUrlOverrides(4100, ["openai"]).some((l) => l === "COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:4100/openai/v1/live/sessions"));
+  // #277: the Gemini Live URL is exported only when gemini is wrapped.
+  assert.ok(!baseUrlOverrides(4100, ["openai"]).some((l) => l.startsWith("COSTCAP_GEMINI_LIVE_URL=")));
+  assert.ok(baseUrlOverrides(4100, ["gemini"]).some((l) => l.startsWith("COSTCAP_GEMINI_LIVE_URL=ws://127.0.0.1:4100/gemini/ws/")));
 });
 
 test("AC1 meters 12 / 18 / 60 s at $0.05/min, frames byte-identical, next call 200", async (t) => {
