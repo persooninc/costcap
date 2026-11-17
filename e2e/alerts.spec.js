@@ -385,3 +385,84 @@ for (const viewport of [{ name: "desktop", width: 1280, height: 800 }, { name: "
     }
   });
 }
+
+// Issue #258: alert routes. An admin adds a team route in the UI; an over-cap
+// team alert reaches only the default Slack and the route Slack (fixture fetch);
+// a viewer sees the routes read-only.
+test("admin adds a team alert route, team cap alert reaches only the expected Slack URLs, viewer is read-only", async ({ page }) => {
+  const { createOrgAlertRouter } = await import("../src/hosted/delivery.js");
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = [];
+  const posted = [];
+  const S0 = "https://hooks.slack.com/services/T0/B0/e2eDefaultS0", S1 = "https://hooks.slack.com/services/T1/B1/e2eRouteS1xy";
+  const deliverAlert = createOrgAlertRouter({ dashboardUrl: origin, fetchImpl: async (url) => { posted.push(url); return { ok: true, status: 200 }; } });
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-routes-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key",
+    verifyChallenge: async (token) => token === fixtureToken,
+    sendCode: async (message) => { codes.push(message); }, sendInvite: async () => {},
+    deliverAlert,
+  });
+  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
+  const signIn = async (email) => {
+    await page.goto(origin);
+    await page.locator("#email").fill(email);
+    await expect(page.locator("#requestButton")).toBeEnabled();
+    await page.locator("#requestButton").click();
+    await expect(page.locator("#verify")).toBeVisible();
+    await page.locator("#code").fill(codes.at(-1).code);
+    await page.locator("#verify button[type=submit]").click();
+    await expect(page.locator("#workspace")).toBeVisible();
+  };
+  try {
+    page.on("dialog", (dialog) => dialog.accept());
+    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
+      status: 200, contentType: "application/javascript",
+      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
+    }));
+    await signIn("route-owner@example.invalid");
+    await page.locator("#enroll button").click();
+    await expect(page.locator("#token")).not.toHaveText("");
+    const token = (await page.locator("#token").innerText()).trim();
+    const agent = await page.evaluate(async ({ credential }) => {
+      const a = await (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "pay-bot" }) })).json();
+      const team = await fetch("/v1/teams", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "payments", agents: [a.agentId], day: 1 }) });
+      return { token: a.token, team: team.status };
+    }, { credential: token });
+    expect(agent.team).toBe(200);
+    // Default Slack limited to cap_hit; the route sends every payments alert to S1.
+    await page.locator("#alertForm input[name=slack]").fill(S0);
+    for (const k of ["cap_approaching", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"]) await page.locator(`#defaultKinds input[value=${k}]`).uncheck();
+    await page.locator("#alertForm button.primary").click();
+    await expect(page.locator("#status")).toContainText("Alert destinations saved.");
+    await page.locator("#routeForm input[name=name]").fill("R1");
+    await page.locator("#routeForm input[name=teams]").fill("payments");
+    await page.locator("#routeForm input[name=slack]").fill(S1);
+    await page.locator("#routeForm button.primary").click();
+    await expect(page.locator("#status")).toContainText("Alert route saved.");
+    await expect(page.locator("#alertRoutes .route")).toContainText("R1 · kinds: all · teams: payments · emails: none · Slack: https://hooks.slack.com/services/…S1xy");
+    const status = await page.evaluate(async ({ t, ts }) => (await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${t}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "r1", ts, cost_usd: 2, model: "m" }] }) })).status, { t: agent.token, ts: new Date().toISOString() });
+    expect(status).toBe(200);
+    await service.evaluateFleetAlerts();
+    expect(posted.length).toBeGreaterThan(0);
+    expect(posted.every((u) => u === S0 || u === S1)).toBe(true);
+    expect(posted.filter((u) => u === S1).length).toBeGreaterThanOrEqual(1);
+    expect(posted.filter((u) => u === S0).length).toBe(1); // one cap_hit to the default; other kinds filtered
+    expect(await page.content()).not.toContain("e2eRouteS1xy");
+    // Viewer: read-only route list.
+    await page.locator("#invite input[name=email]").fill("route-viewer@example.invalid");
+    await page.locator("#invite button").click();
+    await expect(page.locator("#invites")).toContainText("route-viewer@example.invalid");
+    await page.locator("#logout").click();
+    await signIn("route-viewer@example.invalid");
+    await expect(page.locator("#alertRoutes .route")).toContainText("R1");
+    await expect(page.locator("#alertRoutes button")).toHaveCount(0);
+    await expect(page.locator("#routeForm")).toBeHidden();
+    expect(await page.evaluate(async () => (await fetch("/v1/alert-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ routes: [] }) })).status)).toBe(403);
+    expect(await page.content()).not.toContain("e2eRouteS1xy");
+  } finally {
+    service.server.closeAllConnections();
+    await new Promise((resolve) => service.server.close(resolve));
+  }
+});

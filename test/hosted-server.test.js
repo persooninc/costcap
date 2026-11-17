@@ -817,7 +817,7 @@ test("alert settings: roles, isolation, validation, masking, audit, per-org rout
   assert.equal((await f.request("/v1/invitations", { email: "viewer@a.invalid", role: "viewer" }, owner.cookie)).status, 201);
   const viewer = await f.login("viewer@a.invalid");
   assert.equal(viewer.body.role, "viewer");
-  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body, { emails: [], slackWebhook: null, webhook: null, configured: false, canEdit: true });
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body, { emails: [], slackWebhook: null, webhook: null, kinds: null, routes: [], configured: false, canEdit: true });
   assert.equal((await f.request("/v1/alert-settings")).status, 401);
   assert.equal((await f.request("/v1/alert-settings", { slackWebhook: "https://evil.invalid/services/x" }, owner.cookie)).status, 400);
   assert.equal((await f.request("/v1/alert-settings", { slackWebhook: "http://hooks.slack.com/services/x" }, owner.cookie)).status, 400);
@@ -827,7 +827,7 @@ test("alert settings: roles, isolation, validation, masking, audit, per-org rout
   assert.equal((await f.request("/v1/alert-settings", { emails: ["owner@a.invalid"], slackWebhook: hook }, viewer.cookie)).status, 403);
   const saved = await f.request("/v1/alert-settings", { emails: ["Owner@a.invalid", "viewer@a.invalid"], slackWebhook: hook }, owner.cookie);
   assert.equal(saved.status, 200);
-  assert.deepEqual(saved.body, { emails: ["owner@a.invalid", "viewer@a.invalid"], slackWebhook: "https://hooks.slack.com/services/…lue9", webhook: null, configured: true, canEdit: true });
+  assert.deepEqual(saved.body, { emails: ["owner@a.invalid", "viewer@a.invalid"], slackWebhook: "https://hooks.slack.com/services/…lue9", webhook: null, kinds: null, routes: [], configured: true, canEdit: true });
   const asViewer = await f.request("/v1/alert-settings", undefined, viewer.cookie);
   assert.equal(asViewer.body.slackWebhook, "https://hooks.slack.com/services/…lue9");
   assert.equal(asViewer.body.canEdit, false);
@@ -1716,4 +1716,109 @@ test("#259 test alert: roles, isolation, validation, partial config, SSRF, no si
   bodies.push(await (await fetch(`http://127.0.0.1:${port}/v1/audit.csv`, { headers: { cookie: owner.cookie } })).text());
   for (const b of bodies) for (const s of ["fullSecretHookValue9", "pathSecretK3", secret]) assert.equal(b.includes(s), false, `leaked ${s.slice(0, 8)}`);
   assert.equal(JSON.stringify(fleet).includes("test_"), false, "test alert never stored as an alert");
+});
+
+// Issue #258: alert routes. AC1 roles, isolation, validation and masking; AC4 retry through the worker.
+test("issue #258 AC1: alert routes roles, isolation, validation, masking and replacement", async (t) => {
+  const f = await fixture(t);
+  const S1 = "https://hooks.slack.com/services/T1/B1/routeSecretS1zz";
+  const owner = await f.login("rt-owner@a.invalid");
+  const other = await f.login("rt-owner@b.invalid");
+  await f.request("/v1/invitations", { email: "rt-viewer@a.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("rt-viewer@a.invalid");
+  const token = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, owner.cookie)).body.token;
+  const a1 = (await f.request("/v1/enroll", { name: "a1" }, null, token)).body;
+  assert.equal((await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], day: 5 }, owner.cookie)).status, 200);
+  const route = { name: "payments", teams: ["payments"], slackWebhook: S1 };
+  const viewerKey = (await f.request("/v1/api-keys", { name: "ro", role: "viewer" }, owner.cookie)).body.key;
+  assert.equal((await f.request("/v1/alert-settings", { routes: [route] }, viewer.cookie)).status, 403);
+  assert.equal((await f.request("/v1/alert-settings", { routes: [route] }, null, viewerKey)).status, 403);
+  // Another org cannot reference org A's team, and never sees A's routes.
+  assert.equal((await f.request("/v1/alert-settings", { routes: [route] }, other.cookie)).status, 400);
+  for (const bad of [
+    { kinds: ["nope"] }, { routes: [{ ...route, kinds: ["nope"] }] }, { routes: [{ ...route, teams: ["ghost"] }] },
+    { routes: [{ name: "x", emails: ["stranger@a.invalid"] }] }, { routes: [{ name: "x", slackWebhook: "https://evil.invalid/services/x" }] },
+    { routes: Array.from({ length: 11 }, (_, i) => ({ name: `r${i}`, slackWebhook: S1 })) }, { routes: [{ name: "x", teams: null }] },
+    { routes: [{ name: "", slackWebhook: S1 }] }, { routes: [{ name: "x".repeat(41), slackWebhook: S1 }] }, { routes: [{ ...route, id: "rt_ffff" }] },
+  ]) assert.equal((await f.request("/v1/alert-settings", bad, owner.cookie)).status, 400, JSON.stringify(bad).slice(0, 80));
+  const saved = await f.request("/v1/alert-settings", { kinds: ["cap_hit", "agent_silent"], routes: [route, { name: "fin", kinds: ["spend_anomaly"], emails: ["rt-viewer@a.invalid"] }] }, owner.cookie);
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.kinds, ["cap_hit", "agent_silent"]);
+  assert.equal(saved.body.routes.length, 2);
+  const [r1, r2] = saved.body.routes;
+  assert.match(r1.id, /^rt_[a-f0-9]+$/);
+  assert.deepEqual({ ...r1, id: undefined }, { id: undefined, name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: "https://hooks.slack.com/services/…S1zz", disabled: false });
+  assert.deepEqual(r2.kinds, ["spend_anomaly"]);
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, viewer.cookie)).body.routes.map((r) => r.name), ["payments", "fin"]);
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, other.cookie)).body.routes, []);
+  // Re-save without slackWebhook keeps S1; omitting a route removes it.
+  const kept = await f.request("/v1/alert-settings", { routes: [{ id: r1.id, name: "payments-team", teams: ["payments"] }] }, owner.cookie);
+  assert.equal(kept.status, 200);
+  assert.equal(kept.body.routes.length, 1);
+  assert.equal(kept.body.routes[0].id, r1.id);
+  assert.equal(kept.body.routes[0].slackWebhook, "https://hooks.slack.com/services/…S1zz");
+  // Masking grep: no API, CSV or audit body carries the full route webhook.
+  for (const path of ["/v1/alert-settings", "/v1/fleet", "/v1/evidence.json", "/v1/audit", "/v1/metrics"]) {
+    const r = await fetch(`http://127.0.0.1:${f.service().server.address().port}${path}`, { headers: { origin: "http://localhost", cookie: owner.cookie } });
+    assert.equal((await r.text()).includes("routeSecretS1zz"), false, path);
+  }
+  for (const path of ["/v1/audit.csv", "/v1/spend.csv"]) {
+    const r = await fetch(`http://127.0.0.1:${f.service().server.address().port}${path}`, { headers: { origin: "http://localhost", cookie: owner.cookie } });
+    assert.equal((await r.text()).includes("routeSecretS1zz"), false, path);
+  }
+  // Defaults kinds null restores all kinds.
+  assert.equal((await f.request("/v1/alert-settings", { kinds: null }, owner.cookie)).body.kinds, null);
+});
+
+test("issue #258 AC4 + AC5: route channel retries alone and gives up once; team delete disables; member removal drops email", async (t) => {
+  let clock = Date.parse("2026-01-15T01:00:00Z");
+  const S0 = "https://hooks.slack.com/services/T0/B0/defaultS0", S1 = "https://hooks.slack.com/services/T1/B1/paymentsS1";
+  const posts = [], settingsSeen = [];
+  const { createOrgAlertRouter } = await import("../src/hosted/delivery.js");
+  let kind = null; // agent_silent also matches R1 (kinds: null); count cap_hit posts only
+  const router = createOrgAlertRouter({ fetchImpl: async (url) => { if (kind === "cap_hit") posts.push(url); return { ok: url !== S1, status: url === S1 ? 500 : 200 }; } });
+  const deliverAlert = async (a, settings, opts) => { settingsSeen.push({ a, settings }); kind = a.kind; return router(a, settings, opts); };
+  const f = await fixture(t, { now: () => clock, extra: { deliverAlert } });
+  const owner = await f.login("rt-retry@a.invalid");
+  await f.request("/v1/invitations", { email: "rt-fin@a.invalid", role: "viewer" }, owner.cookie);
+  await f.login("rt-fin@a.invalid");
+  const token = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token;
+  const a1 = (await f.request("/v1/enroll", { name: "a1" }, null, token)).body;
+  assert.equal((await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], day: 1 }, owner.cookie)).status, 200);
+  const saved = await f.request("/v1/alert-settings", { slackWebhook: S0, routes: [{ name: "R1", teams: ["payments"], slackWebhook: S1 }, { name: "R2", kinds: ["spend_anomaly"], emails: ["rt-fin@a.invalid"] }] }, owner.cookie);
+  const r1 = saved.body.routes[0].id;
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-1", ts: new Date(clock).toISOString(), cost_usd: 2, model: "test" }] }, null, a1.token)).status, 200);
+  const sweep = () => f.service().evaluateFleetAlerts();
+  await sweep();
+  assert.equal(settingsSeen[0].a.routeTeam, "payments");
+  assert.equal(posts.filter((u) => u === S0).length, 1);
+  assert.equal(posts.filter((u) => u === S1).length, 1);
+  await sweep(); // 1-minute backoff not elapsed
+  assert.equal(posts.filter((u) => u === S1).length, 1);
+  clock += 61_000; await sweep();
+  assert.equal(posts.filter((u) => u === S1).length, 2);
+  for (let i = 0; i < 12; i++) { clock += 31 * 60_000; await sweep(); }
+  assert.equal(posts.filter((u) => u === S1).length, 10);
+  assert.equal(posts.filter((u) => u === S0).length, 1, "S0 never resent");
+  const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
+  const gaveUp = fleet.audit.filter((e) => e.action === "alert.delivery_gave_up");
+  assert.deepEqual(gaveUp.filter((e) => e.detail.kind === "cap_hit").map((e) => e.detail.channel), [`route:${r1}:slack`]);
+  // AC5: removing the member drops them from R2; deleting the team disables R1.
+  const finId = fleet.members.find((m) => m.email === "rt-fin@a.invalid").id;
+  assert.equal((await f.request(`/v1/members/${finId}/remove`, {}, owner.cookie)).status, 200);
+  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body.routes[1].emails, []);
+  assert.equal((await f.request("/v1/teams", { name: "payments", remove: true }, owner.cookie)).status, 200);
+  const after = (await f.request("/v1/alert-settings", undefined, owner.cookie)).body.routes[0];
+  assert.deepEqual([after.teams, after.disabled], [[], true]);
+  // a1's next alert (new day) neither reaches S1 nor widens to all teams.
+  posts.length = 0;
+  clock += 2 * 86_400_000;
+  await sweep();
+  assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "over-2", ts: new Date(clock).toISOString(), cost_usd: 0.5, model: "test" }] }, null, a1.token)).status, 200);
+  const again = await f.login("rt-retry@a.invalid"); // the session expired across the clock jump
+  assert.equal((await f.request(`/v1/agents/${a1.agentId}/policy`, { caps: { day: 0.1 } }, again.cookie)).status, 200);
+  await sweep();
+  assert.ok(settingsSeen.some((x) => x.a.kind === "cap_hit" && x.a.agentId === a1.agentId && !x.a.team && x.a.routeTeam === null));
+  assert.ok(posts.includes(S0), "the new cap_hit occurrence was delivered to the default");
+  assert.equal(posts.includes(S1), false);
 });

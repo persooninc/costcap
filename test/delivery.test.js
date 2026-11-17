@@ -186,3 +186,64 @@ test("#259: test-kind text, signed webhook with kind:test/test:true, channels fi
   assert.deepEqual(only, [{ channel: "slack", status: "accepted" }]);
   assert.equal(calls.length, 1);
 });
+
+// Issue #258: alert routes (per-team / per-kind destinations).
+import { planAlertDestinations, routeMatches, maskAlertSettings as mask258 } from "../src/hosted/delivery.js";
+const S0 = "https://hooks.slack.com/services/T0/B0/defaultS0", S1 = "https://hooks.slack.com/services/T1/B1/paymentsS1";
+const WH = "https://alerts.example.com/costcap";
+const settings258 = { emails: ["o@x.invalid"], slackWebhook: S0, kinds: ["cap_hit", "agent_silent"], webhook: { url: WH, secret: "whsec_t" },
+  routes: [{ id: "rt_1", name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: S1 }, { id: "rt_2", name: "finance", kinds: ["spend_anomaly"], teams: null, emails: ["f@x.invalid"], slackWebhook: null }] };
+async function send258(alert, settings = settings258, opts) {
+  const calls = [];
+  const fetchImpl = async (url, options) => { calls.push({ url, to: url.includes("brevo") ? JSON.parse(options.body).to.map((t) => t.email) : null }); return { ok: true, status: 200 }; };
+  const route = createOrgAlertRouter({ emailKey: "k", emailFrom: "alerts@example.invalid", fetchImpl, lookup: async () => [{ address: "93.184.216.34" }] });
+  const results = await route({ orgId: "A", ...alert }, settings, opts);
+  const got = calls.flatMap((c) => (c.to ? c.to : [c.url === S0 ? "S0" : c.url === S1 ? "S1" : c.url === WH ? "WH" : c.url]));
+  return { results, got };
+}
+test("issue #258 AC2: routing matrix by kind and team, signed webhook gets every alert", async () => {
+  // a1 is in payments (routeTeam set by the worker); a2 is in no team.
+  let r = await send258({ kind: "cap_hit", team: "payments", scope: "month" });
+  assert.deepEqual(r.got.sort(), ["S0", "S1", "WH", "o@x.invalid"]);
+  r = await send258({ kind: "cap_approaching", agentId: "a1", routeTeam: "payments", scope: "day" });
+  assert.deepEqual(r.got.sort(), ["S1", "WH"]);
+  assert.deepEqual(r.results.map((x) => [x.channel, x.status]), [["email", "unconfigured"], ["slack", "unconfigured"], ["route:rt_1:slack", "accepted"], ["webhook", "accepted"]]);
+  r = await send258({ kind: "cap_approaching", agentId: "a2", scope: "day" });
+  assert.deepEqual(r.got, ["WH"]);
+  const noHook = { ...settings258, webhook: undefined };
+  r = await send258({ kind: "cap_approaching", agentId: "a2", scope: "day" }, noHook);
+  assert.deepEqual(r.got, []);
+  assert.ok(r.results.every((x) => x.status === "unconfigured"));
+  r = await send258({ kind: "spend_anomaly", agentId: "a2", today: 9, baseline: 1, multiplier: 9 });
+  assert.deepEqual(r.got.sort(), ["WH", "f@x.invalid"]);
+  r = await send258({ kind: "cap_hit", org: true, scope: "month" });
+  assert.deepEqual(r.got.sort(), ["S0", "WH", "o@x.invalid"]);
+});
+test("issue #258 AC3: no kinds and no routes keeps today's channels exactly", async () => {
+  const plain = { emails: ["o@x.invalid"], slackWebhook: S0 };
+  for (const alert of [{ kind: "cap_hit", agentId: "a" }, { kind: "spend_anomaly", team: "t" }, { kind: "agent_silent", org: true }]) {
+    const r = await send258(alert, plain);
+    assert.deepEqual(r.results.map((x) => x.channel), ["email", "slack", "webhook"]);
+    assert.deepEqual(r.got, ["o@x.invalid", "S0"]);
+  }
+});
+test("issue #258 AC4: a URL or address in several matched destinations is sent once; retry targets one route channel", async () => {
+  const dup = { emails: ["o@x.invalid"], slackWebhook: S0, routes: [{ id: "rt_1", name: "dup", kinds: null, teams: null, emails: ["o@x.invalid", "p@x.invalid"], slackWebhook: S0 }] };
+  let r = await send258({ kind: "cap_hit", agentId: "a" }, dup);
+  assert.deepEqual(r.got, ["o@x.invalid", "S0", "p@x.invalid"]);
+  assert.deepEqual(r.results.map((x) => x.channel), ["email", "slack", "route:rt_1:email", "webhook"]);
+  r = await send258({ kind: "cap_hit", team: "payments" }, settings258, { channels: ["route:rt_1:slack"] });
+  assert.deepEqual(r.got, ["S1"]);
+  assert.deepEqual(r.results, [{ channel: "route:rt_1:slack", status: "accepted" }]);
+});
+test("issue #258: matching rules and masking", () => {
+  assert.equal(routeMatches({ kinds: null, teams: [] }, { kind: "cap_hit", team: "payments" }), false, "disabled route matches nothing");
+  assert.equal(routeMatches({ kinds: null, teams: ["payments"] }, { kind: "cap_hit", org: true }), false);
+  assert.equal(routeMatches({ kinds: [], teams: null }, { kind: "cap_hit" }), false);
+  assert.deepEqual(planAlertDestinations({ kind: "cap_hit" }, { emailTo: ["a"], kinds: [] }).map((p) => p.emails ?? p.slack), [[], null]);
+  const m = mask258(settings258);
+  assert.equal(JSON.stringify(m).includes("paymentsS1"), false);
+  assert.equal(m.routes[0].slackWebhook, "https://hooks.slack.com/services/…tsS1");
+  assert.deepEqual(m.kinds, ["cap_hit", "agent_silent"]);
+  assert.equal(mask258({ routes: [{ id: "rt_9", name: "x", teams: [], emails: ["a"] }] }).routes[0].disabled, true);
+});
