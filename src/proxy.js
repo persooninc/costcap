@@ -1657,6 +1657,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const bModel = typeof r.model === "string" && r.model ? r.model : null;
           const priced = bModel && (userPrices ? isPricedWithOverrides(userPrices, "openai", bModel) : isPricedModel(bModel));
           const extra = { backend: true, response_id: id };
+          if (bModel) backendModels.add(bModel); // #292: caps follow the metered backend model
           // #281: same accumulator as /v1/responses (tool calls, service_tier, image_generation).
           let metered = null;
           if (priced) { const acc = createUsageAccumulator("openai", bModel); acc.add({ type: "response.completed", response: r }); metered = acc.result(); }
@@ -1717,7 +1718,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           try { metered = onEvent(ev); } catch { hardFailure = "Receipt ledger unavailable."; closing = { code: 1011, reason: "accounting_unavailable" }; clientError("accounting_unavailable", "accounting_unavailable"); finish(); return; }
           if (ev.type === "session.closed" && gotClosed) { if (closing) finish(); continue; }
           if (!metered || closing) continue;
-          const g = guarded(() => sessionGate(model, reqTags, delegModel ? [delegModel] : []));
+          const g = guarded(() => sessionGate(model, reqTags, [...new Set([delegModel, ...backendModels].filter(Boolean))]));
           if (g) gateHit(g);
         }
         if (down.corrupt) { closing = closing ?? { code: 1009, reason: "frame_too_large" }; finish(); }
@@ -1726,6 +1727,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
       // #281: session.delegation.responses.model (the Responses backend) is vetted like session.model.
       // #289: model caps also apply to the delegation model, at admission, on update and mid-session.
       let delegModel = null;
+      const backendModels = new Set(); // #292: every backend model metered in this session
       const delegationModelOf = (ev) => { const d = ev?.session?.delegation?.responses; return d && typeof d === "object" && typeof d.model === "string" && d.model ? d.model : null; };
       const vetDelegation = (ev) => {
         const d = ev?.session?.delegation?.responses;

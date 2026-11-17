@@ -401,6 +401,51 @@ test("#289 AC4 hosted scopes (week/month/total) and unknown-cost delegation rece
   assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "accounting_unavailable");
 });
 
+// #292: model caps follow the metered backend model, not only the declared delegation model.
+const noDeleg = { type: "session.start", session: { model: "gpt-live-1" } };
+const emptyDeleg = { type: "session.start", session: { model: "gpt-live-1", delegation: { responses: {} } } };
+const burst = (n = 5) => (conn) => { conn.send(snap(1)); for (let i = 1; i <= n; i++) conn.send(big(`b${i}`)); };
+
+test("#292 AC1/AC2 undeclared backend model reaching its cap closes the session 1008; next session closed on first metered response", async (t) => {
+  for (const start of [noDeleg, emptyDeleg]) {
+    const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 0.5 }] });
+    const { up, port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst() }), proxy: { modelCaps } });
+    const c = await connectRealtime(port, PATH);
+    c.send(start);
+    assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
+    await c.closed;
+    assert.equal(c.closeCode, 1008);
+    assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
+    const c2 = await connectRealtime(port, PATH);
+    c2.send(start);
+    assert.equal((await c2.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
+    await c2.closed;
+    assert.equal(c2.closeCode, 1008);
+  }
+});
+
+test("#292 AC3 backend model differing from the declared delegation model is capped for the rest of the session", async (t) => {
+  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
+  const { up, port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst(3) }), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(delStart("gpt-5.4-mini"));
+  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
+  await c.closed;
+  assert.equal(c.closeCode, 1008);
+  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
+});
+
+test("#292 AC4 unsettled unknown-cost receipt for the metered backend model closes with accounting_unavailable", async (t) => {
+  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 50 }] });
+  modelCaps.record({ id: "u1", model: "gpt-5.4", cost_usd: null, ts: new Date().toISOString() });
+  const { port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst(1) }), proxy: { modelCaps } });
+  const c = await connectRealtime(port, PATH);
+  c.send(noDeleg);
+  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "accounting_unavailable");
+  await c.closed;
+  assert.equal(c.closeCode, 1008);
+});
+
 test("AC7 /live/sessions/x/fork and chat-path upgrades still get 501", async (t) => {
   const { up, port } = await setup(t);
   for (const p of ["/openai/v1/live/sessions/x/fork", "/openai/v1/chat/completions"]) {
