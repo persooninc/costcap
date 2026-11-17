@@ -6,8 +6,8 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy, raiseWeekError, dropLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
-import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
-import { cachedFleetModelVerdict, validWeekModelCaps } from "./model-caps.js";
+import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining } from "./tag-caps.js";
+import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
 import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
@@ -186,6 +186,18 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
       if (!data.agentSpend?.models) return null;
       const synced = new Set(data.syncedIds ?? []);
       return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+    },
+    // #272: fleet model remainders for --preflight (hosted day/month plus model_caps_week rules).
+    modelRemaining(models, nowMs = Date.now()) {
+      if (!data.agentSpend?.models) return [];
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedFleetModelRemaining(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+    },
+    // #272: fleet tag remainders for --preflight (merged with local rules).
+    tagRemaining(tags, localRules = [], nowMs = Date.now()) {
+      if (!data.tagCaps) return [];
+      const synced = new Set(data.syncedIds ?? []);
+      return cachedFleetTagRemaining(data.tagCaps, localRules, tags, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,

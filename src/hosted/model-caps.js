@@ -5,6 +5,7 @@
 import { periodKey, samePeriod } from "../period.js";
 import { isPendingBatch } from "../cap.js";
 import { normalizeModel } from "../model-cap.js";
+import { fleetPreflightHit } from "../tag-cap.js";
 
 // Fleet-enforced scopes. #268 adds week (ISO, Monday start, org timezone); week
 // rules travel in the additive model_caps_week field so a pre-#268 wrapper never
@@ -73,6 +74,28 @@ export function validModelSpend(m) {
 /** Hosted rules the local fallback engine covers (day/month); hour rules stay local, week is fleet-only. */
 export const fleetModelRules = (rules) => (rules ?? []).filter((r) => FALLBACK_SCOPES.includes(r.scope));
 
+// Per-model synced plus pending totals (and unknown count) for the rules naming it.
+function modelTotals(spend, rs, norm, pending, nowMs, budgetPeriod) {
+  const asOfMs = Date.parse(spend.as_of);
+  const e = spend.models[norm] ?? { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 };
+  // #268: unknown cost counts in the windows this model actually caps (month for day/month rules, week for week rules).
+  const wins = [...new Set(rs.map((r) => (r.scope === "week" ? "week" : "month")))];
+  let unknown = 0;
+  for (const w of wins) if (samePeriod(w, nowMs, asOfMs, budgetPeriod)) unknown += w === "week" ? e.unknown_week ?? 0 : e.unknown;
+  const total = {};
+  for (const s of FLEET_MODEL_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? e[s] ?? 0 : 0;
+  for (const r of pending) {
+    if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
+    const tsMs = Date.parse(r.ts);
+    if (!wins.some((w) => samePeriod(w, tsMs, nowMs, budgetPeriod))) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    for (const s of FLEET_MODEL_SCOPES) if (samePeriod(s, tsMs, nowMs, budgetPeriod)) total[s] += r.cost_usd;
+  }
+  return { total, unknown };
+}
+
+const fleetScoped = (rules) => (rules ?? []).filter((r) => FLEET_MODEL_SCOPES.includes(r.scope));
+
 /**
  * Offline fleet model verdict. spend: agent_spend ({as_of, models}); rules: hosted
  * modelCaps; models: the request's model ids; pending: unsynced settled-aware receipts.
@@ -80,32 +103,38 @@ export const fleetModelRules = (rules) => (rules ?? []).filter((r) => FALLBACK_S
  */
 export function cachedFleetModelVerdict(spend, rules, models, pending, nowMs, budgetPeriod = null) {
   if (!spend?.models) return null;
-  const fr = (rules ?? []).filter((r) => FLEET_MODEL_SCOPES.includes(r.scope));
+  const fr = fleetScoped(rules);
   if (!fr.length) return null;
-  const asOfMs = Date.parse(spend.as_of);
   for (const m of models ?? []) {
     const norm = normalizeModel(m);
     const rs = fr.filter((r) => normalizeModel(r.model) === norm);
     if (!rs.length) continue;
-    const e = spend.models[norm] ?? { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 };
-    // #268: unknown cost counts in the windows this model actually caps (month for day/month rules, week for week rules).
-    const wins = [...new Set(rs.map((r) => (r.scope === "week" ? "week" : "month")))];
-    let unknown = 0;
-    for (const w of wins) if (samePeriod(w, nowMs, asOfMs, budgetPeriod)) unknown += w === "week" ? e.unknown_week ?? 0 : e.unknown;
-    const total = {};
-    for (const s of FLEET_MODEL_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? e[s] ?? 0 : 0;
-    for (const r of pending) {
-      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
-      const tsMs = Date.parse(r.ts);
-      if (!wins.some((w) => samePeriod(w, tsMs, nowMs, budgetPeriod))) continue;
-      if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-      for (const s of FLEET_MODEL_SCOPES) if (samePeriod(s, tsMs, nowMs, budgetPeriod)) total[s] += r.cost_usd;
-    }
+    const { total, unknown } = modelTotals(spend, rs, norm, pending, nowMs, budgetPeriod);
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", model: m, unknown_receipts: unknown, fleet: true,
       message: `CostCap: model "${m}" has a fleet model cap and ${unknown} receipt(s) with unknown cost. Reconcile it before calling this model again.` };
     for (const r of rs) if (total[r.scope] >= r.usd) return { model: m, rule_model: r.model, scope: r.scope, spend_usd: round6(total[r.scope]), cap_usd: r.usd, fleet: true };
   }
   return null;
+}
+
+/**
+ * #272: remaining USD of every hosted day/week/month model rule naming one of the
+ * request's models, for --preflight. [] before the first snapshot. A model with
+ * unknown-cost receipts is left out (check() refuses it; never treated as $0).
+ */
+export function cachedFleetModelRemaining(spend, rules, models, pending, nowMs, budgetPeriod = null) {
+  if (!spend?.models) return [];
+  const fr = fleetScoped(rules);
+  const out = [];
+  for (const m of models ?? []) {
+    const norm = normalizeModel(m);
+    const rs = fr.filter((r) => normalizeModel(r.model) === norm);
+    if (!rs.length) continue;
+    const { total, unknown } = modelTotals(spend, rs, norm, pending, nowMs, budgetPeriod);
+    if (unknown > 0) continue;
+    for (const r of rs) out.push({ model: m, rule_model: r.model, scope: r.scope, cap_usd: r.usd, remaining_usd: round6(Math.max(r.usd - total[r.scope], 0)), fleet: true });
+  }
+  return out;
 }
 
 /**
@@ -123,8 +152,10 @@ export function withFleetModelCaps(local, fallback, fleet) {
     record: (r) => both((e) => e.record(r)),
     settle: (id, cost) => { const a = local.settle(id, cost); const b = fallback.settle(id, cost); return a || b; },
     check: (models) => local.check(models) ?? (hasSnapshot() ? fleet.modelCheck(models) : fallback.check(models)),
-    remaining: (models) => [...local.remaining(models), ...(hasSnapshot() ? [] : fallback.remaining(models))],
-    preflight: (models, est) => local.preflight(models, est) ?? (hasSnapshot() ? null : fallback.preflight(models, est)),
+    remaining: (models) => [...local.remaining(models), ...(hasSnapshot() ? fleet.modelRemaining?.(models) ?? [] : fallback.remaining(models))],
+    // #272: once fleet-wide spend arrives, preflight uses the fleet remainders instead of the fallback.
+    preflight: (models, est, reservedFor = null) => local.preflight(models, est, reservedFor)
+      ?? (hasSnapshot() ? fleetPreflightHit(fleet.modelRemaining?.(models), est, reservedFor) : fallback.preflight(models, est, reservedFor)),
     over: () => [...local.over(), ...(hasSnapshot() ? [] : fallback.over())],
   };
 }

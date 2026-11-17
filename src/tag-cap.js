@@ -158,6 +158,13 @@ export function createTagCaps({ rules = [], history = [], now = () => new Date()
   return engine;
 }
 
+// #272: first remainder entry an estimate (plus in-flight reservations) cannot fit.
+export function fleetPreflightHit(entries, estimateUsd, reservedFor = null) {
+  const left = (x) => { const res = reservedFor ? reservedFor(x) : 0; return res ? round(Math.max(x.remaining_usd - res, 0)) : x.remaining_usd; };
+  const r = (entries ?? []).map((x) => ({ ...x, remaining_usd: left(x) })).find((x) => estimateUsd > x.remaining_usd);
+  return r ? { reason: "preflight_estimate", estimate: true, estimate_usd: estimateUsd, ...r } : null;
+}
+
 /**
  * #204: the local engine (may be null) plus an enrolled fleet's tag caps. Local
  * rules are checked against the local ledger first, then the fleet rules (each
@@ -169,8 +176,9 @@ export function withFleetTagCaps(local, fleet, localRules = []) {
     record: (r) => local?.record(r),
     settle: (id, cost) => local?.settle(id, cost) ?? false,
     check: (tags) => local?.check(tags) ?? fleet.tagCheck(tags, localRules),
-    remaining: (tags) => local?.remaining(tags) ?? [],
-    preflight: (tags, est, reservedFor) => local?.preflight(tags, est, reservedFor) ?? null,
+    // #272: fleet remainders count too, so #255 in-flight reservations apply to fleet rules.
+    remaining: (tags) => [...(local?.remaining(tags) ?? []), ...(fleet.tagRemaining?.(tags, localRules) ?? [])],
+    preflight: (tags, est, reservedFor) => local?.preflight(tags, est, reservedFor) ?? fleetPreflightHit(fleet.tagRemaining?.(tags, localRules), est, reservedFor),
     over: () => local?.over() ?? [],
   };
 }

@@ -141,6 +141,25 @@ function syncedEntry(policy, key, value) {
   return { day: floor, week: floor, month: floor, unknown: 0, unknown_week: 0 };
 }
 
+// Synced plus pending spend (and unknown-cost count) of one merged rule for one value.
+function ruleTotals(policy, rule, value, pending, nowMs, budgetPeriod) {
+  const asOfMs = Date.parse(policy.as_of);
+  const e = syncedEntry(policy, rule.key, value);
+  const same = (s) => samePeriod(s, nowMs, asOfMs, budgetPeriod);
+  // #268: a week rule counts unknown cost inside the current week (which can start last month).
+  const win = rule.scope === "week" ? "week" : "month";
+  let unknown = same(win) ? (win === "week" ? e.unknown_week ?? 0 : e.unknown) : 0;
+  let total = same(rule.scope) ? e[rule.scope] ?? 0 : 0;
+  for (const r of pending) {
+    if (r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
+    const tsMs = Date.parse(r.ts);
+    if (!samePeriod(win, tsMs, nowMs, budgetPeriod)) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    if (samePeriod(rule.scope, tsMs, nowMs, budgetPeriod)) total += r.cost_usd;
+  }
+  return { total, unknown };
+}
+
 /**
  * Offline fleet tag verdict for one request's merged tags. pending: this host's
  * unsynced, settled-aware receipts. Returns null, a tag_budget_exceeded hit
@@ -149,25 +168,29 @@ function syncedEntry(policy, key, value) {
  */
 export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs, budgetPeriod = null) {
   if (!policy?.rules?.length) return null;
-  const asOfMs = Date.parse(policy.as_of);
   for (const rule of mergeTagCapRules(policy.rules, localRules)) {
     const value = valueOf(tags, rule.key);
-    const e = syncedEntry(policy, rule.key, value);
-    const same = (s) => samePeriod(s, nowMs, asOfMs, budgetPeriod);
-    // #268: a week rule counts unknown cost inside the current week (which can start last month).
-    const win = rule.scope === "week" ? "week" : "month";
-    let unknown = same(win) ? (win === "week" ? e.unknown_week ?? 0 : e.unknown) : 0;
-    let total = same(rule.scope) ? e[rule.scope] ?? 0 : 0;
-    for (const r of pending) {
-      if (r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
-      const tsMs = Date.parse(r.ts);
-      if (!samePeriod(win, tsMs, nowMs, budgetPeriod)) continue;
-      if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-      if (samePeriod(rule.scope, tsMs, nowMs, budgetPeriod)) total += r.cost_usd;
-    }
+    const { total, unknown } = ruleTotals(policy, rule, value, pending, nowMs, budgetPeriod);
     if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", tag_key: rule.key, tag_value: value, unknown_receipts: unknown, fleet: true,
       message: `CostCap: ${rule.key}=${value} has ${unknown} receipt(s) with unknown cost, so its fleet tag cap cannot be enforced. The upstream call was not made.` };
     if (total >= rule.cap) return { verdict: "tag_budget_exceeded", tag_key: rule.key, tag_value: value, scope: rule.scope, spend_usd: round6(total), cap_usd: rule.cap, fleet: !(rule.cap < rule.fleetUsd) };
   }
   return null;
+}
+
+/**
+ * #272: remaining USD of every fleet tag rule (merged with local rules) for one
+ * request's merged tags, for --preflight. A rule whose value has unknown-cost
+ * receipts is left out: check() already refuses it, and it is never treated as $0.
+ */
+export function cachedFleetTagRemaining(policy, localRules, tags, pending, nowMs, budgetPeriod = null) {
+  if (!policy?.rules?.length) return [];
+  const out = [];
+  for (const rule of mergeTagCapRules(policy.rules, localRules)) {
+    const value = valueOf(tags, rule.key);
+    const { total, unknown } = ruleTotals(policy, rule, value, pending, nowMs, budgetPeriod);
+    if (unknown > 0) continue;
+    out.push({ tag_key: rule.key, tag_value: value, scope: rule.scope, cap_usd: rule.cap, remaining_usd: round6(Math.max(rule.cap - total, 0)), fleet: !(rule.cap < rule.fleetUsd) });
+  }
+  return out;
 }
