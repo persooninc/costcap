@@ -395,10 +395,16 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   at the model's published modality rate (Gemini 2.5 Flash / Flash-Lite audio,
   `gpt-image-1`, `gpt-image-2.6-sunburst` / `-flare` image input and output, and
   IMAGE output on `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`,
-  `gemini-3-pro-image` and `gemini-2.5-flash-image`, #269). Gemini image models
+  `gemini-3-pro-image`, `gemini-2.5-flash-image` and `gemini-nano-banana-2.1`,
+  #269/#275). Gemini image models
   publish no cached-input rate, so a cache read on them is
-  `reason: "cache_read_unpriced"`. `gpt-image-2.5-*` (Batch-only rates) stays
-  unknown. Models with one price for all inputs
+  `reason: "cache_read_unpriced"`. On a Gemini row with an image output rate, a
+  response with `candidatesTokenCount` but no `candidatesTokensDetails` prices
+  the candidates at the image output rate (thinking tokens stay text), never the
+  text rate. `/v1/images/generations` and `/v1/images/edits` output counts as
+  image tokens even without `output_tokens_details`, so `gpt-image-2.5-*`
+  (Batch-only rates) stays unknown: `cost_usd: null`,
+  `reason: "modality_unpriced"`, never fallback-priced. Models with one price for all inputs
   declare `uniform_modalities`; image/video input listed at the text rate is
   declared `text_rate_modalities`. Any other non-text token (including every
   unknown/fallback model) gives `cost_usd: null`, `reason: "modality_unpriced"`

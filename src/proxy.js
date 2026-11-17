@@ -134,6 +134,13 @@ export function isEmbeddingsPath(rawUrl) {
   if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
   return /^\/(?:openai|openrouter)\/v1\/embeddings$/.test(pathname) || GEMINI_EMBED_PATH.test(pathname);
 }
+// #275: OpenAI / OpenRouter image generations and edits: output tokens are image tokens.
+export function isImagesPath(rawUrl) {
+  if (typeof rawUrl !== "string") return false;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
+  return /^\/(?:openai|openrouter)\/v1\/images\/(?:generations|edits)$/.test(pathname);
+}
 // Gemini embeddings (#200): :embedContent / :batchEmbedContents, billed on input only.
 const GEMINI_EMBED_PATH = /^\/gemini\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*:(?:embedContent|batchEmbedContents)$/;
 
@@ -242,7 +249,7 @@ export function geminiServedTier(usage, requestBody, header, { vertex = false } 
 }
 
 // Folds provider usage shapes from parsed JSON chunks (whole body or SSE events).
-export function createUsageAccumulator(provider, requestedModel, { embeddings = false } = {}) {
+export function createUsageAccumulator(provider, requestedModel, { embeddings = false, images = false } = {}) {
   let model = requestedModel ?? "unknown";
   let usage = {};
   const signal = {};
@@ -262,6 +269,8 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   // #250: Gemini candidates[].groundingMetadata by candidate index (Grounding with Google Search).
   const grounding = new Map();
   let groundingUnpriced = false;
+  // #275: Gemini candidates counted without candidatesTokensDetails (modality unknown).
+  let geminiUndetailed = null;
   // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
   // Absent/invalid values are ignored so pricing falls back to the table; it is never trusted on other routes.
   let providerCost;
@@ -334,6 +343,8 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
         if (input && isCount(u.toolUsePromptTokenCount)) input.text += u.toolUsePromptTokenCount;
         const output = geminiModalitySlice(u.candidatesTokensDetails);
         if (output && isCount(u.thoughtsTokenCount)) output.text += u.thoughtsTokenCount;
+        geminiUndetailed = !output && u.candidatesTokenCount > 0
+          ? { input, cached_input: cached, candidates: u.candidatesTokenCount, thoughts: isCount(u.thoughtsTokenCount) ? u.thoughtsTokenCount : 0 } : null;
         const mt = modalityTokens({ input, cached_input: cached, output });
         if (mt) usage.modality_tokens = mt;
       }
@@ -387,7 +398,10 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
         const cached = openaiModalitySlice(cachedDetails, usage.cached_input_tokens);
         const all = openaiModalitySlice(inDetails, usage.input_tokens + usage.cached_input_tokens + (usage.cache_write_input_tokens ?? 0) + (usage.cache_write_1h_input_tokens ?? 0));
         const input = all ? Object.fromEntries(Object.keys(all).map((k) => [k, Math.max(0, all[k] - (cached?.[k] ?? (k === "text" ? usage.cached_input_tokens : 0)))])) : null;
-        const output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details, usage.output_tokens);
+        let output = openaiModalitySlice(u.completion_tokens_details ?? u.output_tokens_details, usage.output_tokens);
+        // #275: /v1/images/{generations,edits} output is image tokens even without output_tokens_details,
+        // so an unlisted image model is modality_unpriced, never text-priced at the fallback.
+        if (images && !output && usage.output_tokens > 0) output = { ...emptySlice(), image: usage.output_tokens };
         const mt = modalityTokens({ input, cached_input: cached, output });
         if (mt) usage.modality_tokens = mt;
       }
@@ -398,6 +412,15 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     // Anthropic: input and output counters are both required (e.g. a stream missing message_start is unknown).
     if (provider === "anthropic" && !(isCount(usage.input_tokens) && isCount(usage.output_tokens))) return null;
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
+    // #275: on a row with an image output rate, candidates of unknown modality are priced as image
+    // output (thoughts stay text), never at the text output rate.
+    if (provider === "gemini" && geminiUndetailed) {
+      const p = lookupPrice(model);
+      if (!p.fallback && Number.isFinite(p.modalities?.image?.output)) {
+        const g = geminiUndetailed;
+        usage = { ...usage, modality_tokens: modalityTokens({ input: g.input, cached_input: g.cached_input, output: { ...emptySlice(), text: g.thoughts, image: g.candidates } }) };
+      }
+    }
     const toolCalls = provider === "anthropic" ? { ...anthropicTools } : {};
     for (const tool of responsesTools.values()) toolCalls[tool] = (toolCalls[tool] ?? 0) + 1;
     const imageUnpriced = [...imageCalls.values()].some((st) => st !== "failed");
@@ -444,7 +467,7 @@ export function extractUsage(provider, text, requestedModel, opts = {}) {
   let chunks;
   try { const parsed = JSON.parse(text); chunks = Array.isArray(parsed) ? parsed : [parsed]; }
   catch {
-    const parser = createSseUsageParser(provider, requestedModel);
+    const parser = createSseUsageParser(provider, requestedModel, opts);
     parser.push(text);
     return parser.end();
   }
@@ -456,8 +479,8 @@ export function extractUsage(provider, text, requestedModel, opts = {}) {
 // Incremental SSE parser: accepts arbitrary text fragments (lines may be split
 // across network chunks), joins multi-line `data:` fields per event, and
 // ignores `[DONE]` and non-JSON payloads.
-export function createSseUsageParser(provider, requestedModel) {
-  const acc = createUsageAccumulator(provider, requestedModel);
+export function createSseUsageParser(provider, requestedModel, opts = {}) {
+  const acc = createUsageAccumulator(provider, requestedModel, opts);
   let pending = "";
   let data = [];
   let done = false;
@@ -1107,7 +1130,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if ((/^text\/event-stream/i.test(contentType) || eventStream) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             // #188: Bedrock eventstream frames are forwarded byte-for-byte and decoded on the side.
-            const parser = eventStream ? (cloudRoute?.converse ? createConverseStreamUsageParser(requestedModel) : createEventStreamUsageParser(requestedModel)) : createSseUsageParser(meterAs, requestedModel);
+            const parser = eventStream ? (cloudRoute?.converse ? createConverseStreamUsageParser(requestedModel) : createEventStreamUsageParser(requestedModel)) : createSseUsageParser(meterAs, requestedModel, { images: req.method === "POST" && isImagesPath(req.url) });
             const decoder = new TextDecoder();
             arm(streamIdleMs);
             const filter = injected ? createUsageChunkFilter() : null;
@@ -1155,7 +1178,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
             metered = cloudRoute?.converse ? extractConverseUsage(raw.toString("utf8"), requestedModel) : extractUsage(meterAs, raw.toString("utf8"), requestedModel,
-              { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
+              { embeddings: req.method === "POST" && isEmbeddingsPath(req.url), images: req.method === "POST" && isImagesPath(req.url) });
           }
           if (meterAs === "gemini" && metered?.usage) {
             metered = { ...metered, usage: geminiServedTier(metered.usage, parsedBody, upstreamRes.headers.get("x-gemini-service-tier"), { vertex: Boolean(cloud) }) };
