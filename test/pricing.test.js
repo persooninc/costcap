@@ -65,6 +65,8 @@ test("every table rate is finite and positive and each provider has a source URL
     for (const field of ["input", "cached_input", "output"]) {
       // Documented exception (#145): input-only models (embeddings) bill no output, so output is exactly 0.
       if (rates.input_only && field === "output") { assert.equal(rates.output, 0, model); continue; }
+      // #269: Gemini image models publish no cached rate; the key is absent (cache reads are unpriced), never 0.
+      if (field === "cached_input" && !Object.hasOwn(rates, "cached_input") && /-image$/.test(model)) continue;
       assert.equal(Number.isFinite(rates[field]) && rates[field] > 0, true, `${model}.${field}`);
     }
   }

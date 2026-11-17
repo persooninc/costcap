@@ -259,9 +259,13 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
   // OpenRouter only (#148): the provider-reported usage.cost (USD) is the exact charge for any routed model.
   // Absent/invalid values are ignored so pricing falls back to the table; it is never trusted on other routes.
   let providerCost;
+  // #269: Responses image_generation_call items by id (latest status wins). The image tool's
+  // usage has no verified field, so a non-failed call makes the receipt tool_use_unpriced, never text-only.
+  const imageCalls = new Map();
   const noteResponsesItems = (items) => {
     if (!Array.isArray(items)) return;
     items.forEach((it, i) => {
+      if (it && it.type === "image_generation_call") imageCalls.set(typeof it.id === "string" && it.id ? it.id : `#${items.length}:${i}`, it.status);
       const tool = it && Object.hasOwn(RESPONSES_TOOL_ITEMS, it.type) ? RESPONSES_TOOL_ITEMS[it.type] : null;
       if (!tool) return;
       // A failed tool call is not billed; items are de-duplicated by id across stream events.
@@ -390,13 +394,15 @@ export function createUsageAccumulator(provider, requestedModel, { embeddings = 
     for (const [k, value] of Object.entries(usage)) if (k !== "modality_tokens" && (!Number.isFinite(value) || value < 0)) return null;
     const toolCalls = provider === "anthropic" ? { ...anthropicTools } : {};
     for (const tool of responsesTools.values()) toolCalls[tool] = (toolCalls[tool] ?? 0) + 1;
+    const imageUnpriced = [...imageCalls.values()].some((st) => st !== "failed");
+    if (imageUnpriced) toolUseUnpriced = true;
     let queryCount = 0;
     if (provider === "gemini" && grounding.size) {
       const g = geminiGroundingCalls([...grounding.values()], model);
       if (g.unpriced) toolUseUnpriced = groundingUnpriced = true;
       else if (g.calls > 0) { toolCalls.google_search = g.calls; queryCount = groundingQueries([...grounding.values()]).queries; }
     }
-    return { ...(groundingUnpriced && { unpricedTool: "Gemini grounding" }), model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(queryCount && { groundingQueries: queryCount }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
+    return { ...(groundingUnpriced && { unpricedTool: "Gemini grounding" }), ...(imageUnpriced && !groundingUnpriced && { unpricedTool: "Responses image_generation" }), model, usage: { ...usage, ...signal }, ...(Object.keys(toolCalls).length && { toolCalls }), ...(queryCount && { groundingQueries: queryCount }), ...(toolUseUnpriced && { toolUseUnpriced: true }), ...(providerCost !== undefined && { providerCost }) };
   };
   // A stream that never reached its provider's terminal event (or errored first) is incomplete.
   return { add, result, get incomplete() {

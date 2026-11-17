@@ -355,7 +355,12 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `candidatesTokensDetails`, OpenAI `*_tokens_details.audio_tokens` /
   `image_tokens`) are recorded on the receipt as `modality_tokens` and priced
   at the model's published modality rate (Gemini 2.5 Flash / Flash-Lite audio,
-  `gpt-image-1` image input and output). Models with one price for all inputs
+  `gpt-image-1`, `gpt-image-2.6-sunburst` / `-flare` image input and output, and
+  IMAGE output on `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`,
+  `gemini-3-pro-image` and `gemini-2.5-flash-image`, #269). Gemini image models
+  publish no cached-input rate, so a cache read on them is
+  `reason: "cache_read_unpriced"`. `gpt-image-2.5-*` (Batch-only rates) stays
+  unknown. Models with one price for all inputs
   declare `uniform_modalities`; image/video input listed at the text rate is
   declared `text_rate_modalities`. Any other non-text token (including every
   unknown/fallback model) gives `cost_usd: null`, `reason: "modality_unpriced"`
@@ -732,7 +737,10 @@ Claude on Bedrock stays unpriced until a rate is published, #222), OpenAI
 Responses `web_search_call` at $10 per 1,000 (`web_search` tool, and
 `web_search_preview` on gpt-5 / o-series) or $25 per 1,000
 (`web_search_preview` on gpt-4o / gpt-4.1), and `file_search_call` at $2.50 per
-1,000. The receipt adds `tool_calls` (for example `{"web_search": 3}`) and
+1,000. A Responses `image_generation_call` (not `failed`) has no verified
+image-tool usage field, so its receipt is `cost_usd: null`,
+`reason: "tool_use_unpriced"` and the run pauses: an image is never billed as
+text tokens only (#269). The receipt adds `tool_calls` (for example `{"web_search": 3}`) and
 `tool_cost_usd`, and `cost_usd` is tokens plus tools, so search spend counts
 toward every cap. In batches the 50% discount applies to tokens only; tool
 calls bill at the full rate. The OpenAI web search type comes from the

@@ -228,17 +228,19 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
   // #262: a premium set prices non-text slices from its own `modalities` (Gemini Priority audio), never the standard ones.
   const modalPrice = premium && tiered.rates?.modalities ? { ...price, modalities: tiered.rates.modalities } : price;
   const modal = selected ? modalityAdjustment(modalPrice, rates, modality_tokens, multiplier ?? 1) : { delta: 0, unpriced: false };
-  const unpriced = tierUnpriced || modal.unpriced || (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
+  // #269: a model with no published cached-input rate (Gemini image models) leaves cache reads unknown.
+  const cacheReadUnpriced = !tierUnpriced && cached_input_tokens > 0 && !Number.isFinite(rates.cached_input);
+  const unpriced = tierUnpriced || modal.unpriced || cacheReadUnpriced || (cache_write_input_tokens > 0 && rates.cache_write == null) || (cache_write_1h_input_tokens > 0 && rates.cache_write_1h == null);
   const cost = unpriced ? 0 :
     (input_tokens * rates.input +
-      cached_input_tokens * rates.cached_input +
+      (cached_input_tokens ? cached_input_tokens * rates.cached_input : 0) +
       cache_write_input_tokens * (rates.cache_write ?? 0) +
       cache_write_1h_input_tokens * (rates.cache_write_1h ?? 0) +
       output_tokens * rates.output + modal.delta) / 1_000_000;
   return {
     model,
     cost_usd: unpriced ? null : Number(cost.toFixed(6)),
-    ...(unpriced ? { reason: tierUnpriced ? "service_tier_unpriced" : modal.unpriced ? "modality_unpriced" : pricing_tier === "long_context" ? "long_context_cache_write_unpriced" : "cache_write_unpriced" } : {}),
+    ...(unpriced ? { reason: tierUnpriced ? "service_tier_unpriced" : modal.unpriced ? "modality_unpriced" : cacheReadUnpriced ? "cache_read_unpriced" : pricing_tier === "long_context" ? "long_context_cache_write_unpriced" : "cache_write_unpriced" } : {}),
     input_tokens,
     output_tokens,
     cached_input_tokens,

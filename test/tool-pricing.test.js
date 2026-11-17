@@ -114,7 +114,7 @@ test("AC6: preflight adds max_uses x rate and refuses a call that would not fit"
 test("AC7: costcap pricing verify passes with the new digest", () => {
   const r = pricingCommand(["verify"]);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /2026-11-16\.23/);
+  assert.match(r.out, /2026-11-16\.24/);
 });
 
 test("#232 gpt-6 family web_search / web_search_preview at $0.01", async () => {
