@@ -109,3 +109,22 @@ test("regression #204 AC4/AC5: offline cache, rule removal and unknown-cost valu
   assert.equal(A.fleet.tagCaps(), null);
   assert.equal((await A.call("customer=acme")).status, 200);
 });
+
+// Issue #268: a fleet week rule travels in tag_caps_v2 and refuses with scope week.
+test("regression #268: fleet customer:week=1 refuses acme on B, globex passes", async (t) => {
+  const h = await hosted(t);
+  await h.setRules([{ key: "customer", scope: "week", usd: 1 }, { key: "customer", scope: "month", usd: 50 }]);
+  const A = await h.agent("a"), B = await h.agent("b");
+  await A.fleet.sync();
+  assert.equal(A.fleet.tagCaps().rules.length, 2, "the new client reads tag_caps_v2");
+  for (let i = 0; i < 3; i++) assert.equal((await A.call("customer=acme")).status, 200);
+  await A.fleet.sync();
+  await B.fleet.sync();
+  const r = await B.call("customer=acme");
+  assert.equal(r.status, 429);
+  assert.equal(r.body.error, "tag_budget_exceeded");
+  assert.equal(r.body.scope, "week");
+  assert.equal(r.body.fleet, true);
+  assert.equal(r.body.spend_usd, 1.2);
+  assert.equal((await B.call("customer=globex")).status, 200);
+});

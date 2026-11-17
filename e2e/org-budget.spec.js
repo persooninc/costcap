@@ -48,8 +48,10 @@ test("Org budget card: admin sets the cap, seeded spend shows verdict and alert,
     await expect(page.locator("#orgBudgetCard")).toBeVisible();
     await expect(page.locator("#orgBudgetState")).toHaveText("No org budget.");
     await page.locator("#orgBudgetDay").fill("1");
+    await page.locator("#orgBudgetWeek").fill("1");
     await page.locator("#orgBudgetSave").click();
     await expect(page.locator("#orgBudgetState")).toContainText("day: $0 of $1");
+    await expect(page.locator("#orgBudgetState")).toContainText("week: $0 of $1");
     await expect(page.locator("#orgBudgetState")).toHaveAttribute("data-verdict", "ok");
     // Seed $1.20 of synced spend from an enrolled agent, then run the alert sweep.
     const token = await page.evaluate(async () => (await (await fetch("/v1/enrollment-tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ caps: {} }) })).json()).token);
@@ -63,6 +65,14 @@ test("Org budget card: admin sets the cap, seeded spend shows verdict and alert,
     await expect(page.locator("#orgBudgetState")).toContainText("day: $1.2 of $1");
     await expect(page.locator("#alerts")).toContainText("cap_hit");
     await expect(page.locator("#alerts")).toContainText("org budget day");
+    // #268: the week cap shows its state line and pages cap_hit too.
+    await expect(page.locator("#orgBudgetState")).toContainText("week: $1.2 of $1");
+    await expect(page.locator("#alerts")).toContainText("org budget week");
+    // The hosted verdict a wrapper checks names org:week once only the week is capped.
+    await page.locator("#orgBudgetDay").fill("");
+    await page.locator("#orgBudgetSave").click();
+    await expect(page.locator("#orgBudgetState")).not.toContainText("day:");
+    expect((await (await fetch(`${origin}/v1/agents/${agent.agentId}/budget`, { headers: { cookie: (await page.context().cookies()).map((c) => c.name + "=" + c.value).join("; ") } })).json()).scope).toBe("org:week");
 
     await page.locator("#invite input[name=email]").fill("org-viewer@example.invalid");
     await page.locator("#invite button").click();
@@ -71,6 +81,7 @@ test("Org budget card: admin sets the cap, seeded spend shows verdict and alert,
     await signIn("org-viewer@example.invalid");
     await expect(page.locator("#orgBudgetState")).toHaveAttribute("data-verdict", "budget_exceeded");
     await expect(page.locator("#orgBudgetDay")).toBeDisabled();
+    await expect(page.locator("#orgBudgetWeek")).toBeDisabled();
     await expect(page.locator("#orgBudgetSave")).toBeDisabled();
     expect(await page.evaluate(async () => (await fetch("/v1/org-budget", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ day: 5 }) })).status)).toBe(403);
   } finally {

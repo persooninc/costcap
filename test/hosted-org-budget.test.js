@@ -74,7 +74,7 @@ test("orgBudgetPolicy / validOrgBudgetPolicy round-trip and reject bad payloads"
   assert.equal(orgBudgetPolicy(null, NOW), null);
   const v = orgBudgetVerdict({ budget: { day: 1 }, agentIds: ["a"], receiptsByAgent: { a: [r("1", 0.5)] }, nowMs: NOW });
   const p = orgBudgetPolicy(v, NOW);
-  assert.deepEqual(p, { caps: { day: 1 }, spend: { day_usd: 0.5, month_usd: 0.5, unknown_count: 0 }, verdict: "ok", as_of: new Date(NOW).toISOString() });
+  assert.deepEqual(p, { caps: { day: 1 }, spend: { day_usd: 0.5, week_usd: 0.5, month_usd: 0.5, unknown_count: 0 }, verdict: "ok", as_of: new Date(NOW).toISOString() });
   assert.equal(validOrgBudgetPolicy(p), true);
   assert.equal(validOrgBudgetPolicy(null), true);
   assert.equal(validOrgBudgetPolicy(undefined), true);

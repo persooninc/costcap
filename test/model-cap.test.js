@@ -263,7 +263,9 @@ test("hosted policy: modelCaps validation, merge (lower cap wins) and resolvePol
     assert.ok(modelCapsError(bad), JSON.stringify(bad));
   }
   assert.deepEqual(validatePolicy({ version: 1, caps: {}, modelCaps: [{ model: OPUS, scope: "day", usd: 1 }] }), []);
-  assert.equal(validatePolicy({ version: 1, caps: {}, modelCaps: [{ model: OPUS, scope: "week", usd: 1 }] }).length, 1);
+  // #268: hosted modelCaps accept week (fleet-enforced); the local --model-cap flag still does not.
+  assert.deepEqual(validatePolicy({ version: 1, caps: {}, modelCaps: [{ model: OPUS, scope: "week", usd: 1 }] }), []);
+  assert.equal(validatePolicy({ version: 1, caps: {}, modelCaps: [{ model: OPUS, scope: "year", usd: 1 }] }).length, 1);
   assert.deepEqual(mergeModelCapRules([{ model: OPUS, scope: "day", usd: 1 }], [{ model: OPUS, scope: "day", cap: 2 }, { model: OPUS, scope: "hour", cap: 0.5 }]), [{ model: OPUS, scope: "day", cap: 1 }, { model: OPUS, scope: "hour", cap: 0.5 }]);
   assert.deepEqual(mergeModelCapRules([{ model: OPUS, scope: "day", usd: 3 }], [{ model: `anthropic/${OPUS}`, scope: "day", cap: 2 }]), [{ model: `anthropic/${OPUS}`, scope: "day", cap: 2 }]);
   assert.deepEqual(mergeModelCapRules(null, null), []);
@@ -409,7 +411,7 @@ test("#244 AC2: unknown cost refuses that model only; OpenRouter dotted id share
     { id: "e", ts: "2026-11-16T11:00:00Z", model: "claude-opus-4-8", cost_usd: null, reason: "batch_pending" },
   ];
   const models = modelSpendPolicy(receipts, rules, nowMs);
-  assert.deepEqual(models, { "claude-opus-4-8": { day: 1, month: 1, unknown: 1 } });
+  assert.deepEqual(models, { "claude-opus-4-8": { day: 1, week: 1, month: 1, unknown: 1, unknown_week: 1 } });
   const spend = { as_of: new Date(nowMs).toISOString(), models };
   const v = cachedFleetModelVerdict(spend, rules, ["anthropic/claude-opus-4.8"], [], nowMs);
   assert.equal(v.verdict, "accounting_unavailable");

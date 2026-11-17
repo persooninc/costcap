@@ -144,3 +144,38 @@ test("regression #240 AC4: an unknown-cost receipt refuses as accounting_unavail
   await B.fleet.sync();
   assert.equal((await B.call()).status, 200);
 });
+
+// Issue #268 AC1/AC5: an org week cap is enforced by real wrappers, carried in
+// org_budget_v2 while org_budget keeps the pre-#268 shape.
+test("regression #268: org week=1 refuses A with org:week once A and B pass $1 this week", async (t) => {
+  const h = await hosted(t);
+  const owner = await h.login("org-268@example.invalid");
+  const saved = await h.req("/v1/org-budget", { week: 1 }, owner, "PUT");
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.org_budget.caps, { week: 1 });
+  const A = await h.agent(owner, "a"), B = await h.agent(owner, "b");
+  assert.equal((await A.call()).status, 200);
+  await A.fleet.sync();
+  assert.equal((await B.call()).status, 200);
+  assert.equal((await B.call()).status, 200);
+  await B.fleet.sync();
+  await A.fleet.sync();
+  assert.equal(A.fleet.orgBudget().caps.week, 1);
+  assert.equal(A.fleet.orgBudget().spend.week_usd, 1.2);
+  const card = (await h.req("/v1/org-budget", undefined, owner)).body.org_budget;
+  assert.equal(card.spend.week_usd, 1.2);
+  assert.equal(card.verdict, "budget_exceeded");
+  assert.equal(card.scope, "org:week");
+  const before = A.hits();
+  const r = await A.call();
+  assert.equal(r.status, 429);
+  assert.equal(r.body.error, "budget_exceeded");
+  assert.equal(r.body.scope, "org:week");
+  assert.equal(r.body.cap_usd, 1);
+  assert.equal(A.hits(), before, "the upstream saw no request");
+  // Clearing the week cap lifts it on the next sync.
+  assert.equal((await h.req("/v1/org-budget", { week: null }, owner, "PUT")).body.org_budget, null);
+  await A.fleet.sync();
+  assert.equal(A.fleet.orgBudget(), null);
+  assert.equal((await A.call()).status, 200);
+});

@@ -6,7 +6,13 @@ import { periodKey, samePeriod } from "../period.js";
 import { isPendingBatch } from "../cap.js";
 import { normalizeModel } from "../model-cap.js";
 
-export const FLEET_MODEL_SCOPES = Object.freeze(["day", "month"]);
+// Fleet-enforced scopes. #268 adds week (ISO, Monday start, org timezone); week
+// rules travel in the additive model_caps_week field so a pre-#268 wrapper never
+// sees them, and agent_spend.models[*] adds week/unknown_week (optional).
+export const FLEET_MODEL_SCOPES = Object.freeze(["day", "week", "month"]);
+// Rules that also go to the local fallback engine (no week window there).
+const FALLBACK_SCOPES = ["day", "month"];
+const REQUIRED_SPEND = ["day", "month"];
 export const MAX_FLEET_MODELS = 20;
 const round6 = (n) => Number(n.toFixed(6));
 
@@ -16,35 +22,56 @@ export function cappedModels(rules) {
   return [...new Set(rules.map((r) => normalizeModel(r?.model)).filter(Boolean))].slice(0, MAX_FLEET_MODELS);
 }
 
-/** {<norm>: {day, month, unknown}} from settled-aware receipts; null when no model is capped. */
+/**
+ * {<norm>: {day, week, month, unknown, unknown_week}} from settled-aware receipts;
+ * null when no model is capped. `unknown` counts the current month (pre-#268
+ * meaning); `unknown_week` the current week, which can start in the previous month.
+ */
 export function modelSpendPolicy(receipts, rules, nowMs, budgetPeriod = null) {
   const models = cappedModels(rules);
   if (!models.length) return null;
-  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
-  const acc = Object.fromEntries(models.map((m) => [m, { day: 0, month: 0, unknown: 0 }]));
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod);
+  const acc = Object.fromEntries(models.map((m) => [m, { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 }]));
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r)) continue;
     const e = acc[normalizeModel(r.model)];
     if (!e) continue;
     const tsMs = Date.parse(r.ts);
-    if (periodKey("month", tsMs, budgetPeriod) !== month) continue;
-    if (r.cost_usd === null || r.cost_usd === undefined) { e.unknown += 1; continue; }
-    e.month += r.cost_usd;
+    const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
+    if (!inMonth && !inWeek) continue;
+    if (r.cost_usd === null || r.cost_usd === undefined) { if (inMonth) e.unknown += 1; if (inWeek) e.unknown_week += 1; continue; }
+    if (inMonth) e.month += r.cost_usd;
+    if (inWeek) e.week += r.cost_usd;
     if (periodKey("day", tsMs, budgetPeriod) === day) e.day += r.cost_usd;
   }
-  for (const e of Object.values(acc)) { e.day = round6(e.day); e.month = round6(e.month); }
+  for (const e of Object.values(acc)) { e.day = round6(e.day); e.week = round6(e.week); e.month = round6(e.month); }
   return acc;
+}
+
+/** #268: hosted modelCaps split into what a pre-#268 wrapper accepts and the week rules. */
+export function splitWeekModelCaps(rules) {
+  const list = Array.isArray(rules) ? rules : [];
+  return { legacy: list.filter((r) => r.scope !== "week"), week: list.filter((r) => r.scope === "week") };
+}
+
+/** model_caps_week from GET /v1/policy: null/undefined or 1-20 week rules. */
+export function validWeekModelCaps(list) {
+  if (list === null || list === undefined) return true;
+  return Array.isArray(list) && list.length <= MAX_FLEET_MODELS && list.every((r) => r && r.scope === "week" && typeof r.model === "string" && r.model
+    && typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0);
 }
 
 export function validModelSpend(m) {
   if (m === undefined || m === null) return true;
   if (typeof m !== "object" || Array.isArray(m) || Object.keys(m).length > MAX_FLEET_MODELS) return false;
   return Object.values(m).every((e) => e && typeof e === "object" && Number.isInteger(e.unknown) && e.unknown >= 0
-    && FLEET_MODEL_SCOPES.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0));
+    && REQUIRED_SPEND.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0)
+    && (e.week === undefined || (typeof e.week === "number" && Number.isFinite(e.week) && e.week >= 0))
+    && (e.unknown_week === undefined || (Number.isInteger(e.unknown_week) && e.unknown_week >= 0)));
 }
 
-/** Hosted rules the fleet verdict owns (day/month); hour rules stay in the local engine. */
-export const fleetModelRules = (rules) => (rules ?? []).filter((r) => FLEET_MODEL_SCOPES.includes(r.scope));
+/** Hosted rules the local fallback engine covers (day/month); hour rules stay local, week is fleet-only. */
+export const fleetModelRules = (rules) => (rules ?? []).filter((r) => FALLBACK_SCOPES.includes(r.scope));
 
 /**
  * Offline fleet model verdict. spend: agent_spend ({as_of, models}); rules: hosted
@@ -53,21 +80,24 @@ export const fleetModelRules = (rules) => (rules ?? []).filter((r) => FLEET_MODE
  */
 export function cachedFleetModelVerdict(spend, rules, models, pending, nowMs, budgetPeriod = null) {
   if (!spend?.models) return null;
-  const fr = fleetModelRules(rules);
+  const fr = (rules ?? []).filter((r) => FLEET_MODEL_SCOPES.includes(r.scope));
   if (!fr.length) return null;
   const asOfMs = Date.parse(spend.as_of);
   for (const m of models ?? []) {
     const norm = normalizeModel(m);
     const rs = fr.filter((r) => normalizeModel(r.model) === norm);
     if (!rs.length) continue;
-    const e = spend.models[norm] ?? { day: 0, month: 0, unknown: 0 };
-    let unknown = samePeriod("month", nowMs, asOfMs, budgetPeriod) ? e.unknown : 0;
+    const e = spend.models[norm] ?? { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 };
+    // #268: unknown cost counts in the windows this model actually caps (month for day/month rules, week for week rules).
+    const wins = [...new Set(rs.map((r) => (r.scope === "week" ? "week" : "month")))];
+    let unknown = 0;
+    for (const w of wins) if (samePeriod(w, nowMs, asOfMs, budgetPeriod)) unknown += w === "week" ? e.unknown_week ?? 0 : e.unknown;
     const total = {};
-    for (const s of FLEET_MODEL_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? e[s] : 0;
+    for (const s of FLEET_MODEL_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? e[s] ?? 0 : 0;
     for (const r of pending) {
       if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
       const tsMs = Date.parse(r.ts);
-      if (!samePeriod("month", tsMs, nowMs, budgetPeriod)) continue;
+      if (!wins.some((w) => samePeriod(w, tsMs, nowMs, budgetPeriod))) continue;
       if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
       for (const s of FLEET_MODEL_SCOPES) if (samePeriod(s, tsMs, nowMs, budgetPeriod)) total[s] += r.cost_usd;
     }
@@ -104,7 +134,8 @@ export function modelCapStatus(receipts, rules, nowMs, budgetPeriod = null) {
   const spend = modelSpendPolicy(receipts, rules, nowMs, budgetPeriod) ?? {};
   return (rules ?? []).map((r) => {
     const e = spend[normalizeModel(r.model)];
-    const spent = r.scope === "hour" || !e ? null : e.unknown > 0 ? null : e[r.scope];
-    return { model: r.model, scope: r.scope, usd: r.usd, spent, unknown: e?.unknown ?? 0 };
+    const unknown = (r.scope === "week" ? e?.unknown_week : e?.unknown) ?? 0;
+    const spent = r.scope === "hour" || !e ? null : unknown > 0 ? null : e[r.scope];
+    return { model: r.model, scope: r.scope, usd: r.usd, spent, unknown };
   });
 }

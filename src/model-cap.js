@@ -67,6 +67,9 @@ export function parseModelCaps(list) {
   return out;
 }
 
+// #268: hosted modelCaps also take week (fleet-enforced only); the local --model-cap flag does not (#264).
+export const HOSTED_MODEL_CAP_SCOPES = Object.freeze(["hour", "day", "week", "month"]);
+
 /** Hosted `modelCaps: [{model, scope, usd}]`: an error string or null. */
 export function modelCapsError(list) {
   if (!Array.isArray(list) || !list.length || list.length > 20) return "modelCaps must be a list of 1-20 {model, scope, usd} rules";
@@ -74,7 +77,7 @@ export function modelCapsError(list) {
   for (const r of list) {
     if (!r || typeof r !== "object" || Array.isArray(r) || Object.keys(r).some((k) => !["model", "scope", "usd"].includes(k))) return "modelCaps entries are {model, scope, usd}";
     if (typeof r.model !== "string" || !MODEL_ID.test(r.model)) return "modelCaps model must be a model id";
-    if (!MODEL_CAP_SCOPES.includes(r.scope)) return "modelCaps scope must be hour, day or month";
+    if (!HOSTED_MODEL_CAP_SCOPES.includes(r.scope)) return "modelCaps scope must be hour, day, week or month";
     if (!(typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0)) return "modelCaps usd must be a positive number";
     const id = `${normalizeModel(r.model)}:${r.scope}`;
     if (seen.has(id)) return `duplicate modelCaps rule ${r.model}:${r.scope}`;

@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { validatePolicy, resolvePolicy } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict } from "./tag-caps.js";
-import { cachedFleetModelVerdict } from "./model-caps.js";
+import { cachedFleetModelVerdict, validWeekModelCaps } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
 import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
@@ -178,12 +178,12 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         org: data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null,
       };
     },
-    // #244: hosted day/month modelCaps against the agent's fleet-wide per-model
+    // #244 (#268: plus week rules from model_caps_week): hosted modelCaps against the agent's fleet-wide per-model
     // synced spend plus this host's unsynced receipts. No agent_spend.models: no-op.
     modelCheck(models, nowMs = Date.now()) {
       if (!data.agentSpend?.models) return null;
       const synced = new Set(data.syncedIds ?? []);
-      return cachedFleetModelVerdict(data.agentSpend, policy(nowMs).modelCaps ?? [], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
+      return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,
@@ -231,11 +231,14 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         await uploadSettlements(synced);
         await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: tagCaps = null, budget_period: budgetPeriod = null, org_budget: orgBudget = null, ...fetchedPolicy } = fetched ?? {};
+        // #268: week scopes arrive in additive fields; a pre-#268 server omits them (day/month enforced as before).
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, ...fetchedPolicy } = fetched ?? {};
+        const tagCaps = tagCapsV2 ?? legacyTagCaps, orgBudget = orgBudgetV2 ?? legacyOrgBudget;
         if (!Array.isArray(settlements)) throw new Error("Invalid fleet policy response");
         applyHostedSettlements(settlements);
-        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(tagCaps) || !validOrgBudgetPolicy(orgBudget) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
+        if (validatePolicy(fetchedPolicy).length || !validTeamPolicy(team) || !validAgentSpend(agentSpend) || !validFleetTagCaps(legacyTagCaps) || !validFleetTagCaps(tagCapsV2) || !validOrgBudgetPolicy(legacyOrgBudget) || !validOrgBudgetPolicy(orgBudgetV2) || !validWeekModelCaps(modelCapsWeek) || (budgetPeriod !== null && budgetPeriodError(budgetPeriod))) throw new Error("Invalid fleet policy response");
         if (JSON.stringify(agentSpend) !== JSON.stringify(data.agentSpend ?? null)) { data.agentSpend = agentSpend; saveEnrollment(path, data); }
+        if (JSON.stringify(modelCapsWeek) !== JSON.stringify(data.modelCapsWeek ?? null)) { data.modelCapsWeek = modelCapsWeek; saveEnrollment(path, data); }
         // #204: rules and spend refresh on every poll; a removed rule set (null) lifts enforcement.
         if (JSON.stringify(tagCaps) !== JSON.stringify(data.tagCaps ?? null)) { data.tagCaps = tagCaps; saveEnrollment(path, data); }
         // #209: the org budget period, so offline windows roll over on the org's clock.

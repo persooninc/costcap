@@ -249,7 +249,7 @@ export function evaluateTeamAlerts({ orgId, verdict, blockedScopes = [], nowMs, 
   return out;
 }
 
-// Issue #240: the org-wide budget alerts like a team cap, keyed
+// Issue #240 (#268: plus week): the org-wide budget alerts like a team cap, keyed
 // `<kind>:org:<orgId>:<scope>`, plus a month cap_projected. Unknown cost raises
 // no spend alert (never $0).
 export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, budgetPeriod = null }, { approachFraction = 0.8, warnFractions, minProjectionMs = 24 * 3600_000 } = {}) {
@@ -257,7 +257,7 @@ export function evaluateOrgAlerts({ orgId, verdict, blockedScopes = [], nowMs, b
   const out = [];
   const id = `org:${orgId}`;
   const { fractions, explicit } = fractionsFrom(warnFractions, approachFraction);
-  for (const scope of ["day", "month"]) {
+  for (const scope of ["day", "week", "month"]) {
     const cap = verdict.caps?.[scope];
     if (typeof cap !== "number" || !Number.isFinite(cap)) continue;
     const spent = verdict.spend[`${scope}_usd`];
@@ -290,8 +290,9 @@ export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits =
     const blocked = new Set(blockedHits.filter((h) => h?.tag_key === rule.key && h?.scope === rule.scope && isFleetTagBlock(h, rule)).map((h) => h.tag_value));
     const names = new Set([...Object.keys(values), ...blocked]);
     for (const value of [...names].sort()) {
-      const e = values[value] ?? { day: 0, month: 0, unknown: 0 };
-      if (e.unknown > 0) continue;
+      const e = values[value] ?? { day: 0, week: 0, month: 0, unknown: 0 };
+      // #268: a week rule looks at unknown cost inside its own week only.
+      if ((rule.scope === "week" ? e.unknown_week ?? 0 : e.unknown) > 0) continue;
       const spent = e[rule.scope];
       if (typeof spent !== "number" || !Number.isFinite(spent)) continue;
       const id = `tag:${orgId}:${rule.key}=${value}`;
@@ -376,7 +377,8 @@ export function evaluateModelAlerts({ agentId, rules = [], spend = {}, blockedHi
     seen.add(key);
     const e = spend?.[model];
     const blocked = blockedHits.some((h) => normalize(h?.model) === model && h?.scope === rule.scope);
-    const spent = rule.scope === "hour" ? null : e && e.unknown === 0 ? e[rule.scope] : null;
+    const unknown = (rule.scope === "week" ? e?.unknown_week : e?.unknown) ?? 0;
+    const spent = rule.scope === "hour" ? null : e && unknown === 0 ? e[rule.scope] ?? null : null;
     const base = { model, scope: rule.scope, cap: rule.usd, spent };
     if (blocked || (spent !== null && spent >= rule.usd)) { out.push({ kind: "cap_hit", key: `cap_hit:${key}`, ...base }); continue; }
     if (spent === null) continue;

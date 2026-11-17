@@ -64,6 +64,19 @@ test("Tag caps card: owner adds and removes a rule, viewer is disabled", async (
     await page.locator('#tagCaps li[data-rule="project:month"]').getByRole("button", { name: "Remove" }).click();
     await expect(page.locator('#tagCaps li[data-rule="project:month"]')).toHaveCount(0);
     await expect(page.locator("#tagCaps li[data-rule]")).toHaveCount(1);
+    // #268: a Week rule reaches cap_hit · week for one tag value.
+    await form.locator("input[name=key]").fill("customer");
+    await form.locator("select[name=scope]").selectOption("week");
+    await form.locator("input[name=usd]").fill("1");
+    await page.locator("#tagCapAdd").click();
+    await expect(page.locator('#tagCaps li[data-rule="customer:week"]')).toContainText("$1");
+    const token = await page.evaluate(async () => (await (await fetch("/v1/enrollment-tokens", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ caps: {} }) })).json()).token);
+    const agent = await (await fetch(`${origin}/v1/enroll`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ name: "seed" }) })).json();
+    const synced = await fetch(`${origin}/v1/receipts`, { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "w1", ts: new Date().toISOString(), cost_usd: 1.2, model: "test", tags: { customer: "acme" } }] }) });
+    expect(synced.status).toBe(200);
+    await service.evaluateFleetAlerts();
+    await page.reload();
+    await expect(page.locator("#alerts")).toContainText("cap_hit · week · tag customer=acme week");
 
     await page.locator("#invite input[name=email]").fill("tags-viewer@example.invalid");
     await page.locator("#invite button").click();

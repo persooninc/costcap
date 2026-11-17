@@ -128,3 +128,25 @@ test("regression #244 AC4: alert worker fires cap_approaching then cap_hit per m
   assert.ok(model.length >= 2);
   assert.ok(model.every((a) => !a.active), "removing the rule resolves model alerts");
 });
+
+// Issue #268 AC3: a hosted week rule (model_caps_week) is enforced fleet-wide.
+test("regression #268: gpt-4o week=1 from H1 refuses gpt-4o on H2 with scope week; another model passes", async (t) => {
+  const h = await hosted(t);
+  await h.setModelCaps([{ model: "gpt-4o", scope: "week", usd: 1 }]);
+  const H1 = await h.host("h1"), H2 = await h.host("h2");
+  await H1.sync();
+  assert.equal(H1.fleet.policy().modelCaps, undefined, "week rules never reach the legacy modelCaps field");
+  for (let i = 0; i < 3; i++) assert.equal((await H1.call("gpt-4o")).status, 200);
+  await H1.sync();
+  await H2.sync();
+  assert.equal(H2.fleet.agentSpend().models["gpt-4o"].week, 1.2);
+  const r = await H2.call("gpt-4o");
+  assert.equal(r.status, 429);
+  assert.equal(r.body.error, "model_budget_exceeded");
+  assert.equal(r.body.scope, "week");
+  assert.equal(r.body.fleet, true);
+  assert.equal((await H2.call("gpt-4o-mini")).status, 200);
+  // The agent card shows week spend for the rule.
+  const row = (await h.req("/v1/fleet", undefined, h.owner)).body.agents.find((a) => a.id === h.agentId);
+  assert.deepEqual(row.modelCapSpend, [{ model: "gpt-4o", scope: "week", usd: 1, spent: 1.2, unknown: 0 }]);
+});

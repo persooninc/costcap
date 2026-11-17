@@ -8,7 +8,12 @@ import { UNTAGGED } from "../tag-cap.js";
 import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 
-export const FLEET_TAG_SCOPES = Object.freeze(["day", "month"]);
+// #268: week rules (ISO week, Monday start, org timezone). Spend entries always
+// carry day and month; week and unknown_week are optional (an old server omits them).
+export const FLEET_TAG_SCOPES = Object.freeze(["day", "week", "month"]);
+// What a pre-#268 wrapper accepts in tag_caps; week rules travel in tag_caps_v2.
+export const LEGACY_TAG_SCOPES = Object.freeze(["day", "month"]);
+const REQUIRED_SPEND = ["day", "month"];
 export const MAX_FLEET_TAG_RULES = 10;
 export const MAX_TAG_VALUES = 1000;
 
@@ -23,7 +28,7 @@ export function parseFleetTagCaps(input) {
   const rules = [];
   for (const r of input) {
     if (!r || typeof r !== "object" || typeof r.key !== "string" || !TAG_KEY.test(r.key)) return { error: "Each rule key must match [a-z0-9_.-]{1,32}" };
-    if (!FLEET_TAG_SCOPES.includes(r.scope)) return { error: "Each rule scope must be day or month" };
+    if (!FLEET_TAG_SCOPES.includes(r.scope)) return { error: "Each rule scope must be day, week or month" };
     if (!(typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd > 0)) return { error: "Each rule usd must be a positive number" };
     const id = `${r.key}:${r.scope}`;
     if (seen.has(id)) return { error: `Duplicate rule ${id}` };
@@ -40,36 +45,61 @@ export function parseFleetTagCaps(input) {
 
 /**
  * The tag_caps block of GET /v1/policy. receipts: settled-aware org receipts.
- * spend[key][value] = {day, month, unknown} for the current UTC month, at most
- * MAX_TAG_VALUES values per key (unknown-cost values first, then highest month).
+ * spend[key][value] = {day, month, unknown} for the current period, at most
+ * MAX_TAG_VALUES values per key (unknown-cost values first, then highest spend).
+ * #268: with { week: true } each entry adds week and unknown_week, and receipts
+ * count back to min(month start, week start) so a week that began last month is
+ * not under-counted. Without it the output is the pre-#268 shape, unchanged.
  */
-export function fleetTagCapsPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES, budgetPeriod = null) {
+export function fleetTagCapsPolicy(rules, receipts, nowMs, max = MAX_TAG_VALUES, budgetPeriod = null, { week = false } = {}) {
   if (!Array.isArray(rules) || !rules.length) return null;
   const now = new Date(nowMs).toISOString();
-  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod), wk = periodKey("week", nowMs, budgetPeriod);
   const keys = [...new Set(rules.map((r) => r.key))];
   const acc = Object.fromEntries(keys.map((k) => [k, new Map()]));
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     const tsMs = Date.parse(r.ts);
-    if (periodKey("month", tsMs, budgetPeriod) !== month || isPendingBatch(r)) continue;
+    if (isPendingBatch(r)) continue;
+    const inMonth = periodKey("month", tsMs, budgetPeriod) === month;
+    const inWeek = week && periodKey("week", tsMs, budgetPeriod) === wk;
+    if (!inMonth && !inWeek) continue;
     for (const key of keys) {
       const v = valueOf(r.tags, key);
-      const e = acc[key].get(v) ?? { day: 0, month: 0, unknown: 0 };
+      const e = acc[key].get(v) ?? { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 };
       acc[key].set(v, e);
-      if (r.cost_usd === null || r.cost_usd === undefined) { e.unknown += 1; continue; }
-      e.month += r.cost_usd;
+      if (r.cost_usd === null || r.cost_usd === undefined) { if (inMonth) e.unknown += 1; if (inWeek) e.unknown_week += 1; continue; }
+      if (inMonth) e.month += r.cost_usd;
+      if (inWeek) e.week += r.cost_usd;
       if (periodKey("day", tsMs, budgetPeriod) === day) e.day += r.cost_usd;
     }
   }
   let truncated = false;
   const spend = {};
+  const top = (e) => (week ? Math.max(e.month, e.week) : e.month);
+  const anyUnknown = (e) => e.unknown > 0 || e.unknown_week > 0;
   for (const key of keys) {
-    const sorted = [...acc[key]].sort((a, b) => (b[1].unknown > 0) - (a[1].unknown > 0) || b[1].month - a[1].month || (a[0] < b[0] ? -1 : 1));
+    const sorted = [...acc[key]].sort((a, b) => anyUnknown(b[1]) - anyUnknown(a[1]) || top(b[1]) - top(a[1]) || (a[0] < b[0] ? -1 : 1));
     if (sorted.length > max) truncated = true;
-    spend[key] = Object.fromEntries(sorted.slice(0, max).map(([v, e]) => [v, { day: round6(e.day), month: round6(e.month), unknown: e.unknown }]));
+    spend[key] = Object.fromEntries(sorted.slice(0, max).map(([v, e]) => [v, week
+      ? { day: round6(e.day), week: round6(e.week), month: round6(e.month), unknown: e.unknown, unknown_week: e.unknown_week }
+      : { day: round6(e.day), month: round6(e.month), unknown: e.unknown }]));
   }
   return { rules: rules.map((r) => ({ ...r })), spend, truncated, as_of: now };
+}
+
+/**
+ * #268: the two GET /v1/policy blocks. tag_caps keeps the pre-#268 shape (day and
+ * month rules only, null when every rule is week); tag_caps_v2 carries every rule
+ * plus week spend and is present only when a week rule exists.
+ */
+export function fleetTagCapsPayload(rules, receipts, nowMs, budgetPeriod = null) {
+  const all = Array.isArray(rules) ? rules : [];
+  const legacy = all.filter((r) => LEGACY_TAG_SCOPES.includes(r.scope));
+  return {
+    tag_caps: fleetTagCapsPolicy(legacy, receipts, nowMs, MAX_TAG_VALUES, budgetPeriod),
+    tag_caps_v2: all.some((r) => r.scope === "week") ? fleetTagCapsPolicy(all, receipts, nowMs, MAX_TAG_VALUES, budgetPeriod, { week: true }) : null,
+  };
 }
 
 export function validFleetTagCaps(t) {
@@ -80,7 +110,9 @@ export function validFleetTagCaps(t) {
     if (!values || typeof values !== "object") return false;
     for (const e of Object.values(values)) {
       if (!e || !Number.isInteger(e.unknown) || e.unknown < 0) return false;
-      if (!FLEET_TAG_SCOPES.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0)) return false;
+      if (!REQUIRED_SPEND.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0)) return false;
+      if (e.week !== undefined && !(typeof e.week === "number" && Number.isFinite(e.week) && e.week >= 0)) return false;
+      if (e.unknown_week !== undefined && !(Number.isInteger(e.unknown_week) && e.unknown_week >= 0)) return false;
     }
   }
   return true;
@@ -99,13 +131,14 @@ export function mergeTagCapRules(fleetRules = [], localRules = []) {
 function syncedEntry(policy, key, value) {
   const values = policy.spend?.[key] ?? {};
   if (values[value]) return values[value];
-  if (!policy.truncated) return { day: 0, month: 0, unknown: 0 };
+  if (!policy.truncated) return { day: 0, week: 0, month: 0, unknown: 0, unknown_week: 0 };
   // Values with unknown-cost receipts sort first and may show $0, so they never set
   // the floor. If every listed value has unknown cost, the unlisted one can't be bounded.
-  const known = Object.values(values).filter((e) => e.unknown === 0);
-  if (!known.length) return { day: 0, month: 0, unknown: Object.keys(values).length ? 1 : 0 };
-  const floor = Math.min(...known.map((e) => e.month));
-  return { day: floor, month: floor, unknown: 0 };
+  // #268: a week payload sorts on max(month, week), which bounds day, week and month.
+  const known = Object.values(values).filter((e) => e.unknown === 0 && !(e.unknown_week > 0));
+  if (!known.length) { const u = Object.keys(values).length ? 1 : 0; return { day: 0, week: 0, month: 0, unknown: u, unknown_week: u }; }
+  const floor = Math.min(...known.map((e) => Math.max(e.month, e.week ?? 0)));
+  return { day: floor, week: floor, month: floor, unknown: 0, unknown_week: 0 };
 }
 
 /**
@@ -121,12 +154,14 @@ export function cachedFleetTagVerdict(policy, localRules, tags, pending, nowMs, 
     const value = valueOf(tags, rule.key);
     const e = syncedEntry(policy, rule.key, value);
     const same = (s) => samePeriod(s, nowMs, asOfMs, budgetPeriod);
-    let unknown = same("month") ? e.unknown : 0;
-    let total = same(rule.scope) ? e[rule.scope] : 0;
+    // #268: a week rule counts unknown cost inside the current week (which can start last month).
+    const win = rule.scope === "week" ? "week" : "month";
+    let unknown = same(win) ? (win === "week" ? e.unknown_week ?? 0 : e.unknown) : 0;
+    let total = same(rule.scope) ? e[rule.scope] ?? 0 : 0;
     for (const r of pending) {
       if (r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || valueOf(r.tags, rule.key) !== value) continue;
       const tsMs = Date.parse(r.ts);
-      if (!samePeriod("month", tsMs, nowMs, budgetPeriod)) continue;
+      if (!samePeriod(win, tsMs, nowMs, budgetPeriod)) continue;
       if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
       if (samePeriod(rule.scope, tsMs, nowMs, budgetPeriod)) total += r.cost_usd;
     }

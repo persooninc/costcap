@@ -1589,7 +1589,7 @@ test("#244 model caps: agent_spend.models, cap_approaching/cap_hit per model, re
   assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "o1", ts: ts(), cost_usd: 4.1, model: "anthropic/claude-opus-4.8" }, { id: "h1", ts: ts(), cost_usd: null, model: "claude-haiku-4-5", reason: "usage_unavailable" }] }, null, a.token)).status, 200);
   assert.equal((await f.request("/v1/receipts", { receipts: [{ id: "x1", ts: ts(), cost_usd: 50, model: "claude-opus-4-8" }] }, null, x.token)).status, 200);
   const pol = (await f.request("/v1/policy", undefined, null, a.token)).body;
-  assert.deepEqual(pol.agent_spend.models, { "claude-opus-4-8": { day: 4.1, month: 4.1, unknown: 0 }, "claude-haiku-4-5": { day: 0, month: 0, unknown: 1 } });
+  assert.deepEqual(pol.agent_spend.models, { "claude-opus-4-8": { day: 4.1, week: 4.1, month: 4.1, unknown: 0, unknown_week: 0 }, "claude-haiku-4-5": { day: 0, week: 0, month: 0, unknown: 1, unknown_week: 1 } });
   assert.equal((await f.request("/v1/policy", undefined, null, x.token)).body.agent_spend.models, undefined);
   const fleet = (await f.request("/v1/fleet", undefined, owner.cookie)).body;
   assert.deepEqual(fleet.agents[0].modelCapSpend[0], { model: "claude-opus-4-8", scope: "day", usd: 5, spent: 4.1, unknown: 0 });
@@ -1716,4 +1716,70 @@ test("#259 test alert: roles, isolation, validation, partial config, SSRF, no si
   bodies.push(await (await fetch(`http://127.0.0.1:${port}/v1/audit.csv`, { headers: { cookie: owner.cookie } })).text());
   for (const b of bodies) for (const s of ["fullSecretHookValue9", "pathSecretK3", secret]) assert.equal(b.includes(s), false, `leaked ${s.slice(0, 8)}`);
   assert.equal(JSON.stringify(fleet).includes("test_"), false, "test alert never stored as an alert");
+});
+
+// Issue #268 AC4/AC6: week scopes on all three surfaces — validation, viewer 403,
+// audit, restart, the policy split, cross-org isolation and the alert lifecycle.
+test("#268 week scopes: org/tag/model validation, audit, restart, policy split, isolation and alerts", async (t) => {
+  let clock = Date.parse("2026-11-18T12:00:00.000Z"); // Wednesday
+  const f = await fixture(t, { now: () => clock });
+  const owner = await f.login("wk-owner@example.invalid");
+  await f.request("/v1/invitations", { email: "wk-viewer@example.invalid", role: "viewer" }, owner.cookie);
+  const viewer = await f.login("wk-viewer@example.invalid");
+  const outsider = await f.login("wk-out@example.invalid");
+  const port = () => f.service().server.address().port;
+  const send = async (path, body, cookie, method = "PUT") => {
+    const r = await fetch(`http://127.0.0.1:${port()}${path}`, { method, headers: { origin: "http://localhost", "content-type": "application/json", cookie }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json() };
+  };
+  for (const week of [0, -1, "5"]) {
+    assert.equal((await send("/v1/org-budget", { week }, owner.cookie)).status, 400);
+    assert.equal((await send("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "week", usd: week }] }, owner.cookie)).status, 400);
+  }
+  assert.equal((await send("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "week", usd: 1 }, { key: "customer", scope: "week", usd: 2 }] }, owner.cookie)).status, 400);
+  assert.equal((await send("/v1/org-budget", { week: 10 }, viewer.cookie)).status, 403);
+  assert.equal((await send("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "week", usd: 1 }] }, viewer.cookie)).status, 403);
+  assert.equal((await send("/v1/org-budget", { week: 10, warnFractions: [0.5] }, owner.cookie)).status, 200);
+  assert.equal((await send("/v1/tag-caps", { tagCaps: [{ key: "customer", scope: "week", usd: 10, warnFractions: [0.5] }] }, owner.cookie)).status, 200);
+  const token = (await f.request("/v1/enrollment-tokens", { caps: {} }, owner.cookie)).body.token;
+  const agent = (await f.request("/v1/enroll", { name: "wk" }, null, token)).body;
+  for (const usd of [0, -1, "5"]) assert.equal((await f.request(`/v1/agents/${agent.agentId}/policy`, { caps: {}, modelCaps: [{ model: "gpt-4o", scope: "week", usd }] }, owner.cookie)).status, 400);
+  assert.equal((await f.request(`/v1/agents/${agent.agentId}/policy`, { caps: {}, warnFractions: [0.5], modelCaps: [{ model: "gpt-4o", scope: "week", usd: 10 }] }, owner.cookie)).status, 200);
+  assert.equal((await f.request(`/v1/agents/${agent.agentId}/policy`, { caps: {}, modelCaps: [{ model: "gpt-4o", scope: "week", usd: 10 }] }, viewer.cookie)).status, 403);
+  const audit = (await f.request("/v1/evidence.json", undefined, owner.cookie)).body.audit;
+  assert.deepEqual(audit.find((e) => e.action === "org_budget.change").detail, { before: null, after: { week: 10, warnFractions: [0.5] } });
+  assert.deepEqual(audit.find((e) => e.action === "tag_caps.change").detail.next, [{ key: "customer", scope: "week", usd: 10, warnFractions: [0.5] }]);
+  assert.deepEqual(audit.filter((e) => e.action === "policy.change").at(-1).detail.policy.modelCaps, [{ model: "gpt-4o", scope: "week", usd: 10 }]);
+  await f.restart();
+  assert.deepEqual((await f.request("/v1/org-budget", undefined, owner.cookie)).body.org_budget.caps, { week: 10 });
+  assert.deepEqual((await f.request("/v1/tag-caps", undefined, owner.cookie)).body.tagCaps, [{ key: "customer", scope: "week", usd: 10, warnFractions: [0.5] }]);
+  // Another org spends; it never counts here.
+  const otoken = (await f.request("/v1/enrollment-tokens", { caps: {} }, outsider.cookie)).body.token;
+  const other = (await f.request("/v1/enroll", { name: "x" }, null, otoken)).body;
+  await f.request("/v1/receipts", { receipts: [{ id: "x1", ts: new Date(clock).toISOString(), cost_usd: 99, model: "gpt-4o", tags: { customer: "acme" } }] }, null, other.token);
+  // $5 on Monday: 50% on all three week caps.
+  await f.request("/v1/receipts", { receipts: [{ id: "w1", ts: "2026-11-16T12:00:00.000Z", cost_usd: 5, model: "gpt-4o", tags: { customer: "acme" } }] }, null, agent.token);
+  const pol = (await f.request("/v1/policy", undefined, null, agent.token)).body;
+  assert.equal(pol.org_budget, null, "a week-only org budget is invisible to a pre-#268 wrapper");
+  assert.equal(pol.org_budget_v2.spend.week_usd, 5);
+  assert.equal(pol.tag_caps, null);
+  assert.equal(pol.tag_caps_v2.spend.customer.acme.week, 5);
+  assert.equal(pol.modelCaps, undefined);
+  assert.deepEqual(pol.model_caps_week, [{ model: "gpt-4o", scope: "week", usd: 10 }]);
+  assert.equal(pol.agent_spend.models["gpt-4o"].week, 5);
+  await f.service().evaluateFleetAlerts();
+  await f.service().evaluateFleetAlerts();
+  const weekAlerts = () => f.delivery.filter((a) => a.scope === "week");
+  assert.deepEqual(weekAlerts().map((a) => a.kind), ["cap_approaching", "cap_approaching", "cap_approaching"]);
+  await f.request("/v1/receipts", { receipts: [{ id: "w2", ts: new Date(clock).toISOString(), cost_usd: 5, model: "gpt-4o", tags: { customer: "acme" } }] }, null, agent.token);
+  await f.service().evaluateFleetAlerts();
+  await f.service().evaluateFleetAlerts();
+  assert.equal(weekAlerts().filter((a) => a.kind === "cap_hit").length, 3, "org, tag value and model each page cap_hit once");
+  // Next Monday: every week alert resolves.
+  clock = Date.parse("2026-11-23T00:30:00.000Z");
+  await f.service().evaluateFleetAlerts();
+  const again = await f.login("wk-owner@example.invalid"); // the session aged out with the clock
+  const list = (await f.request("/v1/alerts?status=all", undefined, again.cookie)).body;
+  const recs = (list.alerts ?? list).filter((a) => a.scope === "week");
+  assert.ok(recs.length >= 3 && recs.every((a) => !a.active), "week alerts resolve at the next Monday");
 });
