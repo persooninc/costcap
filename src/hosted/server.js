@@ -22,6 +22,7 @@ import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
+import { trackFunnel, accountId as funnelAccount } from "./funnel.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook, MAX_ALERT_ROUTES, pagerDutyProblem, teamsWebhookProblem, discordWebhookProblem, maskRoutingKey, maskTeamsWebhook, maskDiscordWebhook } from "./delivery.js";
 import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
@@ -249,7 +250,9 @@ function metricsTagCaps(rules, receiptsOf, nowMs, bp) {
 export function createHostedServer({ storePath, store: injectedStore, verifyChallenge, sendCode, sendInvite, deliverAlert, deliverDigest,
   now = () => Date.now(), secureCookies = true, origin, turnstileSiteKey = "", bodyLimit = 256_000,
   requestLog = () => {}, billingFactory, stripeEnv = process.env, stripeMode = stripeEnv.COSTCAP_STRIPE_MODE || "test",
-  plans = DEFAULT_PLANS, enforceEntitlements, publicPricing, resolveHost } = {}) {
+  plans = DEFAULT_PLANS, enforceEntitlements, publicPricing, resolveHost, funnel = {} } = {}) {
+  // go-to-market#14: fire-and-forget GA4 funnel events; silent unless GA4 env is set.
+  const funnelEvent = (name, params) => { trackFunnel(name, params, { env: funnel.env ?? process.env, ...(funnel.fetchImpl ? { fetchImpl: funnel.fetchImpl } : {}) }).catch(() => {}); };
   if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
   const store = injectedStore ?? openStore(storePath);
   scrubStoredReceipts(store);
@@ -376,7 +379,18 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (browserMutation && !(billing && path === "/billing/webhook") && req.headers.origin !== origin) fail(403, "Origin rejected");
       let text = "";
       for await (const chunk of req) { text += chunk; if (Buffer.byteLength(text) > bodyLimit) fail(413, "Body too large"); }
-      if (billing && path === "/billing/webhook" && req.method === "POST") return json(200, await billing.webhook(text, req.headers["stripe-signature"]));
+      if (billing && path === "/billing/webhook" && req.method === "POST") {
+        const out = await billing.webhook(text, req.headers["stripe-signature"]);
+        if (out?.received && !out.duplicate && !out.ignored) {
+          let ev = null;
+          try { ev = JSON.parse(text); } catch { /* verified by billing.webhook */ }
+          const o = ev?.data?.object;
+          if (ev?.type === "checkout.session.completed" && o?.metadata?.app === "costcap" && o.payment_status === "paid") {
+            funnelEvent("purchase", { account_id: funnelAccount(o.client_reference_id || o.metadata.org_id), plan: o.metadata.plan || "workspace", currency: String(o.currency || "usd").toUpperCase(), value: Number.isFinite(o.amount_total) ? o.amount_total / 100 : undefined, transaction_id: o.id });
+          }
+        }
+        return json(200, out);
+      }
       if (billing && path.startsWith("/billing/") && ["GET", "POST"].includes(req.method)) {
         if (req.method === "POST" && req.headers.origin !== origin) fail(403, "Origin rejected");
         sessionOnly(req);
@@ -387,7 +401,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           let plan;
           try { plan = text ? JSON.parse(text).plan : undefined; } catch { fail(400, "Invalid JSON"); }
           if (plan !== undefined && (typeof plan !== "string" || !/^[a-z]{1,20}$/.test(plan))) fail(400, "Unknown plan");
-          return json(200, await billing.checkout(user, plan ? { plan } : {}));
+          const started = await billing.checkout(user, plan ? { plan } : {});
+          funnelEvent("begin_checkout", { account_id: funnelAccount(user.orgId), plan: plan || "workspace" });
+          return json(200, started);
         }
         if (path === "/billing/portal" && req.method === "POST") return json(200, await billing.portal(user.orgId));
       }
@@ -412,6 +428,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/auth/verify" && req.method === "POST") {
         const challengeHash = hashToken(String(body.challengeId ?? ""));
         const sessionToken = token();
+        let signedUp = null;
         const result = store.transaction((s) => {
           const challenge = s.challenges[challengeHash];
           if (!challenge || challenge.expires <= now() || challenge.attempts >= 5) return { error: "Challenge expired" };
@@ -443,12 +460,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
               user = { id, email: challenge.email, orgId, role: "owner", verified: true };
               s.users[id] = user;
               audit(s, orgId, id, "org.create", orgId);
+              signedUp = orgId;
             }
           }
           s.sessions[hashToken(sessionToken)] = { userId: user.id, expires: now() + 24 * 3600_000 };
           return { id: user.id, orgId: user.orgId, role: user.role };
         });
         if (result.error) fail(401, result.error);
+        if (signedUp) funnelEvent("sign_up", { account_id: funnelAccount(signedUp), method: "email_code" });
         return json(200, result, { "set-cookie": `costcap_session=${sessionToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${secureCookies ? "; Secure" : ""}` });
       }
       if (path === "/auth/logout" && req.method === "POST") {
@@ -538,11 +557,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/receipts" && req.method === "POST") {
         if (!Array.isArray(body.receipts) || body.receipts.length > 100) fail(400, "Up to 100 receipts required");
+        let firstReceiptOrg = null;
         const result = store.transaction((s) => {
           const a = agentUser(s, req);
           const acceptedIds = [];
           let expired = 0;
           const keep = retentionWindow(s, a.orgId);
+          const hadReceipts = Object.values(s.receipts).some((x) => x.orgId === a.orgId);
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
@@ -557,8 +578,10 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           }
           a.lastSeen = now();
           audit(s, a.orgId, a.id, "receipts.sync", a.id, expired ? { count: acceptedIds.length, expired } : { count: acceptedIds.length });
+          if (!hadReceipts && Object.values(s.receipts).some((x) => x.orgId === a.orgId)) firstReceiptOrg = a.orgId;
           return { acceptedIds, expired };
         });
+        if (firstReceiptOrg) funnelEvent("activation", { account_id: funnelAccount(firstReceiptOrg), activation_kind: "first_receipt" });
         return json(200, result);
       }
       if (path === "/v1/receipts.csv" && req.method === "GET") {
