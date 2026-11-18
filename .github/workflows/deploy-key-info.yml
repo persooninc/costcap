@@ -1,0 +1,21 @@
+name: deploy-key-info
+# costcap#252: read-only. Shows the public half of the deploy SSH key and the deploy user/host,
+# so the key can be authorized on the app host. Prints no private key and opens no SSH session.
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  info:
+    runs-on: [self-hosted, dev-home-01]
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Public key and target
+        env:
+          COSTCAP_DEPLOY_HOST: ${{ secrets.COSTCAP_DEPLOY_HOST }}
+          COSTCAP_DEPLOY_SSH_KEY: ${{ secrets.COSTCAP_DEPLOY_SSH_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/id-info; printf '%s\n' "$COSTCAP_DEPLOY_SSH_KEY" > /tmp/id-info
+          trap 'rm -f /tmp/id-info' EXIT
+          bash scripts/deploy-key-info.sh /tmp/id-info "$COSTCAP_DEPLOY_HOST" infra/ssh/costcap-deploy.known_hosts | tee -a "$GITHUB_STEP_SUMMARY"
