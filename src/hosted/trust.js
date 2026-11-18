@@ -14,6 +14,7 @@ export const TRUST_ROUTES = Object.freeze([
   Object.freeze({ path: "/privacy", priority: 0.3, changefreq: "yearly" }),
   Object.freeze({ path: "/terms", priority: 0.3, changefreq: "yearly" }),
   Object.freeze({ path: "/security", priority: 0.3, changefreq: "yearly" }),
+  Object.freeze({ path: "/refund", priority: 0.3, changefreq: "yearly" }),
 ]);
 
 /**
@@ -87,6 +88,22 @@ export function trustDocument(path, { operator = "Persoon.ai Inc", contact = DEF
       { heading: "Liability", items: [
         `To the extent the law allows, ${operator} is not liable for indirect or consequential losses, or for provider spend that a cap did not stop.`,
         `Questions: ${reach}.`,
+      ] },
+    ],
+  };
+  // Copy from persooninc/go-to-market legal/refund.md (go-to-market#13); do not edit wording here.
+  if (path === "/refund") return {
+    path, title: `${product} | Refunds`, heading: "Cancellation and Refund Policy",
+    description: `How to cancel a ${product} subscription and request a refund.`,
+    lede: `This policy covers paid ${product} plans sold by ${operator}.`,
+    sections: [
+      { heading: "Cancellation and refunds", items: [
+        "Subscriptions can be cancelled at any time. Your plan stays active until the end of the paid period. We do not give prorated refunds.",
+        "One-time purchases are refundable on request within 14 days of purchase.",
+        "Refunds are issued through Stripe to the original payment method.",
+      ] },
+      { heading: "Contact", items: [
+        "To cancel or request a refund, email support@costcap.dev.",
       ] },
     ],
   };

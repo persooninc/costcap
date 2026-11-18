@@ -4,14 +4,14 @@ import { uiResponse } from "../src/hosted/ui.js";
 import { TRUST_ROUTES, trustDocument } from "../src/hosted/trust.js";
 
 test("trust pages render with stable headings, footer links and no certification claims", () => {
-  const headings = { "/privacy": "Privacy", "/terms": "Terms of use", "/security": "Security" };
+  const headings = { "/privacy": "Privacy", "/terms": "Terms of use", "/security": "Security", "/refund": "Cancellation and Refund Policy" };
   for (const { path } of TRUST_ROUTES) {
     const r = uiResponse(path, "", "https://costcap.dev");
     assert.ok(r, path);
     assert.match(r.headers["content-type"], /text\/html/);
     assert.match(r.body, new RegExp(`<h1>${headings[path]}</h1>`));
     assert.match(r.body, new RegExp(`rel="canonical" href="https://costcap.dev${path}"`));
-    for (const href of ["/privacy", "/terms", "/security"]) assert.match(r.body, new RegExp(`<footer>[\\s\\S]*href="${href}"`));
+    for (const href of ["/privacy", "/terms", "/refund", "/security"]) assert.match(r.body, new RegExp(`<footer>[\\s\\S]*href="${href}"`));
     assert.doesNotMatch(r.body, /<script>(?!<\/script>)/);
     // Honesty: say we hold no certification, and never claim one.
     assert.doesNotMatch(r.body.replace(/hold no SOC 2 or ISO certification and do not claim one/, ""), /SOC ?2|ISO 27001|HIPAA|GDPR[- ]compliant/i);
@@ -24,6 +24,10 @@ test("trust pages render with stable headings, footer links and no certification
   const terms = trustDocument("/terms").sections.flatMap((s) => s.items).join(" ");
   assert.match(terms, /one accepted call can exceed the remaining cap/);
   assert.match(terms, /not your provider's bill/);
+  const refund = trustDocument("/refund").sections.flatMap((s) => s.items).join(" ");
+  assert.match(refund, /cancelled at any time/);
+  assert.match(refund, /within 14 days/);
+  assert.match(refund, /support@costcap\.dev/);
   assert.equal(trustDocument("/nope"), null);
 });
 

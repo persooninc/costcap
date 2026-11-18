@@ -18,14 +18,14 @@ test("landing footer links privacy, terms and security pages", async ({ page }) 
   try {
     await page.goto(base + "/");
     const footer = page.locator("footer");
-    for (const [label, heading] of [["Privacy", "Privacy"], ["Terms", "Terms of use"], ["Security", "Security"]]) {
+    for (const [label, heading] of [["Privacy", "Privacy"], ["Terms", "Terms of use"], ["Refunds", "Cancellation and Refund Policy"], ["Security", "Security"]]) {
       await expect(footer.getByRole("link", { name: label, exact: true })).toBeVisible();
       await footer.getByRole("link", { name: label, exact: true }).click();
       await expect(page.getByRole("heading", { level: 1 })).toHaveText(heading);
       await expect(page.locator("footer").getByRole("link", { name: "Privacy", exact: true })).toBeVisible();
       await page.goto(base + "/");
     }
-    for (const path of ["/privacy", "/terms", "/security"]) {
+    for (const path of ["/privacy", "/terms", "/refund", "/security"]) {
       const res = await page.request.get(base + path);
       expect(res.status()).toBe(200);
     }
