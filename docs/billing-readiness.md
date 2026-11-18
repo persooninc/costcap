@@ -18,6 +18,10 @@ compose and `scripts/deploy-remote.sh`. Live mode is never assumed: it needs an 
 the mode unset, a live key fails the deploy preflight (`test mode requires an sk_test_ key`)
 before any image is built.
 
+To declare the mode without touching any key, dispatch `host-stripe-mode` (mode `live` or `test`). It runs
+`scripts/host-stripe-mode.py` on the host over the pinned SSH key: it sets `COSTCAP_STRIPE_MODE` only when it
+matches the class of the key already in `/opt/costcap/.env` (backup kept, value never printed), and refuses otherwise.
+
 `COSTCAP_STRIPE_MODE=test` accepts only an `sk_test_` key. A live key refuses
 to build the client and does not call Stripe. Test mode does not create or
 edit a price; it sends the owner-supplied `COSTCAP_STRIPE_PRICE_ID`. A

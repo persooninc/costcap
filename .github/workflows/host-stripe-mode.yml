@@ -1,0 +1,34 @@
+name: host-stripe-mode
+# costcap#252: sets COSTCAP_STRIPE_MODE in the host .env to match the Stripe key already
+# there, so the deploy preflight (scripts/deploy-remote.sh) stops refusing it. Sends no key,
+# changes no key, prints no value, makes no Stripe call. Refuses when the mode and key differ.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Stripe mode that matches the key already on the host
+        required: true
+        type: choice
+        options: [live, test]
+permissions:
+  contents: read
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+jobs:
+  mode:
+    runs-on: [self-hosted, dev-home-01]
+    environment: production
+    env:
+      COSTCAP_DEPLOY_HOST: ${{ secrets.COSTCAP_DEPLOY_HOST }}
+      COSTCAP_DEPLOY_SSH_KEY: ${{ secrets.COSTCAP_DEPLOY_SSH_KEY }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Declare the mode on the host (pinned host key)
+        run: |
+          case "$MODE" in live|test) ;; *) echo "mode must be live or test"; exit 2;; esac
+          install -m 600 /dev/null /tmp/id; printf '%s\n' "$COSTCAP_DEPLOY_SSH_KEY" > /tmp/id
+          trap 'rm -f /tmp/id' EXIT
+          S="ssh -i /tmp/id -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=20 -o UserKnownHostsFile=$PWD/infra/ssh/costcap-deploy.known_hosts -o StrictHostKeyChecking=yes"
+          $S "$COSTCAP_DEPLOY_HOST" "python3 - $MODE /opt/costcap/.env" < scripts/host-stripe-mode.py
