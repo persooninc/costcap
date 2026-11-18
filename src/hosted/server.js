@@ -363,9 +363,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     };
     try {
       const path = new URL(req.url, origin).pathname;
-      if (req.method === "GET") {
-        const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode, { publicPricing: pricingPublic, plans, checkout: Boolean(billing) });
-        if (ui) return res.writeHead(200, ui.headers).end(ui.body);
+      if (req.method === "GET" || req.method === "HEAD") {
+        const ui = uiResponse(path, turnstileSiteKey, origin, Boolean(billing) && stripeMode !== "test", stripeMode, { publicPricing: pricingPublic, plans, checkout: Boolean(billing), host: req.headers.host });
+        if (ui) return res.writeHead(200, ui.headers).end(req.method === "HEAD" ? undefined : ui.body);
       }
       if (req.method === "GET" && path === "/health") return json(200, { status: "ok", product: "CostCap", beta: true, billing: billing ? "enabled" : "disabled", persistence: store.mode ?? "single-process-file", ...(store.healthy && !store.healthy() ? { datastore: "degraded" } : {}), version: VERSION, sha: process.env.COSTCAP_GIT_SHA || null });
       if (req.method === "GET" && path === "/api/health/stripe") {

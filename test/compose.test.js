@@ -150,3 +150,13 @@ test("apex costcap.dev serves /pricing directly instead of redirecting (costcap#
   assert.ok(Number(label("priority")) > 100, "must outrank the apex redirect router");
   assert.doesNotMatch(label("middlewares"), /cc-apex/);
 });
+
+test("apex costcap.dev serves the marketing root and discovery files directly (go-to-market#18)", () => {
+  const text = readFileSync(join(repo, "compose.production.yaml"), "utf8");
+  const label = (k) => text.match(new RegExp(`traefik\\.http\\.routers\\.cc-apex-site\\.${k.replace(/\./g, "\\.")}=(.*)`))?.[1]?.trim();
+  assert.match(label("rule"), /Host\(`costcap\.dev`\)/);
+  for (const p of ["/", "/og.png", "/llms.txt", "/robots.txt", "/sitemap.xml"]) assert.ok(label("rule").includes("Path(`" + p + "`)"), p);
+  assert.equal(label("service"), "cc");
+  assert.ok(Number(label("priority")) > 100);
+  assert.doesNotMatch(label("middlewares"), /cc-apex/);
+});

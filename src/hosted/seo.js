@@ -57,7 +57,51 @@ export function openGraphTags(origin, path, title = OG_TITLE, summary = OG_DESCR
     ["og:title", title],
     ["og:description", summary],
     ["og:url", absoluteUrl(origin, path)],
-  ].map(([property, content]) => `<meta property="${property}" content="${htmlEscape(content)}">`).join("");
+    ["og:image", absoluteUrl(origin, OG_IMAGE_PATH)],
+    ["og:image:width", "1200"],
+    ["og:image:height", "630"],
+    ["og:image:alt", OG_IMAGE_ALT],
+  ].map(([property, content]) => `<meta property="${property}" content="${htmlEscape(content)}">`).join("")
+    + [
+      ["twitter:card", "summary_large_image"],
+      ["twitter:title", title],
+      ["twitter:description", summary],
+      ["twitter:image", absoluteUrl(origin, OG_IMAGE_PATH)],
+      ["twitter:image:alt", OG_IMAGE_ALT],
+    ].map(([name, content]) => `<meta name="${name}" content="${htmlEscape(content)}">`).join("");
+}
+
+export const OG_IMAGE_PATH = "/og.png";
+export const OG_IMAGE_ALT = "CostCap: spend caps for AI agents. Guardrails, not guarantees.";
+export const ROBOTS_META = '<meta name="robots" content="index, follow, max-image-preview:large">';
+
+// Hosts that are the public marketing root (the apex), not the app.
+export const APEX_HOSTS = Object.freeze(["costcap.dev", "www.costcap.dev"]);
+export function isApexHost(host) {
+  return APEX_HOSTS.includes(String(host ?? "").toLowerCase().replace(/:\d+$/, ""));
+}
+
+// llms.txt (llmstxt.org): a plain-text summary for AI crawlers.
+export function llmsTxt(appOrigin = "https://app.costcap.dev") {
+  const app = canonicalOrigin(appOrigin);
+  return [
+    "# CostCap",
+    "",
+    "> Spend guardrails for AI agents: a local metering proxy that meters, caps and hard-stops proxy-routed LLM API spend. Free CLI, optional hosted workspace. Guardrails, not guarantees.",
+    "",
+    "CostCap wraps an agent process with a local proxy. Once a USD cap (per run, day or month) or a step limit is reached, further provider calls are refused. Supports OpenAI, Anthropic, Gemini, OpenRouter and Bedrock style endpoints.",
+    "",
+    "Limits: only proxy-routed traffic is capped; one accepted call can exceed the remaining cap; costs are estimates from a versioned price table, not your provider bill.",
+    "",
+    "## Links",
+    "",
+    `- [Home](${PUBLIC_ORIGIN}/): what CostCap is`,
+    `- [CLI](${app}/cli): install and wrap an agent`,
+    `- [Hosted workspace](${app}/): fleet caps, alerts and kill switch`,
+    `- [Comparison](${app}/compare): how CostCap compares`,
+    "- [Source](https://github.com/persooninc/costcap): MIT licensed",
+    "",
+  ].join("\n");
 }
 
 function xmlEscape(value) {

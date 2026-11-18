@@ -1,16 +1,27 @@
 import { offlineProof } from './proof.js';
 import { ALERT_KINDS } from './alerts.js';
 // Same-origin UI for the free beta. GA4 (G-P6NP48RRGC) installed per issue #53; config lives in same-origin /assets/ga.js to keep CSP free of inline scripts.
-import { absoluteUrl, description, htmlEscape, jsonLdScript, openGraphTags, robotsTxt, sitemapXml, PUBLIC_ORIGIN, PUBLIC_ROUTES, PRICING_ROUTE } from './seo.js';
+import { absoluteUrl, description, htmlEscape, isApexHost, jsonLdScript, llmsTxt, openGraphTags, robotsTxt, sitemapXml, OG_DESCRIPTION, OG_IMAGE_PATH, OG_TITLE, PUBLIC_ORIGIN, PUBLIC_ROUTES, PRICING_ROUTE, ROBOTS_META } from './seo.js';
+import { readFileSync } from 'node:fs';
+const ogPng = readFileSync(new URL('./og.png', import.meta.url));
 import { DEFAULT_PLANS, listPlans } from '../billing/index.js';
 import { comparePage, COMPARE_PATH } from './compare.js';
 import { DEFAULT_CONTACT, TRUST_UPDATED, trustDocument } from './trust.js';
 // IndexNow ownership key: public by design, served at /<key>.txt per the protocol.
 const INDEXNOW_KEY = '8459b118d7f227de932db7f94357f430';
 // options.publicPricing is an owner gate (COSTCAP_PUBLIC_PRICING=enabled). Off: no /pricing page, no sitemap entry.
-export function uiResponse(path, siteKey = '', origin = PUBLIC_ORIGIN, billing = false, stripeMode = 'live', { publicPricing = false, plans = DEFAULT_PLANS, checkout = billing, contact = DEFAULT_CONTACT, operator } = {}) {
+export function uiResponse(path, siteKey = '', origin = PUBLIC_ORIGIN, billing = false, stripeMode = 'live', { publicPricing = false, plans = DEFAULT_PLANS, checkout = billing, contact = DEFAULT_CONTACT, operator, host } = {}) {
   const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
     'referrer-policy': 'no-referrer', 'content-security-policy': "default-src 'self'; script-src 'self' https://challenges.cloudflare.com https://www.googletagmanager.com; frame-src https://challenges.cloudflare.com; style-src 'self'; connect-src 'self' https://challenges.cloudflare.com https://www.google-analytics.com https://region1.google-analytics.com; img-src 'self' data: https://www.google-analytics.com; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" };
+  if (path === OG_IMAGE_PATH) return { body: ogPng, headers: { ...headers, 'cache-control': 'public, max-age=86400', 'content-type': 'image/png' } };
+  if (path === '/llms.txt') return { body: llmsTxt(origin), headers: { ...headers, 'content-type': 'text/plain; charset=utf-8' } };
+  // Apex (costcap.dev): a crawlable marketing root. Only the paths routed to the app by the apex router answer here.
+  if (isApexHost(host)) {
+    if (path === '/') return { body: apexPage(origin, publicPricing), headers: { ...headers, 'content-type': 'text/html; charset=utf-8' } };
+    if (path === '/robots.txt') return { body: robotsTxt(PUBLIC_ORIGIN), headers: { ...headers, 'content-type': 'text/plain; charset=utf-8' } };
+    if (path === '/sitemap.xml') return { body: sitemapXml(PUBLIC_ORIGIN, undefined, publicPricing ? [PUBLIC_ROUTES[0], PRICING_ROUTE] : [PUBLIC_ROUTES[0]]), headers: { ...headers, 'content-type': 'application/xml; charset=utf-8' } };
+    if (path === '/llms.txt' || path === '/assets/app.css' || path === '/assets/ga.js' || path === PRICING_ROUTE.path) { /* shared below */ } else return null;
+  }
   if (path === '/proof/offline-policy.txt') return { body: offlineProof, headers: { ...headers, 'content-type': 'text/plain; charset=utf-8' } };
   if (path === '/') return { body: page(origin, billing, stripeMode, { publicPricing, plans, checkout }), headers: { ...headers, 'content-type': 'text/html; charset=utf-8' } };
   if (path === '/cli') return { body: cliPage(origin), headers: { ...headers, 'content-type': 'text/html; charset=utf-8' } };
@@ -27,8 +38,17 @@ export function uiResponse(path, siteKey = '', origin = PUBLIC_ORIGIN, billing =
   if (path === '/ui/config') return { body: JSON.stringify({ siteKey }), headers: { ...headers, 'content-type': 'application/json' } };
   return null;
 }
+// Marketing root for the apex. Static, no sign-in; every CTA points at the app origin.
+const apexPage = (appOrigin, publicPricing = false) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="${htmlEscape(OG_DESCRIPTION)}"><title>CostCap | Spend cap for AI agents</title>${ROBOTS_META}<link rel="canonical" href="${PUBLIC_ORIGIN}">${openGraphTags(PUBLIC_ORIGIN, '/', OG_TITLE, OG_DESCRIPTION)}<link rel="stylesheet" href="/assets/app.css">${jsonLdScript(PUBLIC_ORIGIN)}</head>
+<body><header><a class="brand" href="/">CostCap<span class="badge">FREE BETA</span></a><a href="${htmlEscape(appOrigin)}/">Sign in</a></header>
+<main class="doc"><p class="eyebrow">SPEND CAPS FOR AI AGENTS</p><h1>Stop runaway AI agent spend before the bill arrives.</h1><p class="lede">CostCap wraps your agent with a local metering proxy. Set a USD cap per run, day or month; once it is reached, further provider calls are refused.</p>
+<p><a class="primary" href="${htmlEscape(appOrigin)}/">Open the free hosted workspace</a> · <a href="${htmlEscape(appOrigin)}/cli">Run the free CLI</a>${publicPricing ? ' · <a href="/pricing">Pricing</a>' : ''}</p>
+<section class="card"><h2>What it does</h2><ul><li>Meters OpenAI, Anthropic, Gemini, OpenRouter and Bedrock style calls through a local proxy.</li><li>Hard-stops an agent at a per-run, daily or monthly cap, or a step limit.</li><li>Hosted workspace: fleet caps, alerts, retry-loop detection and a remote freeze.</li></ul></section>
+<section class="card"><h2>Limits, stated up front</h2><ul><li>Only proxy-routed traffic is capped.</li><li>One accepted call can exceed the remaining cap.</li><li>Costs are estimates from a versioned price table, not your provider bill.</li></ul></section></main>
+<footer>CostCap · Guardrails, not guarantees · <a href="https://github.com/persooninc/costcap">Source</a></footer></body></html>`;
 const page = (origin, billing, stripeMode = 'live', { publicPricing = false, plans = DEFAULT_PLANS, checkout = billing } = {}) => `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="${description(billing)}"><title>CostCap | Spend cap for AI agents</title><link rel="canonical" href="${origin}">${openGraphTags(origin, '/')}<link rel="stylesheet" href="/assets/app.css"><script async src="https://www.googletagmanager.com/gtag/js?id=G-P6NP48RRGC"></script><script src="/assets/ga.js" defer></script><script src="/assets/app.js" defer></script><script type="application/ld+json">${jsonLdScript(origin, billing)}</script></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="${description(billing)}"><title>CostCap | Spend cap for AI agents</title>${ROBOTS_META}<link rel="canonical" href="${origin}">${openGraphTags(origin, '/')}<link rel="stylesheet" href="/assets/app.css"><script async src="https://www.googletagmanager.com/gtag/js?id=G-P6NP48RRGC"></script><script src="/assets/ga.js" defer></script><script src="/assets/app.js" defer></script><script type="application/ld+json">${jsonLdScript(origin, billing)}</script></head>
 <body><header><a class="brand" href="/">CostCap<span class="badge">FREE BETA</span></a><button id="logout" hidden>Sign out</button></header>
 <main><section id="login" class="hero"><div><p class="eyebrow">KEEP YOUR AGENTS IN BUDGET</p><h1>Know the spend.<br>Control the fleet.</h1><p class="lede">Set caps, catch retry loops, and freeze enrolled agents from one place.</p><p><a href="/cli">Run the local spend cap: one wrap command, no sign-in</a>${publicPricing ? ' · <a href="/pricing">Compare plans</a>' : ''}</p><p class="boundary">Guardrails, not guarantees. Only proxy-routed traffic is controlled. Receipt-based caps can overshoot by one accepted request.</p><div class="proof"><span>CLI stays free</span><span>${billing ? "Free beta. Optional $19/month plan." : stripeMode === "test" ? "Test mode. No public price." : "No card. No charges."}</span><span>Separate org per new email</span></div><p><a href="/proof/offline-policy.txt">Read the offline policy proof and its limits</a></p></div>
 <div class="card"><h2>Open your workspace</h2><p>Sign in with an email code. A new email creates a separate organization. Shared company domains do not grant access to another workspace.</p><form id="request"><label for="email">Email address</label><input id="email" type="email" autocomplete="email" required maxlength="295" placeholder="you@company.com"><div id="challenge"></div><button class="primary" id="requestButton" type="submit" disabled>Send sign-in code</button></form><form id="verify" hidden><label for="code">8-digit email code</label><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{8}" maxlength="8" required><button class="primary" type="submit">Verify and open workspace</button><button id="restart" type="button">Use another email</button><p>Code expires in 10 minutes.</p></form><p id="loginStatus" role="status" aria-live="polite"></p></div></section>
