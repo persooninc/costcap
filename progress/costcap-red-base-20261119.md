@@ -36,3 +36,13 @@
 - Fix: the e2e install step retries up to 5 times, 30 s apart, and then fails with an `::error::`.
   `test/workflows-lint.test.js` runs the step's real script with a fake `npx`: success first time,
   success after 2 lock failures (3 calls), and a hard failure after 5 attempts.
+
+## Follow-up: `verify / e2e` on main `056e2d2` (run 44471161743)
+
+- The install retry held (the browser install passed). 47/50 specs passed; `alerts.spec.js:16`, `anomaly.spec.js:17`
+  and `billing.spec.js:9` hit Playwright's 30 s default test timeout. All three were in the first wave: 8 workers
+  cold-started 8 browsers and app servers together at runner load ~65, and the rest of that wave took 20-30 s too.
+  The same specs passed in 7-11 s on the run before. Not an app regression.
+- Fix: `playwright.config.js` sets 4 workers and a 60 s per-test timeout when `CI` is set; local runs keep the
+  defaults; retries stay 0. `test/playwright-config.test.js` loads the config with and without `CI`.
+  The three specs pass with `CI=true` locally (about 10 s each at load ~63).
