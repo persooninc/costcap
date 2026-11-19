@@ -215,3 +215,55 @@ test("Spend card: a cache_storage receipt appears under its model", async ({ pag
     await new Promise((r) => service.server.close(r));
   }
 });
+
+// #294: "This month" shows a linear month-end projection on the total and on top agent rows.
+test("Spend card: month-end projection at a pinned clock, period switch, viewer, org isolation", async ({ page, browser }) => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const codes = {};
+  const service = createHostedServer({
+    storePath: join(mkdtempSync(join(tmpdir(), "cc-spend-294-")), "data.json"),
+    origin, secureCookies: false, turnstileSiteKey: "fixture-key", stripeEnv: {}, now: () => Date.parse("2026-11-11T00:00:00Z"),
+    verifyChallenge: async () => true, sendCode: async (d) => { codes[d.email] = d.code; }, sendInvite: async () => {},
+  });
+  await new Promise((r) => service.server.listen(port, "127.0.0.1", r));
+  const post = (path, body, headers = {}) => fetch(origin + path, { method: "POST", headers: { origin, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  const session = async (email) => {
+    const c = await post("/auth/request", { email, turnstileToken: "x" }).then((r) => r.json());
+    return (await post("/auth/verify", { challengeId: c.challengeId, code: codes[email] })).headers.get("set-cookie").split(";")[0];
+  };
+  const enroll = async (cookie, name) => {
+    const token = await post("/v1/enrollment-tokens", {}, { cookie }).then((r) => r.json());
+    return fetch(origin + "/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${token.token}`, "content-type": "application/json" }, body: JSON.stringify({ name }) }).then((r) => r.json());
+  };
+  const sync = (agent, receipts) => fetch(origin + "/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agent.token}`, "content-type": "application/json" }, body: JSON.stringify({ receipts }) });
+  try {
+    const owner = await session("fc-294@example.invalid"), other = await session("fc-294-other@example.invalid");
+    const a = await enroll(owner, "A"), b = await enroll(owner, "B"), x = await enroll(other, "X");
+    expect((await sync(a, [{ id: "a1", ts: "2026-11-02T00:00:00Z", cost_usd: 30, model: "m" }])).status).toBe(200);
+    expect((await sync(b, [{ id: "b1", ts: "2026-11-05T00:00:00Z", cost_usd: 10, model: "m" }])).status).toBe(200);
+    expect((await sync(x, [{ id: "x1", ts: "2026-11-05T00:00:00Z", cost_usd: 999, model: "m" }])).status).toBe(200);
+    expect((await post("/v1/invitations", { email: "fc-294-viewer@example.invalid", role: "viewer" }, { cookie: owner })).status).toBe(201);
+    const viewer = await session("fc-294-viewer@example.invalid");
+    for (const cookie of [owner, viewer]) {
+      const ctx = await browser.newContext();
+      await ctx.addCookies([{ name: "costcap_session", value: cookie.split("=")[1], url: origin }]);
+      const p = await ctx.newPage();
+      await p.route("**/challenges.cloudflare.com/**", (route) => route.fulfill({ contentType: "application/javascript", body: "" }));
+      await p.goto(origin);
+      await expect(p.locator("#spendTotal")).toContainText("$40.00");
+      await expect(p.locator("#spendTotal")).not.toContainText("Projected");
+      await p.locator("#spendPeriodSelect").selectOption("month");
+      await expect(p.locator("#spendTotal")).toContainText("Projected by 2026-12-01: $120.00");
+      await expect(p.locator(`#spendAgents [data-key="${a.agentId}"]`)).toContainText("→ $90.00 projected");
+      await expect(p.locator(`#spendAgents [data-key="${b.agentId}"]`)).toContainText("→ $30.00 projected");
+      await p.locator("#spendPeriodSelect").selectOption("7d");
+      await expect(p.locator("#spendTotal")).not.toContainText("Projected");
+      await expect(p.locator("#spendAgents .spend-projected")).toHaveCount(0);
+      await ctx.close();
+    }
+  } finally {
+    service.server.closeAllConnections?.();
+    await new Promise((r) => service.server.close(r));
+  }
+});

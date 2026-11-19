@@ -218,3 +218,22 @@ test("rendering: HTML escapes, Slack blocks, signed webhook payload", async () =
   const priv = createDigestDelivery({ fetchImpl, lookup: async () => [{ address: "10.0.0.1" }], nowMs });
   assert.equal((await priv(d, dest, { channels: ["webhook"] }))[0].status, "failed");
 });
+
+// Issue #294: the digest carries the org month-end forecast.
+test("#294 AC5: digest forecast and 'Projected this budget month' line (≥ with unsettled unknown)", () => {
+  const D10 = Date.parse("2026-11-11T00:00:00Z");
+  const s = { orgs: { [ORG]: { id: ORG, name: "acme.test" }, "org-b": { id: "org-b" } }, agents: {}, teams: {}, alerts: {},
+    receipts: Object.fromEntries([rec("A", "2026-11-02T00:00:00Z", 30, "m"), rec("B", "2026-11-05T00:00:00Z", 10, "m"), rec("X", "2026-11-05T00:00:00Z", 999, "m", "org-b")]) };
+  const d = buildDigest(s, ORG, { week: "2026-W45", nowMs: D10 });
+  assert.deepEqual(d.forecast, { period_end: "2026-12-01T00:00:00.000Z", period_end_local: "2026-12-01", projected_usd: 120, lower_bound: false });
+  assert.match(digestText(d), /Projected this budget month: \$120\.00 by 2026-12-01/);
+  assert.match(digestHtml(d), /Projected this budget month: \$120\.00/);
+  assert.match(JSON.stringify(digestSlack(d)), /Projected this budget month: \$120\.00/);
+  s.receipts["B:u"] = { orgId: ORG, agentId: "B", receipt: { id: "u", ts: "2026-11-06T00:00:00Z", cost_usd: null, model: "m" } };
+  const lb = buildDigest(s, ORG, { week: "2026-W45", nowMs: D10 });
+  assert.equal(lb.forecast.lower_bound, true);
+  assert.match(digestText(lb), /Projected this budget month: ≥ \$120\.00/);
+  const early = buildDigest(s, ORG, { week: "2026-W44", nowMs: Date.parse("2026-11-01T12:00:00Z") });
+  assert.equal(early.forecast.projected_usd, null);
+  assert.ok(!digestText(early).includes("Projected"));
+});

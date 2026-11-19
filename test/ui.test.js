@@ -42,6 +42,11 @@ test('same-origin UI assets use CSP and no inline scripts or data HTML injection
   assert.ok(!js.includes('localStorage'));
   assert.ok(!js.includes('sessionStorage'));
   assert.match(js, /textContent/);
+  // #294: the projected line renders for the "month" period only, rows get "→ $P projected".
+  assert.match(js, /function spendForecast\(p,f\)\{if\(p!=='month'\|\|!f\)return ''/);
+  assert.match(js, /' Projected by '\+f\.period_end_local/);
+  assert.match(js, /' projected','spend-projected'/);
+  assert.match(js, /Projection available after the first 24 h of the budget month/);
   assert.match(js, /Estimated spend \('\+\(b\.budget_period\?b\.budget_period\.timezone:'UTC'\)/); // #209
   assert.equal(uiResponse('/anything'), null);
 });

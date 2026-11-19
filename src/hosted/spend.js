@@ -5,6 +5,10 @@
 import { TAG_KEY } from "../tags.js";
 import { normalizeBudgetPeriod, periodKey, periodBounds, localParts, zonedMidnight } from "../period.js";
 import { cell } from "./receipts-csv.js";
+import { projectSpend } from "./alerts.js";
+
+// #294: projections are kept on these groupings only.
+export const FORECAST_GROUPS = ["agent", "team", "model", "tag"];
 
 export const SPEND_GROUPS = ["day", "model", "agent", "tag", "team", "outcome"];
 // #225: run outcome buckets, always all four, in this order.
@@ -73,7 +77,7 @@ export function parseSpendQuery(params, { csv = false, budgetPeriod = null, now 
 
 // items: [{ agentId, receipt, settlement? }]. names: { agentId: label }.
 // teams (group_by=team): [{ name, agents }] of the caller's org only.
-export function spendBreakdown(items, { groupBy = "day", range = null, since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [], outcomeOf = () => "unknown" } = {}) {
+export function spendBreakdown(items, { groupBy = "day", range = null, since, until, untilExclusive = false, cutoff = null, names = {}, tagKey, budgetPeriod = null, teams = [], outcomeOf = () => "unknown", now = null } = {}) {
   if (!SPEND_GROUPS.includes(groupBy)) throw bad(`group_by must be one of ${SPEND_GROUPS.join("|")}`);
   if (groupBy === "tag" && (!tagKey || !TAG_KEY.test(tagKey))) throw bad("tag_key is required with group_by=tag");
   let from = since, clamped = false;
@@ -127,6 +131,20 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
     ...(groupBy === "outcome" ? { runs: runSets.get(b.key)?.size ?? 0, lower_bound: !b.cost_complete } : {}) }));
   if (groupBy === "outcome") rows.sort((a, b) => OUTCOME_BUCKETS.indexOf(a.key) - OUTCOME_BUCKETS.indexOf(b.key));
   else rows.sort(groupBy === "day" ? (a, b) => a.key.localeCompare(b.key) : (a, b) => b.usd_known - a.usd_known || b.unknown_count - a.unknown_count || a.key.localeCompare(b.key));
+  // #294: linear month-end forecast, only for exactly the current budget month.
+  let forecast = null;
+  if (range === "current_month" && until === undefined && Number.isFinite(now)) {
+    const { start, end } = periodBounds("month", now, budgetPeriod);
+    const base = { method: "linear", period_start: new Date(start).toISOString(), period_end: new Date(end).toISOString(),
+      period_end_local: periodKey("day", end, budgetPeriod), elapsed_fraction: Math.max(0, Math.min(1, round6((now - start) / (end - start)))) };
+    const project = (usd) => { const p = projectSpend("month", usd, now, { budgetPeriod }); return p === null ? null : round6(p); };
+    if (clamped && from > start) forecast = { ...base, total: null, reason: "retention_clamped" };
+    else {
+      const projected = project(round6(total.usd_known));
+      forecast = { ...base, total: { projected_usd: projected, lower_bound: !total.cost_complete }, reason: projected === null ? "too_early" : null };
+      if (FORECAST_GROUPS.includes(groupBy)) for (const r of rows) { r.projected_usd = project(r.usd_known); r.lower_bound = !r.cost_complete; }
+    }
+  }
   return {
     group_by: groupBy,
     ...(groupBy === "tag" ? { tag_key: tagKey } : {}),
@@ -140,6 +158,7 @@ export function spendBreakdown(items, { groupBy = "day", range = null, since, un
     retention_clamped: clamped,
     total: { ...total, usd_known: round6(total.usd_known), saved_usd: round6(total.saved_usd), user_priced_usd: round6(total.user_priced_usd) },
     buckets: rows,
+    forecast,
   };
 }
 

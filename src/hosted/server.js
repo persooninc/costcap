@@ -620,7 +620,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const u = member(s, req);
           const query = parseSpendQuery(new URL(req.url, origin).searchParams, { budgetPeriod: orgPeriod(s, u.orgId), now: now() });
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId) });
+          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId), now: now() });
         }));
       }
       // #220: Prometheus scrape endpoint. Viewer/admin cck_ keys or a member session; org-scoped.

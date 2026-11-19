@@ -303,3 +303,79 @@ test("#215 /v1/spend and /v1/spend.csv with range=current_month under an LA/15th
   assert.equal((await f.request("/v1/spend?range=bogus", undefined, owner)).status, 400);
   assert.equal((await f.request("/v1/spend.csv?range=7d&since=2026-11-01", undefined, owner)).status, 400);
 });
+
+// Issue #294: linear month-end forecast on /v1/spend for exactly the current budget month.
+const D10 = Date.parse("2026-11-11T00:00:00.000Z"); // day 10 of 30: factor 3
+const FC = [
+  { agentId: "A", receipt: { id: "f1", ts: "2026-11-02T00:00:00Z", model: "m1", cost_usd: 30, tags: { customer: "acme" } } },
+  { agentId: "B", receipt: { id: "f2", ts: "2026-11-05T00:00:00Z", model: "m2", cost_usd: 10 } },
+  { agentId: "B", receipt: { id: "f0", ts: "2026-10-20T00:00:00Z", model: "m2", cost_usd: 500 } }, // last month
+];
+const fcOpts = (extra = {}) => ({ range: "current_month", since: Date.parse("2026-11-01T00:00:00Z"), now: D10, ...extra });
+test("#294 AC1: forecast total and per-agent projections, unknown is a lower bound, settled counts", () => {
+  const r = spendBreakdown(FC, { ...fcOpts(), groupBy: "agent" });
+  assert.equal(r.forecast.method, "linear");
+  assert.equal(r.forecast.period_end, "2026-12-01T00:00:00.000Z");
+  assert.equal(r.forecast.period_end_local, "2026-12-01");
+  assert.equal(r.forecast.period_start, "2026-11-01T00:00:00.000Z");
+  assert.equal(r.forecast.elapsed_fraction, 0.333333);
+  assert.deepEqual(r.forecast.total, { projected_usd: 120, lower_bound: false });
+  assert.equal(r.forecast.reason, null);
+  assert.deepEqual(r.buckets.map((b) => [b.key, b.projected_usd, b.lower_bound]), [["A", 90, false], ["B", 30, false]]);
+  const unk = { agentId: "B", receipt: { id: "u", ts: "2026-11-06T00:00:00Z", model: "m2", cost_usd: null } };
+  const lb = spendBreakdown([...FC, unk], { ...fcOpts(), groupBy: "agent" });
+  assert.deepEqual(lb.forecast.total, { projected_usd: 120, lower_bound: true });
+  assert.deepEqual(lb.buckets.map((b) => [b.key, b.projected_usd, b.lower_bound]), [["A", 90, false], ["B", 30, true]]);
+  const settled = spendBreakdown([...FC, { ...unk, settlement: { cost_usd: 2 } }], { ...fcOpts(), groupBy: "agent" });
+  assert.deepEqual(settled.forecast.total, { projected_usd: 126, lower_bound: false });
+  assert.equal(settled.buckets.find((b) => b.key === "B").projected_usd, 36);
+});
+test("#294 AC2: too early, other windows null, retention clamp", () => {
+  const early = spendBreakdown(FC, { ...fcOpts({ now: Date.parse("2026-11-01T12:00:00Z") }), groupBy: "agent" });
+  assert.deepEqual(early.forecast.total, { projected_usd: null, lower_bound: false });
+  assert.equal(early.forecast.reason, "too_early");
+  assert.equal(early.buckets[0].projected_usd, null);
+  for (const o of [{ range: "7d" }, { range: "30d" }, { range: null }, { until: D10 }]) assert.equal(spendBreakdown(FC, { ...fcOpts(o), groupBy: "agent" }).forecast, null);
+  assert.equal(spendBreakdown(FC, { since: 0, groupBy: "agent", now: D10 }).forecast, null);
+  assert.equal(spendBreakdown(FC, { ...fcOpts(), now: null }).forecast, null);
+  const clamped = spendBreakdown(FC, { ...fcOpts(), groupBy: "agent", cutoff: Date.parse("2026-11-04T00:00:00Z") });
+  assert.equal(clamped.forecast.reason, "retention_clamped");
+  assert.equal(clamped.forecast.total, null);
+  assert.equal(clamped.buckets[0].projected_usd, undefined);
+  // A cutoff before the period start does not clamp the month.
+  assert.deepEqual(spendBreakdown(FC, { ...fcOpts(), cutoff: Date.parse("2026-10-01T00:00:00Z") }).forecast.total, { projected_usd: 120, lower_bound: false });
+});
+test("#294 AC4: LA/15th period and which group_by values carry bucket projections", () => {
+  const now = Date.parse("2026-11-25T00:00:00-08:00"); // 10 of 30 local days
+  const items = [{ agentId: "A", receipt: { id: "1", ts: "2026-11-16T00:00:00-08:00", model: "m", cost_usd: 10, tags: { customer: "acme" } } }];
+  const opts = { range: "current_month", since: Date.parse("2026-11-15T00:00:00-08:00"), now, budgetPeriod: LA, teams: [{ name: "core", agents: ["A"] }] };
+  const team = spendBreakdown(items, { ...opts, groupBy: "team" });
+  assert.equal(team.forecast.period_end_local, "2026-12-15");
+  assert.equal(team.forecast.period_end, new Date(Date.parse("2026-12-15T00:00:00-08:00")).toISOString());
+  assert.equal(team.forecast.total.projected_usd, 30);
+  assert.equal(team.buckets.find((b) => b.key === "core").projected_usd, 30);
+  assert.equal(spendBreakdown(items, { ...opts, groupBy: "tag", tagKey: "customer" }).buckets[0].projected_usd, 30);
+  assert.equal(spendBreakdown(items, { ...opts, groupBy: "model" }).buckets[0].projected_usd, 30);
+  for (const g of ["day", "outcome"]) {
+    const r = spendBreakdown(items, { ...opts, groupBy: g });
+    assert.equal(r.forecast.total.projected_usd, 30);
+    assert.ok(r.buckets.every((b) => !("projected_usd" in b)), g);
+  }
+});
+test("#294 GET /v1/spend forecast: viewer sees the same values, another org never changes them", async (t) => {
+  const f = await serve(t);
+  f.setNow(D10);
+  const owner = await f.login("fc-owner@example.invalid"), outsider = await f.login("fc-out@example.invalid");
+  const a = await f.agent(owner, "A"), b = await f.agent(owner, "B"), o = await f.agent(outsider, "O");
+  await f.request("/v1/receipts", { receipts: [FC[0].receipt] }, null, a.token);
+  await f.request("/v1/receipts", { receipts: [FC[1].receipt] }, null, b.token);
+  await f.request("/v1/receipts", { receipts: [{ id: "x", ts: "2026-11-03T00:00:00Z", cost_usd: 99, model: "m" }] }, null, o.token);
+  const r = (await f.request("/v1/spend?group_by=agent&range=current_month", undefined, owner)).body;
+  assert.deepEqual(r.forecast.total, { projected_usd: 120, lower_bound: false });
+  assert.deepEqual(r.buckets.map((x) => [x.label, x.projected_usd]), [["A", 90], ["B", 30]]);
+  await f.request("/v1/invitations", { email: "fc-viewer@example.invalid", role: "viewer" }, owner);
+  const viewer = await f.login("fc-viewer@example.invalid");
+  assert.deepEqual((await f.request("/v1/spend?group_by=agent&range=current_month", undefined, viewer)).body.forecast, r.forecast);
+  assert.equal((await f.request("/v1/spend?group_by=agent&range=7d", undefined, owner)).body.forecast, null);
+  assert.equal((await f.request("/v1/spend?group_by=agent&since=2026-11-01", undefined, owner)).body.forecast, null);
+});

@@ -119,6 +119,9 @@ export function buildDigest(state, orgId, { week, nowMs, dashboardUrl = null } =
     const scope = capScope(t);
     if (scope) room({ type: "team", id: t.name, name: t.name }, scope, t[scope], t.agents ?? []);
   }
+  // #294: org month-end forecast, same maths as /v1/spend and cap_projected.
+  const fc = spendBreakdown(items, { range: "current_month", since: periodBounds("month", nowMs, bp).start, budgetPeriod: bp, now: nowMs }).forecast;
+  const forecast = { period_end: fc.period_end, period_end_local: fc.period_end_local, projected_usd: fc.total?.projected_usd ?? null, lower_bound: fc.total?.lower_bound ?? false };
   const alerts = Object.values(state.alerts ?? {}).filter((a) => a.orgId === orgId && Date.parse(a.fired_at) >= weekStart && Date.parse(a.fired_at) < weekEnd);
   const byKind = {};
   for (const a of alerts) byKind[a.kind] = (byKind[a.kind] ?? 0) + 1;
@@ -131,6 +134,7 @@ export function buildDigest(state, orgId, { week, nowMs, dashboardUrl = null } =
     top_agents: top(byAgent.buckets, (r) => ({ id: r.key, name: r.label ?? r.key, ...amount(r) })),
     top_teams: top(byTeam.buckets.filter((r) => r.key !== NO_TEAM), (r) => ({ name: r.key, ...amount(r) })),
     top_models: top(byModel.buckets, (r) => ({ model: r.key, ...amount(r) })),
+    forecast,
     headroom, headroom_as_of: new Date(nowMs).toISOString(),
     unknown: { count: total.unknown_count, lower_bound: total.unknown_count > 0 },
     alerts: { total: alerts.length, by_kind: byKind },
@@ -146,6 +150,9 @@ const changeText = (d) => {
   const pct = d.change.pct === null ? "" : ` (${d.change.pct >= 0 ? "+" : ""}${d.change.pct}%)`;
   return `${sign}${money(Math.abs(d.change.usd))}${pct} vs ${spendText(d.previous)} the week before${d.change.lower_bound ? " (known cost only)" : ""}`;
 };
+/** #294: "Projected this budget month: $X" (≥ when unknown cost is unsettled), or null before 24 h. */
+export const forecastText = (d) => (d.forecast?.projected_usd == null ? null
+  : `Projected this budget month: ${d.forecast.lower_bound ? "≥ " : ""}${money(d.forecast.projected_usd)} by ${d.forecast.period_end_local} (linear estimate at the current pace, not a bill)`);
 const sections = (d) => {
   const s = [];
   s.push(["Top agents", d.top_agents.map((a) => `${a.name}: ${spendText(a)}`)]);
@@ -158,6 +165,7 @@ const sections = (d) => {
 export const digestSubject = (d) => `CostCap weekly digest ${d.week}: ${spendText(d.total)}`;
 export function digestText(d) {
   const lines = [`CostCap weekly spend digest for ${d.org_name ?? d.org_id}, week ${d.week} (${d.timezone}).`, "", `Spend: ${spendText(d.total)} (${changeText(d)}).`];
+  if (forecastText(d)) lines.push(`${forecastText(d)}.`);
   if (d.unknown.count) lines.push(`${d.unknown.count} receipt${d.unknown.count === 1 ? "" : "s"} with unknown cost not yet settled: the total is a lower bound.`);
   for (const [title, rows] of sections(d)) { lines.push("", `${title}:`); lines.push(...(rows.length ? rows.map((r) => `- ${r}`) : ["- none"])); }
   if (d.dashboard_url) lines.push("", `Dashboard: ${d.dashboard_url}`);
@@ -167,6 +175,7 @@ export function digestText(d) {
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export function digestHtml(d) {
   const parts = [`<h2>CostCap weekly spend digest, week ${esc(d.week)}</h2>`, `<p><strong>${esc(spendText(d.total))}</strong> (${esc(changeText(d))}).</p>`];
+  if (forecastText(d)) parts.push(`<p>${esc(forecastText(d))}.</p>`);
   if (d.unknown.count) parts.push(`<p>${d.unknown.count} receipt${d.unknown.count === 1 ? "" : "s"} with unknown cost not yet settled: the total is a lower bound.</p>`);
   for (const [title, rows] of sections(d)) parts.push(`<h3>${esc(title)}</h3><ul>${(rows.length ? rows : ["none"]).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>`);
   if (d.dashboard_url) parts.push(`<p><a href="${esc(d.dashboard_url)}">Open the CostCap dashboard</a></p>`);
@@ -177,7 +186,7 @@ export function digestHtml(d) {
 export function digestSlack(d) {
   const blocks = [
     { type: "header", text: { type: "plain_text", text: `CostCap weekly digest ${d.week}` } },
-    { type: "section", text: { type: "mrkdwn", text: `*${spendText(d.total)}* (${changeText(d)})${d.unknown.count ? `\n${d.unknown.count} unknown-cost receipt(s) unsettled: lower bound.` : ""}` } },
+    { type: "section", text: { type: "mrkdwn", text: `*${spendText(d.total)}* (${changeText(d)})${d.unknown.count ? `\n${d.unknown.count} unknown-cost receipt(s) unsettled: lower bound.` : ""}${forecastText(d) ? `\n${forecastText(d)}` : ""}` } },
   ];
   for (const [title, rows] of sections(d)) if (rows.length) blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${title}*\n${rows.map((r) => `• ${r}`).join("\n")}` } });
   if (d.dashboard_url) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `<${d.dashboard_url}|Open dashboard> · Estimated spend guardrails, not a billing guarantee.` }] });
