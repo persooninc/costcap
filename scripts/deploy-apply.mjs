@@ -1,6 +1,7 @@
 // Applies one replica when the deploy key, host, and commit are present. Otherwise it exits 2.
 // Exit codes: 0 applied, 2 missing inputs, 3 host key does not match the pin (never connected),
-// 4 the host preflight in deploy-remote.sh refused (running image unchanged), other = failure.
+// 4 the host preflight in deploy-remote.sh refused (running image unchanged), 5 the host rejected
+// the deploy key (Permission denied; nothing was sent), other = failure.
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,6 +15,12 @@ export const EXIT_APPLIED = 0;
 export const EXIT_MISSING = 2;
 export const EXIT_HOST_KEY = 3;
 export const EXIT_HOST_PREFLIGHT = 4;
+export const EXIT_AUTH = 5;
+
+// True when ssh failed because the host refused every offered key (not a network or host key error).
+export function isAuthRejected(error) {
+  return error?.status === 255 && /Permission denied \(/.test(String(error?.stderr || ""));
+}
 
 // Parses known_hosts text into Map<type, Set<base64>> for one plain (unhashed) host name.
 export function keysForHost(text, hostname) {
@@ -83,6 +90,17 @@ export function applyDeploy({ host = "", key = "", sha = "", cwd = process.cwd()
     chmodSync(keyPath, 0o600);
     const ssh = ["-i", keyPath, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=20"];
     if (pinned) ssh.push("-o", `UserKnownHostsFile=${knownHosts}`, "-o", "StrictHostKeyChecking=yes");
+    // Authenticate once before sending the tree, so a rejected key is its own exit code (not an EPIPE crash).
+    try {
+      run("ssh", [...ssh, host, "true"], { stdio: ["ignore", "ignore", "pipe"] });
+    } catch (error) {
+      if (error?.stderr) process.stderr.write(String(error.stderr));
+      if (isAuthRejected(error)) {
+        console.error("deploy: apply was not run; the deploy host rejected COSTCAP_DEPLOY_SSH_KEY (Permission denied). Authorize the deploy key on the host (see the deploy-key-info workflow) or fix the secret.");
+        return EXIT_AUTH;
+      }
+      throw error;
+    }
     const archive = run("tar", ["-czf", "-", "--exclude", "node_modules", "--exclude", ".git", "--exclude", ".env", "-C", cwd, "."], { maxBuffer: 64 * 1024 * 1024 });
     run("ssh", [...ssh, host, "rm -rf /opt/costcap/src && mkdir -p /opt/costcap/src && tar -xzf - -C /opt/costcap/src"], { input: archive });
     try {

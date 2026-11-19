@@ -4,7 +4,7 @@
 // Opens nothing and changes nothing. Prints shas and hours, never secrets.
 //
 // Owner-pending acknowledgement: when the deploy is blocked on an owner action
-// (see deploy-apply exits 3/4), a committed ack file (default infra/drift-ack.json)
+// (see deploy-apply exits 3/4/5), a committed ack file (default infra/drift-ack.json)
 // can downgrade `drift` to a warning. The ack only applies to the exact prod sha
 // it names, never to an unreachable or unknown prod, and it expires after at
 // most MAX_ACK_DAYS so the alarm comes back on its own.

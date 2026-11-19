@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyDeploy } from "../scripts/deploy-apply.mjs";
+import { applyDeploy, EXIT_AUTH, isAuthRejected } from "../scripts/deploy-apply.mjs";
 import { skipUnlessDocker } from "./support/docker.js";
 
 const skip = skipUnlessDocker(["compose", "version"]);
@@ -119,7 +119,8 @@ test("apply contacts the host only when the key and commit are present", () => {
   const sha = "b".repeat(40);
   const code = applyDeploy({ host: "deploy@example", key: marker, sha, cwd: repo, run, knownHostsPath });
   assert.equal(code, 0);
-  assert.deepEqual(calls.map((call) => call[0]), ["ssh-keyscan", "tar", "ssh", "ssh"]);
+  assert.deepEqual(calls.map((call) => call[0]), ["ssh-keyscan", "ssh", "tar", "ssh", "ssh"]);
+  assert.equal(calls[1][1].at(-1), "true", "auth probe runs before the tree is sent");
   const flat = JSON.stringify(calls);
   assert.equal(flat.includes(marker), false);
   assert.match(flat, new RegExp(sha));
@@ -137,6 +138,91 @@ test("apply contacts the host only when the key and commit are present", () => {
     return run(file, args);
   };
   assert.equal(applyDeploy({ host: "deploy@example", key: marker, sha, cwd: repo, run: refuse, knownHostsPath }), 4);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a deploy key the host rejects is exit 5 and nothing is sent", () => {
+  const dir = mkdtempSync(join(tmpdir(), "costcap-kh-"));
+  const knownHostsPath = join(dir, "known_hosts");
+  writeFileSync(knownHostsPath, "example ssh-ed25519 AAAApinned\n");
+  const calls = [];
+  const denied = Object.assign(new Error("ssh failed"), { status: 255, stderr: Buffer.from("deploy@example: Permission denied (publickey).\r\n") });
+  const run = (file, args) => {
+    calls.push(file);
+    if (file === "ssh-keyscan") return Buffer.from("example ssh-ed25519 AAAApinned\n");
+    if (file === "ssh") throw denied;
+    return Buffer.from("");
+  };
+  const errors = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => { errors.push(String(chunk)); return true; };
+  let code;
+  try {
+    code = applyDeploy({ host: "deploy@example", key: "not-a-real-deploy-key", sha: "c".repeat(40), cwd: repo, run, knownHostsPath });
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.equal(code, EXIT_AUTH);
+  assert.equal(code, 5);
+  assert.deepEqual(calls, ["ssh-keyscan", "ssh"], "no tar upload and no deploy-remote.sh after a rejected key");
+  assert.match(errors.join(""), /Permission denied \(publickey\)/);
+  assert.equal(errors.join("").includes("not-a-real-deploy-key"), false);
+  // A network failure on the probe is not an owner-blocked skip: it still throws.
+  const unreachable = Object.assign(new Error("ssh failed"), { status: 255, stderr: Buffer.from("ssh: connect to host example port 22: Connection timed out\r\n") });
+  const offline = (file) => {
+    if (file === "ssh-keyscan") return Buffer.from("example ssh-ed25519 AAAApinned\n");
+    if (file === "ssh") throw unreachable;
+    return Buffer.from("");
+  };
+  process.stderr.write = () => true;
+  try {
+    assert.throws(() => applyDeploy({ host: "deploy@example", key: "k", sha: "c".repeat(40), cwd: repo, run: offline, knownHostsPath }), /ssh failed/);
+  } finally {
+    process.stderr.write = original;
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("isAuthRejected matches only ssh's Permission denied exit", () => {
+  assert.equal(isAuthRejected({ status: 255, stderr: "u@h: Permission denied (publickey,password)." }), true);
+  assert.equal(isAuthRejected({ status: 255, stderr: "Connection refused" }), false);
+  assert.equal(isAuthRejected({ status: 1, stderr: "Permission denied (publickey)." }), false);
+  assert.equal(isAuthRejected(undefined), false);
+});
+
+test("auto-deploy warns and skips on exits 3, 4 and 5; manual dispatch and other codes fail", () => {
+  const workflow = readFileSync(join(repo, ".github/workflows/deploy.yml"), "utf8");
+  const step = workflow.slice(workflow.indexOf("- name: apply one replica"), workflow.indexOf("- name: canary the applied origin"));
+  const lines = step.split("\n");
+  const start = lines.findIndex((line) => /^\s+run: \|$/.test(line));
+  assert.ok(start > 0, "apply step has a run block");
+  const indent = lines[start + 1].match(/^\s*/)[0].length;
+  const script = lines.slice(start + 1).filter((line) => line.trim()).map((line) => line.slice(indent)).join("\n");
+  assert.match(script, /node scripts\/deploy-apply\.mjs/);
+  const dir = mkdtempSync(join(tmpdir(), "costcap-apply-step-"));
+  const runStep = (event, code) => {
+    const out = join(dir, `out-${event}-${code}`);
+    const summary = join(dir, `summary-${event}-${code}`);
+    writeFileSync(out, "");
+    writeFileSync(summary, "");
+    const body = script.replace("node scripts/deploy-apply.mjs", `(exit ${code})`);
+    const result = spawnSync("bash", ["-e", "-c", body], {
+      env: { PATH: process.env.PATH, EVENT: event, DEPLOY_SHA: "d".repeat(40), GITHUB_OUTPUT: out, GITHUB_STEP_SUMMARY: summary },
+      encoding: "utf8",
+    });
+    return { status: result.status, stdout: result.stdout, output: readFileSync(out, "utf8"), summary: readFileSync(summary, "utf8") };
+  };
+  assert.equal(runStep("workflow_run", 0).output.trim(), "applied=true");
+  for (const [code, reason] of [[3, /known_hosts/], [4, /host \.env/], [5, /rejected the deploy key/]]) {
+    const skipped = runStep("workflow_run", code);
+    assert.equal(skipped.status, 0, `auto run skips exit ${code}`);
+    assert.equal(skipped.output.trim(), "applied=false");
+    assert.match(skipped.stdout, /::warning title=auto-deploy skipped::/);
+    assert.match(skipped.stdout, reason);
+    assert.match(skipped.summary, /Production is unchanged/);
+    assert.equal(runStep("workflow_dispatch", code).status, code, `manual dispatch fails on exit ${code}`);
+  }
+  assert.equal(runStep("workflow_run", 1).status, 1, "an unexpected failure still fails the auto run");
   rmSync(dir, { recursive: true, force: true });
 });
 
