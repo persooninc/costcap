@@ -27,3 +27,12 @@
   through `waitFor(cond, what, 10 s)`, which throws instead of spinning. No product change.
 - Checked: with the #255 bug put back in `src/proxy.js` (no wait while `inFlight > 0`), AC1 fails in 0.2 s
   instead of hanging. `test/proxy-concurrency.test.js` 18/18, 3 runs in a row at load ~63.
+
+## Follow-up: `verify / e2e` on main `c145191` (run 44470107827)
+
+- `test (20)`, `test (22)` and `action-self-test` were green (the #255 fix held). `e2e` failed before any test ran:
+  `npx playwright install --with-deps chromium` exited 100 with "Could not get lock /var/lib/apt/lists/lock.
+  It is held by process ... (apt-get)". Another job on the shared self-hosted runner was running apt.
+- Fix: the e2e install step retries up to 5 times, 30 s apart, and then fails with an `::error::`.
+  `test/workflows-lint.test.js` runs the step's real script with a fake `npx`: success first time,
+  success after 2 lock failures (3 calls), and a hard failure after 5 attempts.

@@ -100,7 +100,17 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      # The runner is shared: another job's apt-get can hold /var/lib/apt/lists/lock, and
+      # `--with-deps` then exits 100 before any test runs (run 44470107827). Retry instead.
+      - name: install chromium and its system deps (retries while apt is locked)
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if npx playwright install --with-deps chromium; then exit 0; fi
+            echo "playwright install failed (attempt $attempt of 5)"
+            [ "$attempt" = 5 ] || sleep "${PW_INSTALL_RETRY_SECONDS:-30}"
+          done
+          echo "::error::npx playwright install --with-deps chromium failed 5 times"
+          exit 1
       - run: npx playwright test
       # persooninc/infra/actions/ci-artifacts is not resolvable from this repo
       # ("Unable to resolve action persooninc/infra, not found"), which failed the
