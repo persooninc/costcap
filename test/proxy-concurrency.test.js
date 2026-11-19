@@ -25,14 +25,17 @@ const tmp = (p = "cc-249-") => mkdtempSync(join(tmpdir(), p));
 const readReceipts = (f) => readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
 
 // Counting upstream: `delay(i)` ms per request, `body(i, req)` JSON response.
-async function upstream(t, { delay = () => 300, body = () => ({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } }) } = {}) {
+// `hold(i)` may return a promise: request i stays in flight until it settles (then `delay(i)`).
+async function upstream(t, { delay = () => 300, hold = () => undefined, body = () => ({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } }) } = {}) {
   const st = { hits: 0, inFlight: 0, peak: 0 };
   const s = http.createServer((q, res) => {
     let b = ""; q.on("data", (d) => (b += d));
     q.on("end", () => {
       const i = st.hits++;
       st.inFlight++; st.peak = Math.max(st.peak, st.inFlight);
-      setTimeout(() => { st.inFlight--; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body(i, b))); }, delay(i));
+      Promise.resolve(hold(i)).then(() => {
+        setTimeout(() => { st.inFlight--; res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body(i, b))); }, delay(i));
+      });
     });
   });
   await new Promise((r) => s.listen(0, "127.0.0.1", r));
@@ -53,6 +56,23 @@ async function proxy(t, up, opts = {}) {
     return { status: r.status, json };
   };
   return { call, receiptsPath, server: p.server };
+}
+
+// Polls `cond` every 5 ms; rejects after `ms` instead of spinning forever (a test that times out
+// cannot stop its own loop, and a live loop keeps the file, and so `npm test`, from exiting).
+async function waitFor(cond, what, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out after ${ms} ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+// A latch: `gate.wait` resolves once `gate.open()` is called.
+function latch() {
+  let open;
+  const wait = new Promise((r) => (open = r));
+  return { wait, open };
 }
 
 const errOf = (r) => (typeof r.json?.error === "string" ? r.json.error : r.json?.error?.type ?? r.json?.error?.reason);
@@ -362,12 +382,19 @@ test("--policy maxConcurrent alone sets concurrency (min with flag)", { timeout:
 test("#255 AC1: lowering maxConcurrent 4→1 with 4 in flight never exceeds 4, then ≤1 (20 runs)", { timeout: 120_000 }, async (t) => {
   for (let run = 0; run < 20; run++) {
     let n = 4;
-    const up = await upstream(t, { delay: () => 60 });
+    // The first 4 are held open until released, so "4 in flight" is reached even on a loaded
+    // runner (with a plain 60 ms delay the first could answer before the 4th was admitted).
+    const gate = latch();
+    const up = await upstream(t, { delay: () => 20, hold: (i) => (i < 4 ? gate.wait : undefined) });
     const p = await proxy(t, up, { maxConcurrent: () => n });
     const first = Array.from({ length: 4 }, () => p.call());
-    while (up.inFlight < 4) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => up.inFlight === 4, `run ${run}: 4 calls in flight`);
     n = 1;
     const rest = Array.from({ length: 12 }, () => p.call());
+    // With 4 in flight and a ceiling of 1, no queued call may start.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(up.hits, 4, `run ${run}: a queued call started above the lowered ceiling`);
+    gate.open();
     await Promise.all(first);
     assert.ok(up.peak <= 4, `run ${run}: peak ${up.peak} > 4`);
     up.peak = up.inFlight;
@@ -379,12 +406,17 @@ test("#255 AC1: lowering maxConcurrent 4→1 with 4 in flight never exceeds 4, t
 
 test("#255 AC2: raising maxConcurrent while requests are queued lets up to the new N run", async (t) => {
   let n = 2;
-  const up = await upstream(t, { delay: () => 400 });
+  // Every call is held until the check, so the 4 queued ones can only start because n was raised,
+  // never because one of the first 2 finished.
+  const gate = latch();
+  const up = await upstream(t, { delay: () => 20, hold: () => gate.wait });
   const p = await proxy(t, up, { maxConcurrent: () => n });
   const all = Array.from({ length: 6 }, () => p.call());
-  while (up.inFlight < 2) await new Promise((r) => setTimeout(r, 5));
+  await waitFor(() => up.inFlight === 2, "2 calls in flight");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(up.hits, 2, "the ceiling of 2 holds before it is raised");
   n = 6;
-  await new Promise((r) => setTimeout(r, 150));
-  assert.equal(up.inFlight, 6, "queued calls start without waiting for a release");
+  await waitFor(() => up.inFlight === 6, "queued calls start without waiting for a release");
+  gate.open();
   assert.deepEqual((await Promise.all(all)).map((r) => r.status), Array(6).fill(200));
 });
