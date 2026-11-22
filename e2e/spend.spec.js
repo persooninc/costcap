@@ -81,7 +81,9 @@ test("Spend card: day, model and agent rows, incomplete badge, period switch, vi
     const csv = await fetch(origin + href, { headers: { cookie: owner } }).then((r) => r.text());
     const month = today.slice(0, 7);
     expect(csv).toContain(`${month},team,core,core,1.25,2,1,false,0`);
-    expect(csv).toContain(`${month},team,(no team),(no team),0.5,1,0,true,0`);
+    // b2 is seeded 20 days back: from the 21st on it falls inside this month too.
+    const noTeam = old.toISOString().slice(0, 7) === month ? "4.5,2" : "0.5,1";
+    expect(csv).toContain(`${month},team,(no team),(no team),${noTeam},0,true,0`);
     await page.locator("#spendPeriodSelect").selectOption("30d");
 
     // #169: By tag. Tagged receipts, one unknown-cost, one untagged.
