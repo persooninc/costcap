@@ -15,6 +15,7 @@ import { enroll, createFleetClient, requestRaise } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
 import { spawn } from "node:child_process";
+import { constants as osConstants } from "node:os";
 import { startMeteringProxy, baseUrlOverrides } from "./proxy.js";
 import { createCapEngine, loadSettledReceipts, loadEvents } from "./cap.js";
 import { createSettler } from "./settle.js";
@@ -222,7 +223,9 @@ export async function wrap(argv) {
     // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
     onExternalSettle: (s, r) => settleReceipt(s, r),
   }) : null;
-  const release = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
+  const releaseLedger = sharedLedger ? sharedLedger.close : lockLedger(receiptsPath);
+  let ledgerReleased = false;
+  const release = () => { if (ledgerReleased) return; ledgerReleased = true; releaseLedger(); };
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
   cap = createCapEngine({ caps, history, runId: who.run_id });
@@ -353,11 +356,32 @@ export async function wrap(argv) {
     child.kill("SIGTERM");
     setTimeout(() => child.kill("SIGKILL"), 5000).unref();
   }, Number(process.env.COSTCAP_KILL_POLL_MS) || 500);
+  // Stale-lock fix: docker stop / reboot sends SIGTERM to PID 1 and node would exit
+  // without running the finally below, leaving ${receipts}.lock behind. Forward the
+  // signal, wait (bounded) for the child, release the lock, exit 128+signo.
+  const childExited = new Promise((r) => { child.once("exit", r); child.once("error", r); });
+  let stopping = false;
+  const onSignal = async (sig) => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`costcap: received ${sig}, stopping wrapped process`);
+    try { child.kill(sig); } catch {}
+    const graceMs = Number(process.env.COSTCAP_SIGNAL_GRACE_MS) || 10_000; // test hook
+    let t;
+    const timedOut = await Promise.race([childExited.then(() => false), new Promise((r) => { t = setTimeout(() => r(true), graceMs); })]);
+    clearTimeout(t);
+    if (timedOut) { try { child.kill("SIGKILL"); } catch {} }
+    try { release(); } catch (e) { console.error(`costcap: warning: ledger lock not released: ${e.code ?? e.message}`); }
+    process.exit(128 + (osConstants.signals[sig] ?? 15));
+  };
+  const signalHandlers = ["SIGTERM", "SIGINT", "SIGHUP"].map((sig) => { const h = () => onSignal(sig); process.on(sig, h); return [sig, h]; });
   let exitSignal = null;
   const code = await new Promise((resolve) => {
     child.on("exit", (c, sig) => { exitSignal = sig ?? null; resolve(killedByCostcap ? 143 : (c ?? (sig ? 1 : 0))); });
     child.on("error", (e) => { console.error(`costcap: failed to start ${command[0]}: ${e.message}`); resolve(127); });
   });
+  if (stopping) await new Promise(() => {}); // the signal handler owns shutdown
+  for (const [sig, h] of signalHandlers) process.off(sig, h);
   clearInterval(watcher);
   if (syncTimer) clearInterval(syncTimer);
   const s = cap.spend();
