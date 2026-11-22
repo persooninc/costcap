@@ -31,22 +31,48 @@ function liveSharedWrappers(path) {
   return live;
 }
 
-export function lockLedger(path) {
+// Locks this process holds right now (so owner.pid === process.pid is not mistaken for stale).
+const heldLocks = new Set();
+
+// A same-host lock is stale when its PID is gone, or when it names our own PID
+// while we hold no lock: a previous incarnation of PID 1 in the same container
+// that was stopped by a signal before it could release.
+export function lockIsStale(owner, lock, host = hostname()) {
+  if (!owner || owner.host !== host || !Number.isInteger(owner.pid)) return false;
+  if (owner.pid === process.pid) return !heldLocks.has(lock);
+  return ownerIsDead(owner, host);
+}
+
+export function lockLedger(path, { host = hostname(), log = (m) => console.error(m) } = {}) {
   const lock = `${path}.lock`;
   mkdirSync(dirname(path), { recursive: true });
-  try { mkdirSync(lock, { mode: 0o700 }); }
+  for (let attempt = 0; ; attempt++) {
+  try { mkdirSync(lock, { mode: 0o700 }); break; }
   catch (err) {
     if (err.code !== "EEXIST") throw err;
     // Never auto-delete an ambiguous lock or a lock on another host.
     const owner = readOwner(`${lock}/owner.json`);
+    if (attempt === 0 && lockIsStale(owner, lock, host)) {
+      log(`costcap: reclaiming stale receipt ledger lock ${lock} (PID ${owner.pid} on ${owner.host} is not running)`);
+      rmSync(lock, { recursive: true, force: true });
+      continue;
+    }
     throw new Error(`Receipt ledger is locked${owner ? ` by PID ${owner.pid} on ${owner.host}` : ""}. Confirm the owner stopped before removing ${lock}.`);
   }
+  }
   try {
-    writeFileSync(`${lock}/owner.json`, JSON.stringify({ pid: process.pid, host: hostname() }), { mode: 0o600 });
+    writeFileSync(`${lock}/owner.json`, JSON.stringify({ pid: process.pid, host }), { mode: 0o600 });
     const shared = liveSharedWrappers(path);
     if (shared.length) throw new Error(`Receipt ledger is shared by ${shared.length} wrapper(s) (--shared-ledger). Use --shared-ledger too, or stop them.`);
   } catch (err) { rmSync(lock, { recursive: true, force: true }); throw err; }
-  return () => rmSync(lock, { recursive: true, force: true });
+  heldLocks.add(lock);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    heldLocks.delete(lock);
+    rmSync(lock, { recursive: true, force: true });
+  };
 }
 
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
