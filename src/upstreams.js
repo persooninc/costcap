@@ -8,7 +8,7 @@ import { premiumTier } from "./pricing.js";
 import { OVERRIDE_PROVIDERS, validateBuiltinPrices, validateToolPrices } from "./price-overrides.js";
 
 export const BUILTIN_PROVIDERS = Object.freeze(["openai", "anthropic", "openrouter", "gemini", "bedrock", "vertex"]);
-export const BUILTIN_ENV_VARS = Object.freeze(["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "OPENROUTER_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL", "GOOGLE_VERTEX_BASE_URL"]);
+export const BUILTIN_ENV_VARS = Object.freeze(["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "OPENROUTER_BASE_URL", "GOOGLE_GEMINI_BASE_URL", "GEMINI_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"]);
 const NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);

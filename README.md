@@ -188,170 +188,55 @@ rate record `cost_usd: null, reason: "user_price_unpriced"`, never $0. Groq repo
 records `service_tier_unpriced`.
 `--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
 request with no body `model` (Azure deployments) is model-less and refused when
-an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere v2)
-and embeddings/batch/files billing on custom upstreams stay unknown. Claude on
-Bedrock and Vertex has its own built-in routes (next section).
+an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere
+v2) and embeddings/batch/files billing on custom upstreams stay unknown; Claude
+on Bedrock and Vertex has its own built-in routes (below).
 
-## Negotiated rates and new models
+### Claude on Amazon Bedrock / Google Vertex AI
 
-The same `--upstream-prices FILE` can override the shipped table for the built-in
-providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `--upstream`:
+`wrap` also sets the variables Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` /
+`CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic Bedrock/Vertex SDKs read:
 
-```json
-{ "version": "acme-2026-11", "upstreams": {
-  "anthropic": { "claude-sonnet-4-5": { "discount": 0.2 } },
-  "openai": { "gpt-6-preview": { "input": 3, "output": 12 }, "*": { "discount": 0.1 } } } }
-```
+| Provider | Child env | Upstream |
+|---|---|---|
+| Bedrock | `ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:<port>/bedrock` | `https://bedrock-runtime.<region>.amazonaws.com` |
+| Vertex AI | `ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex/v1` | `https://<location>-aiplatform.googleapis.com` (`global`: `aiplatform.googleapis.com`) |
 
-- `{discount: d}` (0 < d < 1) scales every table component of the model (standard,
-  long context, fast/priority, modalities, batch) by `1-d`. `"*"` applies a discount to
-  every model in the table for that provider; a model-specific entry wins over it.
-- Absolute rates (`input`, `output`, optional `cached_input`, `cache_write`, `cache_write_1h`,
-  USD per 1M tokens) can price a model that isn't in the table. They price only the
-  standard text components they list.
-- **Never $0, never silently lower.** Rates must be > 0. `wrap` exits 2 before spawning on
-  a discount outside (0,1), rates mixed with a discount, an unknown key, or `"*"` with rates.
-  A discount never applies to a fallback-priced model: a `{discount}` entry for a model not in the
-  pricing table is ignored (`wrap` warns "discount ignored: …"), so `--unknown-models refuse` still refuses it and
-  `pricing show`/`--preflight` quote the full fallback rate. If a call needs a component that an
-  absolute entry doesn't list (a cache write with no rate, long context over the table
-  threshold, fast/priority, non-text tokens or a batch line), the receipt is
-  `cost_usd: null, reason: "user_price_unpriced"` and the run pauses. The table rate is never used instead.
-- Receipts record `cost_source: "user_prices"`, `prices_version`, `prices_sha256` and the
-  table pin. `--unknown-models refuse`, `--preflight` and `--models` use the same rates.
-  OpenRouter's reported `usage.cost` still wins.
-- `costcap pricing show MODEL --prices FILE` prints the effective row. `costcap pricing verify
-  --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
-  `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
-
-## OpenAI Realtime API
-
-`wrap` proxies the Realtime WebSocket at `/openai/v1/realtime` and also exports
-`COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` for raw-socket apps.
-
-- The handshake passes the same gate as HTTP calls before `101`: kill, accounting
-  failure, `--models`, `--unknown-models refuse` on `?model=`, agent/team budgets,
-  tag caps and caps. A refusal is a plain HTTP JSON response; nothing reaches OpenAI.
-- Frames are relayed unchanged. Each `response.done` writes one receipt
-  (`transport: "websocket"`, `session_id`, `response_id`) priced at the text, audio
-  and image rates of `gpt-realtime`, `gpt-realtime-2.1` and `gpt-realtime-2.1-mini`
-  (`gpt-realtime-mini` is text-only in the table; its audio is `modality_unpriced`).
-- After each receipt the gate is re-checked. On a hit the client gets that
-  `response.done`, then `{"type":"error","error":{"type":"costcap","code":"<reason>"}}`
-  and close `1008`; the upstream is closed. `costcap kill` closes open sessions within 1 s.
-- Unknowns stop later calls until reconciled: a session closed mid-response
-  (`stream_incomplete`), unpriced audio, and transcription usage (`transcription_unpriced`).
-- The Python SDK works as is (it derives `ws://…/realtime` from `OPENAI_BASE_URL`).
-  The Node SDK forces `wss:` and is not supported against the local plain-HTTP proxy.
-  Clients with a hardcoded `wss://api.openai.com` bypass CostCap. Other WebSocket
-  upgrades get `501 websocket_unsupported`. WebRTC/SIP are not covered.
-
-## Claude on Bedrock / Vertex
-
-`costcap wrap` meters the Gemini API's explicit cache (`/v1beta/cachedContents`). A create
-(`POST`) is billed for storage from the response: `usageMetadata.totalTokenCount` × the
-model's `cache_storage` rate (USD per 1M tokens per hour) × hours from `createTime` to
-`expireTime`. A TTL update (`PATCH`) bills only the extension past the last expiry this
-wrapper saw; for a cache it never saw it bills `updateTime → expireTime` with
-`storage_upper_bound: true`, and a shorter TTL is $0 (no refund). `DELETE`, `GET` and list
-are $0. Receipts carry `kind: "cache_storage"`, `cache_name`, `cache_tokens` and
-`storage_hours`, and count toward every cap. The create's `models/{id}` is checked as `{id}`
-by `--models`, `--unknown-models refuse` and `--model-cap`; `--preflight` lets it through
-(`preflight_estimate: false`) and `--downgrade` never rewrites it. Storage rates are dated
-like token rates (a TTL across a price change is split at the boundary); `costcap pricing
-show <model>` prints them. Gemini 4 has no published storage rate, so a create on it, or a
-response without a token count or expiry, is `cache_storage_unpriced` and pauses the run
-until reconciled. Receipts are an upper bound: Google documents no refund for early deletes.
-Vertex `cachedContents` stays unsupported.
-
-## Claude on Bedrock / Vertex, Gemini on Vertex
-
-`costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and
-`ANTHROPIC_VERTEX_BASE_URL`, so boto3 / AWS SDK v3 Bedrock callers, Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
-Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
-
-- **Routes.** Bedrock `POST /model/{id}/invoke`, `invoke-with-response-stream` and
-  `count-tokens`, plus Converse `POST /model/{id}/converse` and `converse-stream`
-  (boto3 `converse`/`converse_stream`, LangChain `ChatBedrockConverse`, Strands), go to `bedrock-runtime.<region>.amazonaws.com`. Vertex
-  `…/locations/<loc>/publishers/anthropic/models/{id}:rawPredict` and `:streamRawPredict`
-  go to `<loc>-aiplatform.googleapis.com` (`global` goes to `aiplatform.googleapis.com`).
-  Converse is metered from `usage` (`inputTokens`, `outputTokens`, `cacheReadInputTokens`,
-  `cacheWriteInputTokens`) and ConverseStream from the final `metadata` event; a stream cut
-  before `metadata` is `stream_incomplete` (unknown cost, never $0). Preflight reads
-  `inferenceConfig.maxTokens`. If `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` is already set, wrap leaves
-  it alone and warns once.
-- Non-Anthropic Bedrock models (#278): Amazon Nova (micro, lite, pro, premier, 2 lite), Meta Llama
-  3 / 3.1 / 3.2 / 3.3 / 4 (Scout, Maverick), Mistral (7B, Small, Large), DeepSeek R1, OpenAI gpt-oss
-  (20b, 120b) and Qwen3 (32B, Coder 30B) are priced from the table's `bedrock_models` section
-  (AWS Price List on-demand standard rates, per region: us-east-1, us-west-2, eu-west-1 where AWS
-  lists the model). The rate comes from the request's region (the SigV4 region, else `AWS_REGION` /
-  `AWS_DEFAULT_REGION`); a `us.`/`eu.`/`apac.` geo profile is stripped and billed at that region's
-  row. The Claude 10% regional premium never applies to these rows. An unlisted id, a region with no
-  row, a `global.` profile, an inference-profile ARN, a cache write, or a usage component with no rate
-  stays `cloud_model_unpriced` (or `cache_*_unpriced`) and pauses the run, never the fallback rate.
-  A Converse `serviceTier.type` other than `default` records `service_tier_unpriced`.
-  `costcap pricing show us.amazon.nova-pro-v1:0` prints the per-region rows.
-- `--upstream-prices` accepts `bedrock` and `vertex` override keys (no `--upstream` needed), with the
-  same rules as the first-party keys: `{discount}` scales table rows, absolute rates price an
-  unlisted id, `"*"` takes a discount only. Bedrock keys are the base model id without the geo
-  prefix (`amazon.nova-pro-v1:0`, `meta.llama-x-v1:0`); Vertex keys are the model id
-  (`gemini-2.5-pro`, `claude-sonnet-4-5`). Overridden receipts carry `cost_source: "user_prices"`.
-  Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
-  `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
-- **Non-Anthropic Bedrock models (#278).** Converse/invoke calls to Amazon Nova (Micro, Lite, Pro,
-  Premier, Nova 2 Lite), Meta Llama 3 / 3.1 / 3.2 / 3.3 / 4, Mistral (7B, Small, Large), DeepSeek R1,
-  OpenAI gpt-oss (20b, 120b) and Qwen3 (32B, Coder 30B) are priced from the table's `bedrock_models`
-  section: AWS on-demand standard rates per region (`us-east-1`, `us-west-2`, `eu-west-1`), read from the
-  public AWS Price List bulk JSON (`node scripts/bedrock-prices.mjs` regenerates it). The rate comes from the
-  request's region (the SigV4 signing region, else `AWS_REGION`/`AWS_DEFAULT_REGION`), so a `us.`/`eu.`/`apac.`
-  geo profile bills at its source region; receipts carry `bedrock_region` and no Claude regional premium.
-  An unlisted id, a region with no row, a `global.` profile, an inference-profile ARN, a usage
-  component with no published rate, and a Converse `serviceTier` other than `default`
-  (`service_tier_unpriced`) are unknown cost (never $0, never the fallback) and pause the run.
-  `--unknown-models refuse`, `--models`, `--model-cap amazon.nova-pro-v1:0:day=…`, `--preflight` and
-  `costcap pricing` use the same base id (geo prefix stripped).
-- **Overrides.** `--upstream-prices` takes `bedrock` and `vertex` as built-in keys (#189 semantics):
-  `{"upstreams": {"bedrock": {"meta.llama-x-v1:0": {"input": 1, "output": 2}, "amazon.nova-pro-v1:0": {"discount": 0.3}},
-  "vertex": {"*": {"discount": 0.2}}}}`. Bedrock keys are base ids without the geo prefix; absolute rates price an
-  unlisted id, `{discount}` scales a table row, `"*"` takes a discount only. Receipts get `cost_source: "user_prices"`.
-- **Gemini on Vertex.** wrap also sets `GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex`
-  (read by Google's genai SDKs with `vertexai=True`; for SDKs that don't read it, pass
-  `http_options.base_url` with that value). `…/publishers/google/models/{id}:generateContent`,
-  `:streamGenerateContent` (`?alt=sse` or the default JSON-array stream) and `:countTokens`
-  (free) are metered from `usageMetadata` exactly like `/gemini` calls, with caps, kill switch,
-  allowlist and preflight (`generationConfig.maxOutputTokens`). Receipts have provider `vertex`.
-  `@version` / `-NNN` suffixes price as the base id; only Gemini models listed under
-  `vertex_gemini` in the pricing table are priced, any other id is unknown (never $0).
-  That list covers Gemini 2.5 Pro / Flash / Flash-Lite, Gemini 4 Carbon / Argon / Hydrogen,
-  3.8 / 3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview (#256). Their global rates are the same as
-  the Gemini API rates, and they are priced at the request instant (`COSTCAP_PRICING_CLOCK` pins it),
-  so dated rate changes apply (Carbon/Argon from 2026-12-01, 3.8/3.6 Flash from 2027-01-01, with
-  `rates_effective_from` on the receipt). Gemini API `billed_as` remaps never apply on Vertex.
-  A regional (non-global) endpoint adds Vertex's +10% on GA Gemini 3+ models (`regional_multiplier: 1.1`,
-  on every component including cached input and long context). 3.1 Pro Preview and 2.5 have no premium.
-  Batch prediction, `cachedContents`, tuning, Imagen, Veo, embeddings and Live stay
-  `404 cloud_route_unsupported`.
-- **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes
-  through unchanged; the region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`. A SigV4
-  request is signed by the child for the local proxy, so CostCap verifies it with the static
-  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` in wrap's environment
-  (bad signature: `403 bedrock_signature_invalid`) and re-signs it for the real host. Without
-  static credentials a signed call gets `502 bedrock_credentials_unavailable` and nothing is
-  forwarded. Profiles, SSO and IMDS are not resolved inside the proxy; export them first:
-  `eval "$(aws configure export-credentials --format env)"`. Keys never reach receipts.
-- **Vertex credentials.** The OAuth `Authorization` header passes through unchanged.
-- **Metering.** JSON, Vertex SSE and Bedrock's binary `application/vnd.amazon.eventstream`
-  are metered in real time (frames forwarded byte-for-byte, CRC-checked). A cut stream or a
+- **Routes.** Bedrock `/model/{id}/invoke`, `/invoke-with-response-stream` and
+  `/count-tokens`; Vertex `…/publishers/anthropic/models/{id}:rawPredict` /
+  `:streamRawPredict` on a single-region or `global` location. Anything else
+  (Converse, `GET /inference-profiles`, multi-region `locations/us|eu`) is
+  answered locally with `404 cloud_route_unsupported`: never forwarded, never
+  unmetered, no receipt, no pause.
+- **Bedrock credentials.** A Bedrock API key (`Authorization: Bearer`,
+  `AWS_BEARER_TOKEN_BEDROCK`) passes through; the region is `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`. A SigV4-signed request is verified with wrap's own
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+  (`403 bedrock_signature_invalid` on mismatch) and re-signed for the real host
+  (region from the credential scope). The proxy does not resolve `AWS_PROFILE`,
+  SSO or IMDS: without static credentials a signed call gets
+  `502 bedrock_credentials_unavailable`. Export them first:
+  `eval "$(aws configure export-credentials --format env)"`.
+- **Vertex credentials.** The OAuth bearer `Authorization` header passes through unchanged.
+- **Metering.** JSON and Vertex SSE use the Anthropic usage rules (cache
+  read/write, 1h writes, fast mode, long context). Bedrock's binary
+  `application/vnd.amazon.eventstream` is forwarded byte-for-byte in real time
+  and decoded on the side (CRC-checked); a stream cut before `message_stop` or a
   bad CRC is `stream_incomplete`. `count-tokens` is free.
-- **Models.** The model comes from the path: Bedrock geo prefixes (`global.`, `us.`, `eu.`,
-  `apac.`, `jp.`, `au.`), `anthropic.` and `-vN[:M]` are stripped; Vertex `@YYYYMMDD` is
-  stripped. Receipts carry `provider`, `model` (table id), `provider_model` (raw id) and
-  `endpoint_scope`. A non-Anthropic id, an ARN or an unlisted id records
-  `cost_usd: null, reason: "cloud_model_unpriced"` and pauses; it never uses the fallback rate.
-- **Regional premium.** Claude 4.5+ on regional endpoints costs 10% over global (Bedrock
-  `global.` ids and Vertex `locations/global` are global). The table's `regional_endpoint`
-  multiplier stacks with long context and batch; receipts record `regional_multiplier`.
-- Cloud routes always bypass the response cache (`x-costcap-cache: bypass`).
+- **Model ids** come from the path. Bedrock strips the geo prefix
+  (`global.|us.|eu.|apac.|jp.|au.`), `anthropic.` and `-vN[:M]`; Vertex strips
+  `@YYYYMMDD`. Non-Anthropic ids, inference-profile ARNs and unlisted ids record
+  `cost_usd: null, reason: "cloud_model_unpriced"` (never the fallback rate) and
+  pause the run. `--models`, policy allowlists, `--unknown-models refuse` and
+  `--preflight` use the mapped id.
+- **Regional premium.** Claude 4.5+ on regional (non-global) endpoints costs
+  10% more than global (table key `regional_endpoint`). Bedrock `global.` ids and
+  Vertex `locations/global` are global; every other request is regional and is
+  billed at 1.1x on every rate component, stacking with long context. Receipts
+  carry `provider: "bedrock"|"vertex"`, `model` (table id), `provider_model`,
+  `endpoint_scope` and `regional_multiplier`.
+- Cloud routes never use the response cache (`x-costcap-cache: bypass`).
+  Private-offer / negotiated cloud rates are not modelled.
 
 ## Enforcement limits
 

@@ -46,7 +46,7 @@ const SNAPSHOT_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/;
 // first-party id, which carries the same list rates for these providers.
 const FIRST_PARTY_PREFIX = /^(?:anthropic|openai)\//;
 
-// The table key a model id resolves to (exact, dated snapshot base or first-party id), or null.
+// The table key a model id resolves to (exact, dated snapshot base, or first-party id), or null.
 export function resolveModelId(model) {
   if (typeof model !== "string" || !model) return null;
   const base = model.replace(SNAPSHOT_SUFFIX, "");
@@ -54,6 +54,11 @@ export function resolveModelId(model) {
   if (FIRST_PARTY_PREFIX.test(base)) candidates.push(base.replace(FIRST_PARTY_PREFIX, ""));
   for (const id of candidates) if (Object.hasOwn(table.models, id)) return id;
   return null;
+}
+
+function resolveEntry(model) {
+  const id = resolveModelId(model);
+  return id === null ? undefined : table.models[id];
 }
 
 export { dayOf, datedRow, validateSchedules, pricingAt } from "./pricing-schedule.js";
@@ -160,34 +165,13 @@ export function batchMultiplier(provider) {
   return typeof m === "number" && Number.isFinite(m) && m > 0 ? m : null;
 }
 
-// #188: Claude 4.5+ on Bedrock/Vertex regional (non-global) endpoints costs a published
-// premium over global. Returns the multiplier for a model, or null when none applies.
+// #188: Claude 4.5+ on Bedrock/Vertex regional (non-global) endpoints carries a premium.
+// Returns the multiplier for a listed model, else null (no premium published).
 export function regionalMultiplier(model) {
   const r = table.regional_endpoint;
   const id = resolveModelId(model);
-  if (!r || id === null || !Array.isArray(r.models) || !r.models.includes(id)) return null;
+  if (!r || !Array.isArray(r.models) || id === null || !r.models.includes(id)) return null;
   return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
-}
-
-// #256: Vertex non-global premium for GA Gemini 3+ (vertex_gemini.regional). null when none applies.
-export function vertexGeminiRegionalMultiplier(model) {
-  const r = table.vertex_gemini?.regional;
-  const id = resolveModelId(model);
-  if (!r || id === null || !Array.isArray(r.models) || !r.models.includes(id)) return null;
-  return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
-}
-
-// #217: Gemini models with a published Vertex AI rate (same per-token rates as the table entry).
-export function vertexGeminiModels() {
-  const list = table.vertex_gemini?.models;
-  return Array.isArray(list) ? list.filter((id) => Object.hasOwn(table.models, id)) : [];
-}
-
-// Every numeric rate (including the long-context set) times m; thresholds unchanged.
-export function scalePrice(price, m) {
-  const out = scaleRates(price, m);
-  if (price.long_context) out.long_context = scaleRates(price.long_context, m);
-  return out;
 }
 
 const scaleRates = (rates, m) => Object.fromEntries(Object.entries(rates).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v]));
@@ -217,24 +201,14 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false, vertex = false, bedrock } = {}) {
-  const price = lookupPrice(model, at, { undated, vertex, bedrock });
-  // #198: a per-minute / per-character model (whisper-1, tts-1) has no token rate: unknown, never NaN or $0.
-  if (!price.fallback && !(Number.isFinite(price.input) && Number.isFinite(price.output))) {
-    return { model, cost_usd: null, reason: "unit_unpriced", input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
-      pricing_tier: "standard", table_version: price.table_version, table_sha256: price.table_sha256, fallback: false, cost_source: "table" };
-  }
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false } = {}) {
+  const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
-  // #262: Vertex Priority PayGo has no verified published rate: unpriced, never the Gemini API set or standard.
-  const tierPrice = vertex && price.priority ? { ...price, priority: undefined } : price;
-  const tiered = selectRates(tierPrice, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
-  const batchM = batch ? batchMultiplier(batch) : null;
-  if (batch && batchM === null) throw new Error(`no batch rate for provider ${batch}`);
-  // Regional premium stacks with batch and long-context like batch_multiplier (#188).
-  const regionalM = regional && !price.fallback ? (vertex ? vertexGeminiRegionalMultiplier(model) : regionalMultiplier(model)) : null;
-  // #189: a user discount (scale = 1 - d) stacks like batch/regional; never on the fallback rate.
-  const userM = scale !== undefined && !price.fallback ? scale : null;
-  const multiplier = batchM === null && regionalM === null && userM === null ? null : (batchM ?? 1) * (regionalM ?? 1) * (userM ?? 1);
+  const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
+  const batchMult = batch ? batchMultiplier(batch) : null;
+  if (batch && batchMult === null) throw new Error(`no batch rate for provider ${batch}`);
+  const regionalMult = regional ? regionalMultiplier(model) : null;
+  const multiplier = batchMult === null && regionalMult === null ? null : (batchMult ?? 1) * (regionalMult ?? 1);
   const pricing_tier = tiered.pricing_tier;
   const selected = tiered.rates && multiplier !== null ? scaleRates(tiered.rates, multiplier) : tiered.rates;
   const premium = PREMIUM_TIERS.includes(pricing_tier);
@@ -267,8 +241,8 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     pricing_tier,
     ...(tiered.long_context && { long_context: true }),
     ...(modality_tokens && { modality_tokens }),
-    ...(batchM !== null && { batch_multiplier: batchM }),
-    ...(regionalM !== null && { regional_multiplier: regionalM }),
+    ...(batchMult !== null && { batch_multiplier: batchMult }),
+    ...(regionalMult !== null && { regional_multiplier: regionalMult }),
     ...(signal.speed !== undefined && { speed: signal.speed }),
     ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
     ...(price.rates_effective_from && { rates_effective_from: price.rates_effective_from }),

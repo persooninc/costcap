@@ -64,15 +64,13 @@ export function outputMultiplier(provider, req) {
 // Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
 // #167: an OpenRouter `models` fallback list may route to any entry, so the
 // worst case is the max over every candidate (any unpriced candidate refuses).
-// #188: pathModel (cloud routes) is the model from the request path, used over the body.
-export function estimateWorstCase(provider, body, path = "", priceFor, pathModel, at) {
-  // #236: the shipped table prices at the moment of the check.
-  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
+// #188: `pathModel` (Bedrock/Vertex carry the model in the path) wins over the body's model.
+export function estimateWorstCase(provider, body, path = "", priceFor, pathModel) {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
   let req = {};
   try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
   const candidates = provider === "openrouter" ? openRouterModels(req) : null;
-  if (pathModel !== undefined) return estimateOne(provider, req, text, path, pathModel ?? "unknown", priceFor);
+  if (pathModel !== undefined) return estimateOne(provider, req, text, path, pathModel ?? "", priceFor);
   if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0], priceFor);
   let worst;
   for (const m of candidates) {
@@ -97,6 +95,7 @@ export function openRouterModels(req) {
 
 function estimateOne(provider, req, text, path, forcedModel, priceFor) {
   let model = forcedModel ?? (typeof req.model === "string" ? req.model : undefined);
+  if (model === "") model = undefined;
   if (!model && provider === "gemini") model = /models\/([^/:]+)/.exec(path)?.[1];
   // #186: a custom upstream estimates only from user prices (priceFor), never the shipped table.
   const price = model ? (priceFor ? priceFor(model) : lookupPrice(model)) : null;
@@ -128,45 +127,8 @@ function estimateOne(provider, req, text, path, forcedModel, priceFor) {
 // Compares the estimate with the remaining run/hour/day/month budget.
 // Returns null when it fits, else the refusal detail. When `onFit` is given it
 // receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel, at, reserved = 0) {
-  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel, at), onFit, reserved);
-}
-
-// #205: an Anthropic Message Batches create is estimated as the SUM of every
-// entry's worst case (requests[].params, same bytes/4 + max_tokens maths as a
-// single call) times the provider batch multiplier. Any unpriced or missing
-// entry model refuses as preflight_unpriced naming that model.
-// #230: a Gemini inline batch (batch.input_config.requests.requests[].request) is estimated the
-// same way, each entry priced at the create's path model.
-export function estimateBatch(provider, body, priceFor, pathModel, at) {
-  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
-  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
-  let reqs;
-  if (provider === "gemini") {
-    const g = geminiBatchRequests(text);
-    reqs = g?.map((request) => ({ params: request }));
-  } else try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
-  if (!Array.isArray(reqs) || !reqs.length) return { ok: false, reason: "preflight_unpriced", model: "unknown" };
-  const mult = batchMultiplier(provider) ?? 1;
-  // #218: the batch discount covers tokens only; tool calls (web search) bill at 100%.
-  let usd = 0, toolUsd = 0, toolCalls = 0, input_tokens = 0, output_tokens = 0, model;
-  for (const r of reqs) {
-    const params = r?.params && typeof r.params === "object" ? r.params : {};
-    const e = provider === "gemini"
-      ? estimateOne(provider, params, JSON.stringify(params), `/v1beta/models/${pathModel}:generateContent`, pathModel ?? "unknown", priceFor)
-      : estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
-    if (!e.ok) return e;
-    const t = e.tool_usd_max ?? 0;
-    usd += e.estimate_usd - t; toolUsd += t; toolCalls += e.tool_calls_max ?? 0; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
-  }
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: 1, batch_entries: reqs.length, batch_multiplier: mult,
-    ...(toolCalls && { tool_calls_max: toolCalls, tool_usd_max: Number(toolUsd.toFixed(6)) }),
-    estimate_usd: Number((usd * mult + toolUsd).toFixed(6)) };
-}
-
-// Compares a precomputed estimate (estimateWorstCase / estimateBatch) with the remaining budget.
-// #249: `reserved` is the summed worst case of calls already in flight (--max-concurrent).
-export function checkEstimate(cap, est, onFit, reserved = 0) {
+export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel) {
+  const est = estimateWorstCase(provider, body, path, priceFor, pathModel);
   if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
   const remaining = { ...(cap?.remaining?.() ?? {}) };
   if (reserved > 0) for (const k of Object.keys(remaining)) if (typeof remaining[k] === "number") remaining[k] = Number(Math.max(remaining[k] - reserved, 0).toFixed(6));

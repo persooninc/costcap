@@ -170,64 +170,10 @@ test("regression: a standard-tier proxy receipt only gains pricing_tier: standar
   assert.equal(p.receipts[0].cost_usd, usd(1000 * 1.25 / 1e6 + 100 * 10 / 1e6));
 });
 
-test("#188 regional endpoint premium stacks with the long-context tier", () => {
-  const u = { input_tokens: 300_000, output_tokens: 10_000, cached_input_tokens: 1000 };
-  const lc = costForUsage("claude-sonnet-4-5", u);
-  const reg = costForUsage("claude-sonnet-4-5", u, { regional: true });
-  assert.equal(lc.pricing_tier, "long_context");
-  assert.equal(reg.pricing_tier, "long_context");
-  assert.equal(reg.regional_multiplier, 1.1);
-  const r = lookupPrice("claude-sonnet-4-5").long_context;
-  assert.equal(reg.cost_usd, Number(((u.input_tokens * r.input * 1.1 + u.cached_input_tokens * r.cached_input * 1.1 + u.output_tokens * r.output * 1.1) / 1e6).toFixed(6)));
-});
-
-// #232: OpenAI >272K tier; Fast is 2x the applicable (long-context) rates where published.
-test("#232 AC4: gpt-6.1-sol long context standard and fast", async () => {
-  const { costForUsage } = await import("../src/pricing.js");
-  const lc = costForUsage("gpt-6.1-sol", { input_tokens: 300_000, output_tokens: 1000 });
-  assert.deepEqual([lc.cost_usd, lc.pricing_tier], [1.215, "long_context"]);
-  const fast = costForUsage("gpt-6.1-sol", { input_tokens: 300_000, output_tokens: 1000, service_tier: "fast" });
-  assert.deepEqual([fast.cost_usd, fast.pricing_tier, fast.long_context], [2.43, "priority", true]);
-  assert.equal(costForUsage("gpt-6.1-sol", { input_tokens: 272_000, output_tokens: 1000 }).pricing_tier, "standard");
-  // No stated multiple: ultrafast over 272K, and gpt-5.5 (Fast is 2.5x) Fast over 272K, are unpriced.
-  for (const [m, t] of [["gpt-6.1-sol", "ultrafast"], ["gpt-5.5", "priority"]]) {
-    const r = costForUsage(m, { input_tokens: 300_000, output_tokens: 1, service_tier: t });
-    assert.deepEqual([r.cost_usd, r.reason], [null, "service_tier_unpriced"], m);
-  }
-});
-
-// #234: Haiku 5.5 >100K prompt tier (prompt counts cache reads/writes); Fable 5.2 cache usage through the proxy.
-test("#234 AC3: claude-haiku-5-5 standard up to 100000 prompt tokens, long_context above", () => {
-  const a = costForUsage("claude-haiku-5-5", { input_tokens: 80_000, output_tokens: 1000 });
-  assert.deepEqual([a.cost_usd, a.pricing_tier], [0.0085, "standard"]);
-  const b = costForUsage("claude-haiku-5-5", { input_tokens: 100_000, output_tokens: 1000 });
-  assert.deepEqual([b.cost_usd, b.pricing_tier], [0.0105, "standard"]);
-  const c = costForUsage("claude-haiku-5-5", { input_tokens: 90_000, cached_input_tokens: 20_000, output_tokens: 1000 });
-  assert.deepEqual([c.cost_usd, c.pricing_tier], [0.0485, "long_context"]);
-  const reg = costForUsage("claude-haiku-5-5", { input_tokens: 90_000, cached_input_tokens: 20_000, output_tokens: 1000 }, { regional: true });
-  assert.deepEqual([reg.cost_usd, reg.pricing_tier, reg.regional_multiplier], [0.05335, "long_context", 1.1]);
-});
-
-test("#234 pricing show prints Haiku 5.5 >100000 and Fable 5.2 fast rows; verify passes", () => {
-  const out = pricingCommand(["show"]).out;
-  assert.match(out, /claude-haiku-5-5 \(>100000 input tokens\): input \$0\.5, cached_input \$0\.05/);
-  assert.match(out, /claude-fable-5-2 \(fast\): input \$16/);
-  assert.equal(pricingCommand(["verify"]).code, 0);
-});
-
-const FABLE_USAGE = { input_tokens: 1000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 20_000, cache_creation: { ephemeral_5m_input_tokens: 10_000, ephemeral_1h_input_tokens: 10_000 }, output_tokens: 2000 };
-test("#234 AC2 proxy: claude-fable-5-2 cache usage costs 0.368 as JSON and SSE, no fallback", async (t) => {
-  const json = await through(t, "anthropic", "/v1/messages", JSON.stringify({ model: "claude-fable-5-2", usage: FABLE_USAGE }));
-  assert.equal(await json.call(), 200);
-  const { output_tokens, ...start } = FABLE_USAGE;
-  const events = [
-    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { model: "claude-fable-5-2", usage: { ...start, output_tokens: 1 } } })}`,
-    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens } })}`,
-    'event: message_stop\ndata: {"type":"message_stop"}', ""].join("\n\n");
-  const sse = await through(t, "anthropic", "/v1/messages", events, "text/event-stream");
-  assert.equal(await sse.call(), 200);
-  for (const r of [json.receipts[0], sse.receipts[0]]) {
-    assert.equal(r.cost_usd, 0.368);
-    assert.ok(!r.fallback);
-  }
+test("#188: the regional multiplier stacks with the long-context tier", () => {
+  const usage = { input_tokens: 210_000, output_tokens: 1000, cached_input_tokens: 1000 };
+  const g = costForUsage("claude-sonnet-4-5", usage), r = costForUsage("claude-sonnet-4-5", usage, { regional: true });
+  assert.equal(g.pricing_tier, "long_context"); assert.equal(r.pricing_tier, "long_context");
+  assert.equal(r.regional_multiplier, 1.1);
+  assert.ok(Math.abs(r.cost_usd - g.cost_usd * 1.1) < 1e-6);
 });

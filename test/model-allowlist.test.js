@@ -280,36 +280,15 @@ test("proxy: --unknown-models refuse applies to every OpenRouter fallback", asyn
   assert.equal(f.seen.length, 0);
 });
 
-test("#188 the allowlist sees the mapped Bedrock path model, not the raw provider id", async (t) => {
-  const up = await new Promise((r) => {
-    const s = http.createServer((q, res) => { q.resume(); res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } })); });
-    s.listen(0, "127.0.0.1", () => r({ s, url: `http://127.0.0.1:${s.address().port}` }));
-  });
-  const { server, port } = await startMeteringProxy({ upstreams: { bedrock: up.url }, cloudEnv: { AWS_REGION: "us-east-1" }, allowedModels: () => ["claude-haiku-4-5"] });
-  t.after(() => { server.close(); up.s.close(); });
+test("#188: allowlist checks use the mapped Bedrock path model", async (t) => {
+  const up = http.createServer((q, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "x", usage: { input_tokens: 1, output_tokens: 1 } })));
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  t.after(() => up.close());
+  const { server, port } = await startMeteringProxy({ upstreams: { bedrock: `http://127.0.0.1:${up.address().port}` }, awsRegion: "us-east-1", allowedModels: () => ["claude-sonnet-4-5"] });
+  t.after(() => server.close());
   const call = (id) => fetch(`http://127.0.0.1:${port}/bedrock/model/${encodeURIComponent(id)}/invoke`, { method: "POST", headers: { authorization: "Bearer k" }, body: "{}" });
-  assert.equal((await call("us.anthropic.claude-haiku-4-5-20251001-v1:0")).status, 200);
-  const no = await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
-  assert.equal(no.status, 403);
-  assert.equal((await no.json()).model, "claude-sonnet-4-5");
-  const raw = await call("meta.llama3-70b-instruct-v1:0");
-  assert.equal((await raw.json()).model, "meta.llama3-70b-instruct-v1:0");
-});
-
-test("#257 a cachedContents create's models/{id} is checked as {id} by --models and --unknown-models refuse", async (t) => {
-  const up = await new Promise((r) => {
-    const s = http.createServer((q, res) => { q.resume(); res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ name: "cachedContents/c1", model: "models/gemini-2.5-flash", createTime: "2026-11-16T12:00:00Z", expireTime: "2026-11-16T13:00:00Z", usageMetadata: { totalTokenCount: 1000000 } })); });
-    s.listen(0, "127.0.0.1", () => r({ s, url: `http://127.0.0.1:${s.address().port}` }));
-  });
-  t.after(() => up.s.close());
-  const call = async (opts, model) => {
-    const { server, port } = await startMeteringProxy({ upstreams: { gemini: up.url }, ...opts });
-    t.after(() => server.close());
-    const r = await fetch(`http://127.0.0.1:${port}/gemini/v1beta/cachedContents`, { method: "POST", body: JSON.stringify({ model }) });
-    return [r.status, (await r.json()).model];
-  };
-  assert.deepEqual(await call({ allowedModels: () => ["gemini-2.5-flash"] }, "models/gemini-2.5-flash"), [200, "models/gemini-2.5-flash"]);
-  assert.deepEqual(await call({ unknownModels: "refuse" }, "models/gemini-2.5-flash"), [200, "models/gemini-2.5-flash"]);
-  assert.deepEqual(await call({ allowedModels: () => ["gemini-2.5-pro"] }, "models/gemini-2.5-flash"), [403, "gemini-2.5-flash"]);
-  assert.deepEqual(await call({ unknownModels: "refuse" }, "models/not-a-model"), [403, "not-a-model"]);
+  assert.equal((await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0")).status, 200);
+  const r = await call("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+  assert.equal(r.status, 403);
+  assert.equal((await r.json()).model, "claude-haiku-4-5");
 });
