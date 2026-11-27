@@ -732,6 +732,14 @@ its own unsynced receipts reach the fleet day/month cap (`429 budget_exceeded`,
 unknown cost is unsettled. Spend cached from an earlier UTC day/month counts 0
 for that window. A fresh runner or wiped `.costcap/` no longer starts from $0.
 Overshoot is still bounded by unsynced spend on other hosts (one poll interval).
+||||||| 71682b6
+
+A fleet policy can also carry `maxSteps`, the most upstream calls one wrapped
+run may make (dashboard: "Max steps per run"). An enrolled wrapper enforces it
+from its cached policy, offline too, with the same `breaker_open` /
+`step_budget` receipt as `--max-steps`. A local `--max-steps` can tighten it,
+never loosen it. `GET /v1/agents/:id/budget?run_id=RUN` reports `max_steps` and
+`steps` for that run.
 
 ## Per-agent budgets
 

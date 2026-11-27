@@ -13,14 +13,31 @@ const HOSTED_SCOPES = ["day", "week", "month", "total"];
 // team (optional, issue #123): the teamVerdict() of the agent's team. The agent's own
 // cap applies first, then the team's shared spend.
 export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team = null, orgBudget = null, budgetPeriod = null }) {
+||||||| 71682b6
+export function hostedAgentVerdict({ agent, receipts, nowMs }) {
+
+// runId (optional): also report the step budget (maxSteps) for that run.
+export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null }) {
   const nowDate = new Date(nowMs);
   const who = { agent_id: agent.id, run_id: runId };
+||||||| 71682b6
+  const month = nowDate.toISOString().slice(0, 7);
+  const who = { agent_id: agent.id, run_id: null };
+
+  const month = nowDate.toISOString().slice(0, 7);
+  const who = { agent_id: agent.id, run_id: runId };
+  const maxSteps = runId != null ? agent.policy?.maxSteps ?? null : null;
   const limits = {};
   // #208: an active cap raise applies until its expires_at, then the base cap again.
   const caps = effectiveCaps(agent.policy, nowMs);
   for (const scope of HOSTED_SCOPES) if (caps[scope] != null) limits[scope] = caps[scope];
   const maxSteps = agent.policy?.maxSteps ?? null;
   if (maxSteps != null && runId) limits.maxSteps = maxSteps;
+||||||| 71682b6
+  for (const scope of HOSTED_SCOPES) if (agent.policy?.caps?.[scope] != null) limits[scope] = agent.policy.caps[scope];
+
+  for (const scope of HOSTED_SCOPES) if (agent.policy?.caps?.[scope] != null) limits[scope] = agent.policy.caps[scope];
+  if (maxSteps != null) limits.maxSteps = maxSteps;
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};
   // Only receipts in the widest window (this budget-period month, #209) count, unknown ones included.
   // #265: a total cap counts every receipt since the beginning (unknown ones included).
@@ -29,6 +46,14 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
     .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod, limits.week != null)))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
+||||||| 71682b6
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && new Date(r.ts).toISOString().slice(0, 7) === month)
+    .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id }));
+  const budgets = createAgentBudgets({ policy, history, now: () => nowDate });
+
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && new Date(r.ts).toISOString().slice(0, 7) === month)
+    .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: typeof r.run_id === "string" ? r.run_id : null }));
+  const budgets = createAgentBudgets({ policy, history, now: () => nowDate });
   const remaining = budgetRemaining(budgets, who);
   const budget_remaining = remaining && { day_usd: remaining.day_usd, ...("week_usd" in remaining ? { week_usd: remaining.week_usd } : {}), month_usd: remaining.month_usd, ...("total_usd" in remaining ? { total_usd: remaining.total_usd } : {}) };
   let hit;
@@ -54,5 +79,10 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
     ...(maxSteps != null || runId ? { max_steps: maxSteps } : {}),
     ...(runId ? { steps: history.filter((r) => r.run_id === runId && !r.blocked).length } : {}),
     ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
+||||||| 71682b6
+    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
+
+    ...(runId != null ? { max_steps: maxSteps, steps: budgets.spend(who).steps } : {}),
+    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts", "max_steps", "steps"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
   };
 }

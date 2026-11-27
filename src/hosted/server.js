@@ -1148,6 +1148,13 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const { before, after } = approveCapRequest(s, { request: r, approval, actor: u.id, nowMs: now() });
           audit(s, u.orgId, u.id, "cap_request.approve", r.agentId, { request_id: r.id, scope: r.scope, amount_usd: approval.amount_usd, duration_hours: approval.duration_hours, expires_at: r.expires_at, reason: r.reason, note: approval.note, before, after });
           return r;
+||||||| 71682b6
+          const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now() });
+
+          const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
+          const runId = new URL(req.url, origin).searchParams.get("run_id");
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null });
         }));
       }
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
@@ -1190,6 +1197,14 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           { const errs = validatePolicy(policy); if (errs.length) fail(400, `Invalid policy: ${errs.join("; ")}`); }
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }), ...(prev.maxConcurrent != null && { maxConcurrent: prev.maxConcurrent }) };
+||||||| 71682b6
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed };
+          if (validatePolicy(policy).length) fail(400, "Invalid policy");
+
+          // maxSteps: omitted keeps the current value, null clears it.
+          const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
+          if (validatePolicy(policy).length) fail(400, "Invalid policy");
           a.policy = policy;
           if (JSON.stringify(prev.anomaly ?? null) !== JSON.stringify(policy.anomaly ?? null)) audit(s, u.orgId, u.id, "anomaly.change", a.id, { scope: "agent", before: prev.anomaly ?? null, after: policy.anomaly ?? null });
           audit(s, u.orgId, u.id, "policy.change", a.id, reason ? { previous, policy, reason } : { previous, policy });

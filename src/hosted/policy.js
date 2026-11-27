@@ -176,6 +176,7 @@ export function validatePolicy(p) {
     const err = modelCapsError(p.modelCaps);
     if (err) errors.push(err);
   }
+||||||| 71682b6
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
   const raiseErr = raiseError(p.raise);
   if (raiseErr) errors.push(raiseErr);
@@ -196,6 +197,9 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   if (local.models != null && !isModelList(local.models)) throw new Error("Invalid local models");
   for (const k of ["rpm", "tpm"]) if (local[k] != null && !(Number.isInteger(local[k]) && local[k] > 0)) throw new Error(`Invalid local ${k}`);
   if (local.maxConcurrent != null && !(Number.isInteger(local.maxConcurrent) && local.maxConcurrent >= 1 && local.maxConcurrent <= 64)) throw new Error("Invalid local maxConcurrent");
+||||||| 71682b6
+
+  if (local.maxSteps != null && (!Number.isInteger(local.maxSteps) || local.maxSteps <= 0)) throw new Error("Invalid local maxSteps");
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
   if (fetched && validatePolicy(fetched).length === 0 && (!lastKnown || fetched.version > lastKnown.version)) {
@@ -218,4 +222,11 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   // #207: fleet downgrade; local can only add unmapped models and lower `at`.
   const downgrade = mergeDowngrade(server?.downgrade ?? null, local?.downgrade ?? null);
   return { caps, maxSteps, models, ...(server?.modelCaps ? { modelCaps: server.modelCaps } : {}), ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), ...(minOf("maxConcurrent") != null && { maxConcurrent: minOf("maxConcurrent") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+||||||| 71682b6
+  return { caps, killed: Boolean(server?.killed), version: server?.version ?? null, source };
+
+  // Step budget (upstream calls per run): the tighter of fleet and local wins.
+  const steps = [server?.maxSteps, local?.maxSteps].filter((v) => v != null);
+  const maxSteps = steps.length ? Math.min(...steps) : null;
+  return { caps, maxSteps, killed: Boolean(server?.killed), version: server?.version ?? null, source };
 }

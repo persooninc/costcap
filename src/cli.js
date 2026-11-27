@@ -253,6 +253,9 @@ export async function wrap(argv) {
   const localDowngrade = downgradeMap ? { map: downgradeMap, at: downgradeAt } : downgradeAt != null ? { at: downgradeAt } : null;
   let downgradeConfig = mergeDowngrade(null, localDowngrade);
   let raiseTimer = null;
+||||||| 71682b6
+
+  const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   const setPolicy = (p) => {
     fleetPolicy = p;
     // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
@@ -274,6 +277,12 @@ export async function wrap(argv) {
     modelCaps?.setRules(mergeModelCapRules(hosted.filter((r) => r.scope === "hour"), modelCapRules ?? []));
     hostedModelCaps?.setRules(fleetModelRules(hosted).map((r) => ({ model: r.model, scope: r.scope, cap: r.usd })));
     applyRate();
+||||||| 71682b6
+    cap.updateCaps(resolvePolicy({ local: caps, lastKnown: { version: p.version, caps: p.caps, killed: p.killed } }).caps);
+
+    const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, ...(p.maxSteps != null ? { maxSteps: p.maxSteps } : {}) } });
+    cap.updateCaps(resolved.caps);
+    velocity.setMaxSteps(resolved.maxSteps);
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => settleReceipt(r) });
@@ -326,6 +335,11 @@ export async function wrap(argv) {
   checkWarnings = () => server.checkWarnings();
   // #187: fractions already reached at startup (incl. a cached fleet cap) warn once, deduped by the ledger.
   checkWarnings();
+||||||| 71682b6
+  const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
+  const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
+  const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
