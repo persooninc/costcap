@@ -9,10 +9,8 @@ import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../
 import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict, cachedFleetTagTotalRemaining } from "./tag-caps.js";
 import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict, cachedFleetModelTotalRemaining } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
-import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining, validOrgTotalPolicy, cachedOrgTotalVerdict, cachedOrgTotalRemaining } from "./org-budget.js";
-
-// #291: org window remainders plus the lifetime org total (null when neither applies).
-const orgLeft = (windows, total) => (total == null ? windows : { ...(windows ?? {}), total });
+import { cachedFleetModelVerdict } from "../model-cap.js";
+import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -187,30 +185,15 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         teamCaps: data.team?.caps ?? null,
       };
     },
-    // #244 (#268: plus week rules from model_caps_week): hosted modelCaps against the agent's fleet-wide per-model
-    // synced spend plus this host's unsynced receipts. No agent_spend.models: no-op.
+    // #244: hosted day/month modelCaps against agent_spend.models (every host) plus
+    // this host's unsynced receipts. A server without the models snapshot: the whole
+    // local ledger counts, in the org budget period.
     modelCheck(models, nowMs = Date.now()) {
-      if (!data.agentSpend?.models) return null;
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod)
-        ?? cachedFleetModelTotalVerdict(data.agentSpend, data.modelCapsTotal ?? [], models, pending); // #286
-    },
-    // #272: fleet model remainders for --preflight (hosted day/month plus model_caps_week rules).
-    modelRemaining(models, nowMs = Date.now()) {
-      if (!data.agentSpend?.models) return [];
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return [...cachedFleetModelRemaining(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod),
-        ...cachedFleetModelTotalRemaining(data.agentSpend, data.modelCapsTotal ?? [], models, pending)]; // #291
-    },
-    // #272: fleet tag remainders for --preflight (merged with local rules).
-    tagRemaining(tags, localRules = [], nowMs = Date.now()) {
-      if (!data.tagCaps && !data.tagCapsTotal) return [];
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return [...(data.tagCaps ? cachedFleetTagRemaining(data.tagCaps, localRules, tags, pending, nowMs, data.budgetPeriod) : []),
-        ...cachedFleetTagTotalRemaining(data.tagCapsTotal ?? null, tags, pending)]; // #291
+      const rules = policy(nowMs).modelCaps;
+      if (!Array.isArray(rules) || !rules.length) return null;
+      const snapshot = data.agentSpend?.models ? data.agentSpend : null;
+      const synced = new Set(snapshot ? data.syncedIds ?? [] : []);
+      return cachedFleetModelVerdict(rules, snapshot, models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,

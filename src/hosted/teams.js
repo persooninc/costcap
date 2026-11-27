@@ -7,6 +7,7 @@ import { periodKey, samePeriod, inSpendWindow } from "../period.js";
 // it is never treated as $0.
 import { createAgentBudgets } from "../agent-budget.js";
 import { isPendingBatch } from "../cap.js";
+import { normalizeModel } from "../model-cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 import { anomalyError } from "./anomaly.js";
 import { modelSpendPolicy, validModelSpend } from "./model-caps.js";
@@ -159,35 +160,46 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 
 // Issue #127: the agent's own fleet-wide synced spend (all hosts/runners using
 // this identity), from settled-aware stored receipts. Pure.
-// #244: modelCaps adds `models`, the same totals split per capped model.
-// #265: allTime (the agent has caps.total) adds spent.total over every receipt and
-// counts unknown cost across the whole history, never as $0.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { allTime = false } = {}) {
+// Issue #244: with hosted `modelCaps`, `models` maps each capped normalized
+// model id to its fleet-wide {day, month, unknown} in the same period.
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null) {
   const now = new Date(nowMs).toISOString();
-  const month = periodKey("month", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
-  const spent = { day: 0, week: 0, month: 0, total: 0 };
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
+  const spent = { day: 0, month: 0 };
+  const capped = Array.isArray(modelCaps) && modelCaps.length ? [...new Set(modelCaps.map((r) => normalizeModel(r.model)).filter(Boolean))].slice(0, MAX_SPEND_MODELS) : null;
+  const models = capped ? Object.fromEntries(capped.map((m) => [m, { day: 0, month: 0, unknown: 0 }])) : null;
   let unknown = 0;
   let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    const ts = new Date(r.ts).toISOString();
-    if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
-    // #183: a synced pending batch shows as pending, not as an unreconciled unknown.
-    if (isPendingBatch(r)) { pendingBatches += 1; continue; }
-    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-    spent.total += r.cost_usd;
-    if (inMonth) spent.month += r.cost_usd;
-    if (inWeek) spent.week += r.cost_usd;
-    if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
+    const tsMs = Date.parse(r.ts);
+    if (periodKey("month", tsMs, budgetPeriod) !== month) continue;
+    if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
+    const m = models ? models[normalizeModel(r.model)] : undefined;
+    const today = periodKey("day", tsMs, budgetPeriod) === day;
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; if (m) m.unknown += 1; continue; }
+    spent.month += r.cost_usd;
+    if (today) spent.day += r.cost_usd;
+    if (m) { m.month += r.cost_usd; if (today) m.day += r.cost_usd; }
   }
-  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
+  const out = { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
+  if (models) out.models = Object.fromEntries(Object.entries(models).map(([k, e]) => [k, { day: round6(e.day), month: round6(e.month), unknown: e.unknown }]));
+  return out;
+}
+
+export const MAX_SPEND_MODELS = 20;
+
+function validModelSpend(models) {
+  if (models === undefined) return true;
+  if (!models || typeof models !== "object" || Array.isArray(models) || Object.keys(models).length > MAX_SPEND_MODELS) return false;
+  return Object.values(models).every((e) => e && typeof e === "object" && Number.isInteger(e.unknown) && e.unknown >= 0
+    && TEAM_SCOPES.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0));
 }
 
 export function validAgentSpend(a) {
   if (a === null || a === undefined) return true;
   if (typeof a !== "object" || !Number.isFinite(Date.parse(a.as_of)) || !Number.isInteger(a.unknown) || a.unknown < 0) return false;
-  if (!validModelSpend(a.models)) return false;
-  return TEAM_SCOPES.every((s) => (a.spent?.[s] === undefined && !REQUIRED_SPENT.includes(s)) || (typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0));
+  return TEAM_SCOPES.every((s) => typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0) && validModelSpend(a.models);
 }
 
 // Offline per-agent enforcement against the agent's fleet caps (#127).

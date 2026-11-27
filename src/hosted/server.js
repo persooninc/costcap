@@ -10,7 +10,7 @@ import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
 import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, newOrgDigest, parseWeek, previousWeek, resolveDigest, weekLabel } from "./digest.js";
-import { ALERT_KINDS, evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts, evaluateUnknownCostAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
+import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelCapAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
 import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
@@ -25,7 +25,13 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
-import { isApiKey, parseApiKeyInput, createApiKey, publicApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
+import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
+import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
+import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
+import { normalizeModel } from "../model-cap.js";
+import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
+import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
+import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy } from "./org-budget.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const ALERT_TEST_LIMIT = 5, ALERT_TEST_WINDOW_MS = 600_000;
@@ -209,6 +215,11 @@ export function applyDeliveryResult(record, result, requested, nowMs) {
 // Estimated receipt spend for the dashboard. Null cost is unknown, never zero.
 // Windows follow the org budget period (#209; UTC instant, day 1 by default),
 // matching the hosted cap engine. A numeric offset is not a calendar prefix.
+// Issue #244: the agent card's fleet spend per hosted modelCaps rule, keyed by the rule's model as written.
+export function modelSpendByRule(rules, models = {}) {
+  return Object.fromEntries((rules ?? []).map((r) => [r.model, models?.[normalizeModel(r.model)] ?? { day: 0, month: 0, unknown: 0 }]));
+}
+
 export function spendSummary(receipts, nowMs, budgetPeriod = null) {
   const cur = { day: periodKey("day", nowMs, budgetPeriod), week: periodKey("week", nowMs, budgetPeriod), month: periodKey("month", nowMs, budgetPeriod) };
   const fold = (window) => {
@@ -535,7 +546,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps, { allTime: a.policy.caps?.total != null }), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -660,7 +671,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {
           const u = member(s, req);
-          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)), ...(a.policy?.modelCaps?.length ? { modelCapSpend: modelCapStatus(orgAgentReceipts(s, u.orgId, a.id), a.policy.modelCaps, now(), orgPeriod(s, u.orgId)) } : {}), outcomes: agentOutcomes(s, u.orgId, a.id) })),
+          return { agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId).map(({ hash, ...a }) => ({ ...a, spend: spendSummary(Object.values(s.receipts).filter((r) => r.agentId === a.id), now(), orgPeriod(s, u.orgId)), ...(a.policy?.modelCaps?.length ? { modelSpend: modelSpendByRule(a.policy.modelCaps, agentSpendPolicy(orgAgentReceipts(s, u.orgId, a.id), now(), orgPeriod(s, u.orgId), a.policy.modelCaps).models) } : {}), outcomes: agentOutcomes(s, u.orgId, a.id) })),
             budget_period: { ...orgPeriod(s, u.orgId) },
             receipts: visibleReceipts(s, u.orgId),
             audit: labelAudit(s, u.orgId, s.audit), alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
@@ -1275,38 +1286,35 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // Issue #223: spend anomaly vs the agent's own 14-day median (no cap needed).
         const anomaly = evaluateAnomaly({ id: a.id, receipts, nowMs: now(), budgetPeriod: bp, settings: resolveAnomaly(s.orgs?.[a.orgId]?.anomaly, a.policy.anomaly) });
         if (anomaly) alerts.push(anomaly);
-        // Issue #244: hosted modelCaps alerts per model, from this org's receipts on every host.
-        const modelRules = a.policy.modelCaps ?? [];
-        const modelSpend = modelRules.length ? modelSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), modelRules, now(), bp) ?? {} : {};
-        // #245: day/month blocks count only in the current period; hour blocks in the last hour.
-        const modelHits = modelRules.length ? [...blocksInCurrentPeriod(receipts, { reason: "model_budget_exceeded", nowMs: now(), budgetPeriod: bp }), ...recent.filter((r) => r.reason === "model_budget_exceeded" && r.scope === "hour")].filter((r) => typeof r.model === "string") : [];
-        const modelAlerts = evaluateModelAlerts({ agentId: a.id, rules: modelRules, spend: modelSpend, blockedHits: modelHits, normalize: normalizeModel }, { warnFractions: a.policy.warnFractions });
-        alerts.push(...modelAlerts);
-        // Issue #279: an unsettled unknown-cost receipt pauses this agent: page it.
-        alerts.push(...evaluateUnknownCostAlerts({ orgId: a.orgId, items: Object.values(s.receipts).filter((i) => i.orgId === a.orgId && i.agentId === a.id), agents: [a], nowMs: now(), budgetPeriod: bp }));
+        // Issue #244: hosted modelCaps page per model on fleet-wide (org-scoped) spend.
+        const modelRules = Array.isArray(a.policy.modelCaps) ? a.policy.modelCaps : [];
+        const modelAlerts = [];
+        if (modelRules.length) {
+          const orgOwn = orgAgentReceipts(s, a.orgId, a.id);
+          const models = agentSpendPolicy(orgOwn, now(), bp, modelRules).models ?? {};
+          const blockedHits = [...blocksInCurrentPeriod(orgOwn, { reason: "model_budget_exceeded", nowMs: now(), budgetPeriod: bp }),
+            ...orgOwn.filter((r) => r.reason === "model_budget_exceeded" && r.scope === "hour" && Date.parse(r.ts) > now() - 3600_000)];
+          modelAlerts.push(...evaluateModelCapAlerts({ agentId: a.id, rules: modelRules, models, blockedHits }, { warnFractions: a.policy.warnFractions }));
+          for (const alert of modelAlerts) {
+            alert.period = capPeriod(alert.scope, now(), bp);
+            const e = models[alert.model] ?? { day: 0, month: 0 };
+            alert.warnOk = alert.kind !== "cap_approaching" ? () => true
+              : gateWarnings(s, `${a.id}:model:${alert.model}`, { [alert.scope]: alert.cap }, { day: e.day, month: e.month }, Array.isArray(a.policy.warnFractions) ? a.policy.warnFractions : [0.8], bp);
+          }
+          alerts.push(...modelAlerts);
+        }
+        // A new period is a new firing for a model alert, even if the key matches again.
+        for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && x.model && x.active && x.period && x.period !== capPeriod(x.scope, now(), bp))) resolveAlert(prior, now());
         // A configured global alert channel is not an org recipient grant.
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
         const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: totalSpend }, a.policy.warnFractions, bp);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
-        for (const alert of alerts) {
+        for (const { warnOk: modelOk, ...alert } of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
-          if (alert.model !== undefined) {
-            // #244: per-model arm state; a new org period is a new firing.
-            if (prior && prior[1].period && prior[1].period !== capPeriod(alert.scope, now(), bp)) resolveAlert(prior[1], now());
-            else if (prior) { queueRetry(prior, out); continue; }
-            const e = modelSpend[alert.model] ?? { day: 0, week: 0, month: 0 };
-            const ok = alert.scope === "hour" || gateWarnings(s, `${a.id}:model:${alert.model}`, { [alert.scope]: alert.cap }, { day: e.day, week: e.week, month: e.month, total: e.total }, Array.isArray(a.policy.warnFractions) ? a.policy.warnFractions : [0.8], bp)(alert);
-            if (ok) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...(alert.scope === "hour" ? {} : { period: capPeriod(alert.scope, now(), bp) }) }, { nowMs: now(), id: randomUUID() })) });
-            continue;
-          }
-          // #271: a week cap_projected fires once per ISO week: a new week resolves last week's and re-arms.
-          const weekProj = alert.kind === "cap_projected" && alert.scope === "week";
-          if (weekProj && prior && prior[1].period !== capPeriod("week", now(), bp)) { resolveAlert(prior[1], now()); out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, period: capPeriod("week", now(), bp) }, { nowMs: now(), id: randomUUID() })) }); continue; }
-          if (weekProj && !prior && Object.values(s.alerts).some((x) => x.key === alert.key && x.period === capPeriod("week", now(), bp))) continue;
-          if (!prior && !(alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
-          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...warnExtra(alert, bp), ...(weekProj ? { period: capPeriod("week", now(), bp) } : {}) }, { nowMs: now(), id: randomUUID() })) });
+          if (!prior && !(modelOk ? modelOk(alert) : alert.run_id !== undefined ? runOk(alert) : warnOk(alert))) continue;
+          if (!prior) out.push({ ...claim(fireAlert(s.alerts, alert, { orgId: a.orgId, agentId: a.id, ...(alert.model ? {} : warnExtra(alert, bp)) }, { nowMs: now(), id: randomUUID() })) });
           else queueRetry(prior, out);
         }
       }
@@ -1393,8 +1401,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const prior = activeOccurrence(s.alerts, alert.key);
           if (!prior) {
             const rule = ruleOf[`${alert.tag.key}:${alert.scope}`];
-            const e = spend[alert.tag.key]?.[alert.tag.value] ?? { day: 0, week: 0, month: 0 };
-            const warnOk = gateWarnings(s, `tag:${orgId}:${alert.tag.key}=${alert.tag.value}`, { [alert.scope]: rule.usd }, { day: e.day, week: e.week ?? 0, month: e.month, total: e.total }, rule.warnFractions ?? [0.8], bp);
+            const e = spend[alert.tag.key]?.[alert.tag.value] ?? { day: 0, month: 0 };
+            const warnOk = gateWarnings(s, `tag:${orgId}:${alert.tag.key}=${alert.tag.value}`, { [alert.scope]: alert.cap }, { day: e.day, month: e.month }, rule.warnFractions ?? [0.8], bp);
             if (!warnOk(alert)) continue;
             out.push({ ...claim(fireAlert(s.alerts, alert, { orgId, agentId: null, period: capPeriod(alert.scope, now(), bp) }, { nowMs: now(), id: randomUUID() })) });
           } else queueRetry(prior, out);

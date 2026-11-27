@@ -15,3 +15,5 @@ Receipt-based caps may overshoot by one accepted request. Freeze/resume is polic
 Deployment: retain /opt/costcap/data, apply the completed private env, build/recreate the Docker container, then check /health, /, /ui/config and a real challenge + email-code login. Local test challenges are fixture-only and never enabled by the production launcher.
 
 Local verification command: `npm test`. On a machine with Google Chrome, `node scripts/ui-browser-smoke.mjs` exercises the UI against a local-only challenge fixture and fake email transport: login, enrollment, XSS-safe agent name, caps, freeze/resume, revoke, logout. It sends no external email and does not alter production Turnstile behavior.
+
+Per-model caps (#238, #244): an agent's hosted `modelCaps` are set by API only (`POST /v1/agents/:id/policy`); the agent card's "Model caps" line shows fleet-wide spend against each day/month cap once it has spend (`claude-opus-4-8 day $3.20 / $5`, `unknown` while a receipt for that model has no cost). The Alerts list shows per-model `cap_approaching` / `cap_hit` as `<agent> · model <id> <scope>`.

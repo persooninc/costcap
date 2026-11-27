@@ -317,88 +317,70 @@ test("#240 orgCheck: cached org budget plus unsynced receipts, offline; null lif
   assert.equal(cold.orgCheck(), null);
 });
 
-// Issue #244: agent_spend.models is validated, cached and enforced offline per model.
-test("#244 modelCheck: cached agent_spend.models plus unsynced receipts; invalid models refused", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-models-"));
+// Issue #244: agent_spend.models validation and offline per-model enforcement after sync.
+import { validAgentSpend, agentSpendPolicy } from "../src/hosted/teams.js";
+
+test("#244 agent_spend.models: validated, cached and enforced offline with unsynced receipts", async (t) => {
+  const OPUS = "claude-opus-4-8";
+  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-244-"));
   const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
-  const asOf = new Date().toISOString();
-  let models = { "claude-opus-4-8": { day: 3, month: 3, unknown: 0 } };
+  const as_of = new Date().toISOString();
+  let models = { [OPUS]: { day: 3, month: 3, unknown: 0 } };
+  let modelCaps = [{ model: OPUS, scope: "day", usd: 5 }, { model: OPUS, scope: "hour", usd: 0.01 }];
+  let version = 2;
   const server = http.createServer(async (req, res) => {
     for await (const _ of req) { /* drain */ }
     res.setHeader("content-type", "application/json");
     if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: {}, killed: false } }));
-    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version: 2, caps: {}, killed: false, modelCaps: [{ model: "claude-opus-4-8", scope: "day", usd: 5 }], agent_spend: { spent: { day: 3, month: 3 }, unknown: 0, pending_batches: 0, ...(models ? { models } : {}), as_of: asOf } }));
+    else if (req.url === "/v1/policy") res.end(JSON.stringify({ version, caps: {}, killed: false, ...(modelCaps ? { modelCaps } : {}), agent_spend: { spent: { day: 3, month: 3 }, unknown: 0, pending_batches: 0, as_of, ...(models !== undefined ? { models } : {}) } }));
     else res.end(JSON.stringify({ acceptedIds: [] }));
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   t.after(() => { server.closeAllConnections(); server.close(); });
   await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "e", name: "x", path });
   const client = createFleetClient({ path, receiptsPath });
-  assert.equal(client.modelCheck(["claude-opus-4-8"]), null); // nothing cached
+  assert.equal(client.modelCheck([OPUS]), null); // no rules cached yet
   assert.equal((await client.sync()).online, true);
-  assert.equal(client.modelCheck(["claude-opus-4-8"]), null);
-  appendFileSync(receiptsPath, JSON.stringify({ id: "local", ts: new Date().toISOString(), model: "claude-opus-4-8", cost_usd: 2.1 }) + "\n");
-  const cold = createFleetClient({ path, receiptsPath }); // offline restart
-  const hit = cold.modelCheck(["claude-opus-4-8"]);
-  assert.equal(hit.fleet, true);
-  assert.equal(hit.spend_usd, 5.1);
+  assert.deepEqual(client.agentSpend().models, models);
+  assert.equal(client.modelCheck([OPUS]), null); // $3 < $5; the hour rule stays local
+  appendFileSync(receiptsPath, JSON.stringify({ id: "local-1", ts: new Date().toISOString(), model: OPUS, cost_usd: 2.1 }) + "\n");
+  const cold = createFleetClient({ path, receiptsPath });
+  assert.deepEqual(cold.modelCheck(["claude-haiku-4-5", OPUS]), { model: OPUS, rule_model: OPUS, scope: "day", spend_usd: 5.1, cap_usd: 5, fleet: true });
   assert.equal(cold.modelCheck(["claude-haiku-4-5"]), null);
-  models = { "claude-opus-4-8": { day: -1, month: 3, unknown: 0 } };
-  assert.equal((await client.sync()).online, false, "invalid models map is refused");
-  assert.equal(client.agentSpend().models["claude-opus-4-8"].day, 3, "cache kept");
-  models = null;
+  // Invalid models maps are refused and the cache kept.
+  for (const bad of [[], { [OPUS]: { day: -1, month: 0, unknown: 0 } }, { [OPUS]: { day: 0, month: 0, unknown: 0.5 } }, Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`m${i}`, { day: 0, month: 0, unknown: 0 }]))]) {
+    models = bad;
+    assert.equal((await client.sync()).online, false, JSON.stringify(bad).slice(0, 60));
+  }
+  assert.equal(client.agentSpend().models[OPUS].day, 3);
+  // An older server without models: the whole local ledger counts.
+  models = undefined;
   assert.equal((await client.sync()).online, true);
-  assert.equal(client.modelCheck(["claude-opus-4-8"]), null, "older server: no models, no fleet verdict");
+  assert.equal(client.modelCheck([OPUS]), null); // only $2.10 local
+  appendFileSync(receiptsPath, JSON.stringify({ id: "local-2", ts: new Date().toISOString(), model: OPUS, cost_usd: 3 }) + "\n");
+  assert.equal(client.modelCheck([OPUS]).spend_usd, 5.1);
+  // Removing the rules lifts enforcement.
+  modelCaps = null; version = 3;
+  assert.equal((await client.sync()).online, true);
+  assert.equal(client.modelCheck([OPUS]), null);
+  assert.equal(validAgentSpend({ spent: { day: 0, month: 0 }, unknown: 0, as_of, models: null }), false);
 });
 
-test("#267 a legacy caps key in a cached enrollment is dropped, known caps still enforced", async (t) => {
-  const { resolvePolicy, validatePolicy } = await import("../src/hosted/policy.js");
-  const f = await setup(t);
-  const data = JSON.parse(readFileSync(f.path, "utf8"));
-  data.policy = { ...data.policy, caps: { day: 5, weekly: 50 } };
-  writeFileSync(f.path, JSON.stringify(data));
-  const loaded = loadEnrollment(f.path);
-  assert.deepEqual(loaded.policy.caps, { day: 5 });
-  assert.equal(resolvePolicy({ lastKnown: { version: 1, caps: { day: 5, weekly: 50 } } }).caps.day, 5);
-  // New writes with caps.weekly are still rejected.
-  assert.match(validatePolicy({ version: 1, caps: { weekly: 50 } }).join(), /caps\.weekly is not a cap scope/);
-});
-
-test("#267 wrapper agent_spend counts last month's unknown only when a week is capped", async () => {
-  const { agentSpendPolicy } = await import("../src/hosted/teams.js");
-  const nowMs = Date.parse("2026-12-02T10:00:00Z");
-  const r = [{ id: "u", ts: "2026-11-30T10:00:00Z", cost_usd: null }];
-  assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: false }).unknown, 0);
-  assert.equal(agentSpendPolicy(r, nowMs, null, null, { week: true }).unknown, 1);
-});
-
-// #287: total raises arrive in raise_total; the wrapper folds them under raise.total,
-// enforces the raised cap until expires_at (offline too) and rejects a malformed field.
-test("#287 folds raise_total, reverts at expiry offline and rejects a malformed raise_total", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-fleet-287-"));
-  const path = join(dir, "enrollment.json"), receiptsPath = join(dir, "receipts.jsonl");
-  const expires = Date.now() + 3600_000;
-  let body = { version: 2, caps: { total: 200 }, killed: false, raise_total: [{ amount_usd: 40, expires_at: new Date(expires).toISOString(), request_id: "r1" }] };
-  const server = http.createServer(async (req, res) => {
-    for await (const _ of req);
-    res.setHeader("content-type", "application/json");
-    if (req.url === "/v1/enroll") res.end(JSON.stringify({ agentId: "a", token: "agent-token", policy: { version: 1, caps: { total: 200 }, killed: false } }));
-    else if (req.url === "/v1/policy") res.end(JSON.stringify(body));
-    else res.end(JSON.stringify({ acceptedIds: [] }));
-  });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  t.after(() => { server.closeAllConnections(); server.close(); });
-  await enroll({ url: `http://127.0.0.1:${server.address().port}`, token: "enrollment-token", name: "t", path });
-  const client = createFleetClient({ path, receiptsPath });
-  assert.equal((await client.sync()).online, true);
-  assert.equal(client.policy().caps.total, 240);
-  assert.equal(client.policy(expires).caps.total, 200);
-  body = { version: 3, caps: { total: 200 }, killed: true, raise_total: [{ amount_usd: -1, expires_at: "nope", request_id: "r" }] };
-  assert.equal((await client.sync()).online, false);
-  assert.equal(client.policy().killed, false);
-  assert.equal(client.policy().version, 2);
-  body = { version: 4, caps: { total: 200 }, killed: true };
-  assert.equal((await client.sync()).online, true);
-  assert.equal(client.policy().killed, true);
-  assert.equal(client.policy().caps.total, 200);
+test("#244 agentSpendPolicy models: only capped models, settlement-aware, pending batches and blocks excluded, org period", () => {
+  const OPUS = "claude-opus-4-8";
+  const now = Date.parse("2026-11-16T09:00:00Z");
+  const receipts = [
+    { ts: "2026-11-16T08:30:00Z", model: OPUS, cost_usd: 1 },
+    { ts: "2026-11-16T07:00:00Z", model: "anthropic/claude-opus-4.8", cost_usd: 2 }, // prior LA day
+    { ts: "2026-11-16T08:40:00Z", model: OPUS, cost_usd: null },
+    { ts: "2026-11-16T08:40:00Z", model: OPUS, cost_usd: null, batch_pending: true, reason: "batch_pending" },
+    { ts: "2026-11-16T08:40:00Z", model: OPUS, cost_usd: 0, blocked: true },
+    { ts: "2026-11-16T08:40:00Z", model: "gpt-4o", cost_usd: 7 },
+  ];
+  const la = { timezone: "America/Los_Angeles", monthStartDay: 1 };
+  const p = agentSpendPolicy(receipts, now, la, [{ model: OPUS, scope: "day", usd: 5 }, { model: "anthropic/claude-opus-4.8", scope: "month", usd: 50 }]);
+  assert.deepEqual(p.models, { [OPUS]: { day: 1, month: 3, unknown: 1 } });
+  assert.equal(p.spent.month, 10);
+  assert.equal(agentSpendPolicy(receipts, now, la).models, undefined);
+  assert.equal(agentSpendPolicy(receipts, now, null, [{ model: OPUS, scope: "day", usd: 5 }]).models[OPUS].day, 3); // UTC: same day
 });
