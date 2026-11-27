@@ -49,7 +49,7 @@ async function contract(open, mode) {
     s.users.u2 = { id: "u2", email: "b@b.example", orgId: ORG_B, role: "owner", verified: true };
     s.sessions.h1 = { userId: "u1", expires: 9 };
     s.teams[`${ORG_A}:ops`] = { orgId: ORG_A, name: "ops", agents: ["ag1"], day: 30 };
-    s.orgs[ORG_A].alertSettings = { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract", webhook: { url: "https://alerts.example.com/h", secret: "whsec_contract" }, kinds: ["cap_hit"], routes: [{ id: "rt_c1", name: "payments", kinds: null, teams: ["ops"], emails: [], slackWebhook: "https://hooks.slack.com/services/T/B/route" }] };
+    s.orgs[ORG_A].alertSettings = { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract", webhook: { url: "https://alerts.example.com/h", secret: "whsec_contract" }, kinds: ["cap_hit", "agent_silent"], routes: [{ id: "rt_abc123", name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: "https://hooks.slack.com/services/T/B/route" }] };
     s.receipts["ag1:r1"] = { orgId: ORG_A, agentId: "ag1", receipt: { id: "r1", ts: "2026-11-13T00:00:00Z", model: "m", cost_usd: 0.25, z: 1, a: 2 } };
     s.receipts["ag2:r1"] = { orgId: ORG_B, agentId: "ag2", receipt: { id: "r1", ts: "2026-11-13T00:00:00Z", model: "m", cost_usd: null } };
     for (let i = 0; i < 12; i += 1) s.audit.push({ ts: `t${i}`, org_id: i % 2 ? ORG_B : ORG_A, actor: "u", action: `a${i}`, target: null, detail: {} });
@@ -68,7 +68,7 @@ async function contract(open, mode) {
   assert.equal(reopened.read((s) => s.receipts["ag2:r1"]), undefined);
   assert.equal(reopened.read((s) => s.users.u1.role), "admin");
   // #121: per-org alert settings survive a restart and stay on their own org.
-  assert.deepEqual(reopened.read((s) => s.orgs[ORG_A].alertSettings), { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract", webhook: { url: "https://alerts.example.com/h", secret: "whsec_contract" }, kinds: ["cap_hit"], routes: [{ id: "rt_c1", name: "payments", kinds: null, teams: ["ops"], emails: [], slackWebhook: "https://hooks.slack.com/services/T/B/route" }] }); // #199, #258 kinds/routes
+  assert.deepEqual(reopened.read((s) => s.orgs[ORG_A].alertSettings), { emails: ["a@a.example"], slackWebhook: "https://hooks.slack.com/services/T/B/contract", webhook: { url: "https://alerts.example.com/h", secret: "whsec_contract" }, kinds: ["cap_hit", "agent_silent"], routes: [{ id: "rt_abc123", name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: "https://hooks.slack.com/services/T/B/route" }] } ); // #199, #258 kinds and routes
   assert.equal(reopened.read((s) => s.orgs[ORG_B].alertSettings), undefined);
   // #123: org teams survive a restart on both stores.
   assert.deepEqual(reopened.read((s) => s.teams[`${ORG_A}:ops`]), { orgId: ORG_A, name: "ops", agents: ["ag1"], day: 30 });

@@ -371,3 +371,22 @@ test("#209 AC2: monthStartDay 15 opens a new month window for team caps", () => 
   // UTC (day 1) would keep both in November.
   assert.equal(teamVerdict({ team, receiptsByAgent: { x: receipts }, nowMs: Date.parse("2026-11-15T00:00:01Z") }).verdict, "budget_exceeded");
 });
+
+// Issue #258 AC5: deleting a team removes it from alert routes; a route left
+// with teams: [] is disabled (matches nothing) and never widened to all teams.
+test("issue #258: team deletion disables routes that listed only that team", async (t) => {
+  const S1 = "https://hooks.slack.com/services/T1/B1/teamsRoute01";
+  const f = await fixture(t);
+  const owner = await f.login("rt-teams@example.invalid");
+  const a1 = await f.agent(owner.cookie, "a1"), a2 = await f.agent(owner.cookie, "a2");
+  assert.equal((await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], day: 5 }, owner.cookie)).status, 200);
+  assert.equal((await f.request("/v1/teams", { name: "search", agents: [a2.agentId], day: 5 }, owner.cookie)).status, 200);
+  const saved = await f.request("/v1/alert-settings", { routes: [{ name: "only-payments", teams: ["payments"], slackWebhook: S1 }, { name: "both", teams: ["payments", "search"], slackWebhook: S1 }, { name: "any", teams: null, slackWebhook: S1 }] }, owner.cookie);
+  assert.equal(saved.status, 200);
+  assert.equal((await f.request("/v1/teams", { name: "payments", remove: true }, owner.cookie)).status, 200);
+  const routes = (await f.request("/v1/alert-settings", undefined, owner.cookie)).body.routes;
+  assert.deepEqual(routes.map((r) => [r.name, r.teams, r.disabled]), [["only-payments", [], true], ["both", ["search"], false], ["any", null, false]]);
+  const { routeMatches } = await import("../src/hosted/delivery.js");
+  assert.equal(routeMatches({ kinds: null, teams: [] }, { kind: "cap_hit", routeTeam: "payments" }), false);
+  assert.equal(routeMatches({ kinds: null, teams: [] }, { kind: "cap_hit" }), false);
+});
