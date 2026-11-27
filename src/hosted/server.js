@@ -17,6 +17,7 @@ import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
 import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
 import { parseRunEnd, parseOutcomeOverride, upsertRunEnd, runOutcomeFields, outcomeSummary } from "./run-outcome.js";
 import { parseSpendQuery, spendBreakdown, spendCsv } from "./spend.js";
+import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
 import { validTags } from "../tags.js";
 import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
 import { scrubReceiptPath } from "../receipt-path.js";
@@ -620,28 +621,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId), now: now() });
         }));
       }
-      // #220: Prometheus scrape endpoint. Viewer/admin cck_ keys or a member session; org-scoped.
+      // #220: Prometheus scrape (viewer/admin cck_ key or member session), org-scoped gauges.
       if (path === "/v1/metrics" && req.method === "GET") {
-        const byParam = new URL(req.url, origin).searchParams.get("by");
-        if (byParam !== null && byParam !== "model") fail(400, "by must be model");
+        const by = new URL(req.url, origin).searchParams.get("by");
+        if (by !== null && by !== "model") fail(400, "by must be model");
         const out = store.read((s) => {
           const u = member(s, req);
-          const bp = orgPeriod(s, u.orgId);
-          return buildMetrics({ nowMs: now(), budgetPeriod: bp, byModel: byParam === "model",
-            cutoff: retentionCutoff(entitlements(s, u.orgId), now()),
-            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId && !a.revoked).map((a) => {
-              const caps = effectiveCaps(a.policy, now());
-              const out = { ...a, caps };
-              // #285: model caps and lifetime total, from the same helpers the dashboard and verdict use.
-              if (a.policy?.modelCaps?.length) out.modelCapStatus = modelCapStatus(orgAgentReceipts(s, u.orgId, a.id), a.policy.modelCaps, now(), bp);
-              if (caps.total != null) out.totalRemaining = hostedAgentVerdict({ agent: a, receipts: orgAgentReceipts(s, u.orgId, a.id), nowMs: now(), budgetPeriod: bp }).budget_remaining?.total_usd;
-              return out;
-            }),
-            orgBudget: orgBudgetOfOrg(s, u.orgId),
-            tagCaps: metricsTagCaps(s.orgs?.[u.orgId]?.tagCaps, () => orgReceipts(s, u.orgId), now(), bp),
-            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)),
-            receipts: visibleReceipts(s, u.orgId),
-            alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId) });
+          return buildMetrics({ agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId), teams: orgTeams(s, u.orgId),
+            receipts: visibleReceipts(s, u.orgId), alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId),
+            fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active), nowMs: now(), budgetPeriod: orgPeriod(s, u.orgId),
+            cutoff: retentionCutoff(entitlements(s, u.orgId), now()), byModel: by === "model" });
         });
         return res.writeHead(200, { "content-type": METRICS_CONTENT_TYPE, "cache-control": "no-store", "x-content-type-options": "nosniff" }).end(out.body);
       }
