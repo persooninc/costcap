@@ -3,7 +3,7 @@
 // drift. An unknown cost (cost_usd: null) is never treated as $0.
 import { createAgentBudgets, budgetRemaining } from "../agent-budget.js";
 import { effectiveCaps } from "./policy.js";
-import { inSpendWindow } from "../period.js";
+import { countsAtNow } from "../period.js";
 
 const HOSTED_SCOPES = ["day", "week", "month", "total"];
 
@@ -23,7 +23,7 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null }) {
   // #265: a total cap counts every receipt the agent ever synced (unknown ones included).
   const allTime = limits.total != null;
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && new Date(r.ts).toISOString().slice(0, 7) === month)
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (lifetime || countsAtNow(r, nowMs, budgetPeriod, limits.week != null)))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate });
   const remaining = budgetRemaining(budgets, who);

@@ -1,4 +1,4 @@
-import { periodKey, samePeriod, inSpendWindow } from "../period.js";
+import { periodKey, samePeriod, countsAtNow } from "../period.js";
 // Hosted team budgets (issue #123, SRM #3017). Pure, no I/O.
 // A team shares one day/month cap across a group of enrolled agents in one org.
 // The verdict reuses the local agent-budget engine (src/agent-budget.js), so the
@@ -82,7 +82,8 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
   const lifetime = team.total != null;
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
-      if (!Number.isFinite(Date.parse(r?.ts)) || new Date(r.ts).toISOString().slice(0, 7) !== month) continue;
+      // #261: current month OR current week (a week can start in the previous month).
+      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || countsAtNow(r, nowMs, budgetPeriod, team.week != null))) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
@@ -160,9 +161,10 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 
 // Issue #127: the agent's own fleet-wide synced spend (all hosts/runners using
 // this identity), from settled-aware stored receipts. Pure.
-// Issue #244: with hosted `modelCaps`, `models` maps each capped normalized
-// model id to its fleet-wide {day, month, unknown} in the same period.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null) {
+// #244: modelCaps adds `models`, the same totals split per capped model.
+// #265: { total: true } (the agent has caps.total) counts every receipt since the
+// beginning into spent.total; unknown cost anywhere in that history then refuses.
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false, week: weekCapped = false } = {}) {
   const now = new Date(nowMs).toISOString();
   const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
   const spent = { day: 0, month: 0 };
@@ -175,12 +177,12 @@ export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps
     const tsMs = Date.parse(r.ts);
     if (periodKey("month", tsMs, budgetPeriod) !== month) continue;
     if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
-    const m = models ? models[normalizeModel(r.model)] : undefined;
-    const today = periodKey("day", tsMs, budgetPeriod) === day;
-    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; if (m) m.unknown += 1; continue; }
-    spent.month += r.cost_usd;
-    if (today) spent.day += r.cost_usd;
-    if (m) { m.month += r.cost_usd; if (today) m.day += r.cost_usd; }
+    // #267: a previous-month unknown counts only when the agent caps the week.
+    if (r.cost_usd === null || r.cost_usd === undefined) { if (inMonth || lifetime || weekCapped) unknown += 1; continue; }
+    spent.total += r.cost_usd;
+    if (inMonth) spent.month += r.cost_usd;
+    if (inWeek) spent.week += r.cost_usd;
+    if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
   }
   const out = { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
   if (models) out.models = Object.fromEntries(Object.entries(models).map(([k, e]) => [k, { day: round6(e.day), month: round6(e.month), unknown: e.unknown }]));

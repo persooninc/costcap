@@ -1752,3 +1752,36 @@ test("issue #258 AC4 + AC5: route channel retries alone and gives up once; team 
   assert.ok(posts.includes(S0), "the new cap_hit occurrence was delivered to the default");
   assert.equal(posts.includes(S1), false);
 });
+
+// #267 AC3/AC4: a policy stored before #261 with an unknown caps key loads, is migrated
+// with an audit row, never leaks via the API, and the kill switch still works.
+test("#267: legacy caps.weekly in the store is dropped on load; kill switch returns 200", async (t) => {
+  const f = await fixture(t);
+  const owner = await f.login("legacy@example.invalid");
+  const enrollment = await f.request("/v1/enrollment-tokens", { caps: { day: 5 } }, owner.cookie);
+  const agent = (await f.request("/v1/enroll", { name: "legacy" }, null, enrollment.body.token)).body;
+  await f.restart(); // flush, then seed the pre-#261 shape directly in the store file
+  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
+  raw.agents[agent.agentId].policy.caps = { day: 5, weekly: 50 };
+  writeFileSync(f.storePath, JSON.stringify(raw));
+  await f.restart();
+  const policy = await f.request("/v1/policy", undefined, null, agent.token);
+  assert.equal(policy.status, 200);
+  assert.deepEqual(policy.body.caps, { day: 5 });
+  const fleet = await f.request("/v1/fleet", undefined, owner.cookie);
+  const row = fleet.body.audit.find((e) => e.action === "policy.legacy_caps_drop");
+  assert.deepEqual(row.detail.dropped, ["weekly"]);
+  assert.equal(row.target, agent.agentId);
+  assert.deepEqual(fleet.body.agents.find((a) => a.id === agent.agentId).policy.caps, { day: 5 });
+  const budget = await f.request(`/v1/agents/${agent.agentId}/budget`, undefined, owner.cookie);
+  assert.equal(budget.status, 200);
+  assert.equal(JSON.stringify(budget.body).includes("weekly"), false);
+  const killed = await f.request(`/v1/agents/${agent.agentId}/policy`, { killed: true }, owner.cookie);
+  assert.equal(killed.status, 200);
+  assert.equal((await f.request("/v1/policy", undefined, null, agent.token)).body.killed, true);
+  // New writes with an unknown key still 400 (#261).
+  assert.equal((await f.request(`/v1/agents/${agent.agentId}/policy`, { caps: { weekly: 50 } }, owner.cookie)).status, 400);
+  // Idempotent: a second restart adds no second audit row.
+  await f.restart();
+  assert.equal((await f.request("/v1/fleet", undefined, owner.cookie)).body.audit.filter((e) => e.action === "policy.legacy_caps_drop").length, 1);
+});

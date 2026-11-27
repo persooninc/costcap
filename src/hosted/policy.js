@@ -91,9 +91,11 @@ export function nextRaiseExpiry(policy, nowMs = Date.now()) {
   return t.length ? Math.min(...t) : null;
 }
 
-// #267: drop cap keys stored before #261 rejected them (e.g. "weekly"). Returns the
-// cleaned policy (same object when nothing changed) and the dropped key names.
-export function dropLegacyCapKeys(p) {
+/**
+ * #267: drop caps.* keys that are not cap scopes (stored before #261 made them a 400).
+ * Returns { policy, dropped } ; policy is the same object when nothing is dropped.
+ */
+export function stripLegacyCapKeys(p) {
   const caps = p?.caps;
   if (!caps || typeof caps !== "object" || Array.isArray(caps)) return { policy: p, dropped: [] };
   const dropped = Object.keys(caps).filter((k) => !CAP_KEYS.includes(k));

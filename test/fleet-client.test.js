@@ -384,3 +384,41 @@ test("#244 agentSpendPolicy models: only capped models, settlement-aware, pendin
   assert.equal(agentSpendPolicy(receipts, now, la).models, undefined);
   assert.equal(agentSpendPolicy(receipts, now, null, [{ model: OPUS, scope: "day", usd: 5 }]).models[OPUS].day, 3); // UTC: same day
 });
+
+// #267 AC1/AC2: the wrapper's cached fleet verdict across the Nov 30 -> Dec 2 boundary.
+test("#267: cached fleet verdict ignores a previous-month unknown unless a week cap applies", async (t) => {
+  const { agentSpendPolicy, teamVerdict, teamPolicy } = await import("../src/hosted/teams.js");
+  const { orgBudgetVerdict, orgBudgetPolicy } = await import("../src/hosted/org-budget.js");
+  const f = await setup(t);
+  f.server.closeAllConnections(); f.server.close();
+  const nowMs = Date.parse("2026-12-02T10:00:00Z");
+  const receipts = [{ id: "u1", ts: "2026-11-30T10:00:00Z", cost_usd: null }];
+  const cache = (caps, teamCaps, orgCaps) => {
+    const data = loadEnrollment(f.path);
+    data.policy = { version: 9, caps, killed: false };
+    data.agentSpend = agentSpendPolicy(receipts, nowMs, null, null, { week: caps.week != null });
+    data.team = teamPolicy(teamVerdict({ team: { name: "t", agents: [data.agentId], ...teamCaps }, receiptsByAgent: { [data.agentId]: receipts }, nowMs }), nowMs);
+    data.orgBudget = orgBudgetPolicy(orgBudgetVerdict({ budget: orgCaps, agentIds: [data.agentId], receiptsByAgent: { [data.agentId]: receipts }, nowMs }), nowMs);
+    saveEnrollment(f.path, data);
+    return createFleetClient(f);
+  };
+  const plain = cache({ month: 100 }, { month: 100 }, { month: 100 });
+  assert.equal(plain.fleetCheck(nowMs), null);
+  assert.equal(loadEnrollment(f.path).agentSpend.unknown, 0);
+  assert.equal(cache({ month: 100, week: 50 }, { month: 100 }, { month: 100 }).agentCheck(nowMs).verdict, "accounting_unavailable");
+  assert.equal(cache({ month: 100 }, { month: 100, week: 50 }, { month: 100 }).teamCheck(nowMs).verdict, "accounting_unavailable");
+});
+
+// #267 AC5: a cache written before #261 with a legacy caps key still runs.
+test("#267: legacy unknown caps key in the enrollment cache is dropped, known caps enforced", async (t) => {
+  const f = await setup(t);
+  const data = loadEnrollment(f.path);
+  data.policy = { version: 1, caps: { day: 5, weekly: 50 }, killed: false };
+  writeFileSync(f.path, JSON.stringify(data));
+  const loaded = loadEnrollment(f.path);
+  assert.deepEqual(loaded.policy.caps, { day: 5 });
+  const client = createFleetClient(f);
+  assert.equal(client.policy().caps.weekly, undefined);
+  assert.equal(client.policy().caps.day, 5);
+  assert.equal((await client.sync()).online, true);
+});

@@ -5,7 +5,7 @@ import { uiResponse } from "./ui.js";
 import { applySecurityBaseline } from "./security-baseline.js";
 import { randomBytes, randomUUID, randomInt } from "node:crypto";
 import { openStore } from "./store.js";
-import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise, splitTotalRaise, dropLegacyCapKeys } from "./policy.js";
+import { hashToken, validatePolicy, effectiveCaps, splitWeekRaise, stripLegacyCapKeys } from "./policy.js";
 import { evaluateAnomaly, anomalyError, resolveAnomaly, DEFAULT_ANOMALY } from "./anomaly.js";
 import { parseCapRequest, parseApproval, createCapRequest, findRequest, approveCapRequest, denyCapRequest, expireRaises, listCapRequests, CAP_REQUEST_STATUSES } from "./cap-requests.js";
 import { buildEvidence } from "./evidence.js";
@@ -55,20 +55,21 @@ export function scrubStoredReceipts(store) {
   return changed;
 }
 
-// Issue #267: one-time, idempotent startup migration of agent policies stored with
-// an unknown caps key before #261 rejected them. Each dropped key gets an audit row.
-export function migrateLegacyCapKeys(store) {
-  const dirty = store.read((s) => Object.values(s.agents ?? {}).some((a) => dropLegacyCapKeys(a.policy).dropped.length));
+// #267: one-time, idempotent startup migration. A policy saved before #261 may hold an
+// unknown caps.* key (e.g. "weekly"); it is dropped with an audit row naming it, so
+// policy writes (the kill switch) and enrolled wrappers keep working.
+export function dropLegacyCapKeys(store) {
+  const dirty = store.read((s) => Object.values(s.agents ?? {}).some((a) => stripLegacyCapKeys(a.policy).dropped.length));
   if (!dirty) return 0;
   let changed = 0;
   store.transaction((s) => {
     for (const a of Object.values(s.agents ?? {})) {
-      const { policy, dropped } = dropLegacyCapKeys(a.policy);
+      const { policy, dropped } = stripLegacyCapKeys(a.policy);
       if (!dropped.length) continue;
+      const before = { ...a.policy.caps };
       a.policy = policy;
-      s.audit ??= [];
-      audit(s, a.orgId, "system", "policy.legacy_cap_keys_dropped", a.id, { dropped, caps: { ...policy.caps } });
       changed++;
+      audit(s, a.orgId, "legacy-cap-migration", "policy.legacy_caps_drop", a.id, { dropped, before: { caps: before }, after: { caps: { ...policy.caps } } });
     }
   });
   Promise.resolve(store.flush?.()).catch(() => {});
@@ -258,7 +259,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   if ((!storePath && !injectedStore) || !verifyChallenge || !sendCode || !origin) throw new Error("Store, origin, Turnstile verifier and authorized code sender required");
   const store = injectedStore ?? openStore(storePath);
   scrubStoredReceipts(store);
-  migrateLegacyCapKeys(store);
+  dropLegacyCapKeys(store);
   const billingConfig = resolveBillingConfig({ ...stripeEnv, COSTCAP_STRIPE_MODE: stripeMode });
   const pricingPublic = publicPricing ?? billingConfig.publicPricing;
   const upgradeUrl = pricingPublic ? "/pricing" : "/#plan";
@@ -546,7 +547,16 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => {
+          const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId);
+          // #268: week scopes travel in additive fields (org_budget_v2, tag_caps_v2,
+          // model_caps_week) so a pre-#268 wrapper keeps accepting the policy.
+          // #271: week raises travel in raise_week, never under raise (a pre-#271 validator rejects raise.week).
+          const { policy: legacyPolicy, raise_week: raiseWeek } = splitWeekRaise(a.policy);
+          const { modelCaps: allModelCaps, ...rest } = legacyPolicy;
+          const mc = splitWeekModelCaps(allModelCaps);
+          const org = orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now());
+          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), ...(raiseWeek ? { raise_week: raiseWeek } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null, week: a.policy.caps?.week != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
