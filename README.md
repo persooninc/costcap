@@ -266,44 +266,22 @@ on Bedrock and Vertex has its own built-in routes (below).
   is provably gone; any other holder (another host, unreadable owner) is waited
   on for 5s and then the wrapper refuses calls with `receipt_ledger_unavailable`.
   Shared and exclusive (default) wrappers refuse to run on the same ledger.
-  Sharing across hosts is the hosted fleet's job (fleet-wide agent caps, #127).
-- `--preflight` (or `COSTCAP_PREFLIGHT=1`, off by default) refuses a call whose
-  **estimated** worst case cannot fit the remaining run/day/month budget, before
-  any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
-  It also covers `--policy` agent and team budgets (the tighter remainder) and
-  every matching `--tag-cap` (`tag_budget_exceeded`). With `--enrollment` it also
-  covers the enrolled fleet agent day/month caps and the hosted team budget,
-  against fleet-wide synced spend plus this host's unsynced receipts
-  (`fleet: true`, and `team` for a team budget).
-  It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
-  tokens = `max_tokens` (or `max_completion_tokens`, Gemini
-  `generationConfig.maxOutputTokens`), else a conservative provider default,
-  times the completion count: OpenAI-compatible `n` / `best_of` (the larger,
-  since `best_of` bills every candidate) or Gemini `candidateCount`
-  (`candidate_count`). An invalid count is treated as 1 and flagged
-  `output_multiplier_defaulted`; a count above the provider maximum (128 for
-  OpenAI/OpenRouter, 8 for Gemini) is clamped to it and flagged
-  `output_multiplier_clamped`. Allowed calls record `output_tokens_est` and
-  `output_multiplier` on their receipt.
-  Text that tokenizes denser than 4 bytes/token can still overshoot. Models
-  with no published rate are refused with `preflight_unpriced`, never priced at
-  the fallback. The blocked receipt has `estimate: true`, `estimate_usd` and
-  `scope`, and costs $0 toward spend.
-  Which endpoints are estimated (#205): chat, responses, messages, embeddings
-  and other generating POSTs use the maths above. An Anthropic Message Batches
-  create is estimated as the **sum** of every `requests[].params` worst case
-  times the batch rate (0.5x); the batch preflight discounts tokens only, and
-  each entry's tool worst case (`max_uses` x rate) is added at 100%
-  (`tool_calls_max` / `tool_usd_max` are summed across entries, #218); any unpriced entry refuses with
-  `preflight_unpriced` naming it. These pass through preflight unestimated
-  (still subject to caps, allowlists and rpm; the receipt has
-  `preflight_estimate: false`): `GET`/`HEAD` (background polls, batch and file
-  retrieves, `/v1/models`), `/v1/files` and `/v1/uploads`, and OpenAI batch
-  creates (their models live in the uploaded file; results are metered at
-  settle). Audio (`/v1/audio/*`) is checked against the extracted `model`
-  only: a priced model (e.g. `whisper-1`) passes, an unpriced one refuses with
-  `preflight_unpriced` naming it.
-- Local `wrap`/`check` daily and monthly periods use UTC; hosted caps follow the org budget period (below). Pricing is a versioned estimate, not the
+  Sharing across hosts is the hosted fleet's job.
+- `--preflight` (or `COSTCAP_PREFLIGHT=1`, or `"preflight": true` in a
+  `--policy` file) is **off by default**. Before forwarding, it estimates the
+  call's **worst case** and refuses it with `budget_exceeded`,
+  `reason: "preflight_estimate"` when that can't fit the remaining run, day or
+  month budget. **It is an estimate, not a tokenizer:** input tokens are
+  bounded by `ceil(request bytes / 4)` (images, tool schemas and unusual
+  tokenization can exceed this), output tokens are `max_tokens` /
+  `max_completion_tokens` / `generationConfig.maxOutputTokens`, or a
+  conservative per-provider default maximum when absent (OpenAI/OpenRouter
+  32,768; Anthropic 64,000; Gemini 65,536). Cache discounts and reasoning
+  tokens beyond the max are not modelled. A model with no rate in the table is
+  refused with `preflight_unpriced`, never forwarded as free. Blocked receipts
+  carry `estimate: true`, `estimate_usd` and `scope`, and cost $0 in totals.
+  Post-call metering is unchanged.
+- Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Announced price changes ship as effective-dated rows (#236):
   from 00:00 UTC on the date the new rate applies with no upgrade (Gemini 4 Carbon/Argon

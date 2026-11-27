@@ -18,15 +18,7 @@ import { warningLine } from "./cap-warn.js";
 import { modelBudgetExceededBody } from "./model-cap.js";
 import { DOWNGRADE_HEADER, downgradeLine, downgradeRoute, rewriteModel } from "./downgrade.js";
 import { createSpiralDetector } from "./spiral.js";
-import { preflightCheck, checkEstimate, estimateBatch, openRouterModels } from "./preflight.js";
-import { rateLimitedBody, usageTokens } from "./rate-limit.js";
-import { anthropicBatchModels, batchCreateProvider, batchReadPath, foldBatchResults, geminiBatchId, geminiBatchOutput, geminiBatchRequests, isGeminiBatchFreeCall } from "./batch.js";
-import { loadLedgerLines, isSettlement } from "./cap.js";
-import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
-import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
-import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
-import { cloudUpstream, createEventStreamDecoder, isCloudProvider, mapVertexModel, parseCloudRoute } from "./cloud.js";
-import { verifyRequest, signRequest } from "./sigv4.js";
+import { preflightCheck, preflightBody } from "./preflight.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -694,7 +686,7 @@ function reserveLeft(left, reserved) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, awsCredentials = null, awsRegion = null } = {}) {
+  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #249: concurrency slots. A number or a getter (fleet sync can lower it live).
@@ -1003,49 +995,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           const hit = cap?.check();
           if (hit) return block("budget_exceeded", hit, budgetExceededBody(hit));
           if (preflight) {
-            const pf = route
-              ? preflightCheck(cap, "anthropic", body, path, (est) => { preflightEst = est; }, cloudPrice, route.model ?? "")
-              : preflightCheck(cap, provider, body, path, (est) => { preflightEst = est; }, priceFor);
-            if (pf?.reason === "preflight_unpriced") return block("preflight_unpriced", pf, { error: { type: "preflight_unpriced", model: pf.model,
-              message: `CostCap preflight: model "${pf.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } });
-            if (pf) return block("budget_exceeded", pf, { error: { type: "budget_exceeded", reason: "preflight_estimate", estimate: true,
-              message: `CostCap preflight estimate: worst case $${pf.estimate_usd} does not fit the remaining ${pf.scope} budget ($${pf.remaining_usd[pf.scope]}). This is an estimate. The upstream call was not made.`,
-              scope: pf.scope, estimate_usd: pf.estimate_usd, remaining_usd: pf.remaining_usd } });
-            // #193: the estimate must also fit the agent/team remainder and every matching tag cap.
-            if (preflightEst && !preflightEst.pass) {
-              const est = preflightEst.estimate_usd;
-              const left = agentBudgets?.limitsFor ? reserveLeft(budgetRemaining(agentBudgets, who), reservedUsd()) : null;
-              const agentScope = left && ["run", "hour", "day", "week", "month", "total"].find((sc) => left[`${sc}_usd`] != null && est > left[`${sc}_usd`]);
-              if (agentScope) {
-                const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, scope: agentScope, estimate_usd: est, remaining_usd: left[`${agentScope}_usd`], ...who };
-                return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
-                  message: `CostCap preflight estimate: worst case $${est} does not fit this agent's remaining ${agentScope} budget ($${detail.remaining_usd}). This is an estimate. The upstream call was not made.${totalNote(agentScope)}` });
-              }
-              // #195: enrolled fleet agent caps and hosted team budgets (fleet-wide synced spend).
-              const fr = fleetRemaining?.();
-              const resv = reservedUsd();
-              const fleetLeft = (l) => { if (!l || !resv) return l; const o = { ...l }; for (const x of ["day", "week", "month", "total"]) if (typeof o[x] === "number") o[x] = Number(Math.max(o[x] - resv, 0).toFixed(6)); return o; };
-              for (const [kind, left] of [["agent", fleetLeft(fr?.agent)], ["team", fleetLeft(fr?.team)], ["org", fleetLeft(fr?.org)]]) {
-                const sc = left && ["day", "week", "month", "total"].find((x) => left[x] != null && est > left[x]);
-                if (!sc) continue;
-                const isTeam = kind === "team", isOrg = kind === "org";
-                const detail = { verdict: "budget_exceeded", reason: "preflight_estimate", estimate: true, fleet: true,
-                  scope: isTeam ? teamScope(fr.teamName, sc) : isOrg ? `org:${sc}` : sc, estimate_usd: est, remaining_usd: left[sc],
-                  ...(isTeam ? { team: fr.teamName } : {}), ...(isOrg ? { org: true } : {}), ...who };
-                const what = isTeam ? `team "${fr.teamName}"` : isOrg ? "org" : "fleet agent";
-                return block("budget_exceeded", detail, { error: "budget_exceeded", ...detail,
-                  message: `CostCap preflight estimate: worst case $${est} does not fit the ${what} remaining ${sc} budget ($${left[sc]}). This is an estimate. The upstream call was not made.${totalNote(sc)}` });
-              }
-              const tagPf = tagCaps?.preflight?.(reqTags, est, reservedTag);
-              if (tagPf) return block("tag_budget_exceeded", tagPf, tagBudgetExceededBody(tagPf));
-              const modelPf = capModels.length ? modelCaps?.preflight?.(capModels, est, reservedModel) : null;
-              if (modelPf) return block("model_budget_exceeded", modelPf, modelBudgetExceededBody(modelPf));
-            }
+            const pre = preflightCheck({ provider, body, path, cap });
+            if (pre) return block(pre.reason, pre.detail, preflightBody(pre.reason, pre.detail));
           }
-          // #192: RPM/TPM refuse with Retry-After; never latches, never a step.
-          const rateHit = generates ? rateLimit?.check() : null;
-          if (rateHit) return block("rate_limited", rateHit, rateLimitedBody(rateHit));
-          const vhit = velocity?.check(inFlight);
+          const vhit = velocity?.check();
           if (vhit) return block(vhit.reason, vhit, { error: "breaker_open", ...vhit });
           const spiralHit = spiral?.observe(req.method, path, body.toString("utf8"));
           if (spiralHit) return block("spiral_detected", spiralHit, { error: "spiral_detected", ...spiralHit });

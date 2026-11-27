@@ -41,14 +41,9 @@ import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js"
 import { credentialsFromEnv } from "./sigv4.js";
 import { bedrockStartupNote } from "./cloud.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] -- <command...>\n" +
-  "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
-  "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
-  "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--week-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output] [--baseline FILE] [--max-increase-pct N] [--max-increase-usd N] [--summary-out FILE]\n" +
-  "       costcap summary [--receipts FILE] [--run-id ID] --json\n" +
-  "       costcap diff --baseline FILE --current FILE [--max-increase-pct N] [--max-increase-usd N] [--markdown] [--json]\n" +
-  "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
-  "       costcap bill-check --receipts FILE --provider openai|anthropic (--provider-export FILE | --fetch) [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tolerance-pct 5] [--project ID] [--workspace ID] [--json]\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--policy FILE] [--shared-ledger] [--preflight] -- <command...>\n" +
+  "       costcap check [--cap USD] [--receipts FILE]\n" +
+  "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
   "       costcap request-raise --scope run|hour|day|week|month|total --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
   "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
@@ -65,7 +60,7 @@ export function parseWrapArgs(argv) {
   if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--week-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--upstream NAME=URL[,env=VAR]]... -- <command...>\n  (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url)");
   const flags = argv.slice(0, sep);
   const command = argv.slice(sep + 1);
-  const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", warnAt: [...DEFAULT_WARN_AT], killFile: DEFAULT_KILL_FILE, command };
+  const opts = { caps: {}, preflight: ["1", "true"].includes(process.env.COSTCAP_PREFLIGHT ?? ""), maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", killFile: DEFAULT_KILL_FILE, command };
   const money = (name, v) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number of USD, got "${v}"`);
@@ -75,7 +70,6 @@ export function parseWrapArgs(argv) {
     const f = flags[i];
     if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
     if (f === "--preflight") { opts.preflight = true; continue; }
-    if (f === "--github-output") { opts.githubOutput = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -192,18 +186,10 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, rpm, tpm, downgrade: localDowngrade } = parseWrapArgs(argv);
-  for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
-  for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
-  if (otlp?.insecure) console.error(`costcap: warning: --otlp uses plain http to a non-loopback host (${new URL(otlp.url).host})`);
-  const otlpHeaders = otlp ? parseOtlpHeaders(process.env.COSTCAP_OTLP_HEADERS) : null;
-  const limits = proxyLimits({ timeoutS });
-  // Never price from a tampered table (#122): refuse before spawning anything.
-  assertTableIntegrity();
-  // --preflight or COSTCAP_PREFLIGHT=1 (CC-9): refuse calls whose estimated worst case cannot fit.
-  const preflight = Boolean(preflightFlag) || /^(1|true|on)$/i.test(process.env.COSTCAP_PREFLIGHT ?? "");
+  const { caps, maxSteps, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag } = parseWrapArgs(argv);
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
+  const preflight = preflightFlag || policy?.preflight === true;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
   // #170: every receipt carries run_id, with or without --agent.
   const who = { ...(agentId ? { agent_id: agentId } : {}), run_id: runId ?? randomUUID() };
@@ -289,51 +275,7 @@ export async function wrap(argv) {
   const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
   const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
-  applyRate();
-  const runReceipts = [];
-  const summaryRunId = who.run_id;
-  const startedMs = Date.now();
-  const startedAt = new Date(startedMs).toISOString();
-  const exporter = otlp ? createOtlpExporter({ url: otlp.url, headers: otlpHeaders, runId: summaryRunId }) : null;
-  let priorEvents = [];
-  try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
-  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null, periodFor: (scope, at) => cap.fleetWindow(scope, at.getTime()) });
-  // #207: trigger order: local caps, --policy agent and team budgets, enrolled fleet agent and team caps.
-  const downgradeUsage = () => {
-    const rows = scopeUsage(cap.limits(), cap.spend());
-    if (agentBudgets) {
-      const id = who.agent_id ?? "unknown";
-      const limits = agentBudgets.limitsFor(id);
-      if (limits) rows.push(...scopeUsage(limits, agentBudgets.spend(who), "agent"));
-      const team = agentBudgets.teamFor?.(id);
-      if (team) rows.push(...scopeUsage(team, agentBudgets.teamSpend(who), `team ${team.team}`));
-    }
-    const fr = fleet?.preflightRemaining?.();
-    const spentOf = (caps, left) => Object.fromEntries(Object.entries(left ?? {}).filter(([k, v]) => caps?.[k] != null && typeof v === "number").map(([k, v]) => [k, Math.max(caps[k] - v, 0)]));
-    if (fr?.agent) rows.push(...scopeUsage(fleetPolicy?.caps, spentOf(fleetPolicy?.caps, fr.agent), "fleet"));
-    const team = fleet?.team?.();
-    if (fr?.team && team) { const tc = team.caps ?? {}; rows.push(...scopeUsage(tc, spentOf(tc, fr.team), `team ${team.name}`)); }
-    const org = fleet?.orgBudget?.();
-    if (fr?.org && org) rows.push(...scopeUsage(org.caps, spentOf(org.caps, fr.org), "org"));
-    return rows;
-  };
-  downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
-  // #184: opt-in response cache, default <ledger-dir>/cache.
-  const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, maxConcurrent: () => effectiveConcurrent, ...limits,
-    customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
-    // #188: Bedrock SigV4 re-signing uses wrap's own static credentials (never logged).
-    awsCredentials: credentialsFromEnv(process.env), awsRegion: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null,
-    // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
-    allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels,
-    // #207: fleet downgrade merged with the local flags (local only adds or tightens).
-    downgrade: () => mergeDowngrade(fleetDowngrade, localDowngrade ?? null),
-    downgradeScopes: fleet ? () => { const r = fleet.preflightRemaining(); return r?.agent ? remainingScopes(fleetPolicy?.caps ?? {}, r.agent, "fleet:") : []; } : null,
-    downgradeTracker: createDowngradeTracker({ events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null }) });
-  proxySettle = (r) => server.settle(r);
-  checkWarnings = () => server.checkWarnings();
-  // #187: fractions already reached at startup (incl. a cached fleet cap) warn once, deduped by the ledger.
-  checkWarnings();
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

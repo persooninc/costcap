@@ -230,12 +230,11 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       for (const scope of CAP_SCOPES) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
       caps = { ...next };
     },
-    // Remaining USD per capped scope (uncapped scopes omitted). Used by preflight (CC-9).
+    // Remaining USD per capped scope (null where uncapped). Used by pre-flight (CC-9).
     remaining() {
       const s = spend();
-      const lim = limits();
       const out = {};
-      for (const scope of CAP_SCOPES) if (lim[scope] != null) out[scope] = Number(Math.max(0, lim[scope] - s[scope]).toFixed(6));
+      for (const scope of ["run", "day", "month"]) out[scope] = caps[scope] == null ? null : Number(Math.max(0, caps[scope] - s[scope]).toFixed(6));
       return out;
     },
     // Returns null if the call may proceed, else a budget-exceeded descriptor.

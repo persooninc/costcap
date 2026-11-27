@@ -169,6 +169,7 @@ It is dated 2026-10-11 and lists features as failing because the Docker tests fa
 ### CC-9 Pre-flight budget estimate (done, #117: `wrap --preflight`)
 Metering after the response allows one call to overshoot.
 - Acceptance: an optional mode estimates the worst case from `max_tokens` and the price table and refuses a call that can't fit. It's off by default and labeled an estimate.
+- Status: shipped (#117), `src/preflight.js` behind `wrap --preflight`.
 
 ## Owner gates
 
