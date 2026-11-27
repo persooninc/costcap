@@ -193,3 +193,15 @@ test("AC5 e2e: a 5 MB multipart reaches upstream byte-for-byte; malformed multip
   assert.equal((await m.post("transcriptions", multipart([["model", "whisper-1"]]), "multipart/form-data")).status, 200);
   assert.deepEqual([m.receipts()[0].model, m.receipts()[0].reason], ["unknown", "usage_unavailable"]);
 });
+
+// #273: gpt-live-1 is priced per minute of session time; `costcap pricing` lists it.
+test("#273 gpt-live-1 row: $0.05/minute, shown by costcap pricing", async () => {
+  const { lookupPrice } = await import("../src/pricing.js");
+  const { spawnSync } = await import("node:child_process");
+  const p = lookupPrice("gpt-live-1");
+  assert.equal(p.per_minute, 0.05);
+  assert.equal(p.fallback, false);
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-live-1"], { encoding: "utf8" });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /gpt-live-1: \$0\.05 per minute of session time/);
+});

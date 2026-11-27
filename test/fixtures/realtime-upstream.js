@@ -9,8 +9,9 @@ const accept = (key) => createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA
 /**
  * startRealtimeUpstream({ onSession(conn, req) }) -> { url, port, upgrades, requests, sessions, close }.
  * conn.send(obj | Buffer raw) writes server frames; conn.received holds client messages; conn.closed resolves on close.
+ * #273: onMessage(conn, msg) sees each client text message (GPT-Live /v1/live/sessions sessions).
  */
-export async function startRealtimeUpstream({ onSession = () => {}, onMessage = () => {}, reject = null, maxMessageBytes } = {}) {
+export async function startRealtimeUpstream({ onSession = () => {}, onMessage = () => {}, reject = null } = {}) {
   const state = { upgrades: 0, requests: 0, sessions: [], handshakes: [] };
   // Plain HTTP calls (e.g. chat completions) get a small metered body so one host serves both.
   const server = http.createServer((req, res) => {

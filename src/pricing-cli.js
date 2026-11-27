@@ -58,7 +58,7 @@ export function pricingCommand(args, { tablePath } = {}) {
   // A long-context tier (#151) prints as a second row for the same model.
   // Premium speed / service tiers (#155) print as (fast) / (priority) rows.
   // #198: per-minute / per-character audio models print their unit rate instead of token rates.
-  const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of audio`
+  const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of ${name.startsWith("gpt-live") ? "session time" : "audio"}`
     : `${name}: ${fmt(r.per_million_characters)} per 1M characters of input text`);
   const rowsFor = (name, r) => (Number.isFinite(r.per_minute) || Number.isFinite(r.per_million_characters)) && !Number.isFinite(r.input) ? [unitRow(name, r)] : [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
     ...["fast", "priority", "ultrafast"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
