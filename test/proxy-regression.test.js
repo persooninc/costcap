@@ -638,11 +638,76 @@ test("#184 without a cache every receipt keeps its exact pre-cache shape and no 
   for (const r of receipts) for (const k of ["cache", "saved_usd", "cache_source_receipt"]) assert.equal(k in r, false);
 });
 
-test("#194 AC5: upgrades on non-realtime paths get 501 websocket_unsupported, nothing latches", async (t) => {
-  const { connectRealtime } = await import("./fixtures/realtime-upstream.js");
-  let hits = 0, upgrades = 0;
-  const up = http.createServer((req, res) => { hits++; req.resume(); res.setHeader("content-type", "application/json"); res.end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":1,"completion_tokens":1}}'); });
-  up.on("upgrade", (req, socket) => { upgrades++; socket.destroy(); });
+// #194 AC5: a WebSocket upgrade on a non-realtime route used to reach the HTTP path, fail fetch,
+// latch upstream_outcome_unknown and refuse every later call. It is now refused locally.
+test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hits, next call 200", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream();
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url, anthropic: up.url } });
+  t.after(async () => { server.close(); await up.close(); });
+  // #273 AC7: GPT-Live forks stay unsupported.
+  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages", "/openai/v1/live/sessions/sess_1/fork"]) {
+    const c = await connectRealtime(port, p);
+    assert.equal(c.status, 501);
+    assert.equal(c.body.error, "websocket_unsupported");
+  }
+  assert.equal(up.requests + up.handshakes.length, 0);
+  const r = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) });
+  assert.equal(r.status, 200);
+  assert.equal(server.accountingFailure(), null);
+});
+
+// #273 AC7: /openai/v1/realtime receipts are unchanged by the GPT-Live route; wrap exports the live URL.
+test("#273 realtime receipt shape unchanged; baseUrlOverrides exports COSTCAP_OPENAI_LIVE_URL", async (t) => {
+  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
+  const usage = { input_tokens: 10, output_tokens: 5 };
+  const up = await startRealtimeUpstream({ onSession: (c) => c.send({ type: "response.done", response: { id: "r1", usage } }) });
+  const receipts = [];
+  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url }, onReceipt: (r) => receipts.push(r) });
+  t.after(async () => { server.close(); await up.close(); });
+  const c = await connectRealtime(port, "/openai/v1/realtime?model=gpt-realtime");
+  await c.waitFor((m) => m.type === "response.done");
+  while (!receipts.length) await new Promise((r) => setTimeout(r, 10));
+  const r = receipts[0];
+  assert.equal(r.path, "/v1/realtime?model=gpt-realtime");
+  assert.equal(r.cost_usd, 0.00012);
+  for (const k of ["cost_basis", "billed_seconds", "session_seconds"]) assert.equal(k in r, false);
+  c.close();
+  const { baseUrlOverrides } = await import("../src/proxy.js");
+  assert.ok(baseUrlOverrides(8080).includes("COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:8080/openai/v1/live/sessions"));
+});
+
+test("#196 a GET whose body carries usage is $0 non_billable_request and never pauses", async (t) => {
+  const f = await scripted(t, "openai", [200]);
+  const r = await f.call(0, "GET", "/openai/v1/chat/completions/chatcmpl_1");
+  assert.equal(r.status, 200);
+  assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [0, "non_billable_request"]);
+});
+
+// #200: Gemini embeddings are metered input-only from usageMetadata.promptTokenCount.
+test("#200 extractUsage: Gemini embed/batch usage, invalid shapes stay unknown, generateContent unchanged", () => {
+  const e = { embeddings: true };
+  assert.deepEqual(extractUsage("gemini", '{"embedding":{"values":[0.1]},"usageMetadata":{"promptTokenCount":12}}', "gemini-embedding-001", e),
+    { model: "gemini-embedding-001", usage: { input_tokens: 12, output_tokens: 0, cached_input_tokens: 0 } });
+  assert.deepEqual(extractUsage("gemini", '{"embeddings":[{"values":[1]},{"values":[2]}],"usageMetadata":{"promptTokenCount":40}}', "gemini-embedding-001", e).usage,
+    { input_tokens: 40, output_tokens: 0, cached_input_tokens: 0 });
+  for (const bad of ['{"embedding":{}}', '{"usageMetadata":{}}', '{"usageMetadata":{"promptTokenCount":-1}}', '{"usageMetadata":{"promptTokenCount":"5"}}', '{"usageMetadata":null}'])
+    assert.equal(extractUsage("gemini", bad, "gemini-embedding-001", e), null, bad);
+  const mm = extractUsage("gemini", JSON.stringify({ usageMetadata: { promptTokenCount: 300, promptTokenDetails: [{ modality: "TEXT", tokenCount: 100 }, { modality: "IMAGE", tokenCount: 200 }] } }), "gemini-embedding-2", e);
+  assert.deepEqual(mm.usage.modality_tokens.input, { text: 100, image: 200, audio: 0, video: 0 });
+  assert.equal(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":12}}', "gemini-2.5-flash"), null);
+});
+
+test("#200 isEmbeddingsPath: exact Gemini embed paths only", () => {
+  for (const ok of ["/gemini/v1beta/models/gemini-embedding-001:embedContent", "/gemini/v1/models/gemini-embedding-2:batchEmbedContents",
+    "/gemini/v1alpha/models/gemini-embedding-001:embedContent?key=x"]) assert.equal(isEmbeddingsPath(ok), true, ok);
+  for (const bad of ["/gemini/v1beta/models/gemini-embedding-001:generateContent", "/gemini/v1beta/models/gemini-embedding-001:asyncBatchEmbedContent",
+    "/gemini/v1beta/models/gemini-embedding-001%3AembedContent", "/gemini/v1beta/models/../models/x:embedContent", "/gemini//v1beta/models/x:embedContent",
+    "/gemini/v2/models/x:embedContent", "/gemini/v1beta/models/x:embedContent/", "/vertex/v1beta/models/x:embedContent"]) assert.equal(isEmbeddingsPath(bad), false, bad);
+});
+
+async function geminiEmbedProxy(t, responder) {
+  const up = http.createServer((req, res) => { req.resume(); const [status, body] = responder(req); res.writeHead(status, { "content-type": "application/json" }).end(body); });
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${up.address().port}`;
   const p = await startMeteringProxy({ upstreams: { openai: base, anthropic: base } });

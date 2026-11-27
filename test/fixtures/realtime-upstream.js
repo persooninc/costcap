@@ -8,13 +8,45 @@ import { OP, closePayload, createFrameParser, encodeFrame } from "../../src/real
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const acceptFor = (key) => createHash("sha1").update(key + GUID).digest("base64");
 
-// onConnection(conn, req): conn.send(obj|Buffer raw), conn.messages, conn.close().
-export async function startRealtimeUpstream({ onConnection = () => {}, reject = null } = {}) {
-  const state = { upgrades: 0, httpHits: 0, requests: [], conns: [] };
-  const server = http.createServer((req, res) => { state.httpHits++; res.writeHead(404).end(); });
+/**
+ * startRealtimeUpstream({ onSession(conn, req) }) -> { url, port, upgrades, requests, sessions, close }.
+ * conn.send(obj | Buffer raw) writes server frames; conn.received holds client messages; conn.closed resolves on close.
+ * #273: serves /v1/live/sessions too; set conn.closeSeconds = () => n to answer session.close with session.closed.
+ */
+export async function startRealtimeUpstream({ onSession = () => {}, reject = null } = {}) {
+  const state = { upgrades: 0, requests: 0, sessions: [], handshakes: [] };
+  // Plain HTTP calls (e.g. chat completions) get a small metered body so one host serves both.
+  const server = http.createServer((req, res) => {
+    state.requests++;
+    req.resume();
+    req.on("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1, completion_tokens: 1 } })); });
+  });
   server.on("upgrade", (req, socket) => {
     state.upgrades++;
-    state.requests.push({ url: req.url, headers: req.headers });
+    socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade",
+      `Sec-WebSocket-Accept: ${accept(req.headers["sec-websocket-key"])}`, "", ""].join("\r\n"));
+    const parser = createFrameParser();
+    let resolveClosed;
+    const conn = {
+      socket, received: [], frames: [], req,
+      closed: new Promise((r) => { resolveClosed = r; }),
+      send(ev) { if (!socket.destroyed) socket.write(Buffer.isBuffer(ev) ? ev : encodeFrame(1, JSON.stringify(ev))); },
+    };
+    socket.on("data", (b) => {
+      for (const f of parser.push(b)) {
+        conn.frames.push(f);
+        if (f.message?.opcode === 1) {
+          const msg = JSON.parse(f.message.data.toString());
+          conn.received.push(msg);
+          // #273: a GPT-Live upstream answers session.close with session.closed (usage.seconds).
+          if (msg.type === "session.close" && typeof conn.closeSeconds === "function") {
+            const s = conn.closeSeconds();
+            if (s != null) conn.send({ type: "session.closed", session: { id: conn.sessionId ?? "sess_live" }, usage: { seconds: s } });
+          }
+        }
+        if (f.opcode === 8 && !socket.destroyed) socket.end();
+      }
+    });
     socket.on("error", () => {});
     if (reject) {
       const body = JSON.stringify(reject.body ?? { error: { message: "bad key" } });

@@ -51,6 +51,7 @@ test("operation names", () => {
   assert.equal(operationName("/v1/completions"), "text_completion");
   assert.equal(operationName("/v1/messages"), "chat");
   assert.equal(operationName("/v1/realtime"), "realtime");
+  assert.equal(operationName("/v1/live/sessions"), "live");
   assert.equal(operationName("/v1/files"), "files");
   assert.equal(operationName(""), "call");
   assert.equal(operationName(), "call");
