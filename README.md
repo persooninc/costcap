@@ -978,6 +978,22 @@ costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
 - When a scope has an unknown-cost receipt (a pending batch included), its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
 - `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
 
+## Model downgrade
+
+Degrade, don't die. Past a fraction of any cap, `wrap` sends a mapped model upstream as a cheaper one instead of waiting for the hard stop:
+
+```sh
+costcap wrap --day-cap 10 --downgrade gpt-4o=gpt-4o-mini,claude-sonnet-4-5=claude-haiku-4-5 --downgrade-at 0.8 -- node agent.js
+# costcap: day spend is 80% of its cap; downgrading gpt-4o -> gpt-4o-mini
+```
+
+- **Trigger:** the first run/hour/day/month scope whose spend is at or above `--downgrade-at` (default `0.8`, 0 < F < 1) of its cap. Scopes come from local caps, a `--policy` agent or team budget (`agent:day`, `team:month`) and an enrolled fleet agent cap (`fleet:day`). Under the fraction, requests are byte-identical to today.
+- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes (streamed requests included; stream-usage injection still applies). The allowlist, `--unknown-models refuse`, preflight, tag caps and the cache key all see the target model, so a disallowed or unpriced target is refused, never sent as the original. An unpriced `--downgrade` target exits `2` at wrap start.
+- **Not rewritten:** Gemini path models, Bedrock/Vertex, batches, multipart audio, Realtime and OpenRouter `models[]` arrays pass through unchanged with receipt `downgrade: "unsupported_route"`.
+- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction}`; the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line per scope and period, never counted as spend. The run summary and `costcap runs` show `downgraded_calls`.
+- **Fleet:** a `downgrade: {at, map}` field on the agent policy (dashboard agent card, or `POST /v1/agents/:id/policy`, audited as `policy.change`; `null` clears it). Local flags can only add mappings or lower `at`; the fleet target wins on a clash.
+- At 100% the hard stop still refuses. A downgrade never raises or bypasses a cap.
+
 ## Response cache
 
 `costcap wrap --cache TTL` (off by default; `30s`, `10m`, `24h`, `7d`, at most `7d`) answers repeated identical deterministic requests from a local disk cache. A hit makes no upstream call, costs $0, and still writes a receipt: `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`.

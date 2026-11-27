@@ -20,7 +20,7 @@ export function stopReason(reason) {
 export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false, signal = null, maxConcurrent = 1 }) {
   let firstStop = null;
   const by_model = {};
-  let calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, downgraded_calls = 0, total = 0;
+  let downgraded_calls = 0, calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, total = 0;
   let stopped_by = killed ? "killed" : null, stopped_scope = killed ? (kill?.kill_scope ?? null) : null;
   const cache = { hits: 0, misses: 0, saved_usd: 0 };
   let cacheSeen = cacheEnabled;
@@ -42,6 +42,8 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
     if (r.cache === "hit") { cache.hits++; if (Number.isFinite(r.saved_usd)) cache.saved_usd = r6(cache.saved_usd + r.saved_usd); }
     else if (r.cache === "miss") cache.misses++;
     if (r.reason === "upstream_rejected") rejected_calls++;
+    // #207: a call sent upstream on the cheaper downgrade target.
+    if (typeof r.requested_model === "string" && r.downgrade && typeof r.downgrade === "object") downgraded_calls++;
     const m = r.model ?? "unknown";
     const b = (by_model[m] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 });
     b.calls++;
@@ -61,11 +63,9 @@ export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null
   // #225: stop reason and outcome (success|failure|killed) for hosted run-end sync.
   const stop_reason = stopReasonFor({ killed, reason: firstStop, signal });
   return {
-    schema: SCHEMA, run_id, started_at, ended_at, exit_code, stop_reason, outcome: deriveOutcome({ exit_code, stop_reason }), calls, blocked_calls, rejected_calls, by_model,
-    total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls, ...(downgraded_calls ? { downgraded_calls } : {}),
-    caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(cacheSeen ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
-    // #249: shown only when parallel forwarding was on, so default summaries are unchanged.
-    ...(maxConcurrent > 1 ? { max_concurrent: maxConcurrent } : {}),
+    schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
+    total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls,
+    caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(downgraded_calls ? { downgraded_calls } : {}), ...(cacheSeen ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
   };
 }
 
@@ -74,9 +74,9 @@ export function rollupLine(s) {
     ? `unknown (${s.unknown_cost_calls} unpriced call${s.unknown_cost_calls === 1 ? "" : "s"})`
     : `$${s.total_cost_usd.toFixed(4)}`;
   const saved = s.cache?.hits > 0 ? ` · cache: ${s.cache.hits} hit${s.cache.hits === 1 ? "" : "s"}, saved $${s.cache.saved_usd.toFixed(4)}` : "";
+  const dg = s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : "";
   const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
-  const otlp = s.otlp ? ` otlp=${s.otlp.spans_exported} exported/${s.otlp.spans_dropped} dropped` : "";
-  return `costcap: run ${s.run_id}${s.max_concurrent ? ` max_concurrent=${s.max_concurrent}` : ""} calls=${s.calls}${s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : ""} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${stop}${saved}${otlp}`;
+  return `costcap: run ${s.run_id} calls=${s.calls} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${dg}${stop}${saved}`;
 }
 
 export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");
@@ -115,7 +115,7 @@ export function runsCommand(argv, { log = console.log, warn = console.error } = 
   else if (!runs.length) log("no runs recorded");
   else for (const r of runs) {
     const cost = r.total_cost_usd === null ? "unknown" : `$${Number(r.total_cost_usd).toFixed(4)}`;
-    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.max_concurrent ? `  max_concurrent=${r.max_concurrent}` : ""}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}  outcome=${r.outcome ?? (r.stop_reason ? deriveOutcome(r) : "unknown")}`);
+    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}`);
   }
   return { runs, errors };
 }

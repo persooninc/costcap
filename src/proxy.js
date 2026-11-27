@@ -35,6 +35,7 @@ import { GEMINI_LIVE_PATH, geminiLiveUsage, isExplicitTurn, isTurnInput, setupMo
 import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "./live.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
 import { awsCredentials, getHeader, isSigV4, signRequest, verifyRequest } from "./sigv4.js";
+import { DOWNGRADE_HEADER, capScopes, downgradeLine, rewriteModel, triggerScope } from "./downgrade.js";
 
 const PROVIDERS = {
   openai: "https://api.openai.com",
@@ -690,10 +691,7 @@ function reserveLeft(left, reserved) {
 }
 
 export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, modelCaps = null, rateLimit = null, fleetRemaining = null, downgrader = null, maxConcurrent = 1, now, liveTickMs = 1000, liveCloseWaitMs = 5000 } = {}) {
-  // #237: the COSTCAP_PRICING_CLOCK pin applies only when the caller did not inject a clock.
-  const pinPrices = now === undefined;
-  if (now === undefined) now = Date.now;
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrade = null, downgradeScopes = null, downgradeTracker = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   // #249: concurrency slots. A number or a getter (fleet sync can lower it live).
@@ -948,9 +946,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           send(status, { error, model: requestedModel ?? null, message });
           return "blocked";
         };
-        let preflightEst, reserveModels = [];
-        // #207: budget-triggered downgrade; dg is the applied decision, dgReceipt the receipt fields.
-        let dg = null, dgReceipt = {};
+        let preflightEst;
+        // #207: receipt fields when a budget-triggered downgrade applies (or cannot on this route).
+        let downgradeInfo = null;
         const verdict = guarded(() => {
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
@@ -958,25 +956,38 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           if (accountingFailure) return block("accounting_unavailable", {}, { error: "accounting_unavailable", message: accountingFailure });
           // #233: free management calls (files, batch cancel/delete) skip allowlist, unpriced and preflight checks.
           const generates = !["GET", "HEAD"].includes(req.method);
-          // #257: a cache TTL update names no model; it is billed from the response like a create.
-          const freeMgmt = generates && (isNonBillableFilesRequest(req.method, req.url) || cacheOp === "patch");
-          // #207: decided before the allowlist, unpriced check, preflight and cache key, so all of them see TO.
-          if (downgrader && generates) {
-            const candidates = routerModels?.length ? routerModels : batchModels ?? [requestedModel];
-            const decision = candidates.map((m) => downgrader.decide(m)).find(Boolean) ?? null;
-            if (decision) {
-              const multipart = Boolean(audio && audio !== "speech");
-              if (cacheOp || !downgradeRoute({ provider, custom, cloud, batch: Boolean(batchCreate), multipart, routerModels, parsedBody })) dgReceipt = { downgrade: "unsupported_route" };
+          // #207: past the configured fraction of any cap, rewrite FROM -> TO before every
+          // model check, so the allowlist, unknown-models, preflight, tag caps and cache key use TO.
+          const dg = generates && requestedModel ? downgrade?.() : null;
+          if (dg && Object.hasOwn(dg.map, requestedModel)) {
+            const from = requestedModel, to = dg.map[from];
+            const scopes = [...(cap ? capScopes(cap.limits(), cap.spend()) : [])];
+            if (agentBudgets?.limitsFor) {
+              const own = agentBudgets.limitsFor(who.agent_id ?? "unknown");
+              if (own) scopes.push(...capScopes(own, agentBudgets.spend(who), "agent:"));
+              const team = agentBudgets.teamFor?.(who.agent_id ?? "unknown");
+              if (team) scopes.push(...capScopes(team, agentBudgets.teamSpend(who), "team:"));
+            }
+            try { scopes.push(...(downgradeScopes?.() ?? [])); } catch { /* fleet cache unreadable: local scopes only */ }
+            const hit = triggerScope(scopes, dg.at);
+            if (hit) {
+              const supported = !cloud && !custom ? ["openai", "anthropic", "openrouter"].includes(provider) && !audio && !batchCreate && !Array.isArray(parsedBody?.models) : custom && !batchCreate;
+              const rewritten = supported ? rewriteModel(body, to) : null;
+              if (!rewritten) downgradeInfo = { downgrade: "unsupported_route" };
               else {
-                dg = decision;
-                body = rewriteModel(parsedBody, dg.to);
-                parsedBody = JSON.parse(body);
-                requestedModel = dg.to;
-                dgReceipt = { requested_model: dg.from, downgrade: { scope: dg.scope, fraction: dg.fraction } };
+                body = rewritten;
+                requestedModel = to;
+                downgradeInfo = { requested_model: from, downgrade: { scope: hit.scope, fraction: hit.fraction } };
+                res.setHeader(DOWNGRADE_HEADER, `${from}->${to}`);
+                const ev = downgradeTracker?.observe(hit, from, to);
+                if (ev) {
+                  const done = emitEvent(ev);
+                  try { onWarning(downgradeLine(done)); } catch { /* stderr is best effort */ }
+                }
               }
             }
           }
-          const allow = generates && !freeMgmt ? allowedModels?.() ?? null : null;
+          const allow = generates ? allowedModels?.() ?? null : null;
           if (generates && routerModels === null) {
             emit({ provider, path: storedPath, blocked: true, reason: "invalid_models", outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
             send(400, { error: "invalid_models", model: requestedModel ?? null, message: "CostCap: `models` must be an array of model id strings. The upstream call was not made." });
@@ -1108,7 +1119,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               cache.hit(entry.cost_usd);
               velocity?.step?.();
               emit({ provider, path: storedPath, status: entry.status, blocked: false, model: entry.model ?? requestedModel ?? "unknown",
-                cost_usd: 0, reason: "cache_hit", cache: "hit", ...dgReceipt, saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id });
+                cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd: entry.cost_usd, cache_source_receipt: entry.receipt_id, ...downgradeInfo });
               flushWarnings();
               if (!res.destroyed) res.writeHead(entry.status, { "content-type": entry.content_type, [CACHE_HEADER]: "hit" }).end(entry.body);
               return;
@@ -1165,7 +1176,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
           if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
-          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...dgReceipt, ...(cacheMode && { cache: cacheMode }),
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...(cacheMode && { cache: cacheMode }), ...downgradeInfo,
             ...(preflightEst?.pass ? { preflight_estimate: false } : preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
           let metered, raw, audioCost, streamCut = false, sseIncomplete = false;
           // #196: Responses background create / read / cancel on the first-party OpenAI route.
