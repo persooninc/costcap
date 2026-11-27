@@ -158,50 +158,14 @@ export function selectRates(price, prompt_tokens, signal = {}) {
   return { pricing_tier: premium, rates };
 }
 
-// Batch APIs (#160): a provider-level multiplier applied to every rate component,
-// on top of the long_context tier. null when the provider publishes no batch rate.
+// Batch discount (#160): provider-level multiplier applied to every component,
+// including cache read/write and on top of the long_context tier. null when unpublished.
 export function batchMultiplier(provider) {
-  const m = table.batch?.[provider];
+  const m = table.batch?.[provider]?.multiplier;
   return typeof m === "number" && Number.isFinite(m) && m > 0 ? m : null;
 }
 
-// #188: Claude 4.5+ on Bedrock/Vertex regional (non-global) endpoints carries a premium.
-// Returns the multiplier for a listed model, else null (no premium published).
-export function regionalMultiplier(model) {
-  const r = table.regional_endpoint;
-  const id = resolveModelId(model);
-  if (!r || !Array.isArray(r.models) || id === null || !r.models.includes(id)) return null;
-  return typeof r.multiplier === "number" && Number.isFinite(r.multiplier) && r.multiplier > 0 ? r.multiplier : null;
-}
-
-const scaleRates = (rates, m) => Object.fromEntries(Object.entries(rates).map(([k, v]) => [k, typeof v === "number" && k !== "threshold_input_tokens" ? v * m : v]));
-
-// #163: non-text modality slices. Returns { delta, unpriced } where delta is the extra USD
-// (vs pricing the slice at the text rate) for slices with a published modality rate.
-// uniform_modalities: one price for all inputs. text_rate_modalities: listed at the text rate.
-// Anything else non-text (including every fallback model) is unpriced, never text-priced.
-const BUCKET_RATE = { input: "input", cached_input: "cached_input", output: "output" };
-export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1) {
-  if (!modality_tokens || typeof modality_tokens !== "object") return { delta: 0, unpriced: false };
-  let delta = 0;
-  for (const [bucket, rateKey] of Object.entries(BUCKET_RATE)) {
-    const slice = modality_tokens[bucket];
-    if (!slice) continue;
-    for (const m of ["image", "audio", "video"]) {
-      const n = slice[m] ?? 0;
-      if (!(n > 0)) continue;
-      if (price.fallback) return { delta: 0, unpriced: true };
-      if (price.uniform_modalities === true) continue;
-      if (bucket !== "output" && Array.isArray(price.text_rate_modalities) && price.text_rate_modalities.includes(m)) continue;
-      const r = price.modalities?.[m]?.[rateKey];
-      if (!Number.isFinite(r)) return { delta: 0, unpriced: true };
-      delta += n * (r * multiplier - rates[rateKey]);
-    }
-  }
-  return { delta, unpriced: false };
-}
-
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false } = {}) {
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier } = {}, { multiplier = 1 } = {}) {
   const price = lookupPrice(model);
   const signal = { ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const tiered = selectRates(price, promptTokens({ input_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens }), signal);
@@ -228,7 +192,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
       (cached_input_tokens ? cached_input_tokens * rates.cached_input : 0) +
       cache_write_input_tokens * (rates.cache_write ?? 0) +
       cache_write_1h_input_tokens * (rates.cache_write_1h ?? 0) +
-      output_tokens * rates.output + modal.delta) / 1_000_000;
+      output_tokens * rates.output) * multiplier / 1_000_000;
   return {
     model,
     cost_usd: unpriced ? null : Number(cost.toFixed(6)),

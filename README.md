@@ -417,66 +417,30 @@ on Bedrock and Vertex has its own built-in routes (below).
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
   content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
-- Retrieves never create spend: any GET/HEAD (for example `GET /v1/responses/{id}` or a
-  stored `GET /v1/chat/completions/{id}`) is `cost_usd: 0, reason: "non_billable_request"`
-  even when the body carries usage, unless it settles a pending background response.
-- OpenAI Responses background mode (`POST /openai/v1/responses` with
-  `background: true`): a 2xx `queued`/`in_progress` reply writes a
-  `reason: "background_pending"` receipt with `response_id` at `cost_usd: null`. Like a
-  pending batch it does not pause the run, spend is a lower bound and `costcap check`
-  fails until it settles. A cut `background: true, stream: true` stream that already
-  sent `response.created` is also `background_pending`. Polling `queued`/`in_progress`
-  costs $0. The first terminal (`completed`, `incomplete`, `failed`, `cancelled`) read
-  through the proxy (`GET /v1/responses/{id}`, a resumed `?stream=true` stream, or
-  `POST /v1/responses/{id}/cancel`) appends one
-  `{"event":"reconciliation","source":"background_result","response_id"}` at the
-  create's `ts` (once, including across restarts). A terminal reply with null or
-  unpriceable usage appends `{"event":"background_unpriced"}`: the receipt becomes an
-  unknown `background_unpriced` and the run pauses.
-  Another run's background settle counts toward day/month and `--policy`/`--tag-cap`
-  budgets, never toward this run's cost-velocity breaker (matching batches, #201).
-- Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
-  OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
-  (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
-  run, but the run total stays unknown and `costcap check` fails until the batch
-  settles. Enrolled fleet day/month caps and hosted team caps (`costcap wrap
-  --enrollment`) follow the same rule: a pending batch is shown as pending, not as an
-  unreconciled unknown, and its settled cost counts toward the fleet/team total.
-  Reading the results through the proxy settles it: Anthropic
-  `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
-  links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
-  Succeeded lines are priced at the published 50% batch rate (pricing table
-  `batch`, applied to every component including cache reads/writes and on top of
-  long_context); errored, canceled, expired and non-2xx lines cost $0. One
-  `{"event":"reconciliation","source":"batch_results"}` line is appended (once,
-  however often results are read) and counts at the batch's original `ts`. An
-  unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
-  read is recorded as `reason: "batch_unpriced"` and the run pauses. Every
-  Anthropic `requests[].params.model` is checked against `--models` and
-  `--unknown-models refuse`; an OpenAI batch names its models only inside the
-  input file, so an OpenAI batch create is refused whenever an allowlist is set.
-  Gemini Batch Mode (#230): a 2xx `POST /gemini/v1beta/models/{m}:batchGenerateContent`
-  writes the same `batch_pending` receipt (`batch_id` from `name: "batches/{id}"`,
-  `request_count` for inline requests, the path model checked against `--models`
-  and `--unknown-models refuse`). A `GET /gemini/v1beta/batches/{id}` that is
-  `done` with inlined responses settles it; one that names a `responsesFile`
-  links the file, and `GET /gemini/download/v1beta/files/{f}:download` settles it.
-  Lines are priced like interactive Gemini calls (cache, thoughts, modality and
-  long-context rules) at `batch.gemini` 0.5; error lines are $0. Cancel
-  (`POST …/batches/{id}:cancel`) and `DELETE …/batches/{id}` are $0 and never pause;
-  Batch management calls (#233) are $0 `non_billable_request` receipts that never
-  pause and skip `--models`, `--unknown-models refuse` and `--preflight`: OpenAI
-  `POST /openai/v1/batches/{id}/cancel`, Anthropic `POST /anthropic/v1/messages/batches/{id}/cancel`
-  and `DELETE /anthropic/v1/messages/batches/{id}`, Gemini `POST /gemini/v1beta/batches/{id}:cancel`
-  and `DELETE /gemini/v1beta/batches/{id}`, plus Gemini Files upload
-  (`POST /gemini/upload/v1beta/files`, resumable start and chunks) and
-  `DELETE /gemini/v1beta/files/{name}`. A cancel does not settle a pending batch;
-  a failed, cancelled or expired batch with no output stays pending (unknown).
-  With `--preflight`, an inline Gemini create is estimated as the sum of each
-  request's worst case x 0.5; a file-input create passes unestimated.
-  Not covered: Gemini batch embeddings (`:asyncBatchEmbedContent`), Vertex batch
-  prediction, OpenRouter batches, and polling the provider (costcap only sees
-  results you fetch through it).
+- Batch APIs (#160): a 2xx `POST /v1/messages/batches` (Anthropic) or `POST /v1/batches`
+  (OpenAI) writes a `reason: "batch_pending"` receipt (`cost_usd: null`, `batch_id`,
+  `request_count`). It does not pause the run, but it counts as unknown in `costcap runs`
+  and `costcap check` (never $0) until results come back through the proxy:
+  - Anthropic: `GET /v1/messages/batches/{id}/results` is metered line by line.
+    `succeeded` lines are priced at the batch rate; `errored`, `canceled` and `expired`
+    lines are free.
+  - OpenAI: `GET /v1/batches/{id}` links its `output_file_id` to the batch, then
+    `GET /v1/files/{that id}/content` is metered from each line's `response.body.usage`
+    (chat and Responses shapes); lines with a non-2xx `status_code` are free.
+    Other file downloads stay `non_billable_request`.
+  - The batch rate is the table's provider `batch.multiplier` (0.5 for both) on every
+    component, including cache read/write and the long_context tier. The cost is
+    appended as one `{"event":"reconciliation","source":"batch_results"}` settlement
+    that keeps the batch receipt's `ts`; fetching results again settles nothing.
+  - An unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
+    batch stays unknown and the results receipt says `batch_unpriced` or
+    `batch_results_malformed`. A batch whose results are never fetched stays unknown.
+  - Anthropic batch creates check every `requests[].params.model` against `--models`
+    and `--unknown-models refuse`; one refused model refuses the whole batch. OpenAI
+    input files are not inspected, so an OpenAI batch create is refused while an
+    allowlist (or `--unknown-models refuse`) is set. No worst-case preflight reservation
+    is made for batches, Gemini batch mode and OpenRouter are not covered, and costcap
+    never polls the provider.
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when

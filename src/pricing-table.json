@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-16.6",
+  "version": "2026-11-16.4",
   "sources": [
     "https://developers.openai.com/api/docs/pricing (#273 GPT-Live: gpt-live-1 $0.05/minute of session time, billed per second without rounding; backend model usage billed separately; retrieved 2026-11-16)",
     "https://developers.openai.com/api/docs/models/gpt-4o",
@@ -27,6 +27,10 @@
   "regional_endpoint": { "multiplier": 1.1, "models": ["claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-5", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-haiku-4-5"] },
   "batch": { "openai": 0.5, "anthropic": 0.5 },
   "currency": "usd_per_1m_tokens",
+  "batch": {
+    "openai": { "multiplier": 0.5, "source": "https://developers.openai.com/api/docs/guides/batch" },
+    "anthropic": { "multiplier": 0.5, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+  },
   "fallback": { "input": 2.50, "cached_input": 1.25, "output": 10.00, "cache_write": 3.125, "cache_write_1h": 5.00 },
   "models": {
     "text-embedding-3-small": { "input": 0.02, "cached_input": 0.02, "output": 0, "input_only": true },

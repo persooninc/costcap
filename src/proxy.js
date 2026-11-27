@@ -12,11 +12,10 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier } from "./pricing.js";
-import { budgetExceededBody } from "./cap.js";
-import { warningLine } from "./cap-warn.js";
-import { modelBudgetExceededBody } from "./model-cap.js";
-import { DOWNGRADE_HEADER, downgradeLine, downgradeRoute, rewriteModel } from "./downgrade.js";
+import { batchMultiplier, costForUsage, isPricedModel, premiumTier } from "./pricing.js";
+import { budgetExceededBody, loadLedgerLines } from "./cap.js";
+import { anthropicBatchModels, anthropicResultsBatchId, batchCreateProvider, batchSettlement, createBatchIndex,
+  foldBatchResults, openaiBatchGetId, openaiFileContentId, pendingFromCreate } from "./batch.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, preflightBody } from "./preflight.js";
 
@@ -665,55 +664,15 @@ export function createUsageChunkFilter() {
   };
 }
 
-function batchIdOf(raw) {
-  try {
-    const b = JSON.parse(raw.toString("utf8"));
-    if (typeof b?.id === "string" && /^[A-Za-z0-9_-]+$/.test(b.id)) return b.id;
-    // #230: a Gemini batch create returns an Operation named "batches/<id>".
-    return geminiBatchId(b);
-  } catch { return null; }
-}
-
-// #291: a lifetime total never resets, so its preflight refusal says so (and has no Retry-After).
-const totalNote = (scope) => (scope === "total" ? " A total budget does not reset." : "");
-
-// #249: subtract in-flight preflight worst cases from an agent's remaining budgets.
-function reserveLeft(left, reserved) {
-  if (!left || !reserved) return left;
-  const out = { ...left };
-  for (const k of ["run_usd", "hour_usd", "day_usd", "week_usd", "month_usd", "total_usd"]) if (typeof out[k] === "number") out[k] = Number(Math.max(out[k] - reserved, 0).toFixed(6));
-  return out;
-}
-
-export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
-  spiral = createSpiralDetector(), velocity, killCheck, who = {}, agentBudgets, sharedLedger, preflight = false, timeoutMs = 60_000, maxBodyBytes = 2_000_000 } = {}) {
+export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, onSettlement, cap,
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
-  // #249: concurrency slots. A number or a getter (fleet sync can lower it live).
-  const concurrency = () => { const n = typeof maxConcurrent === "function" ? maxConcurrent() : maxConcurrent; return Number.isInteger(n) && n > 1 ? n : 1; };
-  let inFlight = 0;
-  const inFlightEstimates = new Map(); // token -> preflight estimate_usd of an in-flight call
-  let slotWaiter = null;
-  // #255: re-check periodically so a raised ceiling admits queued calls without a release.
-  const acquireSlot = async () => {
-    while (inFlight >= concurrency()) {
-      await new Promise((resolve) => { slotWaiter = resolve; const t = setTimeout(resolve, 25); t.unref?.(); });
-    }
-  };
-  const releaseSlot = () => { const w = slotWaiter; slotWaiter = null; w?.(); };
-  const reservedUsd = () => { let t = 0; for (const v of inFlightEstimates.values()) t += v.est; return t; };
-  // #255: in-flight reservations for one tag-cap or model-cap remaining entry.
-  const reservedTag = (x) => {
-    let t = 0;
-    for (const v of inFlightEstimates.values()) if (tagCaps?.remaining?.(v.tags)?.some((y) => y.tag_key === x.tag_key && y.tag_value === x.tag_value && y.scope === x.scope)) t += v.est;
-    return t;
-  };
-  const reservedModel = (x) => { let t = 0; for (const v of inFlightEstimates.values()) if (v.models.includes(x.model)) t += v.est; return t; };
-  // #171: unknown-cost failures keyed by the receipt id that caused them; a settlement
-  // of that receipt clears it. Failures with no receipt (ledger/persistence) never clear.
-  const failures = new Map();
-  let hardFailure = null;
-  const accountingFailureNow = () => hardFailure ?? (failures.size ? failures.values().next().value : null);
+  let accountingFailure = null;
+  // #160: pending batches and their OpenAI output files, seeded from the ledger so a later run can settle them.
+  let seed = [];
+  try { seed = receiptsPath ? loadLedgerLines(receiptsPath) : []; } catch { seed = []; }
+  const batches = createBatchIndex(seed);
   // Shared ledger (CC-5): decide and append inside the cross-process critical section.
   // Reentrant: emit() inside an already-guarded decision reuses the held section.
   let held = false;
@@ -728,80 +687,30 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     modelCaps?.record(complete);
     // Persist before invoking integrations. Callback failures must not break metering.
     if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
-    sharedLedger?.track?.(complete);
-    // #239: request-arrival time is passed in memory only (span start); the ledger shape is unchanged.
-    try { Promise.resolve(onReceipt?.(complete, { startMs })).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
-    return complete;
-  });
-  // Batch state (#160): pending batch_id -> receipt, OpenAI output_file_id -> batch_id.
-  const pendingBatches = new Map();
-  const batchFiles = new Map();
-  const resolvedBatches = new Set();
-  const findPending = (batchId) => {
-    if (pendingBatches.has(batchId)) return pendingBatches.get(batchId);
-    if (!receiptsPath) return null;
-    // After a restart, the pending receipt (and any settlement) is read back from the ledger.
-    let lines;
-    try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
-    const r = lines.find((l) => !l.event && l.reason === "batch_pending" && l.batch_id === batchId && l.cost_usd === null);
-    if (!r) return null;
-    const entry = { id: r.id, ts: r.ts, provider: r.provider, batch_id: batchId, run_id: r.run_id ?? null, model: r.model ?? null };
-    pendingBatches.set(batchId, entry);
-    if (lines.some((l) => isSettlement(l) && l.receipt_id === r.id)) resolvedBatches.add(batchId);
-    return entry;
-  };
-  // #196: pending background Responses, response_id -> receipt; restart reads the ledger.
-  const pendingBackground = new Map();
-  const resolvedBackground = new Set();
-  const findPendingBackground = (responseId) => {
-    if (pendingBackground.has(responseId)) return pendingBackground.get(responseId);
-    if (!receiptsPath) return null;
-    let lines;
-    try { lines = loadLedgerLines(receiptsPath); } catch { return null; }
-    const r = lines.find((l) => !l.event && l.reason === "background_pending" && l.response_id === responseId && l.cost_usd === null);
-    if (!r) return null;
-    const entry = { id: r.id, ts: r.ts, response_id: responseId, run_id: r.run_id ?? null, ...(r.web_search_type && { web_search_type: r.web_search_type }) };
-    pendingBackground.set(responseId, entry);
-    if (lines.some((l) => (isSettlement(l) || l.event === "background_unpriced") && l.receipt_id === r.id)) resolvedBackground.add(responseId);
-    return entry;
-  };
-  const emitEvent = (event) => guarded(() => {
-    const complete = { ts: new Date(now()).toISOString(), ...event };
-    if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(complete) + "\n", { mode: 0o600 });
+    batches.observe(complete);
     try { Promise.resolve(onReceipt?.(complete)).catch(() => {}); } catch { /* delivery is outside the local ledger */ }
     return complete;
   });
-  // #164: record spend and queue one cap_warning per newly crossed fraction.
-  // flushWarnings() appends them after the receipt that caused them.
-  let pendingWarnings = [];
-  const recordSpend = (receipt, opts) => {
-    if (!cap) return;
-    const before = cap.spend();
-    cap.record(receipt, opts);
-    if (!capWarner) return;
-    const after = cap.spend();
-    pendingWarnings.push(...capWarner.observe({ caps: cap.limits(), before, after, lowerBound: isLowerBound(after) }));
+  // Settlement for a pending batch: an append-only reconciliation line (never via onReceipt).
+  const settleBatch = (pendingReceipt, fold) => guarded(() => {
+    const line = batchSettlement(pendingReceipt, fold);
+    if (receiptsPath) appendFileSync(receiptsPath, JSON.stringify(line) + "\n", { mode: 0o600 });
+    batches.observe(line);
+    try { onSettlement?.(line); } catch { /* integrations are outside the local ledger */ }
+    cap?.record({ ...pendingReceipt, cost_usd: fold.cost_usd });
+    return line;
+  });
+  // Meters a JSONL results body against its pending batch. Returns receipt fields, or null when untracked.
+  const meterBatchResults = (provider, batchId, text) => {
+    if (!batchId || !batches.isTracked(provider, batchId)) return null;
+    const pendingReceipt = batches.pendingFor(provider, batchId);
+    if (!pendingReceipt) return { batch_id: batchId, cost_usd: 0, reason: "batch_results", already_settled: true };
+    const fold = foldBatchResults(provider, text, { extractUsage, costForUsage, isPricedModel, premiumTier, multiplier: batchMultiplier(provider) });
+    if (fold.cost_usd === null) return { batch_id: batchId, cost_usd: 0, reason: fold.reason, settled_receipt_id: null };
+    settleBatch(pendingReceipt, fold);
+    return { batch_id: batchId, cost_usd: 0, reason: "batch_results", settled_receipt_id: pendingReceipt.id, batch_cost_usd: fold.cost_usd };
   };
-  const flushWarnings = () => {
-    const evs = pendingWarnings;
-    pendingWarnings = [];
-    for (const ev of evs) {
-      const done = emitEvent(ev);
-      try { onWarning(warningLine(done)); } catch { /* stderr is best effort */ }
-    }
-  };
-  // #190: one stderr hint when a custom upstream's first response is a 404 (usually a missing /v1).
-  const customFirstSeen = new Set();
-  // #257: latest Gemini cachedContents expireTime (ms) this wrapper saw, by cache name.
-  const cacheExpiry = new Map();
-  const noteCacheExpiry = (c) => {
-    const t = Date.parse(c?.expireTime);
-    if (typeof c?.name === "string" && Number.isFinite(t)) cacheExpiry.set(c.name, Math.max(t, cacheExpiry.get(c.name) ?? -Infinity));
-  };
-  const server = http.createServer((req, res) => {
-    // #236: an interactive call is priced at the instant the proxy received the request.
-    const reqAt = now();
-    const priceAt = pinPrices ? pricingAt(reqAt) : reqAt; // #237: the pinned pricing clock, if any
+  return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     let [, provider, ...rest] = url.pathname.split("/");
     let upstream = upstreams[provider];
@@ -884,42 +793,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         const routerModels = provider === "openrouter" && parsedBody && typeof parsedBody === "object" ? openRouterModels(parsedBody) : undefined;
         if (typeof requestedModel !== "string" || !requestedModel) requestedModel = undefined;
         if (!requestedModel && provider === "gemini") requestedModel = /models\/([^/:]+)/.exec(path)?.[1];
-        // #188: Bedrock/Vertex carry the model in the path; checks use the mapped table id.
-        // Vertex count-tokens names the model in the body.
-        if (route) requestedModel = route.countTokens && provider === "vertex"
-          ? (typeof parsedBody?.model === "string" && parsedBody.model ? mapVertexModel(parsedBody.model) ?? parsedBody.model : undefined)
-          : (route.model ?? route.rawModel);
-        const cloudFields = route ? { provider_model: route.rawModel, endpoint_scope: route.scope } : {};
-        let target = upstream, cloudSigned = null;
-        if (provider === "bedrock") {
-          const authz = inboundHeaders.authorization;
-          let region = awsRegion;
-          if (typeof authz === "string" && authz.startsWith("AWS4-HMAC-SHA256 ")) {
-            if (!awsCredentials) {
-              try { onWarning('costcap: a SigV4-signed Bedrock request arrived but wrap has no AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY. Export static credentials first, e.g. eval "$(aws configure export-credentials --format env)", or use AWS_BEARER_TOKEN_BEDROCK.'); } catch { /* stderr is best effort */ }
-              send(502, { error: "bedrock_credentials_unavailable", message: 'CostCap needs static AWS credentials in its own environment to re-sign Bedrock requests. Run eval "$(aws configure export-credentials --format env)" before costcap wrap. The upstream call was not made.' });
-              return;
-            }
-            const [rawPath, ...q] = req.url.split("?");
-            const v = verifyRequest({ method: req.method, path: rawPath, search: q.join("?"), headers: inboundHeaders, body, credentials: awsCredentials });
-            if (!v.ok || v.service !== "bedrock") {
-              send(403, { error: "bedrock_signature_invalid", message: "CostCap could not verify this request's AWS signature with wrap's credentials. The upstream call was not made." });
-              return;
-            }
-            region = v.region;
-            cloudSigned = { region };
-          }
-          target = cloudUpstream("bedrock", { region, override: upstream.startsWith("cloud:") ? undefined : upstream });
-          if (!target) { send(502, { error: "bedrock_region_unavailable", message: "CostCap could not determine the Bedrock region: set AWS_REGION. The upstream call was not made." }); return; }
-        } else if (provider === "vertex") {
-          target = cloudUpstream("vertex", { location: route.location, override: upstream.startsWith("cloud:") ? undefined : upstream });
-        }
-        const batchCreate = batchCreateProvider(req.method, req.url);
-        // #160: an Anthropic batch names its models per request; every one is checked.
+        const batchCreate = batchCreateProvider(req.method, req.url) === provider ? provider : null;
+        // Anthropic batch create (#160): every requests[].params.model is checked; one refusal refuses the batch.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
-        if (batchModels && !requestedModel) requestedModel = batchModels.find(Boolean);
-        // #230: a Gemini batch names one model in its path; inline requests are counted (file input: []).
-        const geminiReqs = batchCreate === "gemini" ? geminiBatchRequests(body) : null;
         // Model allowlist (#153): refused before forwarding; zero-cost receipt, the run is not frozen.
         const modelRefusal = (status, error, message) => {
           emit({ provider, path: storedPath, blocked: true, reason: error, outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0, ...cloudFields });
@@ -968,17 +844,12 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             }
           }
           const allow = generates ? allowedModels?.() ?? null : null;
-          if (generates && routerModels === null) {
-            emit({ provider, path: storedPath, blocked: true, reason: "invalid_models", outcome: "blocked_model", model: requestedModel ?? "unknown", cost_usd: 0 });
-            send(400, { error: "invalid_models", model: requestedModel ?? null, message: "CostCap: `models` must be an array of model id strings. The upstream call was not made." });
-            return "blocked";
+          if (batchModels && generates) {
+            // The first offending model drives the refusal below; otherwise any listed model passes both checks.
+            requestedModel = (allow && batchModels.find((m) => !allow.includes(m))) ||
+              (unknownModels === "refuse" && batchModels.find((m) => !isPricedModel(m))) || batchModels[0];
           }
-          const checkModels = batchModels ?? (generates && routerModels?.length ? routerModels : [requestedModel]);
-          // Index of the first missing or refused model (-1: every model passes).
-          const offending = (ok) => checkModels.findIndex((m) => !m || !ok(m));
-          const refuse = (i) => { requestedModel = checkModels[i] ?? undefined; };
-          if (allow && offending((m) => allow.includes(m)) !== -1) {
-            refuse(offending((m) => allow.includes(m)));
+          if (allow && (!requestedModel || !allow.includes(requestedModel))) {
             return modelRefusal(403, "model_not_allowed", allow.length
               ? `CostCap: model "${requestedModel ?? "(none)"}" is not in this agent's allowlist (${allow.join(", ")}). The upstream call was not made.`
               : "CostCap: this agent's model allowlists do not overlap, so every model is refused. The upstream call was not made.");
@@ -1074,13 +945,30 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             return;
           }
           const contentType = upstreamRes.headers.get("content-type") ?? "application/json";
-          if (cacheMode && /^text\/event-stream/i.test(contentType)) cacheMode = "bypass";
-          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false, ...cloudFields, ...(cacheMode && { cache: cacheMode }),
+          const batchResponseFields = (text) => {
+            if (batchCreate) {
+              const p = pendingFromCreate(batchCreate, body, text);
+              return p && { ...p, cost_usd: null, reason: "batch_pending" };
+            }
+            if (provider === "anthropic") {
+              const m = meterBatchResults("anthropic", anthropicResultsBatchId(req.method, req.url), text);
+              return m && { model: "batch", ...m };
+            }
+            if (provider !== "openai") return null;
+            const getId = openaiBatchGetId(req.method, req.url);
+            if (getId && batches.isTracked("openai", getId)) {
+              let b; try { b = JSON.parse(text); } catch { b = null; }
+              const out = typeof b?.output_file_id === "string" && /^[A-Za-z0-9_-]+$/.test(b.output_file_id) ? b.output_file_id : undefined;
+              return { model: "batch", batch_id: getId, ...(out && { output_file_id: out }), cost_usd: 0, reason: "non_billable_request" };
+            }
+            const fileId = openaiFileContentId(req.method, req.url);
+            const m = fileId ? meterBatchResults("openai", batches.batchForFile(fileId), text) : null;
+            return m && { model: "batch", output_file_id: fileId, ...m };
+          };
+          const receipt = { provider, path: storedPath, status: upstreamRes.status, blocked: false,
             ...(preflightEst && { output_tokens_est: preflightEst.output_tokens, output_multiplier: preflightEst.output_multiplier }) };
-          let metered, raw, streamCut = false, sseIncomplete = false;
-          const meterAs = route ? "anthropic" : provider;
-          const eventStream = /^application\/vnd\.amazon\.eventstream/i.test(contentType);
-          if ((eventStream || /^text\/event-stream/i.test(contentType)) && upstreamRes.body) {
+          let metered, raw, streamCut = false, sseIncomplete = false, batchFields = null;
+          if (/^text\/event-stream/i.test(contentType) && upstreamRes.body) {
             // Real-time pass-through: forward each chunk as it arrives, meter from the stream.
             // #188: Bedrock's binary eventstream is forwarded byte-for-byte and decoded on the side.
             const parser = eventStream ? eventStreamParser(requestedModel) : createSseUsageParser(meterAs, requestedModel);
@@ -1133,26 +1021,19 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (parser.incomplete) { sseIncomplete = true; metered = null; }
           } else {
             raw = Buffer.from(await upstreamRes.arrayBuffer());
-            metered = extractUsage(meterAs, raw.toString("utf8"), requestedModel,
+            const ok2xx = upstreamRes.status >= 200 && upstreamRes.status < 300;
+            if (ok2xx) batchFields = batchResponseFields(raw.toString("utf8"));
+            if (!batchFields) metered = extractUsage(provider, raw.toString("utf8"), requestedModel,
               { embeddings: req.method === "POST" && isEmbeddingsPath(req.url) });
           }
           clearTimeout(timer);
           res.off("close", onClientClose);
-          if (metered && route && !route.countTokens && route.model === null) {
-            // #188: a cloud model with no table id is unknown, never the fallback rate.
-            Object.assign(receipt, { model: route.rawModel, cost_usd: null, reason: "cloud_model_unpriced", input_tokens: metered.usage.input_tokens ?? 0, output_tokens: metered.usage.output_tokens ?? 0 });
-            recordSpend(receipt);
-            failMsg = `Model ${route.rawModel} on ${provider} has no published rate. Restart only after reconciling this request.`;
-          } else if (metered && route && !route.countTokens) {
-            Object.assign(receipt, costForUsage(route.model, metered.usage, { regional: route.scope === "regional" }), { model: route.model });
-            if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
-            recordSpend(receipt);
-            if (receipt.reason === "tool_use_unpriced") failMsg = "A provider-side tool (web search / file search) was billed with no published rate. Restart only after reconciling this request.";
-            else if (receipt.reason === "service_tier_unpriced") failMsg = `A premium ${receipt.pricing_tier} tier was billed for ${receipt.model} with no published rate. Restart only after reconciling this request.`;
-            else if (receipt.cost_usd === null) failMsg = "A cache write has no published rate for this model. Restart only after reconciling this request.";
-            else velocity?.record(receipt.cost_usd);
-          } else if (metered && !route) {
-            Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage) : costForUsage(metered.model, metered.usage));
+          if (batchFields) {
+            // #160: batch create is pending (unknown, never $0, run not frozen); results settle it.
+            Object.assign(receipt, batchFields);
+            cap?.record(receipt);
+          } else if (metered) {
+            Object.assign(receipt, costForUsage(metered.model, metered.usage));
             if (metered.providerCost !== undefined && receipt.cost_usd !== null) Object.assign(receipt, { cost_usd: Number(metered.providerCost.toFixed(6)), cost_source: "provider", fallback: false });
             if (metered.toolUseUnpriced) Object.assign(receipt, { cost_usd: null, reason: "tool_use_unpriced" });
             recordSpend(receipt);

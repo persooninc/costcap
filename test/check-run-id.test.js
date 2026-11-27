@@ -94,33 +94,13 @@ test("AC6: --github-output writes run-id; action.yml wires the input", () => {
   assert.match(yml, /args\+=\(--run-id "\$COSTCAP_RUN_ID"\)/);
 });
 
-test("#160 check: a pending batch fails the run as incomplete, then passes once batch_results settles it", () => {
-  const { r } = ledger([{ id: "ok", run_id: "b", cost_usd: 0.1 }, { id: "p", run_id: "b", cost_usd: null, reason: "batch_pending", batch_id: "x" }]);
-  const pending = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "b" });
-  assert.deepEqual([pending.ok, pending.unknown_cost_count, pending.hit.reason], [false, 1, "accounting_unavailable"]);
-  assert.equal(checkBudget({ receiptsPath: r }).hit.reason, "batch_pending");
-  writeFileSync(r, readFileSync(r, "utf8") + JSON.stringify({ event: "reconciliation", receipt_id: "p", cost_usd: 0.2, source: "batch_results", ts }) + "\n");
-  const done = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "b" });
-  assert.deepEqual([done.ok, done.unknown_cost_count, done.total_usd], [true, 0, 0.3]);
-  assert.equal(checkBudget({ receiptsPath: r, caps: { run: 0.25 }, runId: "b" }).ok, false);
-});
-
-test("#164: check warnings field, lower bound on unknown cost, and --warn-at usage errors exit 2", () => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-warn-"));
-  const r = join(dir, "r.jsonl");
-  writeFileSync(r, [{ ts, cost_usd: 0.6, run_id: "a" }, { ts, cost_usd: 0.3, run_id: "a" }].map((x) => JSON.stringify(x)).join("\n") + "\n");
-  const res = checkBudget({ receiptsPath: r, caps: { day: 1, run: 2 }, warnAt: [0.5, 0.8] });
-  assert.equal(res.ok, true);
-  assert.deepEqual(res.warnings.map((w) => [w.scope, w.fraction]), [["day", 0.5], ["day", 0.8]]);
-  const runRes = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "a", warnAt: [0.8] });
-  assert.deepEqual(runRes.warnings, [{ scope: "run", fraction: 0.8, cap: 1, spent_usd: 0.9, lower_bound: false }]);
-  // Unknown cost: lower_bound, and the unknown is not counted as $0 toward a warning that wasn't reached.
-  writeFileSync(r, [{ ts, cost_usd: 0.85 }, { ts, cost_usd: null }].map((x) => JSON.stringify(x)).join("\n") + "\n");
-  const lb = checkBudget({ receiptsPath: r, caps: { day: 1 } });
-  assert.equal(lb.warnings[0].lower_bound, true);
-  for (const bad of ["0", "1", "1.5", "abc", "0.8,0.8", ""]) {
-    const p = spawnSync(process.execPath, [CLI, "check", "--receipts", r, "--day-cap", "1", "--warn-at", bad], { encoding: "utf8" });
-    assert.equal(p.status, 2, bad);
-    assert.match(p.stderr, /--warn-at/);
-  }
+test("#160 --run-id: a pending batch makes the run incomplete until its settlement lands", () => {
+  const { r } = ledger([{ id: "p1", run_id: "batch", reason: "batch_pending", batch_id: "b", cost_usd: null }]);
+  const open = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "batch" });
+  assert.deepEqual([open.ok, open.unknown_cost_count, open.hit.reason], [false, 1, "accounting_unavailable"]);
+  writeFileSync(r, readFileSync(r, "utf8") + JSON.stringify({ event: "reconciliation", source: "batch_results", ts, receipt_id: "p1", cost_usd: 0.5 }) + "\n");
+  const done = checkBudget({ receiptsPath: r, caps: { run: 1 }, runId: "batch" });
+  assert.deepEqual([done.ok, done.total_usd, done.unknown_cost_count], [true, 0.5, 0]);
+  const over = checkBudget({ receiptsPath: r, caps: { run: 0.4 }, runId: "batch" });
+  assert.equal(over.ok, false);
 });

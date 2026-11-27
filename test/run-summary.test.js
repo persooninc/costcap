@@ -182,3 +182,12 @@ test("e2e: costcap runs --json lists two runs newest first and skips a corrupt f
   assert.equal(empty.status, 0);
   assert.match(empty.stderr, /no run summaries yet/);
 });
+
+test("#160 a pending batch is unknown in the run summary, then known once settled", () => {
+  const pending = { id: "p1", ts: "2026-11-16T00:00:00Z", provider: "anthropic", model: "claude-sonnet-4-6", reason: "batch_pending", batch_id: "b", cost_usd: null };
+  const base = { run_id: "r", started_at: "a", ended_at: "b" };
+  const open = buildRunSummary({ ...base, receipts: [pending] });
+  assert.deepEqual([open.total_cost_usd, open.unknown_cost_calls], [null, 1]);
+  const done = buildRunSummary({ ...base, receipts: [pending, { event: "reconciliation", source: "batch_results", receipt_id: "p1", cost_usd: 0.01605 }] });
+  assert.deepEqual([done.total_cost_usd, done.unknown_cost_calls], [0.01605, 0]);
+});

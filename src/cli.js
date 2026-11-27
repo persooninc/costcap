@@ -214,13 +214,7 @@ export async function wrap(argv) {
   const release = () => { if (ledgerReleased) return; ledgerReleased = true; releaseLedger(); };
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
-  cap = createCapEngine({ caps, history, runId: who.run_id });
-  if (tagCapRules?.length) tagCaps = createTagCaps({ rules: tagCapRules, history });
-  // #238: always built when enrolled, so fleet modelCaps can arrive on any sync.
-  if (modelCapRules?.length || enrollmentPath) modelCaps = createModelCaps({ rules: modelCapRules ?? [], history });
-  // #244: hosted day/month rules are enforced fleet-wide from agent_spend.models; this
-  // engine only covers them (UTC, local ledger) until the server sends that snapshot.
-  if (enrollmentPath) hostedModelCaps = createModelCaps({ rules: [], history });
+  cap = createCapEngine({ caps, history, pendingBatchesBlock: false });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -243,9 +237,9 @@ export async function wrap(argv) {
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const startedAt = new Date().toISOString();
-  const summaryRunId = who.run_id ?? runId ?? randomUUID();
-  const runReceipts = [];
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, onSettlement: (e) => { runReceipts.push(e); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
+    // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
+    allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
