@@ -1279,9 +1279,7 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               tagCaps?.settle(bgPending.id, c.cost_usd);
               modelCaps?.settle(bgPending.id, c.cost_usd);
               rateLimit?.record(usageTokens(metered.usage));
-              // #201: another run's settle counts toward day/month and budgets, never this run's velocity (matches batches).
-              if (external) velocity?.step?.();
-              else velocity?.record(c.cost_usd);
+              if (!external) velocity?.record(c.cost_usd); // #201: another run's settle never trips this run's breaker (like batches).
               flushWarnings();
             } else {
               // The pending receipt becomes unknown (applySettlements reads this event); the run pauses until it is reconciled.
