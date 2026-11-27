@@ -5,7 +5,7 @@ import { periodKey, samePeriod, inSpendWindow } from "../period.js";
 // hosted answer and a local `--policy` team cannot drift. Unknown cost
 // (cost_usd: null) from any member makes the team verdict accounting_unavailable;
 // it is never treated as $0.
-import { createAgentBudgets, TOTAL_NEVER_RESETS } from "../agent-budget.js";
+import { createAgentBudgets } from "../agent-budget.js";
 import { isPendingBatch } from "../cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 import { anomalyError } from "./anomaly.js";
@@ -81,15 +81,12 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
   const lifetime = team.total != null;
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
-      // #261: current month OR current week (a week can start in the previous month).
-      // #265: a team total cap counts the members' whole synced history.
-      if (!Number.isFinite(Date.parse(r?.ts)) || (team.total == null && !inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod))) continue;
+      if (!Number.isFinite(Date.parse(r?.ts)) || new Date(r.ts).toISOString().slice(0, 7) !== month) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
-  // #183: keep `reason` so a synced pending batch is pending, not unknown, server side too.
   const pendingBatches = history.filter(isPendingBatch).length;
-  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate, budgetPeriod });
+  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate });
   const spend = budgets.spend({ agent_id: team.agents[0] }, team.agents);
   // Any member's view of the team is the same once its own receipts are folded in.
   const hit = team.agents.map((a) => budgets.check({ agent_id: a })).find(Boolean) ?? null;
@@ -98,7 +95,7 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
     name: team.name,
     agents: [...team.agents],
     caps,
-    spend: { day_usd: round6(spend.day), week_usd: round6(spend.week), month_usd: round6(spend.month), ...(team.total != null ? { total_usd: round6(spend.total) } : {}), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
+    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
     verdict: hit ? hit.verdict : "ok",
     ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd, ...(hit.message ? { message: hit.message } : {}) } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
@@ -138,8 +135,8 @@ export function cachedTotals(entry, pending, nowMs, budgetPeriod) {
   for (const s of TEAM_SCOPES) total[s] = inPeriod(s, nowMs, asOfMs, budgetPeriod) ? (entry.spent?.[s] ?? 0) : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    // #183: a pending batch is not unknown spend (same rule as cap.js); its cost
-    // arrives as a settlement, which settled-aware loading has already applied.
+    // #183: a pending batch is not unknown (same rule as cap.js/agent-budget.js);
+    // its settled cost (settled-aware load) counts like any other receipt.
     if (isPendingBatch(r)) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     for (const s of TEAM_SCOPES) if (inPeriod(s, Date.parse(r.ts), nowMs, budgetPeriod)) total[s] += r.cost_usd;
@@ -173,18 +170,17 @@ export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps
   let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    const tsMs = Date.parse(r.ts);
-    const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
-    if (!inMonth && !inWeek && !allTime) continue; // #261: a week can start in the previous month
-    if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
+    const ts = new Date(r.ts).toISOString();
+    if (ts.slice(0, 7) !== now.slice(0, 7)) continue;
+    // #183: a synced pending batch shows as pending, not as an unreconciled unknown.
+    if (isPendingBatch(r)) { pendingBatches += 1; continue; }
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
     spent.total += r.cost_usd;
     if (inMonth) spent.month += r.cost_usd;
     if (inWeek) spent.week += r.cost_usd;
     if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
   }
-  const models = modelSpendPolicy(receipts, modelCaps, nowMs, budgetPeriod);
-  return { spent: { day: round6(spent.day), week: round6(spent.week), month: round6(spent.month), ...(allTime ? { total: round6(spent.total) } : {}) }, unknown, pending_batches: pendingBatches, ...(models ? { models } : {}), as_of: now };
+  return { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
 }
 
 export function validAgentSpend(a) {

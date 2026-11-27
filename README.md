@@ -417,30 +417,31 @@ on Bedrock and Vertex has its own built-in routes (below).
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
   content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
-- Batch APIs (#160): a 2xx `POST /v1/messages/batches` (Anthropic) or `POST /v1/batches`
-  (OpenAI) writes a `reason: "batch_pending"` receipt (`cost_usd: null`, `batch_id`,
-  `request_count`). It does not pause the run, but it counts as unknown in `costcap runs`
-  and `costcap check` (never $0) until results come back through the proxy:
-  - Anthropic: `GET /v1/messages/batches/{id}/results` is metered line by line.
-    `succeeded` lines are priced at the batch rate; `errored`, `canceled` and `expired`
-    lines are free.
-  - OpenAI: `GET /v1/batches/{id}` links its `output_file_id` to the batch, then
-    `GET /v1/files/{that id}/content` is metered from each line's `response.body.usage`
-    (chat and Responses shapes); lines with a non-2xx `status_code` are free.
-    Other file downloads stay `non_billable_request`.
-  - The batch rate is the table's provider `batch.multiplier` (0.5 for both) on every
-    component, including cache read/write and the long_context tier. The cost is
-    appended as one `{"event":"reconciliation","source":"batch_results"}` settlement
-    that keeps the batch receipt's `ts`; fetching results again settles nothing.
-  - An unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
-    batch stays unknown and the results receipt says `batch_unpriced` or
-    `batch_results_malformed`. A batch whose results are never fetched stays unknown.
-  - Anthropic batch creates check every `requests[].params.model` against `--models`
-    and `--unknown-models refuse`; one refused model refuses the whole batch. OpenAI
-    input files are not inspected, so an OpenAI batch create is refused while an
-    allowlist (or `--unknown-models refuse`) is set. No worst-case preflight reservation
-    is made for batches, Gemini batch mode and OpenRouter are not covered, and costcap
-    never polls the provider.
+- Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
+  OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
+  (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
+  run, but the run total stays unknown and `costcap check` fails until the batch
+  settles. Reading the results through the proxy settles it: Anthropic
+  `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
+  links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
+  Enrolled fleet day/month caps and hosted-team caps (`wrap --enrollment`) follow
+  the same rule: a pending batch is not an unreconciled unknown, so the next call
+  and the results read are allowed, and once settled its cost counts toward the
+  fleet/team cap. The fleet view shows it as `pending_batches` /
+  `pending_batch_count`, not as unknown.
+  Succeeded lines are priced at the published 50% batch rate (pricing table
+  `batch`, applied to every component including cache reads/writes and on top of
+  long_context); errored, canceled, expired and non-2xx lines cost $0. One
+  `{"event":"reconciliation","source":"batch_results"}` line is appended (once,
+  however often results are read) and counts at the batch's original `ts`. An
+  unpriced model, a `speed: "fast"` line or a malformed line settles nothing: the
+  read is recorded as `reason: "batch_unpriced"` and the run pauses. Every
+  Anthropic `requests[].params.model` is checked against `--models` and
+  `--unknown-models refuse`; an OpenAI batch names its models only inside the
+  input file, so an OpenAI batch create is refused whenever an allowlist is set.
+  Not covered: pre-flight reservation for batches, Gemini batch mode and
+  OpenRouter batches, and polling the provider (costcap only sees results you
+  fetch through it).
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when

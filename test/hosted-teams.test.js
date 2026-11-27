@@ -22,7 +22,7 @@ test("unit: team verdict sums members and matches the local agent-budget engine"
   assert.equal(v.verdict, "budget_exceeded");
   assert.equal(v.scope, "team:ops:day");
   assert.equal(v.spent_usd, 30);
-  assert.deepEqual(v.spend, { day_usd: 30, week_usd: 30, month_usd: 30, unknown_count: 0, pending_batch_count: 0, cost_complete: true });
+  assert.deepEqual(v.spend, { day_usd: 30, month_usd: 30, unknown_count: 0, pending_batch_count: 0, cost_complete: true });
   const local = createAgentBudgets({ policy: { teams: { ops: { agents: ["a", "b"], day: 30 } } }, now: () => new Date(NOW),
     history: [{ id: "x", ts: "2026-11-15T01:00:00Z", cost_usd: 20, agent_id: "a" }, { id: "y", ts: "2026-11-15T02:00:00Z", cost_usd: 10, agent_id: "b" }] }).check({ agent_id: "a" });
   assert.equal(teamScope(local.team, local.scope), v.scope);
@@ -81,7 +81,7 @@ test("unit: cached team policy enforces offline with unsynced spend and window r
 test("unit: evidence lists teams and each agent's team", () => {
   const tv = teamVerdict({ team, receiptsByAgent: {}, nowMs: NOW });
   const doc = buildEvidence({ orgId: "o", nowMs: NOW, spendFor: () => ({ day: { usd: 0, unknown: 0 }, month: { usd: 0, unknown: 0 } }), agents: [{ id: "a" }, { id: "z" }], teams: [tv] });
-  assert.deepEqual(doc.teams, [{ name: "ops", agents: ["a", "b"], caps: { day: 30 }, spend: { day_usd: 0, week_usd: 0, month_usd: 0, unknown_count: 0, pending_batch_count: 0, cost_complete: true }, verdict: "ok", scope: null }]);
+  assert.deepEqual(doc.teams, [{ name: "ops", agents: ["a", "b"], caps: { day: 30 }, spend: { day_usd: 0, month_usd: 0, unknown_count: 0, pending_batch_count: 0, cost_complete: true }, verdict: "ok", scope: null }]);
   assert.deepEqual(doc.agents.map((a) => a.team), ["ops", null]);
 });
 

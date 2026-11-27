@@ -24,7 +24,7 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null }) {
   const allTime = limits.total != null;
   const history = receipts
     .filter((r) => Number.isFinite(Date.parse(r?.ts)) && new Date(r.ts).toISOString().slice(0, 7) === month)
-    .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: typeof r.run_id === "string" ? r.run_id : null }));
+    .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate });
   const remaining = budgetRemaining(budgets, who);
   const budget_remaining = remaining && { day_usd: remaining.day_usd, ...("week_usd" in remaining ? { week_usd: remaining.week_usd } : {}), month_usd: remaining.month_usd, ...("total_usd" in remaining ? { total_usd: remaining.total_usd } : {}) };
