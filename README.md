@@ -776,133 +776,22 @@ return the same verdict with `budget_remaining`. Run and step budgets are per
 `run_id`, which the wrapper assigns. Figures are estimates, the same limits above
 apply, and the policy file must be protected from the agent it limits.
 
-### Hosted team budgets
-
-In the hosted workspace an owner or admin defines teams with `POST /v1/teams` (`{"name": "ops", "agents": [agentId, ...], "day": 30, "month": 500}`; `{"name": "ops", "remove": true}` deletes). Any member can read `GET /v1/teams`. Viewers get 403 on writes, and an agent from another org gets 400. An agent belongs to at most one team. Every change is audited as `team.change`, with the previous and new values.
-
-Each enrolled wrapper gets its team's caps and the team's synced spend with every `/v1/policy` poll. It enforces them offline from that cache, adding its own unsynced spend on top. Its own caps apply first, then the team's. A refusal reads `budget_exceeded` with `scope: "team:ops:day"`. An unknown cost (`cost_usd: null`) from any member makes the team verdict `accounting_unavailable`. It is never counted as $0.
-
-**Overshoot:** team spend comes from synced receipts. Spend another member has not synced yet (up to one poll interval, 60s) is not seen, so the team can go over its cap by that amount. Removing an agent from a team stops its team enforcement at its next poll. `GET /v1/agents/:id/budget`, `/v1/evidence.json` (`teams[]`, `agents[].team`) and the dashboard's Team budgets card show each team's cap, spend and verdict.
-
-**Team alerts:** each alert sweep checks every team against its own day and month caps. At 80% of a cap (default 80%, configurable per agent/team) it raises `cap_approaching`, and at 100% it raises `cap_hit` (keys `cap_approaching:team:<orgId>:<name>:<scope>` and `cap_hit:team:<orgId>:<name>:<scope>`). A member receipt blocked with `scope: "team:<name>:<scope>"` in the last hour also raises that team's `cap_hit`, even when synced totals lag. A team with unknown cost raises no cap alert. Team alerts fire once, re-arm after the condition clears, go to the org's alert destinations, and carry `team`, `scope`, `cap` and `spent`. Deleting the team deactivates them. A team with a month cap also gets a month `cap_projected` (key `cap_projected:team:<orgId>:<name>:month`, carrying `projected`) when its linear run rate for the org budget period reaches the cap, from 24h into the period and only while no month `cap_hit` fires. It fires at most once per period: it stays active if the rate dips, and resolves on `cap_hit`, team removal or period rollover.
-
-**Warning fractions (hosted):** `cap_approaching` defaults to 80%, configurable per agent/team. Set `warnFractions` on `POST /v1/agents/:id/policy` or `POST /v1/teams` (or "Warn at (%)" in the dashboard), e.g. `[0.5, 0.8, 0.95]`: 1-5 unique fractions between 0 and 1, stored sorted. Omitted keeps the saved value, `null` resets to the default, and `[]` turns `cap_approaching` off (`cap_hit` still fires). Each sweep fires the highest crossed fraction, at most once per UTC day/month cap period; a jump past lower fractions covers them. The 0.8 key stays `cap_approaching:<id>:<scope>`; others append `:p<pct>` (e.g. `:p95`), and the alert carries `fraction`. Raising a cap re-arms only fractions whose threshold moves above current spend. Wrappers ignore `warnFractions`.
-
-**Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
-
-### Hosted org budget
-
-One hard day and/or month cap for every agent in the workspace together ("all our agents never spend more than $2,000 this month"), including agents enrolled later and agents in no team (#240).
-
-- `GET /v1/org-budget` (any member, viewers included) returns `{ org_budget, canEdit }`; `org_budget` is `null` when unset.
-- `PUT /v1/org-budget` with `{ "day"?: usd, "week"?: usd, "month"?: usd, "warnFractions"?: [0.5, 0.9] }`. USD must be > 0; `null` clears a field; an unknown field or an `hour`/`run` scope returns 400. Owners, admins and admin API keys can write; a viewer session or viewer key gets 403. Every change is audited as `org_budget.change` with `before`/`after`.
-- `/v1/policy` carries `org_budget: { caps, spend: { day_usd, month_usd, unknown_count }, verdict, as_of }`, summed from all of the org's synced receipts (revoked agents' spend still counts) in the org budget period (#209). Settled receipts count at their settled value; a pending batch is pending, not unknown; any unknown cost makes the verdict `accounting_unavailable`, never $0.
-- Each enrolled wrapper adds its own unsynced spend and checks the org cap after its agent cap and team cap (`wrap`, `check`, the MCP budget tool and `--preflight`). A refusal is HTTP 429 `budget_exceeded` with `scope: "org:day"` or `"org:month"` and `org: true`; the upstream never sees the call. An agent or team cap that is hit first is reported with its own scope. Like teams, hosts coordinate through the 60s poll, so the org can overshoot by what other hosts spend between polls.
-- Alerts: `cap_approaching` (default 80%, or `warnFractions`), `cap_hit` and a month `cap_projected`, keyed `<kind>:org:<orgId>:<scope>` and carrying `org: true`. They go to the org's alert destinations, fire once per period, and resolve when the cap is raised or the period rolls over in the org timezone.
-- `GET /v1/agents/:id/budget` and `/v1/evidence.json` include `org_budget`; the dashboard has an **Org budget** card (read-only for viewers).
-- **Week (#268):** `PUT /v1/org-budget` also takes `"week"` (an ISO week, reset Monday 00:00 in the org budget-period timezone; a week that starts in the previous month counts both months). A budget with only `week` is valid. Old wrappers get the `org_budget` block with day/month only (`null` when only `week` is set); the full budget with `caps.week` and `spend.week_usd` goes in the additive `org_budget_v2` block, sent only when a week cap is set. A refusal is `budget_exceeded` with `scope: "org:week"`. `cap_approaching`/`cap_hit` fire once per week. The card has **Week USD** and shows `week: $X of $Y`.
-- Week (#271): the org week budget projects (`cap_projected:org:<orgId>:week`) and `--preflight` refuses against the org week remainder (`scope: "org:week"`).
-- Out of scope: hour/run org caps, automatic fleet freeze (the fleet freeze stays manual).
-
-## Model downgrade
-
-Degrade, don't die: past a fraction of a cap, a wrapped agent's expensive model calls go upstream on a cheaper model instead of stopping at 100%.
-
-```sh
-costcap wrap --day-cap 10 --downgrade gpt-4o=gpt-4o-mini,claude-opus-4-1=claude-sonnet-4-5 --downgrade-at 0.8 -- node agent.js
-```
-
-- **Trigger:** the first run/hour/day/month scope whose spend is at or above `F` (default `0.8`, 0 < F ≤ 1) of its cap. That can be a local cap, a `--policy` agent or team budget, or an enrolled fleet agent or team cap. Unknown cost is never counted as $0: known spend is a lower bound and still triggers.
-- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes (streamed requests included). Under `F`, requests are byte-identical. The allowlist, `--unknown-models refuse`, preflight, tag caps and the cache key all see the new model. A disallowed or unpriced target is refused as usual, never sent as the original. An unpriced `--downgrade` target exits `2` at wrap start.
-- **Not rewritten:** Gemini (model in the path), Bedrock/Vertex, batches, multipart audio and OpenRouter `models[]`. These pass through unchanged, with receipt `downgrade: "unsupported_route"`.
-- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction}`, and the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line are written per scope and period, never counted as spend. The run summary and `costcap runs` show `downgraded_calls`.
-- **Hard stop:** at 100% the cap still refuses. A downgrade never raises or bypasses any cap.
-- **Fleet:** `downgrade: {at, map}` on `POST /v1/agents/:id/policy` ("Downgrade models" / "Downgrade at (%)" on the agent card; `null` clears it). A bad fraction, an empty map or FROM equal to TO returns `400`. Enrolled wrappers use the cached map offline. Local `--downgrade` can only add models the fleet does not map, and local `--downgrade-at` can only lower `at`.
-
-## Rate limits
-
-Cap how fast a wrapped agent may call the model, independent of dollars:
-
-```sh
-node src/cli.js wrap --rpm 60 --tpm 200000 -- node your-agent.js
-```
-
-- **Where:** `--rpm N` / `--tpm N` (positive integers), `rpm`/`tpm` on `default` or an agent in a `--policy` file, or "Requests/min" / "Tokens/min" on the dashboard agent card (`rpm`/`tpm` on `POST /v1/agents/:id/policy`, audited as `policy.change`). The minimum of all three applies, so a local value can tighten a fleet value but never loosen it. The cached fleet value is enforced offline.
-- **Window:** rolling 60 s, per wrapper process (not shared across `--shared-ledger` wrappers or the fleet).
-- **RPM** counts requests admitted to the upstream; the slot is reserved before forwarding, so a concurrent burst cannot overshoot. GET/HEAD, cache hits and calls CostCap refuses do not count. A call the provider rejects (including its own 429) does count.
-- **TPM** adds the metered tokens (input + cached input + cache writes + output) when a call completes. It is checked before each call, so one in-flight call can overshoot it. Unknown usage adds 0 tokens.
-- **Refusal:** CostCap never queues. It returns `429` with `Retry-After` (seconds, at least 1) and `{error:{type:"rate_limited", source:"costcap", limit:"rpm"|"tpm", limit_value, observed, window_s:60, retry_after_s, message}}`, which the OpenAI and Anthropic SDKs retry. Each refusal writes a $0 `blocked:true, reason:"rate_limited"` receipt. It never latches and never counts toward `maxSteps`, velocity, spiral, caps or alerts.
-
-## Parallel calls
-
-By default a wrapper forwards one model call at a time. An agent that fans out (parallel tool calls, sub-agents, `asyncio.gather`) can run several at once:
-
-```sh
-node src/cli.js wrap --cap 5 --max-concurrent 8 -- node your-agent.js
-```
-
-- **Where:** `--max-concurrent N` (integer 1–64, default 1), `maxConcurrent` on `default` or an agent in a `--policy` file, or `maxConcurrent` on `POST /v1/agents/:id/policy` (API only, audited as `policy.change`; a dashboard save keeps it). The minimum of all three applies; the fleet value is a ceiling and the cached value is enforced offline.
-- **Admission stays serialized.** Requests beyond N wait in FIFO order (never a 429 for concurrency). When a slot frees, the next request runs the full verdict (kill, accounting failure, allowlist, caps, tag/model caps, preflight, rate, velocity, spiral) against every completed receipt. Only the upstream fetch and forwarding run in parallel; receipt append, spend recording, cap warnings and the `--shared-ledger` critical section stay serialized.
-- **Bounds.** `--max-steps` counts in-flight calls, so it is never exceeded. The RPM slot is reserved before forwarding, as before. With `--preflight`, the worst-case estimates of in-flight calls are subtracted from the remaining budget first. An unknown-cost receipt or the kill switch stops new admissions; calls already in flight finish and are recorded.
-- **Overshoot:** at most N in-flight calls per wrapper, so recorded spend stays within `cap + Σ(N per wrapper) × max single-call cost`. Without `--preflight`, no dollars are reserved for in-flight calls.
-- The run summary, rollup line and `costcap runs` show `max_concurrent` when it is above 1.
-
-## Soft warnings
-
-`wrap` and `check` warn before the hard stop. By default, a warning fires when run, day or month spend reaches 80% of its cap:
-
-```sh
-costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
-# costcap: warning: day spend $8.0123 is 80% of $10 cap (2026-11-16 UTC)
-```
-
-- `--warn-at F[,F...]` takes fractions with 0 < F < 1. The default is `0.8`, and `--warn-at off` disables warnings. A bad value exits `2`.
-- The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`.
-- Warnings never block a call and are never spend. Receipts, runs and check totals ignore `cap_warning` lines.
-- `wrap` also checks once at startup: a fraction already reached (including from a cached fleet cap) warns once if this period has no matching `cap_warning` yet.
-- When a scope has an unknown-cost receipt (a pending batch included), its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
-- `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
-
-## Model downgrade
-
-Degrade, don't die. Past a fraction of any cap, `wrap` sends a mapped model upstream as a cheaper one instead of waiting for the hard stop:
-
-```sh
-costcap wrap --day-cap 10 --downgrade gpt-4o=gpt-4o-mini,claude-sonnet-4-5=claude-haiku-4-5 --downgrade-at 0.8 -- node agent.js
-# costcap: day spend is 80% of its cap; downgrading gpt-4o -> gpt-4o-mini
-```
-
-- **Trigger:** the first run/hour/day/month scope whose spend is at or above `--downgrade-at` (default `0.8`, 0 < F < 1) of its cap. Scopes come from local caps, a `--policy` agent or team budget (`agent:day`, `team:month`) and an enrolled fleet agent cap (`fleet:day`). Under the fraction, requests are byte-identical to today.
-- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes (streamed requests included; stream-usage injection still applies). The allowlist, `--unknown-models refuse`, preflight, tag caps and the cache key all see the target model, so a disallowed or unpriced target is refused, never sent as the original. An unpriced `--downgrade` target exits `2` at wrap start.
-- **Not rewritten:** Gemini path models, Bedrock/Vertex, batches, multipart audio, Realtime and OpenRouter `models[]` arrays pass through unchanged with receipt `downgrade: "unsupported_route"`.
-- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction}`; the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line per scope and period, never counted as spend. The run summary and `costcap runs` show `downgraded_calls`.
-- **Fleet:** a `downgrade: {at, map}` field on the agent policy (dashboard agent card, or `POST /v1/agents/:id/policy`, audited as `policy.change`; `null` clears it). Local flags can only add mappings or lower `at`; the fleet target wins on a clash.
-- At 100% the hard stop still refuses. A downgrade never raises or bypasses a cap.
-
-## Response cache
-
-`costcap wrap --cache TTL` (off by default; `30s`, `10m`, `24h`, `7d`, at most `7d`) answers repeated identical deterministic requests from a local disk cache. A hit makes no upstream call, costs $0, and still writes a receipt: `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`.
-
-- **Cached:** `POST` non-streaming generation requests whose JSON body sets `temperature` (Gemini: `generationConfig.temperature`) to exactly `0`, and embeddings requests. Only a `2xx` response with a known, numeric `cost_usd` is stored.
-- **Never cached** (`x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), batches, Files, count-tokens, GET/HEAD and `n > 1`. Provider errors, unknown or unpriced cost `batch_pending` and `background_pending` responses are never stored.
-- **Key:** SHA-256 of provider, upstream, method, path and query, the exact body bytes, `anthropic-version`, `anthropic-beta`, `openai-organization`, `openai-project`, and a hash of the API key headers and any `key=` query value. Different keys never share entries.
-- **Order:** the lookup runs after every check (kill file, caps, allowlist, preflight, breaker, spiral). A hit never bypasses a refusal. Hits count toward `--max-steps` and policy `maxSteps`, never toward velocity spend, caps, alerts or billing.
-- **Storage:** `--cache-dir DIR` (default `<ledger-dir>/cache`, mode `0700`, entries `0600`). `--cache-max-mb N` (default 256) evicts least recently used entries; a response over 1/10 of the cap is not stored. Entries hold status, content-type, response body, model, original cost, source receipt id and a timestamp. They never hold request bodies, headers or keys. Delete the directory to purge.
-- **Per call:** send `x-costcap-cache: bypass` to skip lookup and store. CostCap always strips the header before forwarding. Responses carry `x-costcap-cache: hit|miss|bypass`.
-- **Reporting:** the run summary gains `cache: {hits, misses, saved_usd}`, the roll-up line adds ` · cache: N hits, saved $X`, and hosted `/v1/spend` reports `cache_hits` and `saved_usd` per bucket and in the total.
-
-Cached answers can be stale for up to the TTL. Use a short TTL, or the bypass header, where freshness matters.
-
 ## Run summaries
 
-Every `costcap wrap` run writes `<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`) when it ends, including after a cap stop, breaker stop or `costcap kill`. It holds `calls`, `blocked_calls`, `by_model` (calls, input/output/cache-read/cache-write tokens, `cost_usd`), `total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope) and `stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`, plus `stopped_scope`). If any call has unknown cost, `total_cost_usd` is `null`, never a silent $0. A one-line roll-up is printed to stderr.
+Every `costcap wrap` run, including one that exits non-zero, hits a cap, trips
+the breaker or is stopped by `costcap kill`, writes
+`<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`): `run_id`,
+`started_at`, `ended_at`, `exit_code`, `calls`, `blocked_calls`, `by_model`
+(calls, input/output/cache read/cache write tokens, cost per model),
+`total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope),
+`stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`) and
+`stopped_scope`. If any call has unknown cost, `total_cost_usd` is `null`, never
+$0. A one-line roll-up is printed to stderr when the run ends.
 
 ```sh
-node src/cli.js runs                 # newest first
-node src/cli.js runs --json --receipts .costcap/receipts.jsonl
+node src/cli.js runs            # recent runs, newest first
+node src/cli.js runs --json     # the summaries as JSON; corrupt files are reported and skipped
 ```
-
-Corrupt summary files are reported and skipped. No account is needed.
 
 ## CI check and local MCP
 

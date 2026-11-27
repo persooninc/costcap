@@ -25,9 +25,9 @@ import { createRateLimiter, minLimit } from "./rate-limit.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels, isMaxConcurrent, MAX_CONCURRENT_LIMIT } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { buildRunSummary, rollupLine, runsCommand, writeRunSummary, runEndRecord } from "./run-summary.js";
-import { createKillCheck, hostKillFile, kill, killStatus, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
+import { readFileSync } from "node:fs";
+import { buildRunSummary, rollupLine, writeRunSummary, listRunSummaries } from "./run-summary.js";
+import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
 import { summaryCommand, diffCommand, summarizeLedger, stableStringify, readSummary, diffSummaries, formatDiffText, parseThresholds } from "./cost-diff.js";
@@ -45,14 +45,10 @@ const USAGE = "usage: costcap wrap [--cap USD] [--day-cap USD] [--month-cap USD]
   "       costcap check [--cap USD] [--receipts FILE]\n" +
   "       costcap reconcile --receipts FILE --provider FILE\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
-  "       costcap request-raise --scope run|hour|day|week|month|total --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
-  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
-  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
+  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
+  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
-  "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--json] [--export csv]\n" +
-  "       costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--prices FILE]\n" +
-  "       costcap kill [note] [--host] [--kill-file FILE] [--receipts FILE] | costcap kill --status | costcap resume [--host] [--kill-file FILE] [--receipts FILE]\n" +
-  "       (--host uses $COSTCAP_HOME/KILL, default ~/.costcap/KILL, and freezes every wrapped agent on this machine)\n" +
+  "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
 
 export function parseWrapArgs(argv) {
@@ -245,8 +241,11 @@ export async function wrap(argv) {
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
-  const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });
+  agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
+  const startedAt = new Date().toISOString();
+  const summaryRunId = who.run_id ?? runId ?? randomUUID();
+  const runReceipts = [];
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
@@ -307,8 +306,10 @@ export async function wrap(argv) {
   if (fleet) { fleet.queueRunEnd(runEndRecord(summary)); await fleet.sync({ wait: true }); }
   server.closeAllConnections();
   server.close();
-  // #239: final OTLP flush, capped at 5 s; failures never change the exit code.
-  if (exporter) summary.otlp = await exporter.finish(summary, { startMs: startedMs });
+  const s = cap.spend();
+  const summary = buildRunSummary({ runId: summaryRunId, startedAt, endedAt: new Date().toISOString(), exitCode: code, receipts: runReceipts, caps, spent: s, killed: killedByCostcap });
+  try { writeRunSummary(receiptsPath, summary); } catch (err) { console.error(`costcap: warning: run summary not written: ${err.code ?? err.message}`); }
+  console.error(rollupLine(summary));
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
@@ -385,21 +386,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exitCode = result.ok ? 0 : 1;
       }
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
-  } else if (cmd === "pricing") {
-    try {
-      const { code, out, err } = pricingCommand(rest);
-      if (out) console.log(out);
-      if (err) console.error(err);
-      process.exitCode = code;
-    } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
-  } else if (cmd === "receipts") {
-    process.exitCode = receiptsCommand(rest);
-  } else if (cmd === "summary") {
-    process.exitCode = summaryCommand(rest);
-  } else if (cmd === "diff") {
-    process.exitCode = diffCommand(rest);
   } else if (cmd === "runs") {
-    runsCommand(rest);
+    const json = rest.includes("--json");
+    const i = rest.indexOf("--receipts");
+    const { runs, errors } = listRunSummaries(i >= 0 ? rest[i + 1] : ".costcap/receipts.jsonl");
+    for (const e of errors) console.error(`costcap: skipped corrupt run summary ${e.file}: ${e.error}`);
+    if (json) console.log(JSON.stringify(runs, null, 2));
+    else if (!runs.length) console.error("costcap: no run summaries yet.");
+    else for (const r of runs) console.log(rollupLine(r).replace(/^costcap: /, `${r.ended_at} `));
   } else if (cmd === "kill" || cmd === "resume") {
     const { file: projectFile, receipts, words, host, status } = parseKillArgs(rest);
     if (status) {

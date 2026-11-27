@@ -1,132 +1,96 @@
-import { applySettlements } from "./cap.js";
-import { stopReasonFor, deriveOutcome } from "./hosted/run-outcome.js";
-// Local per-run JSON summary (costcap.run-summary/v1): calls, tokens and cost per
-// model, unknown-cost count, caps and stop reason. Written to <ledger-dir>/runs/.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+// Local per-run JSON summary (costcap.run-summary/v1, #119).
+// Built only from this run's receipt lines, written next to the ledger as
+// <ledger-dir>/runs/<run_id>.json. Unknown cost is never summed as $0: one
+// null-cost call makes total_cost_usd null.
+//
+// Public API: buildRunSummary, rollupLine, writeRunSummary, listRunSummaries,
+// runsDirFor. Deps: node:fs, node:path only.
+
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const SCHEMA = "costcap.run-summary/v1";
-const BREAKER = new Set(["breaker_open", "spiral_detected", "step_budget", "cost_velocity"]);
-const r6 = (n) => Number(n.toFixed(6));
+const BREAKER_REASONS = new Set(["breaker_open", "step_budget", "cost_velocity", "spiral_detected"]);
+const round6 = (n) => Number(n.toFixed(6));
 
-export function stopReason(reason) {
-  if (reason === "killed") return "killed";
-  if (reason === "budget_exceeded" || reason === "tag_budget_exceeded") return "budget_exceeded";
-  if (BREAKER.has(reason)) return "breaker_open";
+export const runsDirFor = (receiptsPath) => join(dirname(receiptsPath), "runs");
+
+// Maps a blocked receipt to a stop cause, or null when it is not a stop cause.
+function stopCause(r) {
+  if (r.reason === "killed") return { stopped_by: "killed", scope: null };
+  if (r.reason === "budget_exceeded") return { stopped_by: "budget_exceeded", scope: r.scope ?? null };
+  if (BREAKER_REASONS.has(r.reason)) return { stopped_by: "breaker_open", scope: r.reason };
   return null;
 }
 
-// Build a summary from this run's receipt lines (event lines are ignored).
-export function buildRunSummary({ run_id, started_at, ended_at, exit_code = null, receipts = [], caps = {}, spend = {}, killed = false, kill = null, warnings = [], cacheEnabled = false, signal = null, maxConcurrent = 1 }) {
-  let firstStop = null;
-  const by_model = {};
-  let downgraded_calls = 0, calls = 0, blocked_calls = 0, rejected_calls = 0, unknown_cost_calls = 0, total = 0;
-  let stopped_by = killed ? "killed" : null, stopped_scope = killed ? (kill?.kill_scope ?? null) : null;
-  const cache = { hits: 0, misses: 0, saved_usd: 0 };
-  let cacheSeen = cacheEnabled;
-  let killInfo = killed && kill?.kill_scope ? { kill_scope: kill.kill_scope, kill_file: kill.kill_file } : null;
-  for (const r of applySettlements(receipts.filter(Boolean))) {
-    if (r.blocked) {
-      blocked_calls++;
-      const s = stopReason(r.reason);
-      if (s && !firstStop) firstStop = r.reason;
-      if (s && !stopped_by) { stopped_by = s; stopped_scope = r.scope ?? r.kill_scope ?? null; }
-      if (s === "killed" && !killInfo && r.kill_scope) killInfo = { kill_scope: r.kill_scope, kill_file: r.kill_file };
-      continue;
-    }
-    calls++;
-    // #207: calls sent upstream on a cheaper model after a budget-triggered downgrade.
-    if (r.requested_model && r.downgrade && typeof r.downgrade === "object") downgraded_calls++;
-    // #184: cache hits are $0 calls; saved_usd is reported, never added to cost.
-    if (r.cache) cacheSeen = true;
-    if (r.cache === "hit") { cache.hits++; if (Number.isFinite(r.saved_usd)) cache.saved_usd = r6(cache.saved_usd + r.saved_usd); }
-    else if (r.cache === "miss") cache.misses++;
-    if (r.reason === "upstream_rejected") rejected_calls++;
-    // #207: a call sent upstream on the cheaper downgrade target.
-    if (typeof r.requested_model === "string" && r.downgrade && typeof r.downgrade === "object") downgraded_calls++;
-    const m = r.model ?? "unknown";
-    const b = (by_model[m] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 });
-    b.calls++;
-    b.input_tokens += r.input_tokens ?? 0;
-    b.output_tokens += r.output_tokens ?? 0;
-    b.cache_read_tokens += r.cached_input_tokens ?? 0;
-    b.cache_write_tokens += (r.cache_write_input_tokens ?? 0) + (r.cache_write_1h_input_tokens ?? 0);
-    // #148: where each model's cost came from (provider-reported, table or fallback rate); "mixed" if it varied.
-    if (r.cost_source) b.cost_source = b.cost_source && b.cost_source !== r.cost_source ? "mixed" : r.cost_source;
-    if (r.cost_usd == null) { unknown_cost_calls++; b.cost_usd = null; }
-    else { total += r.cost_usd; if (b.cost_usd !== null) b.cost_usd = r6(b.cost_usd + r.cost_usd); }
+export function buildRunSummary({ runId, startedAt, endedAt, exitCode, receipts = [], caps = {}, spent = {}, killed = false }) {
+  const byModel = {};
+  let calls = 0, blocked = 0, unknown = 0, total = 0, cause = null;
+  for (const r of receipts) {
+    if (r.event) continue;
+    if (r.blocked) { blocked += 1; cause = stopCause(r) ?? cause; continue; }
+    calls += 1;
+    const m = (byModel[r.model ?? "unknown"] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0 });
+    m.calls += 1;
+    m.input_tokens += r.input_tokens ?? 0;
+    m.output_tokens += r.output_tokens ?? 0;
+    m.cache_read_tokens += r.cached_input_tokens ?? 0;
+    m.cache_write_tokens += (r.cache_write_input_tokens ?? 0) + (r.cache_write_1h_input_tokens ?? 0);
+    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; m.cost_usd = null; }
+    else { total += r.cost_usd; if (m.cost_usd !== null) m.cost_usd = round6(m.cost_usd + r.cost_usd); }
   }
-  const capsOut = {};
-  for (const scope of ["run", "day", "week", "month"]) {
-    if (caps[scope] != null) capsOut[scope] = { limit_usd: caps[scope], spent_usd: r6(spend[scope] ?? 0) };
+  if (killed) cause = { stopped_by: "killed", scope: null };
+  const capOut = {};
+  for (const scope of ["run", "day", "month"]) {
+    if (caps[scope] != null || spent[scope] != null) capOut[scope] = { limit_usd: caps[scope] ?? null, spent_usd: spent[scope] != null ? round6(spent[scope]) : null };
   }
-  // #225: stop reason and outcome (success|failure|killed) for hosted run-end sync.
-  const stop_reason = stopReasonFor({ killed, reason: firstStop, signal });
   return {
-    schema: SCHEMA, run_id, started_at, ended_at, exit_code, calls, blocked_calls, rejected_calls, by_model,
-    total_cost_usd: unknown_cost_calls > 0 ? null : r6(total), unknown_cost_calls,
-    caps: capsOut, warnings: warnings.map(({ scope, fraction, cap, spent_usd, period, lower_bound }) => ({ scope, fraction, cap, spent_usd, period, lower_bound })), stopped_by, ...(downgraded_calls ? { downgraded_calls } : {}), ...(cacheSeen ? { cache } : {}), ...(stopped_scope ? { stopped_scope } : {}), ...(killInfo ?? {}),
+    schema: SCHEMA,
+    run_id: runId,
+    started_at: startedAt,
+    ended_at: endedAt,
+    exit_code: exitCode,
+    calls,
+    blocked_calls: blocked,
+    by_model: byModel,
+    total_cost_usd: unknown > 0 ? null : round6(total),
+    unknown_cost_calls: unknown,
+    caps: capOut,
+    stopped_by: cause?.stopped_by ?? null,
+    stopped_scope: cause?.scope ?? null,
   };
 }
 
 export function rollupLine(s) {
-  const cost = s.total_cost_usd === null
-    ? `unknown (${s.unknown_cost_calls} unpriced call${s.unknown_cost_calls === 1 ? "" : "s"})`
-    : `$${s.total_cost_usd.toFixed(4)}`;
-  const saved = s.cache?.hits > 0 ? ` · cache: ${s.cache.hits} hit${s.cache.hits === 1 ? "" : "s"}, saved $${s.cache.saved_usd.toFixed(4)}` : "";
-  const dg = s.downgraded_calls ? ` downgraded=${s.downgraded_calls}` : "";
-  const stop = s.stopped_by ? ` stopped_by=${s.stopped_by}${s.stopped_scope ? `:${s.stopped_scope}` : ""}` : "";
-  return `costcap: run ${s.run_id} calls=${s.calls} rejected=${s.rejected_calls ?? 0} refused=${s.blocked_calls} models=${Object.keys(s.by_model).length} cost=${cost}${dg}${stop}${saved}`;
+  const cost = s.total_cost_usd === null ? `unknown (${s.unknown_cost_calls} unpriced call${s.unknown_cost_calls === 1 ? "" : "s"})` : `$${s.total_cost_usd.toFixed(4)}`;
+  const models = Object.keys(s.by_model).length;
+  const stop = s.stopped_by ? `, stopped by ${s.stopped_by}${s.stopped_scope ? ` (${s.stopped_scope})` : ""}` : "";
+  return `costcap: run ${s.run_id}: ${s.calls} call${s.calls === 1 ? "" : "s"} across ${models} model${models === 1 ? "" : "s"}, ${s.blocked_calls} refused, cost ${cost}${stop}`;
 }
 
-export const runsDir = (receiptsPath) => join(dirname(receiptsPath), "runs");
-
 export function writeRunSummary(receiptsPath, summary) {
-  const dir = runsDir(receiptsPath);
+  const dir = runsDirFor(receiptsPath);
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `${summary.run_id}.json`);
-  writeFileSync(file, JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, file);
   return file;
 }
 
-// List summaries newest first. Corrupt files are reported in `errors`, never thrown.
-export function listRunSummaries(receiptsPath) {
-  const dir = runsDir(receiptsPath);
+// Newest first by ended_at. Corrupt files are reported in `errors`, never thrown.
+export function listRunSummaries(receiptsPath, { limit = 20 } = {}) {
+  const dir = runsDirFor(receiptsPath);
   let names;
   try { names = readdirSync(dir).filter((n) => n.endsWith(".json")); } catch { return { runs: [], errors: [] }; }
   const runs = [], errors = [];
-  for (const n of names) {
+  for (const name of names) {
     try {
-      const s = JSON.parse(readFileSync(join(dir, n), "utf8"));
-      if (s?.schema !== SCHEMA || typeof s.run_id !== "string") throw new Error("not a run summary");
+      const s = JSON.parse(readFileSync(join(dir, name), "utf8"));
+      if (s?.schema !== SCHEMA || !Number.isFinite(Date.parse(s.ended_at))) throw new Error("not a costcap.run-summary/v1 file");
       runs.push(s);
-    } catch (e) { errors.push({ file: n, error: e.message }); }
+    } catch (err) { errors.push({ file: name, error: err.message }); }
   }
-  runs.sort((a, b) => String(b.ended_at).localeCompare(String(a.ended_at)));
-  return { runs, errors };
-}
-
-// `costcap runs [--json] [--receipts FILE]`
-export function runsCommand(argv, { log = console.log, warn = console.error } = {}) {
-  const i = argv.indexOf("--receipts");
-  const { runs, errors } = listRunSummaries(i !== -1 && argv[i + 1] ? argv[i + 1] : ".costcap/receipts.jsonl");
-  for (const e of errors) warn(`costcap: skipped corrupt run summary ${e.file}: ${e.error}`);
-  if (argv.includes("--json")) log(JSON.stringify(runs, null, 2));
-  else if (!runs.length) log("no runs recorded");
-  else for (const r of runs) {
-    const cost = r.total_cost_usd === null ? "unknown" : `$${Number(r.total_cost_usd).toFixed(4)}`;
-    log(`${r.ended_at}  ${r.run_id}  calls=${r.calls}${r.downgraded_calls ? `  downgraded=${r.downgraded_calls}` : ""}  cost=${cost}${r.stopped_by ? `  stopped_by=${r.stopped_by}` : ""}`);
-  }
-  return { runs, errors };
-}
-
-// #225: the run-end record an enrolled wrap syncs to the hosted service.
-export function runEndRecord(summary) {
-  return {
-    run_id: summary.run_id, started_at: summary.started_at, ended_at: summary.ended_at,
-    exit_code: Number.isInteger(summary.exit_code) && summary.exit_code >= 0 && summary.exit_code <= 255 ? summary.exit_code : null,
-    stop_reason: summary.stop_reason, calls: summary.calls + summary.blocked_calls,
-    usd_known: summary.total_cost_usd ?? r6(Object.values(summary.by_model).reduce((n, m) => n + (m.cost_usd ?? 0), 0)),
-    unknown_count: summary.unknown_cost_calls,
-  };
+  runs.sort((a, b) => Date.parse(b.ended_at) - Date.parse(a.ended_at));
+  return { runs: runs.slice(0, limit), errors };
 }
