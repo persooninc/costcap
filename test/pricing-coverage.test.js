@@ -109,3 +109,17 @@ test("#234 AC2: Fable 5.2 cache usage meters every cache component at list price
   const r = costForUsage("claude-fable-5-2", { input_tokens: 1000, cached_input_tokens: 100_000, cache_write_input_tokens: 10_000, cache_write_1h_input_tokens: 10_000, output_tokens: 2000 });
   assert.deepEqual([r.cost_usd, r.fallback], [0.368, false]);
 });
+
+test("#278 every bedrock_models row has input/output and a dated AWS Price List source", async () => {
+  const { readFileSync } = await import("node:fs");
+  const t = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
+  for (const [id, row] of Object.entries(t.bedrock_models)) {
+    assert.ok(Array.isArray(row.sources) && row.sources.length > 0, id);
+    for (const [region, r] of Object.entries(row.regions)) {
+      assert.ok(r.input > 0 && r.output > 0 && (r.cached_input === undefined || r.cached_input > 0), `${id} ${region}`);
+      assert.equal(r.cache_write, undefined, `${id}: cache writes stay unknown`);
+      assert.ok(row.sources.some((s) => s.includes(`/${region}/index.json`) && s.includes("retrieved 2026-")), `${id} ${region}`);
+    }
+    assert.equal(isPricedModel(id), false, `${id} is never priced outside the Bedrock route`);
+  }
+});

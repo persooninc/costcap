@@ -9,7 +9,7 @@ import { startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
 import { costForUsage } from "../src/pricing.js";
 import { loadUpstreamPrices } from "../src/upstreams.js";
-import { builtinOverride, costWithOverrides, effectivePrice, isPricedWithOverrides, unpricedDiscountWarnings } from "../src/price-overrides.js";
+import { builtinOverride, cloudEffectivePrice, costForCloud, costWithOverrides, effectivePrice, isPricedWithOverrides, unpricedDiscountWarnings } from "../src/price-overrides.js";
 import { foldBatchResults } from "../src/batch.js";
 import { auditReceipts } from "../src/pricing-digest.js";
 import { pricingCommand } from "../src/pricing-cli.js";
@@ -31,10 +31,11 @@ test("validation: bad built-in entries throw; built-in keys need no --upstream (
   for (const e of bad) assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: { m: e } } }), []), /upstream-prices/, JSON.stringify(e));
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: [] } }), []), /object of models/);
-  // #278: bedrock/vertex are built-in override keys (no --upstream needed); validated like the others.
-  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { "amazon.nova-pro-v1:0": { discount: 0.1 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
-  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { m: { input: 0, output: 1 } } } }), []), /never \$0/);
-  assert.throws(() => loadUpstreamPrices(file({ upstreams: { vertex: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
+  // #278: bedrock / vertex are built-in override keys with the same validation.
+  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { m: { discount: 0.1 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
+  for (const e of [{ input: 0, output: 1 }, { input: -1, output: 2 }, { discount: 1 }]) assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { "meta.llama-x-v1:0": e } } }), []), /upstream-prices/);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { "*": { input: 1, output: 2 } } } }), []), /"\*" takes only/);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { vertex: { "*": { input: 1, output: 2 } } } }), []), /"\*" takes only/);
 });
 
 test("discount scales every tier, including cache and long context (AC1)", () => {
@@ -251,22 +252,31 @@ test("#254 AC4: --prices tools.code_execution prices standalone code execution a
   assert.equal(receipts[0].cost_usd, Number((costForUsage("claude-sonnet-4-6", { input_tokens: 10, output_tokens: 5 }).cost_usd + 0.01).toFixed(6)));
 });
 
-test("#278 cloudCostWithOverrides: vertex '*' discount scales a Gemini receipt; no entry is byte-identical", async () => {
-  const { cloudCostWithOverrides } = await import("../src/price-overrides.js");
-  const { costForUsage } = await import("../src/pricing.js");
-  const prices = loadUpstreamPrices(file({ version: "v", upstreams: { vertex: { "*": { discount: 0.2 } }, bedrock: { "anthropic.claude-sonnet-4-5-20250929-v1:0": { discount: 0.5 } } } }), []);
+test("#278 bedrock / vertex overrides on cloud routes: vertex * discount, bedrock absolute, warnings, preflight rows", () => {
+  const p = loadUpstreamPrices(file({ version: "c1", upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 1, output: 2 }, "meta.unlisted-v9:0": { discount: 0.3 } }, vertex: { "*": { discount: 0.2 } } } }), []);
   const usage = { input_tokens: 1000, output_tokens: 500 };
-  const opts = { regional: false, vertex: true, at: "2026-11-16T12:00:00Z" };
-  const base = costForUsage("gemini-2.5-pro", usage, opts);
-  const d = cloudCostWithOverrides(prices, "vertex", ["google/gemini-2.5-pro", "gemini-2.5-pro"], usage, opts);
-  assert.equal(d.cost_usd, r6(base.cost_usd * 0.8));
-  assert.deepEqual([d.cost_source, d.discount], ["user_prices", 0.2]);
-  assert.deepEqual(cloudCostWithOverrides(null, "vertex", ["google/gemini-2.5-pro", "gemini-2.5-pro"], usage, opts), base);
-  const claude = { regional: true, undated: true };
-  const b = cloudCostWithOverrides(prices, "bedrock", ["us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude-sonnet-4-5"], usage, claude);
-  assert.equal(b.cost_usd, r6(costForUsage("claude-sonnet-4-5", usage, claude).cost_usd * 0.5));
-  assert.deepEqual(cloudCostWithOverrides(prices, "bedrock", ["us.anthropic.claude-haiku-4-5-v1:0", "claude-haiku-4-5"], usage, claude), costForUsage("claude-haiku-4-5", usage, claude));
-  // A cloud key never leaks into the first-party override lookup.
-  const { builtinOverride } = await import("../src/price-overrides.js");
-  assert.equal(builtinOverride(prices, "vertex", "gemini-2.5-pro"), null);
+  const g = costForUsage("gemini-2.5-pro", usage, { vertex: true });
+  const vg = costForCloud(p, "vertex", "gemini-2.5-pro", usage, { rawId: "google/gemini-2.5-pro", gemini: true });
+  assert.deepEqual([vg.cost_usd, vg.discount, vg.cost_source], [r6(g.cost_usd * 0.8), 0.2, "user_prices"]);
+  const vc = costForCloud(p, "vertex", "claude-sonnet-4-5", usage, { rawId: "claude-sonnet-4-5", regional: true });
+  assert.equal(vc.cost_usd, r6(costForUsage("claude-sonnet-4-5", usage, { regional: true, undated: true }).cost_usd * 0.8));
+  const b = costForCloud(p, "bedrock", "meta.llama-x-v1:0", usage, { rawId: "us.meta.llama-x-v1:0", region: "us-east-1" });
+  assert.deepEqual([b.cost_usd, b.cost_source, b.region], [0.002, "user_prices", "us-east-1"]);
+  // No override: Claude on Bedrock is byte-identical to the table (1.1 regional premium kept).
+  const claude = costForCloud(null, "bedrock", "claude-sonnet-4-5", usage, { rawId: "us.anthropic.claude-sonnet-4-5-20250929-v1:0", region: "us-east-1", regional: true });
+  assert.deepEqual(claude, costForUsage("claude-sonnet-4-5", usage, { regional: true, undated: true }));
+  assert.equal(claude.regional_multiplier, 1.1);
+  // A Nova row never takes the Claude regional multiplier.
+  const nova = costForCloud(null, "bedrock", "amazon.nova-pro-v1:0", usage, { region: "us-east-1", regional: true });
+  assert.deepEqual([nova.cost_usd, nova.regional_multiplier], [0.0024, undefined]);
+  assert.deepEqual(cloudEffectivePrice(p, "bedrock", "meta.llama-x-v1:0", { rawId: "meta.llama-x-v1:0", region: "us-east-1" }), { model: "meta.llama-x-v1:0", input: 1, output: 2, fallback: false, user_prices: true });
+  assert.equal(cloudEffectivePrice(null, "bedrock", "amazon.nova-pro-v1:0", { region: "ap-southeast-3" }), null);
+  assert.deepEqual(unpricedDiscountWarnings(p), ["costcap: warning: discount ignored: bedrock/meta.unlisted-v9:0 is not in the pricing table; add absolute rates"]);
+});
+
+test("#278 pricing show lists a Bedrock model's per-region rows", () => {
+  const r = pricingCommand(["show", "us.amazon.nova-pro-v1:0"]);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /bedrock\/amazon\.nova-pro-v1:0 us-east-1: input \$0\.8, cached_input \$0\.2, .*output \$3\.2/);
+  assert.match(r.out, /bedrock\/amazon\.nova-pro-v1:0 eu-west-1: input \$0\.92/);
 });

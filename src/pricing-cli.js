@@ -4,8 +4,9 @@
 import { readFileSync } from "node:fs";
 import { loadPricingTable, datedRow, dayOf } from "./pricing.js";
 import { auditReceipts } from "./pricing-digest.js";
+import { mapCloudModel } from "./cloud.js";
 import { loadUpstreamPrices } from "./upstreams.js";
-import { builtinOverride, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
+import { builtinOverride, CLOUD_OVERRIDE_PROVIDERS, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
 
 function option(args, name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
 
@@ -79,15 +80,22 @@ export function pricingCommand(args, { tablePath } = {}) {
   // #189: with --prices, the effective row for the first built-in provider that overrides the model.
   // A model-specific entry wins over another provider's "*" discount.
   const listed = (p) => [model, model.replace(/-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/, "")].some((id) => Object.hasOwn(prices.upstreams[p] ?? {}, id));
-  const provider = prices && (OVERRIDE_PROVIDERS.find((p) => listed(p) && builtinOverride(prices, p, model)) ?? OVERRIDE_PROVIDERS.find((p) => builtinOverride(prices, p, model)));
+  // #278: bedrock / vertex overrides apply on cloud routes only; `show` prints first-party overrides.
+  const FIRST_PARTY = OVERRIDE_PROVIDERS.filter((p) => !CLOUD_OVERRIDE_PROVIDERS.includes(p));
+  const provider = prices && (FIRST_PARTY.find((p) => listed(p) && builtinOverride(prices, p, model)) ?? FIRST_PARTY.find((p) => builtinOverride(prices, p, model)));
   if (provider) {
     const o = builtinOverride(prices, provider, model);
     const tag = o.absolute ? ` (user_prices ${prices.sha256.slice(0, 8)})` : ` (discount ${o.discount})`;
     const eff = effectivePrice(prices, provider, model, `${day}T00:00:00Z`);
     return { code: 0, out: [head, ...(o.absolute ? [row(`${provider}/${model}`, eff, tag)] : rowsFor(`${provider}/${model}`, eff).map((l, i) => (i === 0 ? l.replace(":", `${tag}:`) : l)))].join("\n"), err: "" };
   }
-  const bedrockId = model.replace(/^(?:bedrock\/)?(?:us|eu|apac|jp|au)\./, "").replace(/^bedrock\//, "");
-  if (Object.hasOwn(bedrock, bedrockId)) return { code: 0, out: [head, ...bedrockRows(bedrockId)].join("\n"), err: "" };
+  // #278: a non-Anthropic Bedrock model prints one row per region the table lists.
+  const bedrockId = mapCloudModel("bedrock", model);
+  if (bedrockId && Object.hasOwn(table.bedrock_models ?? {}, bedrockId)) {
+    const regions = table.bedrock_models[bedrockId].regions;
+    return { code: 0, out: [head, `bedrock/${bedrockId} (on-demand standard; other regions and service tiers are unpriced)`,
+      ...Object.entries(regions).map(([r, rr]) => row(`bedrock/${bedrockId} ${r}`, rr))].join("\n"), err: "" };
+  }
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const id = Object.hasOwn(table.models, model) ? model : Object.hasOwn(table.models, base) ? base : null;
   if (id === null) return { code: 0, out: [head, row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };

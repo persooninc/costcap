@@ -2,7 +2,7 @@
 // host derivation, path-model mapping and a real-time AWS eventstream decoder.
 // The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
 // Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
-import { bedrockModels, bedrockRow, resolveModelId, vertexGeminiModels } from "./pricing.js";
+import { isBedrockTableModel, resolveModelId, vertexGeminiModels } from "./pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
 export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
@@ -79,10 +79,18 @@ export function bedrockHost(region) {
 
 const BEDROCK_GEO = /^(?:global|us|eu|apac|jp|au)\./;
 
-/** #278: a Bedrock model id without its geo inference-profile prefix (us./eu./global./...). */
+/** #278: a Bedrock model id without its geo prefix (us./eu./apac./global./...), or null for an ARN. */
 export function bedrockBaseId(rawId) {
   if (typeof rawId !== "string" || !rawId || rawId.startsWith("arn:")) return null;
-  return rawId.replace(BEDROCK_GEO, "");
+  return rawId.replace(BEDROCK_GEO, "") || null;
+}
+
+/** #278: a Converse request's serviceTier.type when it is not "default" (unpriced), else null. */
+export function converseServiceTier(body) {
+  const t = body && typeof body === "object" ? body.serviceTier : undefined;
+  if (t === undefined || t === null) return null;
+  const type = t && typeof t === "object" ? t.type : t;
+  return type === "default" ? null : typeof type === "string" && type ? type : "unrecognised";
 }
 
 /**
@@ -97,8 +105,12 @@ export function mapCloudModel(provider, rawId, { region } = {}) {
   let id = rawId;
   if (provider === "bedrock") {
     if (id.startsWith("arn:")) return null;
-    // #278: a listed non-Anthropic model maps to its base id (geo prefix stripped; rates are per region).
-    if (isBedrockThirdParty(id)) { const b = bedrockBaseId(id); return isListedBedrockModel(b) ? b : null; }
+    // #278: a listed non-Anthropic model id (geo prefix stripped); `global.` profiles only when listed.
+    if (!/^(?:[a-z]+\.)?anthropic\./.test(id)) {
+      if (isBedrockTableModel(id)) return id;
+      const base = bedrockBaseId(id);
+      return base && !id.startsWith("global.") && isBedrockTableModel(base) ? base : null;
+    }
     id = id.replace(BEDROCK_GEO, "");
     if (!id.startsWith("anthropic.")) {
       if (rawId.startsWith("global.") || !bedrockModels().includes(id)) return null;

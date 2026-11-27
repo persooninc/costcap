@@ -12,7 +12,7 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, vertexGeminiRegionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling, cacheStorageCost } from "./pricing.js";
+import { bedrockPrice, isBedrockTableModel, costForUsage, isPricedModel, lookupPrice, regionalMultiplier, vertexGeminiRegionalMultiplier, scalePrice, requestWebSearchType, pricingAt, googleSearchBilling, cacheStorageCost } from "./pricing.js";
 import { budgetExceededBody, isLowerBound } from "./cap.js";
 import { tagBudgetExceededBody } from "./tag-cap.js";
 import { budgetRemaining } from "./agent-budget.js";
@@ -27,8 +27,8 @@ import { loadLedgerLines, isSettlement } from "./cap.js";
 import { PENDING_STATUSES, TERMINAL_STATUSES, createResponsesStreamTracker, isResponsesCreate, requestsBackground, responseState, responsesReadPath } from "./background.js";
 import { CACHE_HEADER, cacheKey, isCacheable, isStreamRequest } from "./response-cache.js";
 import { costForUserPrices, isCustomProvider, userPrice } from "./upstreams.js";
-import { costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
-import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockHost, classifyCloudRoute, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
+import { cloudEffectivePrice, cloudOverride, costForCloud, costWithOverrides, effectivePrice, isPricedWithOverrides, withToolCost } from "./price-overrides.js";
+import { BEDROCK_UPSTREAM, VERTEX_UPSTREAM, bedrockBaseId, bedrockHost, classifyCloudRoute, converseServiceTier, converseUsage, createEventStreamDecoder, isCloudProvider, mapCloudModel, vertexHost } from "./cloud.js";
 import { REALTIME_PATH, closePayload, createFrameParser, encodeFrame, realtimeUsage, writeHttpJson } from "./realtime.js";
 import { LIVE_PATH, backendResponse, durationCost, liveSeconds, sessionStartModel } from "./live.js";
 import { audioRoute, audioUnitCost, parseMultipartFields } from "./audio.js";
@@ -934,16 +934,15 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
             if (!region && upstream === BEDROCK_UPSTREAM) { send(502, { error: "bedrock_region_unavailable", message: "Set AWS_REGION for Bedrock. The upstream call was not made." }); return; }
             cloudAuth = { region };
           }
-          // #278: a non-Anthropic Bedrock model is priced per region (the request's region also
-          // bills a geo profile's source region); an unlisted base id may carry an absolute user rate.
-          const base = bedrockBaseId(providerModel);
-          cloudModel = mapCloudModel(provider, providerModel, { region: cloudAuth.region });
-          bedrockRegionRow = cloudModel !== null && !cloudModel.startsWith("claude-");
-          if (!cloudModel && base && !providerModel.startsWith("global.") && hasAbsoluteCloudPrice(userPrices, "bedrock", base)) { cloudModel = base; bedrockUserOnly = true; }
+          // #278: a listed non-Anthropic model is priced only in a region the table lists;
+          // an unlisted id is priced only by an absolute bedrock override in --upstream-prices.
+          if (isBedrockTableModel(cloudModel) && !bedrockPrice(cloudModel, cloudAuth.region)) cloudModel = null;
+          if (!cloudModel && bedrockBaseId(providerModel) && !String(providerModel).startsWith("global.") &&
+            cloudOverride(userPrices, "bedrock", { rawId: providerModel, model: bedrockBaseId(providerModel), region: cloudAuth.region })?.absolute) cloudModel = bedrockBaseId(providerModel);
           requestedModel = cloudModel ?? providerModel ?? undefined;
         }
-        // #278: a Converse serviceTier other than default (flex/priority) has no rate in the table.
-        const converseTier = cloudRoute?.converse && typeof parsedBody?.serviceTier?.type === "string" && parsedBody.serviceTier.type !== "default" ? parsedBody.serviceTier.type : null;
+        // #278: a Converse serviceTier other than "default" has no published rate here.
+        const cloudTier = cloudRoute?.converse ? converseServiceTier(parsedBody) : null;
         const batchCreate = batchCreateProvider(req.method, req.url);
         // #160: an Anthropic batch names its models per request; every one is checked.
         const batchModels = batchCreate === "anthropic" ? anthropicBatchModels(body) : null;
@@ -1059,8 +1058,11 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
               // #256: Gemini on Vertex is priced at the (pinned) request instant, with its own non-global premium.
               const g = cloudRoute.gemini === true;
               const rm = cloudRoute.scope === "regional" ? (g ? vertexGeminiRegionalMultiplier(cloudModel) : regionalMultiplier(cloudModel)) : null;
-              const base = g ? lookupPrice(cloudModel, priceAt, { vertex: true }) : lookupPrice(cloudModel, undefined, { undated: true });
-              return cloudOverridePrice(userPrices, provider, cloudModel, rm ? scalePrice(base, rm) : base);
+              if (provider === "bedrock" && isBedrockTableModel(cloudModel) && !userPrices) { const r = bedrockPrice(cloudModel, cloudAuth?.region); return r && { model: cloudModel, ...r, fallback: false }; }
+              const base = isBedrockTableModel(cloudModel) || !isPricedModel(cloudModel) ? null
+                : g ? lookupPrice(cloudModel, priceAt, { vertex: true }) : lookupPrice(cloudModel, undefined, { undated: true });
+              const scaled = base && rm ? scalePrice(base, rm) : base;
+              return userPrices ? cloudEffectivePrice(userPrices, provider, cloudModel, { rawId: providerModel, region: cloudAuth?.region, base: scaled }) : scaled;
             } : undefined;
             const onFit = (est) => { preflightEst = est; };
             const reserved = reservedUsd(); // #249: in-flight worst cases are already spoken for
@@ -1364,14 +1366,10 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
           } else if (metered) {
             if (cloud) metered.model = cloudModel;
             Object.assign(receipt, custom ? costForUserPrices(userPrices, provider, metered.model, metered.usage)
-              : cloud ? costForCloud(userPrices, provider, metered.model, metered.usage, bedrockRegionRow || bedrockUserOnly
-                ? { bedrock: cloudAuth.region }
-                : cloudRoute.gemini === true
-                  ? { regional: cloudRoute.scope === "regional", vertex: true, at: priceAt }
-                  : { regional: cloudRoute.scope === "regional", undated: true }, { tablePriced: !bedrockUserOnly })
+              : cloud ? costForCloud(userPrices, provider, metered.model, metered.usage, { rawId: providerModel, region: cloudAuth?.region,
+                regional: cloudRoute.scope === "regional", gemini: cloudRoute.gemini === true, at: priceAt })
                 : costWithOverrides(userPrices, provider, metered.model, metered.usage, { at: priceAt }));
-            // #278: a flex/priority Converse call has no table rate: unknown, never the standard rate.
-            if (converseTier) Object.assign(receipt, { cost_usd: null, reason: "service_tier_unpriced", pricing_tier: converseTier, service_tier: converseTier });
+            if (cloudTier) Object.assign(receipt, { cost_usd: null, reason: "service_tier_unpriced", pricing_tier: cloudTier, service_tier: cloudTier });
             // #262: Gemini tier provenance on the receipt (Vertex trafficType, a downgraded Priority request).
             if (metered.usage.traffic_type !== undefined) receipt.traffic_type = metered.usage.traffic_type;
             if (metered.usage.requested_service_tier !== undefined) receipt.requested_service_tier = metered.usage.requested_service_tier;

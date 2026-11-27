@@ -96,8 +96,7 @@ test("model mapping: geo/anthropic prefixes and version suffix stripped; non-Ant
   assert.equal(mapCloudModel("bedrock", "global.anthropic.claude-haiku-4-5-20251001-v1:0"), "claude-haiku-4-5");
   assert.equal(mapCloudModel("bedrock", "anthropic.claude-opus-4-5-20251101-v1"), "claude-opus-4-5");
   for (const g of ["eu", "apac", "jp", "au"]) assert.equal(mapCloudModel("bedrock", `${g}.anthropic.claude-sonnet-4-5-20250929-v1:0`), "claude-sonnet-4-5");
-  // #278: listed non-Anthropic models map to their base id; unlisted ones stay null.
-  assert.equal(mapCloudModel("bedrock", "meta.llama3-70b-instruct-v1:0"), "meta.llama3-70b-instruct-v1:0");
+  assert.equal(mapCloudModel("bedrock", "meta.llama3-70b-instruct-v1:0"), "meta.llama3-70b-instruct-v1:0"); // #278: listed
   assert.equal(mapCloudModel("bedrock", "meta.unlisted-v1:0"), null);
   assert.equal(mapCloudModel("bedrock", "arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0"), null);
   assert.equal(mapCloudModel("bedrock", "anthropic.claude-unlisted-9-v1:0"), null);
