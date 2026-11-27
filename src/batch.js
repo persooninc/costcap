@@ -1,10 +1,10 @@
-// Batch metering (#160): OpenAI Batch API and Anthropic Message Batches.
-// Pure helpers: exact-path matchers, model extraction for the allowlist, JSONL
-// results folding at the provider batch rate, and an in-memory pending-batch
-// index (seeded from the ledger) that links results back to the batch_pending
-// receipt. Settlement lines reuse the {"event":"reconciliation"} shape that
-// applySettlements in src/cap.js already folds (keeping the original ts).
-// Dependencies are injected (extractUsage, costForUsage, ...) so the module stays portable.
+// Batch APIs (#160): OpenAI Batch, Anthropic Message Batches and (#230) Gemini Batch Mode. Pure helpers:
+// exact-path matchers, request model extraction and JSONL results folding.
+// A batch create has no usage; its cost is known only once results are read.
+// Results are priced at the provider's batch multiplier (pricing table `batch`).
+import { billedAsGrounding, createUsageAccumulator } from "./proxy.js";
+import { costWithOverrides, withToolCost } from "./price-overrides.js";
+import { premiumTier } from "./pricing.js";
 
 const UNSAFE = /%|\\|\/\.{1,2}(?:\/|$)|\/\//;
 const pathOf = (rawUrl) => {
@@ -52,68 +52,26 @@ export function anthropicBatchModels(body) {
 
 const parseJson = (text) => { try { return JSON.parse(text); } catch { return undefined; } };
 
-/** Pending receipt fields from a 2xx batch create response (null when it has no batch id). */
-export function pendingFromCreate(provider, requestBody, responseText) {
-  const res = parseJson(responseText);
-  if (!res || typeof res.id !== "string" || !res.id) return null;
-  let request_count = null, model = "unknown";
-  if (provider === "anthropic") {
-    const models = anthropicBatchModels(requestBody) ?? [];
-    request_count = models.length || null;
-    const uniq = [...new Set(models)];
-    if (uniq.length) model = uniq.length === 1 ? uniq[0] : "mixed";
-  } else if (Number.isInteger(res.request_counts?.total) && res.request_counts.total > 0) {
-    request_count = res.request_counts.total;
+function priceLine(provider, body, userPrices, model, instants = [undefined]) {
+  const acc = createUsageAccumulator(provider, model);
+  acc.add(body);
+  const metered = acc.result();
+  if (!metered || metered.toolUseUnpriced) return null;
+  // A premium speed/service tier has no published batch rate: unknown, never standard.
+  if (premiumTier(metered.usage)) return null;
+  // #189: a discount stacks on the batch multiplier; an absolute override has no batch rate (unknown).
+  // #236: priced at the create and the settle instant; the higher cost is kept, never the cheaper guess.
+  // #214: tool calls bill at the full per-call rate; the batch discount applies to tokens only.
+  // #263: grounding follows the billed_as model's unit at each instant, as on the live path (#260).
+  let c = null;
+  for (const at of instants) {
+    const t = costWithOverrides(userPrices, provider, metered.model, metered.usage, { batch: provider, at });
+    if (t.fallback || t.cost_usd === null) return null;
+    const total = withToolCost(t, userPrices, provider, billedAsGrounding(provider, null, t, metered), null, body);
+    if (total.cost_usd === null) return null;
+    if (!c || total.cost_usd > c.cost_usd) c = total;
   }
-  return { batch_id: res.id, request_count, model };
-}
-
-const FREE_ANTHROPIC = new Set(["errored", "canceled", "expired"]);
-
-/**
- * Folds a JSONL results body. Returns { cost_usd, succeeded, free, by_model } when every
- * line is accounted for, else { cost_usd: null, reason } (never a $0 guess):
- * - batch_unpriced: unpublished batch rate, unpriced model, fast/priority tier, provider tool, cache write without a rate;
- * The discount applies to every component (input, output, cache read/write) and stacks on long_context.
- * - batch_results_malformed: an unparseable line, an unknown result shape, or missing usage.
- */
-export function foldBatchResults(provider, text, { extractUsage, costForUsage, isPricedModel, premiumTier, multiplier }) {
-  if (!multiplier) return { cost_usd: null, reason: "batch_unpriced" };
-  const lines = String(text).split("\n").map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return { cost_usd: null, reason: "batch_results_malformed" };
-  let total = 0, succeeded = 0, free = 0;
-  const by_model = {};
-  for (const line of lines) {
-    const j = parseJson(line);
-    if (!j || typeof j !== "object") return { cost_usd: null, reason: "batch_results_malformed" };
-    let body;
-    if (provider === "anthropic") {
-      const type = j.result?.type;
-      if (FREE_ANTHROPIC.has(type)) { free++; continue; }
-      if (type !== "succeeded" || !j.result.message || typeof j.result.message !== "object") return { cost_usd: null, reason: "batch_results_malformed" };
-      body = j.result.message;
-    } else {
-      const sc = j.response?.status_code;
-      if (Number.isInteger(sc) && (sc < 200 || sc >= 300)) { free++; continue; }
-      if (!Number.isInteger(sc)) { if (j.error) { free++; continue; } return { cost_usd: null, reason: "batch_results_malformed" }; }
-      body = j.response.body;
-      if (!body || typeof body !== "object") return { cost_usd: null, reason: "batch_results_malformed" };
-    }
-    const m = extractUsage(provider, JSON.stringify(body));
-    if (!m) return { cost_usd: null, reason: "batch_results_malformed" };
-    if (m.toolUseUnpriced || premiumTier(m.usage) || !isPricedModel(m.model)) return { cost_usd: null, reason: "batch_unpriced", model: m.model };
-    // Standard cost per line (6 dp, as a receipt would be), discounted once on the total.
-    const c = costForUsage(m.model, m.usage);
-    if (c.cost_usd === null) return { cost_usd: null, reason: "batch_unpriced", model: m.model };
-    succeeded++;
-    total += c.cost_usd;
-    const b = (by_model[m.model] ??= { calls: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, cache_write_1h_input_tokens: 0, standard_cost_usd: 0 });
-    b.calls++;
-    for (const k of ["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens", "cache_write_1h_input_tokens"]) b[k] += c[k] ?? 0;
-    b.standard_cost_usd += c.cost_usd;
-  }
-  for (const b of Object.values(by_model)) { b.cost_usd = Number((b.standard_cost_usd * multiplier).toFixed(6)); b.standard_cost_usd = Number(b.standard_cost_usd.toFixed(6)); }
-  return { cost_usd: Number((total * multiplier).toFixed(6)), succeeded, free, by_model, multiplier };
+  return { ...c, model: metered.model ?? null };
 }
 
 /**
