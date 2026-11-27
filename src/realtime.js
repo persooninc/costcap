@@ -1,25 +1,86 @@
-// #194: OpenAI Realtime API (/v1/realtime WebSocket) support. Node built-ins only.
-// A minimal RFC 6455 frame codec used as a side tap: frames are relayed byte-for-byte,
-// and complete text messages are parsed to meter `response.done` usage.
-
-export const REALTIME_PATH = /^\/openai\/v1\/realtime\/?$/;
-// #273: GPT-Live WebSocket sessions (exact path; /live/sessions/{id}/fork stays 501).
-export const LIVE_PATH = /^\/openai\/v1\/live\/sessions\/?$/;
-
+// #194: OpenAI Realtime API (/v1/realtime WebSocket) support, Node built-ins only.
+// The proxy relays bytes unchanged both ways; this module holds the RFC 6455 frame
+// codec used to tap the upstream's messages (response.done etc.) and to write
+// CostCap's own error/close frames.
 import { randomBytes } from "node:crypto";
 
-const isCount = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+export const REALTIME_PATH = /^\/openai\/v1\/realtime$/;
+export const OP = Object.freeze({ CONT: 0x0, TEXT: 0x1, BINARY: 0x2, CLOSE: 0x8, PING: 0x9, PONG: 0xa });
+// A tapped message larger than this is not parsed (it is still relayed unchanged).
+export const MAX_TAP_MESSAGE_BYTES = 16 * 1024 * 1024;
 
-/** Encodes one frame. Client-to-server frames must be masked (RFC 6455 5.3). */
-export function encodeFrame(opcode, payload = Buffer.alloc(0), { fin = true, mask = false } = {}) {
-  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+export function isRealtimePath(rawUrl) {
+  if (typeof rawUrl !== "string") return false;
+  const pathname = rawUrl.split(/[?#]/, 1)[0];
+  if (/%|\\|\/\.{1,2}(?:\/|$)|\/\//.test(pathname)) return false;
+  return REALTIME_PATH.test(pathname);
+}
+
+// Incremental frame parser: push() raw TCP chunks; onMessage(opcode, payload) fires for
+// each complete (defragmented, unmasked) data message and for every control frame.
+export function createFrameParser(onMessage, { maxMessageBytes = MAX_TAP_MESSAGE_BYTES } = {}) {
+  let buf = Buffer.alloc(0);
+  let fragOpcode = null, fragParts = [], fragSize = 0, fragTooBig = false;
+  let broken = false;
+  const push = (chunk) => {
+    if (broken) return;
+    buf = buf.length ? Buffer.concat([buf, chunk]) : Buffer.from(chunk);
+    for (;;) {
+      if (buf.length < 2) return;
+      const b0 = buf[0], b1 = buf[1];
+      const fin = (b0 & 0x80) !== 0;
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2); off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) return;
+        const big = buf.readBigUInt64BE(2);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) { broken = true; return; }
+        len = Number(big); off = 10;
+      }
+      const maskOff = off;
+      if (masked) off += 4;
+      if (buf.length < off + len) return;
+      let payload = buf.subarray(off, off + len);
+      if (masked) {
+        const key = buf.subarray(maskOff, maskOff + 4);
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= key[i & 3];
+      }
+      buf = buf.subarray(off + len);
+      if (opcode >= 0x8) { onMessage(opcode, Buffer.from(payload)); continue; }
+      if (opcode === OP.CONT) {
+        if (fragOpcode === null) continue; // stray continuation: ignore
+      } else {
+        fragOpcode = opcode; fragParts = []; fragSize = 0; fragTooBig = false;
+      }
+      fragSize += payload.length;
+      if (fragSize > maxMessageBytes) { fragTooBig = true; fragParts = []; }
+      else if (!fragTooBig) fragParts.push(Buffer.from(payload));
+      if (fin) {
+        const op = fragOpcode;
+        const whole = fragTooBig ? null : Buffer.concat(fragParts);
+        fragOpcode = null; fragParts = []; fragSize = 0; fragTooBig = false;
+        if (whole) onMessage(op, whole);
+      }
+    }
+  };
+  return { push, get broken() { return broken; } };
+}
+
+// One complete frame. Client-to-server frames must be masked (RFC 6455 5.3).
+export function encodeFrame(opcode, payload = Buffer.alloc(0), { mask = false, fin = true } = {}) {
+  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload));
   const len = data.length;
-  const head = [((fin ? 0x80 : 0) | (opcode & 0x0f))];
-  const m = mask ? 0x80 : 0;
+  const head = [(fin ? 0x80 : 0) | opcode];
   let ext = Buffer.alloc(0);
-  if (len < 126) head.push(m | len);
-  else if (len < 65536) { head.push(m | 126); ext = Buffer.alloc(2); ext.writeUInt16BE(len); }
-  else { head.push(m | 127); ext = Buffer.alloc(8); ext.writeBigUInt64BE(BigInt(len)); }
+  if (len < 126) head.push((mask ? 0x80 : 0) | len);
+  else if (len < 65536) { head.push((mask ? 0x80 : 0) | 126); ext = Buffer.alloc(2); ext.writeUInt16BE(len); }
+  else { head.push((mask ? 0x80 : 0) | 127); ext = Buffer.alloc(8); ext.writeBigUInt64BE(BigInt(len)); }
   if (!mask) return Buffer.concat([Buffer.from(head), ext, data]);
   const key = randomBytes(4);
   const out = Buffer.from(data);
@@ -27,96 +88,38 @@ export function encodeFrame(opcode, payload = Buffer.alloc(0), { fin = true, mas
   return Buffer.concat([Buffer.from(head), ext, key, out]);
 }
 
-/** Close frame payload: 2-byte code plus a UTF-8 reason (truncated to fit 125 bytes). */
 export function closePayload(code, reason = "") {
-  const r = Buffer.from(reason).subarray(0, 123);
+  const r = Buffer.from(reason, "utf8").subarray(0, 123);
   const b = Buffer.alloc(2 + r.length);
   b.writeUInt16BE(code);
   r.copy(b, 2);
   return b;
 }
 
-/**
- * Incremental frame parser. push(bytes) returns the complete frames found so far, each
- * { raw, fin, opcode, payload, message } where `message` is set on the frame that completes
- * a (possibly fragmented) data message: { opcode, data }. Partial frames stay buffered.
- */
-export function createFrameParser({ maxMessageBytes = 16 * 1024 * 1024 } = {}) {
-  let buf = Buffer.alloc(0);
-  let fragOpcode = null, frags = [], fragSize = 0;
-  let corrupt = false;
-  const push = (bytes) => {
-    if (corrupt) return [];
-    buf = buf.length ? Buffer.concat([buf, bytes]) : Buffer.from(bytes);
-    const frames = [];
-    for (;;) {
-      if (buf.length < 2) break;
-      const b0 = buf[0], b1 = buf[1];
-      let len = b1 & 0x7f, off = 2;
-      if (len === 126) { if (buf.length < 4) break; len = buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) {
-        if (buf.length < 10) break;
-        const big = buf.readBigUInt64BE(2);
-        if (big > BigInt(maxMessageBytes)) { corrupt = true; break; }
-        len = Number(big); off = 10;
-      }
-      const masked = (b1 & 0x80) !== 0;
-      const keyOff = off;
-      if (masked) off += 4;
-      if (buf.length < off + len) break;
-      const raw = buf.subarray(0, off + len);
-      let payload = Buffer.from(buf.subarray(off, off + len));
-      if (masked) { const key = buf.subarray(keyOff, keyOff + 4); for (let i = 0; i < payload.length; i++) payload[i] ^= key[i & 3]; }
-      buf = buf.subarray(off + len);
-      const fin = (b0 & 0x80) !== 0, opcode = b0 & 0x0f;
-      const frame = { raw: Buffer.from(raw), fin, opcode, payload };
-      if (opcode === 0x1 || opcode === 0x2 || opcode === 0x0) {
-        if (opcode !== 0x0) { fragOpcode = opcode; frags = []; fragSize = 0; }
-        if (fragOpcode !== null) {
-          frags.push(payload);
-          fragSize += payload.length;
-          // #295: the overflowing frame is never surfaced (no message, nothing to forward).
-          if (fragSize > maxMessageBytes) { corrupt = true; frags = []; break; }
-          if (fin) { frame.message = { opcode: fragOpcode, data: Buffer.concat(frags) }; fragOpcode = null; frags = []; fragSize = 0; }
-        }
-      }
-      frames.push(frame);
-    }
-    return frames;
-  };
-  return { push, get corrupt() { return corrupt; }, get pending() { return buf.length; }, get buffered() { return Buffer.from(buf); } };
+export function costcapErrorEvent(code, message) {
+  return JSON.stringify({ type: "error", error: { type: "costcap", code, ...(message && { message }) } });
 }
 
-/**
- * Realtime usage (response.done `response.usage`) -> the proxy's usage shape. Realtime uses
- * input_token_details / output_token_details (singular "token") with a cached_tokens_details
- * split. Returns null when the required counters are missing.
- */
-export function realtimeUsage(u) {
-  if (!u || typeof u !== "object" || !isCount(u.input_tokens) || !isCount(u.output_tokens)) return null;
-  const n = (v) => (isCount(v) ? v : 0);
-  const itd = u.input_token_details && typeof u.input_token_details === "object" ? u.input_token_details : {};
-  const otd = u.output_token_details && typeof u.output_token_details === "object" ? u.output_token_details : {};
-  const cached = Math.min(n(itd.cached_tokens), u.input_tokens);
-  const ctd = itd.cached_tokens_details && typeof itd.cached_tokens_details === "object" ? itd.cached_tokens_details : null;
-  const cAudio = ctd ? n(ctd.audio_tokens) : 0, cImage = ctd ? n(ctd.image_tokens) : 0;
-  const cachedSlice = { text: Math.max(0, cached - cAudio - cImage), image: cImage, audio: cAudio, video: 0 };
-  const iAudio = n(itd.audio_tokens), iImage = n(itd.image_tokens);
-  const allSlice = { text: Math.max(0, u.input_tokens - iAudio - iImage), image: iImage, audio: iAudio, video: 0 };
-  const input = Object.fromEntries(Object.keys(allSlice).map((k) => [k, Math.max(0, allSlice[k] - cachedSlice[k])]));
-  const oAudio = n(otd.audio_tokens);
-  const output = { text: Math.max(0, u.output_tokens - oAudio), image: 0, audio: oAudio, video: 0 };
-  const usage = { input_tokens: u.input_tokens - cached, cached_input_tokens: cached, output_tokens: u.output_tokens };
-  const nonText = (s) => s.image + s.audio + s.video;
-  if (nonText(input) + nonText(cachedSlice) + nonText(output) > 0) usage.modality_tokens = { input, cached_input: cachedSlice, output };
-  return usage;
+// Headers forwarded to the upstream handshake: x-costcap-* and Sec-WebSocket-Extensions
+// are stripped (no permessage-deflate, so the tap can read frames); Host is the upstream's.
+export function upstreamHandshakeHeaders(headers, host) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (key.startsWith("x-costcap-") || key === "sec-websocket-extensions" || key === "host" || key === "content-length") continue;
+    out[key] = v;
+  }
+  out.host = host;
+  return out;
 }
 
-/** Writes a plain HTTP JSON response on a raw upgrade socket and closes it. */
-export function writeHttpJson(socket, status, body, headers = {}) {
+// Raw HTTP response on a socket that never upgraded (refusals, 501, upstream rejections).
+export function writeHttpResponse(socket, status, body, headers = {}) {
   if (socket.destroyed) return;
-  const text = JSON.stringify(body);
+  const text = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+  const data = Buffer.isBuffer(text) ? text : Buffer.from(text);
   const reason = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 429: "Too Many Requests", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable" }[status] ?? "Error";
-  const extra = Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join("");
-  socket.end(`HTTP/1.1 ${status} ${reason}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(text)}\r\nconnection: close\r\n${extra}\r\n${text}`);
+  const all = { "content-type": "application/json", ...headers, "content-length": String(data.length), connection: "close" };
+  const lines = [`HTTP/1.1 ${status} ${reason}`, ...Object.entries(all).map(([k, v]) => `${k}: ${v}`), "", ""];
+  socket.end(Buffer.concat([Buffer.from(lines.join("\r\n")), data]));
 }

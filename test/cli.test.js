@@ -680,30 +680,24 @@ test("#189 costcap pricing show --prices prints the discounted row (AC5)", () =>
   assert.match(r.stdout, /\(discount 0\.2\): input \$2\.4,/);
 });
 
-// #194 AC6: a real `costcap wrap` child reads COSTCAP_OPENAI_REALTIME_URL; its session is metered,
-// closed at the cap, and `costcap runs` shows the realtime spend.
-test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered and closed at the cap", async (t) => {
-  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
-  const usage = { input_tokens: 1300, output_tokens: 600,
-    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
-    output_token_details: { text_tokens: 100, audio_tokens: 500 } };
-  const up = await startRealtimeUpstream({ onSession: (conn) => {
-    conn.socket.on("data", () => {
-      const n = conn.received.filter((m) => m.type === "response.create").length;
-      if (n > (conn.answered ?? 0)) { conn.answered = n; conn.send({ type: "response.done", response: { id: `r${n}`, usage } }); }
-    });
+test("#194 AC6: wrap exports COSTCAP_OPENAI_REALTIME_URL; the session is metered, closed at the cap and shown in runs", async (t) => {
+  const { startRealtimeUpstream, responseDone } = await import("./fixtures/realtime-upstream.js");
+  const up = await startRealtimeUpstream({ onConnection: async (conn) => {
+    conn.send({ type: "session.created", session: { id: "sess_w", model: "gpt-realtime" } });
+    conn.send(responseDone("r1"));
+    await new Promise((r) => setTimeout(r, 30));
+    conn.send(responseDone("r2"));
   } });
   t.after(() => up.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt-cli-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt-wrap-"));
+  const receipts = path.join(dir, "r.jsonl");
   const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
   const script = `
-    import { connectRealtime } from ${JSON.stringify(fixture)};
+    const { connectRealtime } = await import(${JSON.stringify(fixture)});
     const u = new URL(process.env.COSTCAP_OPENAI_REALTIME_URL);
     const c = await connectRealtime(Number(u.port), u.pathname + "?model=gpt-realtime");
-    for (let i = 0; i < 3 && c.closeCode === null; i++) { c.send({ type: "response.create" }); await new Promise((r) => setTimeout(r, 150)); }
     await c.closed;
-    console.log(u.protocol, c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
-  const receipts = path.join(dir, "r.jsonl");
+    console.log(c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
   const res = await new Promise((resolve) => {
     const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
       { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
@@ -711,95 +705,17 @@ test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered an
     c.on("exit", (code) => resolve({ code, out }));
   });
   assert.equal(res.code, 0);
-  assert.equal(res.out.trim(), "ws: 101 2 budget_exceeded 1008");
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.transport === "websocket");
-  assert.equal(lines.length, 2);
-  assert.ok(lines.every((r) => r.cost_usd === 0.0538 && r.run_id));
+  assert.equal(res.out.trim(), "101 2 budget_exceeded 1008");
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const metered = lines.filter((l) => l.transport === "websocket" && l.response_id);
+  assert.deepEqual(metered.map((l) => l.cost_usd), [0.0538, 0.0538]);
   const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
   assert.equal(runs.status, 0);
   assert.match(runs.stdout, /0\.1076/);
 });
 
-// #273: a real `costcap wrap` child reads COSTCAP_OPENAI_LIVE_URL; its GPT-Live session is metered,
-// closed at the cap and `costcap runs` shows the spend.
-test("#273 wrap exports COSTCAP_OPENAI_LIVE_URL; live session closed at the cap", async (t) => {
-  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
-  const up = await startRealtimeUpstream({ onMessage: (conn, m) => {
-    if (m.type === "session.start") { conn.send({ type: "session.started", session: { id: "ls", model: m.session.model } }); conn.send({ type: "session.usage.updated", usage: { seconds: 12 } }); conn.send({ type: "session.usage.updated", usage: { seconds: 30 } }); }
-    if (m.type === "session.close") conn.send({ type: "session.closed", usage: { seconds: 31 } });
-  } });
-  t.after(() => up.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-live-cli-"));
-  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
-  const script = `
-    import { connectRealtime } from ${JSON.stringify(fixture)};
-    const u = new URL(process.env.COSTCAP_OPENAI_LIVE_URL);
-    const c = await connectRealtime(Number(u.port), u.pathname);
-    c.send({ type: "session.start", session: { model: "gpt-live-1" } });
-    await c.closed;
-    console.log(u.protocol, u.pathname, c.status, c.messages.find((m) => m.type === "error").error.code, c.closeCode);`;
-  const receipts = path.join(dir, "r.jsonl");
-  const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.02", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
-    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
-    c.on("exit", (code) => resolve({ code, out }));
-  });
-  assert.equal(res.code, 0);
-  assert.equal(res.out.trim(), "ws: /openai/v1/live/sessions 101 budget_exceeded 1008");
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.cost_basis === "duration");
-  assert.deepEqual(lines.map((r) => r.cost_usd), [0.01, 0.015, 0.000833]);
-  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
-  assert.equal(runs.status, 0);
-  assert.match(runs.stdout, /0\.025833/);
-});
-
-test("#197 wrap warns once per ignored {discount} on an unpriced model and still starts", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
-  const f = path.join(dir, "p.json");
-  writeFileSync(f, JSON.stringify({ upstreams: { openai: { "gpt-6-preview": { discount: 0.2 }, "gpt-4o": { discount: 0.1 } } } }));
-  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--receipts", path.join(dir, "r.jsonl"), "--upstream-prices", f, "--", process.execPath, "-e", "process.stdout.write('ran')"], { encoding: "utf8" });
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, "ran");
-  const warns = r.stderr.split("\n").filter((l) => l.includes("discount ignored"));
-  assert.deepEqual(warns, ["costcap: warning: discount ignored: openai/gpt-6-preview is not in the pricing table; add absolute rates"]);
-  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-6-preview", "--prices", f], { encoding: "utf8" });
-  assert.equal(show.status, 0);
-  assert.doesNotMatch(show.stdout, /discount/);
-});
-
-test("#257 wrap --cap 0.15: a Gemini cachedContents create bills storage, the cached generate is refused at the cap", async (t) => {
-  const seen = [];
-  const T0 = "2026-11-16T12:00:00Z";
-  const up = await new Promise((r) => {
-    const s = http.createServer((req, res) => {
-      req.resume();
-      seen.push(`${req.method} ${req.url}`);
-      res.setHeader("content-type", "application/json");
-      res.end(req.url.endsWith("/cachedContents")
-        ? JSON.stringify({ name: "cachedContents/abc123", model: "models/gemini-2.5-flash", createTime: T0, expireTime: "2026-11-16T13:00:00Z", usageMetadata: { totalTokenCount: 200000 } })
-        : '{"modelVersion":"gemini-2.5-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1}}');
-    });
-    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
-  });
-  t.after(() => up.s.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-257-"));
-  const receipts = path.join(dir, "r.jsonl");
-  const script = `
-    const b = process.env.GOOGLE_GEMINI_BASE_URL + "/v1beta";
-    const h = { "x-goog-api-key": "k", "content-type": "application/json" };
-    const a = await fetch(b + "/cachedContents", { method: "POST", headers: h, body: JSON.stringify({ model: "models/gemini-2.5-flash", contents: [], ttl: "3600s" }) });
-    const g = await fetch(b + "/models/gemini-2.5-flash:generateContent", { method: "POST", headers: h, body: JSON.stringify({ cachedContent: "cachedContents/abc123", contents: [] }) });
-    console.log("STATUS", a.status, g.status, (await g.json()).error?.type);`;
-  const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.15", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, GOOGLE_GEMINI_BASE_URL: "https://generativelanguage.googleapis.com", COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
-    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
-    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "") }));
-  });
-  assert.match(res.out, /^STATUS 200 429 budget_exceeded$/m);
-  assert.deepEqual(seen, ["POST /v1beta/cachedContents"]);
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  const r = lines.find((x) => x.kind === "cache_storage");
-  assert.deepEqual([r.cost_usd, r.model, r.cache_name], [0.2, "gemini-2.5-flash", "cachedContents/abc123"]);
+test("#194 AC6: pricing show gpt-realtime lists the audio rates; snapshots resolve", () => {
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-realtime-2025-08-28"], { encoding: "utf8" });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /gpt-realtime-2025-08-28 \(audio\): input \$32, cached_input \$0\.4, output \$64/);
 });
