@@ -45,7 +45,7 @@ test("fleet client: preflightRemaining from the cached enrollment, minus unsynce
     team: { name: "ops", caps: { day: 50 }, spent: { day: 40, month: 40 }, unknown: 0, as_of: today } }), { mode: 0o600 });
   writeFileSync(receiptsPath, [JSON.stringify({ id: "s1", ts: today, cost_usd: 5 }), JSON.stringify({ id: "u1", ts: today, cost_usd: 0.5 })].join("\n") + "\n");
   const r = createFleetClient({ path, receiptsPath }).preflightRemaining();
-  assert.deepEqual(r, { agent: { day: 0.5, month: null }, team: { day: 9.5, month: null }, teamName: "ops", org: null });
+  assert.deepEqual(r, { agent: { day: 0.5, month: null }, team: { day: 9.5, month: null }, teamName: "ops", agentCaps: { day: 10 }, teamCaps: { day: 50 } });
   const bare = join(dir, "bare.json");
   writeFileSync(bare, JSON.stringify({ url: "http://127.0.0.1:9", token: "t", agentId: "a1", policy: { version: 1, caps: {}, killed: false }, syncedIds: [] }), { mode: 0o600 });
   assert.equal(createFleetClient({ path: bare, receiptsPath }).preflightRemaining(), null);

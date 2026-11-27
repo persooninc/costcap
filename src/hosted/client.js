@@ -182,7 +182,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs, data.budgetPeriod) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs, data.budgetPeriod) : null,
         teamName: data.team?.name ?? null,
-        org: orgLeft(data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null, cachedOrgTotalRemaining(data.orgTotal ?? null, pending)),
+        // #207: the caps behind those remainders, for the downgrade trigger.
+        agentCaps: data.agentSpend ? policy(nowMs).caps : null,
+        teamCaps: data.team?.caps ?? null,
       };
     },
     // #244 (#268: plus week rules from model_caps_week): hosted modelCaps against the agent's fleet-wide per-model

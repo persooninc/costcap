@@ -1098,7 +1098,19 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const reason = fleetReason(body.reason, false);
           // maxSteps: omitted keeps the current value, null clears it.
           const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
+          // silentAfterHours (issue #134): omitted keeps, null resets to the 6h default, 0 turns silence alerts off.
+          const silentAfterHours = body.silentAfterHours === undefined ? a.policy.silentAfterHours : body.silentAfterHours;
+          // models (issue #153): omitted keeps the allowlist, null clears it.
+          const models = body.models === undefined ? a.policy.models : body.models;
+          // warnFractions (issue #165): omitted keeps, null resets to the [0.8] default, [] turns cap_approaching off.
+          const rawWarn = body.warnFractions === undefined ? a.policy.warnFractions : body.warnFractions;
+          const warnFractions = Array.isArray(rawWarn) && rawWarn.every((f) => typeof f === "number") ? sortWarnFractions(rawWarn) : rawWarn;
+          // rpm/tpm (issue #192): omitted keeps the current value, null clears it.
+          const rpm = body.rpm === undefined ? a.policy.rpm : body.rpm;
+          const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
+          // downgrade (issue #207): omitted keeps, null clears.
+          const downgrade = body.downgrade === undefined ? a.policy.downgrade : body.downgrade;
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }), ...(prev.downgrade != null && { downgrade: prev.downgrade }) };

@@ -12,10 +12,12 @@ import { dirname } from "node:path";
 import { receiptPath } from "./receipt-path.js";
 import { mergeTags, parseTagHeader, TAG_HEADER } from "./tags.js";
 import { randomUUID } from "node:crypto";
-import { batchMultiplier, costForUsage, isPricedModel, premiumTier } from "./pricing.js";
-import { budgetExceededBody, loadLedgerLines } from "./cap.js";
-import { anthropicBatchModels, anthropicResultsBatchId, batchCreateProvider, batchSettlement, createBatchIndex,
-  foldBatchResults, openaiBatchGetId, openaiFileContentId, pendingFromCreate } from "./batch.js";
+import { costForUsage, isPricedModel, lookupPrice, regionalMultiplier, scalePrice } from "./pricing.js";
+import { budgetExceededBody, isLowerBound } from "./cap.js";
+import { tagBudgetExceededBody } from "./tag-cap.js";
+import { budgetRemaining } from "./agent-budget.js";
+import { warningLine } from "./cap-warn.js";
+import { DOWNGRADE_HEADER, downgradeLine, downgradeTrigger, rewriteModel } from "./downgrade.js";
 import { createSpiralDetector } from "./spiral.js";
 import { preflightCheck, preflightBody } from "./preflight.js";
 
@@ -664,8 +666,12 @@ export function createUsageChunkFilter() {
   };
 }
 
-export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, onSettlement, cap,
-  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES } = {}) {
+function batchIdOf(raw) {
+  try { const b = JSON.parse(raw.toString("utf8")); return typeof b?.id === "string" && /^[A-Za-z0-9_-]+$/.test(b.id) ? b.id : null; } catch { return null; }
+}
+
+export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onReceipt, cap,
+  spiral = createSpiralDetector(), velocity, allowedModels, unknownModels = "fallback", killCheck, who = {}, agentBudgets, teamCheck, sharedLedger, capWarner, onWarning = (line) => console.error(line), preflight = false, timeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS, streamIdleMs = DEFAULT_STREAM_IDLE_MS, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, tags: wrapperTags = null, cache = null, customUpstreams = {}, userPrices = null, cloudEnv = process.env, tagCaps = null, rateLimit = null, fleetRemaining = null, downgrade = null, downgradeNotifier = null } = {}) {
   if (receiptsPath) mkdirSync(dirname(receiptsPath), { recursive: true });
   let queue = Promise.resolve();
   let accountingFailure = null;
@@ -708,12 +714,32 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     cap.record(receipt);
     queueWarnings();
   };
-  // #181: level-based, so spend that moved past a fraction by another path
-  // (settlement, sibling receipt, cap change) still warns once.
-  const queueWarnings = () => {
-    if (!cap || !capWarner) return;
-    const spend = cap.spend();
-    pendingWarnings.push(...capWarner.sync({ caps: cap.limits(), spend, lowerBound: spend.unknown > 0 }));
+  // #207: every cap whose spend can trigger a downgrade. Spend excludes unknown cost (a lower bound).
+  const downgradeSources = () => {
+    const out = [];
+    if (cap) out.push({ kind: "local", caps: cap.limits(), spend: cap.spend() });
+    if (agentBudgets?.limitsFor) {
+      const own = agentBudgets.limitsFor(who.agent_id ?? "unknown");
+      if (own) out.push({ kind: "agent", caps: own, spend: agentBudgets.spend(who) });
+      const team = agentBudgets.teamFor?.(who.agent_id ?? "unknown");
+      if (team) out.push({ kind: "team", caps: team, spend: agentBudgets.teamSpend(who) });
+    }
+    const fr = fleetRemaining?.();
+    for (const [kind, left, caps] of [["fleet_agent", fr?.agent, fr?.agentCaps], ["fleet_team", fr?.team, fr?.teamCaps]]) {
+      if (!left || !caps) continue;
+      const spend = {};
+      for (const sc of ["day", "month"]) if (caps[sc] != null && left[sc] != null) spend[sc] = Math.max(0, caps[sc] - left[sc]);
+      out.push({ kind, caps: { day: caps.day, month: caps.month }, spend });
+    }
+    return out;
+  };
+  const flushWarnings = () => {
+    const evs = pendingWarnings;
+    pendingWarnings = [];
+    for (const ev of evs) {
+      const done = emitEvent(ev);
+      try { onWarning(warningLine(done)); } catch { /* stderr is best effort */ }
+    }
   };
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -756,7 +782,9 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     // #188: cloud routes are never served from the response cache.
     const cacheBypass = cloud || String(req.headers[CACHE_HEADER] ?? "").toLowerCase() === "bypass";
     delete req.headers[CACHE_HEADER];
-    const emit = (receipt) => emitBase(reqTags ? { ...receipt, tags: reqTags } : receipt, reqAt);
+    // #207: set once a request's model was downgraded (or could not be); stamped on its receipt.
+    let dgFields = null;
+    const emit = (receipt) => emitBase(reqTags || dgFields ? { ...receipt, ...(dgFields ?? {}), ...(reqTags ? { tags: reqTags } : {}) } : receipt);
     if (tagError) {
       reqTags = wrapperTags && Object.keys(wrapperTags).length ? wrapperTags : null;
       req.resume();
@@ -811,6 +839,24 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
         // #207: receipt fields when a budget-triggered downgrade applies (or cannot on this route).
         let downgradeInfo = null;
         const verdict = guarded(() => {
+          // #207: past the downgrade fraction, rewrite FROM -> TO before every check, so the
+          // allowlist, --unknown-models, preflight, tag caps and the cache key all see TO.
+          const dg = downgrade?.();
+          if (dg && requestedModel && Object.hasOwn(dg.map, requestedModel) && !["GET", "HEAD"].includes(req.method)) {
+            const trigger = downgradeTrigger({ at: dg.at, sources: downgradeSources() });
+            if (trigger) {
+              const rw = rewriteModel({ provider, body, parsed: parsedBody, model: requestedModel, map: dg.map,
+                route: { batch: !!batchCreate, audio: !!audio, realtime: false } });
+              if (rw?.unsupported) dgFields = { downgrade: "unsupported_route" };
+              else if (rw) {
+                body = rw.body; parsedBody = rw.parsed; requestedModel = rw.to;
+                dgFields = { requested_model: rw.from, downgrade: { scope: trigger.scope, fraction: trigger.fraction, ...(trigger.kind !== "local" && { source: trigger.kind }) } };
+                res.setHeader(DOWNGRADE_HEADER, `${rw.from}->${rw.to}`);
+                const ev = downgradeNotifier?.observe(trigger, { from: rw.from, to: rw.to });
+                if (ev) { const done = emitEvent(ev); try { onWarning(downgradeLine(done)); } catch { /* stderr is best effort */ } }
+              }
+            }
+          }
           const killed = killCheck?.();
           if (killed) return block("killed", killed, { error: "killed", ...killed });
           const accountingFailure = accountingFailureNow();

@@ -755,6 +755,35 @@ Each enrolled wrapper gets its team's caps and the team's synced spend with ever
 
 **Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
 
+## Rate limits
+
+Cap how fast a wrapped agent may call the model, independent of dollars:
+
+```sh
+node src/cli.js wrap --rpm 60 --tpm 200000 -- node your-agent.js
+```
+
+- **Where:** `--rpm N` / `--tpm N` (positive integers), `rpm`/`tpm` on `default` or an agent in a `--policy` file, or "Requests/min" / "Tokens/min" on the dashboard agent card (`rpm`/`tpm` on `POST /v1/agents/:id/policy`, audited as `policy.change`). The minimum of all three applies, so a local value can tighten a fleet value but never loosen it. The cached fleet value is enforced offline.
+- **Window:** rolling 60 s, per wrapper process (not shared across `--shared-ledger` wrappers or the fleet).
+- **RPM** counts requests admitted to the upstream; the slot is reserved before forwarding, so a concurrent burst cannot overshoot. GET/HEAD, cache hits and calls CostCap refuses do not count. A call the provider rejects (including its own 429) does count.
+- **TPM** adds the metered tokens (input + cached input + cache writes + output) when a call completes. It is checked before each call, so one in-flight call can overshoot it. Unknown usage adds 0 tokens.
+- **Refusal:** CostCap never queues. It returns `429` with `Retry-After` (seconds, at least 1) and `{error:{type:"rate_limited", source:"costcap", limit:"rpm"|"tpm", limit_value, observed, window_s:60, retry_after_s, message}}`, which the OpenAI and Anthropic SDKs retry. Each refusal writes a $0 `blocked:true, reason:"rate_limited"` receipt. It never latches and never counts toward `maxSteps`, velocity, spiral, caps or alerts.
+
+## Model downgrade
+
+Degrade, don't die: past a fraction of a cap, send a cheaper model instead of stopping at 100%.
+
+```sh
+node src/cli.js wrap --day-cap 20 --downgrade gpt-4o=gpt-4o-mini,claude-sonnet-4-5=claude-haiku-4-5 --downgrade-at 0.8 -- node your-agent.js
+```
+
+- **Trigger:** the first run/hour/day/month scope whose spend is at or above F (`--downgrade-at`, default 0.8) of its cap, from a local cap, a `--policy` agent or team budget, or an enrolled fleet agent/team cap. Unknown-cost receipts are left out of spend (a lower bound, never $0).
+- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes, streamed or not (stream usage injection still applies). Under F, requests are byte-identical. Gemini path models, Bedrock/Vertex, batches, multipart audio, Realtime and OpenRouter `models[]` pass through unchanged with receipt `downgrade: "unsupported_route"`.
+- **Checks use TO:** the allowlist, `--unknown-models refuse`, preflight, tag caps and the response-cache key. A disallowed or unpriced TO is refused, never sent as FROM. `wrap` exits 2 at start when a `--downgrade` TO has no published rate (or `--upstream-prices` row).
+- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction[, source]}`; the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line per source, scope and period (never spend). The run summary, rollup and `costcap runs` show `downgraded=N`.
+- **Never a loosening:** the hard stop at 100% still refuses; a downgrade never raises or bypasses a cap.
+- **Fleet:** `downgrade: {at?, map: {FROM: TO}}` on `POST /v1/agents/:id/policy` ("Downgrade models" / "Downgrade at (%)" on the agent card; `null` clears). A bad fraction, empty map or FROM equal to TO returns 400. An enrolled wrapper applies the cached fleet map offline; local `--downgrade` pairs add to it (a fleet pair wins on the same FROM) and a local `--downgrade-at` can lower `at`, never raise it.
+
 ## Soft warnings
 
 `wrap` and `check` warn before the hard stop. By default, a warning fires when run, day or month spend reaches 80% of its cap:

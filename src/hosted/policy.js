@@ -8,7 +8,7 @@
 
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
-import { downgradeError, mergeDowngrade } from "../downgrade.js";
+import { downgradeError } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 // Enrollment tokens are shown once. Only the SHA-256 hash is stored.
@@ -114,7 +114,7 @@ export function validatePolicy(p) {
   }
   if (p.maxSteps !== undefined && p.maxSteps !== null && !(Number.isInteger(p.maxSteps) && p.maxSteps > 0)) errors.push("maxSteps must be a positive integer");
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
-  // Budget-triggered model downgrade (issue #207): optional { at, map }.
+  // Budget-triggered model downgrade (issue #207): { at?, map }.
   const dgErr = downgradeError(p.downgrade);
   if (dgErr) errors.push(dgErr);
   const raiseErr = raiseError(p.raise);
@@ -148,5 +148,9 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   // Step budget (upstream calls per run): the tighter of fleet and local wins.
   const steps = [server?.maxSteps, local?.maxSteps].filter((v) => v != null);
   const maxSteps = steps.length ? Math.min(...steps) : null;
-  return { caps, maxSteps, killed: Boolean(server?.killed), version: server?.version ?? null, source };
+  // Model allowlists combine as an intersection (most restrictive wins, #153).
+  const models = intersectModels(server?.models ?? null, local?.models ?? null);
+  // #192: rate limits: the minimum wins, so local can tighten but never loosen.
+  const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
+  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), ...(server?.downgrade ? { downgrade: server.downgrade } : {}), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }

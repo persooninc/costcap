@@ -1,24 +1,31 @@
 // Budget-triggered model downgrade (#207): "degrade, don't die". Once the first
-// run/hour/day/month scope reaches a fraction `at` of its cap, a request whose JSON
-// `model` is a mapped FROM goes upstream as TO. Only the `model` field changes.
-// A downgrade never raises or bypasses a cap: the hard stop at 100% is unchanged.
-// Pure module except for the tracker's in-memory dedupe.
+// run/hour/day/month scope of any cap (local, --policy agent/team, enrolled fleet)
+// reaches a fraction F of its cap, a request for model FROM is forwarded as model TO.
+// Only the JSON `model` field changes. A downgrade never raises or bypasses a cap:
+// the hard stop at 100% is untouched, and TO goes through every model check.
+// Unknown-cost receipts are excluded from spend, so spend is a lower bound and never $0-padded.
+// Pure module: no proxy, CLI or hosted globals; config is injected.
+
+import { isCustomProvider } from "./upstreams.js";
 
 export const DEFAULT_DOWNGRADE_AT = 0.8;
 export const DOWNGRADE_HEADER = "x-costcap-model-downgraded";
 export const DOWNGRADE_SCOPES = Object.freeze(["run", "hour", "day", "month"]);
-const MAX_MAP = 50;
+export const MAX_DOWNGRADE_PAIRS = 50;
 
-const isId = (m) => typeof m === "string" && m.trim() !== "" && m === m.trim() && m.length <= 200;
+const MODEL_ID = /^[A-Za-z0-9._:/@-]{1,200}$/;
 
-/** "--downgrade FROM=TO[,FROM=TO]" -> { FROM: TO }. Throws on anything invalid. */
-export function parseDowngradeMap(v, into = {}) {
-  const out = { ...into };
-  for (const part of String(v).split(",")) {
-    const [from, to, extra] = part.split("=").map((s) => s.trim());
-    if (extra !== undefined || !isId(from) || !isId(to)) throw new Error(`--downgrade needs FROM=TO[,FROM=TO], got "${v}"`);
+/** "FROM=TO[,FROM=TO]" -> { FROM: TO }. FROM==TO, duplicates and empty ids are errors. */
+export function parseDowngradeMap(v) {
+  const out = {};
+  const parts = String(v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) throw new Error(`--downgrade needs FROM=TO[,FROM=TO], got "${v}"`);
+  for (const p of parts) {
+    const i = p.indexOf("=");
+    const from = i > 0 ? p.slice(0, i).trim() : "", to = i > 0 ? p.slice(i + 1).trim() : "";
+    if (!MODEL_ID.test(from) || !MODEL_ID.test(to)) throw new Error(`--downgrade needs FROM=TO model ids, got "${p}"`);
     if (from === to) throw new Error(`--downgrade maps ${from} to itself`);
-    if (Object.hasOwn(out, from) && out[from] !== to) throw new Error(`--downgrade maps ${from} twice`);
+    if (Object.hasOwn(out, from)) throw new Error(`--downgrade has a duplicate FROM ${from}`);
     out[from] = to;
   }
   return out;
@@ -31,94 +38,98 @@ export function parseDowngradeAt(v) {
   return n;
 }
 
-/** Fleet policy `downgrade: { at, map }` validation. Returns an error string or null. */
+/** Hosted policy field `downgrade: { at?, map }`; returns an error string or null. */
 export function downgradeError(d) {
   if (d === undefined || d === null) return null;
-  if (typeof d !== "object" || Array.isArray(d)) return "downgrade must be an object { at, map }";
-  for (const k of Object.keys(d)) if (k !== "at" && k !== "map") return `downgrade.${k} is not allowed`;
-  if (!(typeof d.at === "number" && Number.isFinite(d.at) && d.at > 0 && d.at < 1)) return "downgrade.at must be a number between 0 and 1 (exclusive)";
-  const m = d.map;
-  if (!m || typeof m !== "object" || Array.isArray(m)) return "downgrade.map must be an object of FROM: TO model ids";
-  const entries = Object.entries(m);
-  if (!entries.length || entries.length > MAX_MAP) return `downgrade.map needs 1 to ${MAX_MAP} entries`;
-  for (const [from, to] of entries) {
-    if (!isId(from) || !isId(to)) return "downgrade.map keys and values must be model ids";
+  if (typeof d !== "object" || Array.isArray(d)) return "downgrade must be an object";
+  for (const k of Object.keys(d)) if (k !== "at" && k !== "map") return `downgrade.${k} is not a field`;
+  if (d.at !== undefined && !(typeof d.at === "number" && Number.isFinite(d.at) && d.at > 0 && d.at < 1)) return "downgrade.at must be a fraction between 0 and 1";
+  if (!d.map || typeof d.map !== "object" || Array.isArray(d.map)) return "downgrade.map must be an object of FROM: TO";
+  const pairs = Object.entries(d.map);
+  if (!pairs.length) return "downgrade.map must not be empty";
+  if (pairs.length > MAX_DOWNGRADE_PAIRS) return `downgrade.map has more than ${MAX_DOWNGRADE_PAIRS} entries`;
+  for (const [from, to] of pairs) {
+    if (!MODEL_ID.test(from) || typeof to !== "string" || !MODEL_ID.test(to)) return "downgrade.map entries must be model ids";
     if (from === to) return `downgrade.map maps ${from} to itself`;
   }
   return null;
 }
 
 /**
- * Fleet + local merge: local settings can only add or tighten. `at` is the lower
- * (earlier) fraction; maps are unioned and the fleet target wins on a clash.
+ * Effective downgrade from the fleet (server) setting and local flags. Local can only add
+ * pairs or tighten: `at` is the lower of the two, and a fleet pair wins over a local one.
  */
 export function mergeDowngrade(server, local) {
-  const parts = [server, local].filter((d) => d && d.map && Object.keys(d.map).length);
-  if (!parts.length) return null;
-  const at = Math.min(...parts.map((d) => d.at ?? DEFAULT_DOWNGRADE_AT));
-  return { at, map: { ...(local?.map ?? {}), ...(server?.map ?? {}) } };
+  const s = server && !downgradeError(server) ? server : null;
+  const l = local && local.map && Object.keys(local.map).length ? local : null;
+  if (!s && !l) return null;
+  const ats = [s ? s.at ?? DEFAULT_DOWNGRADE_AT : null, l ? l.at ?? DEFAULT_DOWNGRADE_AT : null].filter((x) => x != null);
+  // A local --downgrade-at without a local map still lowers the fleet threshold.
+  if (local?.at != null) ats.push(local.at);
+  return { at: Math.min(...ats), map: { ...(l?.map ?? {}), ...(s?.map ?? {}) } };
 }
 
 /**
- * First scope (in caller order) whose spend is at or above at * cap.
- * scopes: [{ scope, cap, spent }]. Returns { scope, fraction } or null.
+ * First scope (run, hour, day, month; sources in order within a scope) whose spend is at or
+ * above `at` of its cap. sources: [{ kind, caps: {scope: usd}, spend: {scope: usd} }].
  */
-export function triggerScope(scopes, at) {
-  for (const s of scopes ?? []) {
-    if (s == null || !(s.cap > 0) || typeof s.spent !== "number" || !Number.isFinite(s.spent)) continue;
-    if (s.spent >= s.cap * at) return { scope: s.scope, fraction: Number((s.spent / s.cap).toFixed(4)), cap: s.cap, spent_usd: Number(s.spent.toFixed(6)) };
+export function downgradeTrigger({ at, sources = [] }) {
+  if (!(at > 0)) return null;
+  for (const scope of DOWNGRADE_SCOPES) {
+    for (const src of sources) {
+      const cap = src?.caps?.[scope], spent = src?.spend?.[scope];
+      if (!(typeof cap === "number" && cap > 0) || typeof spent !== "number" || !Number.isFinite(spent)) continue;
+      if (spent >= cap * at) return { scope, kind: src.kind, cap, spent_usd: Number(spent.toFixed(6)), fraction: Number((spent / cap).toFixed(4)) };
+    }
   }
   return null;
 }
 
-/** Scopes from a cap engine: limits() + spend(). Optional prefix (e.g. "agent:"). */
-export function capScopes(limits = {}, spend = {}, prefix = "") {
-  return DOWNGRADE_SCOPES.filter((sc) => limits[sc] != null).map((sc) => ({ scope: `${prefix}${sc}`, cap: limits[sc], spent: spend[sc] ?? 0 }));
-}
-
-/** Scopes from caps + remaining (fleet-synced spend): spent = cap - remaining. */
-export function remainingScopes(caps = {}, remaining = {}, prefix = "") {
-  return DOWNGRADE_SCOPES.filter((sc) => caps?.[sc] != null && typeof remaining?.[sc] === "number")
-    .map((sc) => ({ scope: `${prefix}${sc}`, cap: caps[sc], spent: Math.max(0, caps[sc] - remaining[sc]) }));
-}
-
-/** Rewrites only the JSON `model`. Returns the new body Buffer, or null when it cannot. */
-export function rewriteModel(body, to) {
-  let parsed;
-  try { parsed = JSON.parse(body); } catch { return null; }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || typeof parsed.model !== "string") return null;
-  parsed.model = to;
-  return Buffer.from(JSON.stringify(parsed));
-}
-
-function periodOf(scope, runId, now) {
-  const base = scope.split(":").pop();
-  const iso = now.toISOString();
-  if (base === "run") return String(runId ?? "");
-  if (base === "hour") return iso.slice(0, 13);
-  if (base === "day") return iso.slice(0, 10);
-  return iso.slice(0, 7);
-}
+const REWRITE_PROVIDERS = new Set(["openai", "anthropic", "openrouter"]);
+export const isRewritableProvider = (provider) => REWRITE_PROVIDERS.has(provider) || isCustomProvider(provider);
 
 /**
- * Dedupe for the `model_downgrade` ledger line: one per (scope, period).
- * `events` are prior ledger events so a restarted wrapper does not repeat itself.
+ * Rewrites only the JSON `model` field. Returns null when the model is not mapped,
+ * { unsupported: true, from } when it is mapped but this route cannot be rewritten,
+ * else { body, parsed, from, to }.
  */
-export function createDowngradeTracker({ events = [], runId = null, agentId = null, now = () => new Date() } = {}) {
-  const seen = new Set();
-  for (const e of events) if (e?.event === "model_downgrade") seen.add(`${e.scope}|${e.period}`);
-  return {
-    // Returns the event to persist (not yet written), or null when already noted.
-    observe({ scope, fraction, cap, spent_usd }, from, to) {
-      const period = periodOf(scope, runId, now());
-      const k = `${scope}|${period}`;
-      if (seen.has(k)) return null;
-      seen.add(k);
-      return { event: "model_downgrade", scope, fraction, cap, spent_usd, period, from, to, run_id: runId, agent_id: agentId };
-    },
-  };
+export function rewriteModel({ provider, body, parsed, model, map, route = {} }) {
+  if (typeof model !== "string" || !map || !Object.hasOwn(map, model)) return null;
+  const to = map[model];
+  const unsupported = !isRewritableProvider(provider) || route.batch || route.audio || route.realtime
+    || !parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.model !== model
+    || (provider === "openrouter" && parsed.models !== undefined);
+  if (unsupported) return { unsupported: true, from: model };
+  const next = { ...parsed, model: to };
+  return { body: Buffer.from(JSON.stringify(next)), parsed: next, from: model, to };
 }
 
-export function downgradeLine({ scope, fraction, from, to }) {
-  return `costcap: ${scope} spend is ${Math.round(fraction * 100)}% of its cap; downgrading ${from} -> ${to}`;
+export function downgradePeriod(scope, { runId, now = new Date() } = {}) {
+  const iso = new Date(now).toISOString();
+  if (scope === "run") return String(runId ?? "");
+  if (scope === "hour") return iso.slice(0, 13);
+  if (scope === "day") return iso.slice(0, 10);
+  if (scope === "month") return iso.slice(0, 7);
+  throw new Error(`unknown scope ${scope}`);
+}
+
+export const downgradeLine = (ev) => `costcap: ${ev.kind} ${ev.scope} spend $${ev.spent_usd.toFixed(4)} is ${Math.round(ev.fraction * 100)}% of $${ev.cap} cap; downgrading ${ev.from} -> ${ev.to} (${ev.scope === "run" ? `run ${ev.period}` : `${ev.period} UTC`})`;
+
+/**
+ * One {"event":"model_downgrade"} ledger line per (kind, scope, period); rebuilt from prior
+ * ledger events so a second wrap in the same period stays quiet. Events are never spend.
+ */
+export function createDowngradeNotifier({ events = [], runId = null, agentId = null, now = () => new Date() } = {}) {
+  const key = (kind, scope, period) => `${kind}|${scope}|${period}`;
+  const seen = new Set();
+  for (const e of events) if (e?.event === "model_downgrade") seen.add(key(e.kind, e.scope, e.period));
+  return {
+    observe(trigger, { from, to }) {
+      const period = downgradePeriod(trigger.scope, { runId, now: now() });
+      const k = key(trigger.kind, trigger.scope, period);
+      if (seen.has(k)) return null;
+      seen.add(k);
+      return { event: "model_downgrade", kind: trigger.kind, scope: trigger.scope, fraction: trigger.fraction, cap: trigger.cap, spent_usd: trigger.spent_usd, from, to, period, run_id: runId, agent_id: agentId };
+    },
+  };
 }
