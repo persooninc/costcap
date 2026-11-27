@@ -25,15 +25,7 @@ import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, ret
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
 import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
-import { parseKinds, parseRoutes, dropTeamFromRoutes, dropEmailFromRoutes } from "./alert-routes.js";
-import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
-import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
-import { parseFleetTagCaps, fleetTagCapsPolicy, fleetTagCapsPayload, fleetTagTotalPolicy } from "./tag-caps.js";
-import { modelSpendPolicy, modelCapStatus, splitWeekModelCaps } from "./model-caps.js";
-import { normalizeModel } from "../model-cap.js";
-import { expiredReceiptKeys, isExpired, retentionCutoffMs, totalCapAgents, totalCapKeep, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
-import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
-import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy, legacyOrgBudgetPolicy, weekOrgBudgetPolicy, totalOrgBudgetPolicy } from "./org-budget.js";
+import { isApiKey, parseApiKeyInput, createApiKey, publicApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
 const token = () => randomBytes(32).toString("base64url");
 const ALERT_TEST_LIMIT = 5, ALERT_TEST_WINDOW_MS = 600_000;
@@ -280,20 +272,28 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     if (!user?.verified) fail(401, "Email verification required");
     return user;
   };
-  // Issue #203: a human route accepts a session or an org API key (`cck_`).
-  const member = (s, req) => { const raw = bearerApiKey(req); return raw ? apiKeyPrincipal(findApiKey(s, raw, now())) : sessionUser(s, req); };
-  const memberAdmin = (s, req) => { const u = member(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
-  // Key management, billing, members and enrollment stay session-only: a key never mints a key.
-  const sessionOnly = (req) => { if (bearerApiKey(req)) fail(403, "API keys cannot use this route"); };
+  const bearer = (req) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
   const agentUser = (s, req) => {
     if (bearerApiKey(req)) fail(401, "Agent credential invalid or revoked");
     const credential = (req.headers.authorization ?? "").replace(/^Bearer /, "");
+    // Issue #203: an org API key is never an agent credential.
+    if (isApiKey(credential)) fail(401, "Agent credential invalid or revoked");
     const hashed = hashToken(credential);
     const agent = Object.values(s.agents).find((a) => a.hash === hashed && !a.revoked);
     if (!agent) fail(401, "Agent credential invalid or revoked");
     return agent;
   };
   const admin = (s, req) => { const u = sessionUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
+  // Issue #203: routes that accept an org API key (`Authorization: Bearer cck_…`) as well as
+  // a session. An agent token or any other bearer falls through to the session check (401).
+  const memberUser = (s, req) => {
+    const raw = bearer(req);
+    if (!isApiKey(raw)) return sessionUser(s, req);
+    const k = findApiKey(s, raw, now(), hashToken);
+    if (!k || !s.orgs[k.orgId]) fail(401, "API key invalid, expired or revoked");
+    return apiKeyPrincipal(k);
+  };
+  const memberAdmin = (s, req) => { const u = memberUser(s, req); if (!["owner", "admin"].includes(u.role)) fail(403, "Admin role required"); return u; };
   const ownerOnly = (s, req) => { const u = sessionUser(s, req); if (u.role !== "owner") fail(403, "Workspace owner required"); return u; };
   const orgMembers = (s, orgId) => Object.values(s.users).filter((m) => m.orgId === orgId).map((m) => ({ id: m.id, email: m.email, role: m.role, verified: Boolean(m.verified) })).sort((a, b) => a.email.localeCompare(b.email));
   // Issue #123: org teams and their verdicts from synced receipts.
@@ -467,35 +467,42 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         });
         return json(200, { ok: true }, { "set-cookie": "costcap_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
       }
-      // Issue #203: a valid key records last use before the route runs (reads use a snapshot).
-      const rawKey = bearerApiKey(req);
-      if (rawKey) store.transaction((s) => { findApiKey(s, rawKey, now()).lastUsedAt = new Date(now()).toISOString(); });
-      if (path === "/v1/api-keys" && req.method === "GET") {
-        sessionOnly(req);
-        return json(200, store.read((s) => { const u = admin(s, req); return { keys: Object.values(s.apiKeys ?? {}).filter((k) => k.orgId === u.orgId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map((k) => maskApiKey(k, now())) }; }));
-      }
-      if (path === "/v1/api-keys" && req.method === "POST") {
-        sessionOnly(req);
-        const input = parseApiKeyInput(body, now());
-        const result = store.transaction((s) => {
-          const u = admin(s, req);
-          const { record, raw } = createApiKey(s, { orgId: u.orgId, createdBy: u.id, ...input }, now());
-          audit(s, u.orgId, u.id, "api_key.create", record.id, { name: record.name, role: record.role, expires_at: record.expiresAt });
-          return { ...maskApiKey(record, now()), key: raw };
-        });
-        return json(201, result);
+      // Issue #203: record last use of a live org API key (best effort, its own transaction).
+      if (isApiKey(bearer(req))) {
+        store.transaction((s) => { const k = findApiKey(s, bearer(req), now(), hashToken); if (k) k.last_used_at = new Date(now()).toISOString(); });
       }
       const keyRevoke = /^\/v1\/api-keys\/([^/]+)\/revoke$/.exec(path);
-      if (keyRevoke && req.method === "POST") {
-        sessionOnly(req);
-        const result = store.transaction((s) => {
+      if ((path === "/v1/api-keys" && ["GET", "POST"].includes(req.method)) || (keyRevoke && req.method === "POST")) {
+        // Keys are managed only from a signed-in session: a key can never create, list or revoke keys.
+        if (req.headers.authorization) fail(401, "API keys are managed from a signed-in session");
+        if (req.method === "GET") {
+          return json(200, store.read((s) => {
+            const u = admin(s, req);
+            return { keys: Object.values(s.apiKeys ?? {}).filter((k) => k.orgId === u.orgId).sort((a, b) => b.created_at.localeCompare(a.created_at)).map((k) => publicApiKey(k, now())) };
+          }));
+        }
+        if (keyRevoke) {
+          const id = decodeURIComponent(keyRevoke[1]);
+          return json(200, store.transaction((s) => {
+            const u = admin(s, req);
+            const k = Object.hasOwn(s.apiKeys ?? {}, id) ? s.apiKeys[id] : null;
+            if (!k || k.orgId !== u.orgId) fail(404, "API key not found");
+            if (!k.revoked_at) {
+              k.revoked_at = new Date(now()).toISOString();
+              audit(s, u.orgId, u.id, "api_key.revoke", `apikey:${k.id}`, { name: k.name, role: k.role });
+            }
+            return { key: publicApiKey(k, now()) };
+          }));
+        }
+        const input = parseApiKeyInput(body, now());
+        return json(201, store.transaction((s) => {
           const u = admin(s, req);
-          const k = (s.apiKeys ?? {})[decodeURIComponent(keyRevoke[1])];
-          if (!k || k.orgId !== u.orgId) fail(404, "API key not found");
-          if (!k.revokedAt) { k.revokedAt = new Date(now()).toISOString(); audit(s, u.orgId, u.id, "api_key.revoke", k.id, { name: k.name }); }
-          return maskApiKey(k, now());
-        });
-        return json(200, result);
+          const { raw, record } = createApiKey({ orgId: u.orgId, createdBy: u.id, ...input, nowMs: now(), hash: hashToken });
+          s.apiKeys ??= {};
+          s.apiKeys[record.id] = record;
+          audit(s, u.orgId, u.id, "api_key.create", `apikey:${record.id}`, { name: record.name, role: record.role, expires_at: record.expires_at });
+          return { ...publicApiKey(record, now()), secret: raw };
+        }));
       }
       if (path === "/v1/enrollment-tokens" && req.method === "POST") {
         sessionOnly(req);
@@ -560,7 +567,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
-          const u = member(s, req);
+          const u = memberUser(s, req);
           const orgAgents = new Set(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => a.id));
           const query = parseReceiptsQuery(new URL(req.url, origin).searchParams, orgAgents, parseAuditRange);
           const rows = visibleReceipts(s, u.orgId).map((item) => ({
@@ -592,7 +599,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/audit.csv" && req.method === "GET") {
         const csv = store.read((s) => {
-          const u = member(s, req);
+          const u = memberUser(s, req);
           const range = parseAuditRange(new URL(req.url, origin).searchParams);
           return auditCsv(labelAudit(s, u.orgId, s.audit), range);
         });
@@ -605,8 +612,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/evidence.json" && req.method === "GET") {
         return json(200, store.read((s) => {
-          const u = member(s, req);
-          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now(), orgPeriod(s, u.orgId)),
+          const u = memberUser(s, req);
+          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
             agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
             receipts: visibleReceipts(s, u.orgId),
             alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
@@ -616,8 +623,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/spend" && req.method === "GET") {
         return json(200, store.read((s) => {
-          const u = member(s, req);
-          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { budgetPeriod: orgPeriod(s, u.orgId), now: now() });
+          const u = memberUser(s, req);
+          const query = parseSpendQuery(new URL(req.url, origin).searchParams);
           const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
           return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId), now: now() });
         }));
@@ -1130,7 +1137,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         if (!ALERT_STATUSES.includes(status)) fail(400, "status must be active, acknowledged, resolved or all");
         const range = parseAuditRange(params);
         return json(200, store.read((s) => {
-          const u = member(s, req);
+          const u = memberUser(s, req);
           return { alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId), { status, ...range }) };
         }));
       }

@@ -1127,7 +1127,25 @@ scrape_configs:
 
 ### Fleet freeze (kill switch)
 
-`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin [API key](#org-api-keys), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
+`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin org API key (see below), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
+
+### Org API keys (#203)
+
+Owners and admins create revocable bearer keys for CI, incident tooling and BI from the dashboard "API keys" card or the API (signed-in session only):
+
+- `POST /v1/api-keys` `{ "name": "pagerduty", "role": "viewer" | "admin", "expires_at"?: "<ISO time>" }` returns the full `cck_…` key once (`secret`). Only its SHA-256 hash is stored.
+- `GET /v1/api-keys` lists keys masked (`cck_…` + last 4) with `status` (active, expired, revoked) and `last_used_at`.
+- `POST /v1/api-keys/:id/revoke` revokes a key at once.
+
+Send `Authorization: Bearer cck_…` (no `Origin` header needed). A viewer key reads `/v1/spend`, `/v1/receipts.csv`, `/v1/audit.csv`, `/v1/evidence.json` and `/v1/alerts`. An admin key can also `POST /v1/fleet/freeze|resume`, agent policy/revoke, alert ack and receipt settle. Actions taken with a key are audited with actor `apikey:<id>` (label `api-key:<name>`); `api_key.create` and `api_key.revoke` are audited too. A key never manages keys, members, invitations or billing, never reads `/v1/fleet`, and is never accepted as an agent token; agent tokens stay rejected on human routes. Unknown, expired, revoked and other-org keys get 401 (or 404 for another org's resources).
+
+Turn a #199 alert webhook into an automatic freeze:
+
+```sh
+curl -sX POST https://app.costcap.dev/v1/fleet/freeze -H "Authorization: Bearer $COSTCAP_API_KEY" \
+  -H 'content-type: application/json' -d '{"reason":"cap_hit webhook"}'
+```
+
 
 ### Time-boxed cap raise requests
 
