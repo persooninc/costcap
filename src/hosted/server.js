@@ -24,7 +24,8 @@ import { scrubReceiptPath } from "../receipt-path.js";
 import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
 import { onboardingState } from "./onboarding.js";
 import { hostedAgentVerdict } from "./agent-verdict.js";
-import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook, MAX_ALERT_ROUTES, pagerDutyProblem, teamsWebhookProblem, discordWebhookProblem, maskRoutingKey, maskTeamsWebhook, maskDiscordWebhook } from "./delivery.js";
+import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook } from "./delivery.js";
+import { parseKinds, parseRoutes, dropTeamFromRoutes, dropEmailFromRoutes } from "./alert-routes.js";
 import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
 import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
 import { parseFleetTagCaps, fleetTagCapsPolicy, fleetTagCapsPayload, fleetTagTotalPolicy } from "./tag-caps.js";
@@ -725,7 +726,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           for (const [key, session] of Object.entries(s.sessions)) if (session.userId === target.id) delete s.sessions[key];
           const org = s.orgs[actor.orgId];
           if (org?.alertSettings?.emails?.includes(target.email)) org.alertSettings = { ...org.alertSettings, emails: org.alertSettings.emails.filter((e) => e !== target.email) };
-          if (org?.alertSettings?.routes?.some((r) => r.emails?.includes(target.email))) org.alertSettings = { ...org.alertSettings, routes: org.alertSettings.routes.map((r) => ({ ...r, emails: (r.emails ?? []).filter((e) => e !== target.email) })) };
+          if (org?.alertSettings?.routes?.length) org.alertSettings = { ...org.alertSettings, routes: dropEmailFromRoutes(org.alertSettings.routes, target.email) }; // #258
           delete s.users[target.id];
           audit(s, actor.orgId, actor.id, "member.remove", target.id, { email: target.email, role: target.role });
           return { removed: true, id: target.id };
@@ -738,7 +739,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(200, store.read((s) => { const u = sessionUser(s, req); return { ...maskAlertSettings(s.orgs[u.orgId]?.alertSettings), canEdit: ["owner", "admin"].includes(u.role) }; }));
       }
       if (path === "/v1/alert-settings" && req.method === "POST") {
-        sessionOnly(req); // #258 AC1: destinations are session-only; any API key (viewer included) gets 403.
+        sessionOnly(req); // #258: destinations are session-only; any API key (viewer included) gets 403.
         if (body.emails !== undefined && (!Array.isArray(body.emails) || body.emails.length > 20 || body.emails.some((e) => typeof e !== "string"))) fail(400, "emails must be a list of up to 20 addresses");
         if (body.slackWebhook !== undefined && body.slackWebhook !== null && body.slackWebhook !== "" && !validSlackWebhook(body.slackWebhook)) fail(400, "Slack webhook must be https://hooks.slack.com/services/...");
         if (body.webhook !== undefined && body.webhook !== null && body.webhook !== "") {
@@ -787,32 +788,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             if (!webhook) fail(400, "No webhook to rotate");
             if (!issued) { issued = newWebhookSecret(); webhook = { url: webhook.url, secret: issued }; }
           }
-          const kinds = body.kinds === undefined ? (current.kinds ?? null) : body.kinds === null ? null : [...new Set(body.kinds)];
+          // Issue #258: default kinds filter and per-team/per-kind routes. undefined keeps, null clears kinds.
+          const kinds = body.kinds === undefined ? (current.kinds ?? null) : parseKinds(body.kinds);
           let routes = current.routes ?? [];
           if (body.routes !== undefined) {
             const members = new Set(Object.values(s.users).filter((m) => m.orgId === u.orgId && m.verified).map((m) => m.email));
             const teamNames = new Set(orgTeams(s, u.orgId).map((t) => t.name));
-            const prior = new Map(routes.map((r) => [r.id, r]));
-            const seen = new Set();
-            routes = body.routes.map((r) => {
-              const old = r.id ? prior.get(r.id) : null;
-              if (r.id && !old) fail(400, "Unknown route id");
-              const id = old ? old.id : `rt_${randomBytes(9).toString("hex")}`;
-              if (seen.has(id)) fail(400, "Duplicate route id");
-              seen.add(id);
-              const routeEmails = [...new Set((r.emails ?? []).map((e) => e.toLowerCase().trim()).filter(Boolean))];
-              if (routeEmails.some((e) => !members.has(e))) fail(400, "Alert emails must be verified members of this organization");
-              const teams = r.teams == null ? null : [...new Set(r.teams)];
-              if (teams?.some((t) => !teamNames.has(t))) fail(400, "Route teams must be teams in this organization");
-              const hook = r.slackWebhook === undefined ? (old?.slackWebhook ?? null) : (r.slackWebhook || null);
-              if (!routeEmails.length && !hook) fail(400, "Each route needs at least one destination (emails or Slack webhook)");
-              return { id, name: r.name.trim(), kinds: r.kinds == null ? null : [...new Set(r.kinds)], teams, emails: routeEmails, slackWebhook: hook };
-            });
+            routes = body.routes === null ? [] : parseRoutes(body.routes, { current: routes, teamNames, members, validSlack: validSlackWebhook });
           }
-          const pagerduty = body.pagerduty === undefined ? (current.pagerduty ?? null) : body.pagerduty === null ? null : { routingKey: body.pagerduty.routingKey, region: body.pagerduty.region ?? "us", kinds: body.pagerduty.kinds == null ? null : [...new Set(body.pagerduty.kinds)] };
-          const teamsWebhook = body.teamsWebhook === undefined ? (current.teamsWebhook ?? null) : (body.teamsWebhook || null);
-          const discordWebhook = body.discordWebhook === undefined ? (current.discordWebhook ?? null) : (body.discordWebhook || null);
-          const next = { emails, slackWebhook, ...(webhook ? { webhook } : {}), ...(kinds ? { kinds } : {}), ...(routes.length ? { routes } : {}), ...(pagerduty ? { pagerduty } : {}), ...(teamsWebhook ? { teamsWebhook } : {}), ...(discordWebhook ? { discordWebhook } : {}) };
+          const next = { emails, slackWebhook, ...(webhook ? { webhook } : {}), ...(Array.isArray(kinds) ? { kinds } : {}), ...(routes.length ? { routes } : {}) };
           org.alertSettings = next;
           audit(s, u.orgId, u.id, "alert_settings.change", u.orgId, { previous: maskAlertSettings(current), next: maskAlertSettings(next), ...(issued ? { webhookSecret: "issued" } : {}) });
           return { ...maskAlertSettings(next), canEdit: true, ...(issued ? { webhookSecret: issued } : {}) };
@@ -1002,9 +986,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (input.remove) {
             if (!current) fail(404, "Team not found");
             delete s.teams[key];
-            // Issue #258: drop the team from routes; a route left with no teams is disabled, never widened.
+            // #258: a deleted team leaves its routes (never widens them to all teams).
             const org = s.orgs[u.orgId];
-            if (org?.alertSettings?.routes?.some((r) => r.teams?.includes(input.name))) org.alertSettings = { ...org.alertSettings, routes: org.alertSettings.routes.map((r) => (Array.isArray(r.teams) ? { ...r, teams: r.teams.filter((t) => t !== input.name) } : r)) };
+            if (org?.alertSettings?.routes?.length) org.alertSettings = { ...org.alertSettings, routes: dropTeamFromRoutes(org.alertSettings.routes, input.name) };
             audit(s, u.orgId, u.id, "team.change", input.name, { previous: strip(current), next: null });
             return { removed: true, name: input.name };
           }
@@ -1469,9 +1453,15 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const saved = s.orgs[a.orgId]?.alertSettings;
           if (!saved) return null;
           const members = new Set(Object.values(s.users).filter((m) => m.orgId === a.orgId && m.verified).map((m) => m.email));
-          return { emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null, ...(saved.pagerduty ? { pagerduty: saved.pagerduty } : {}), ...(saved.teamsWebhook ? { teamsWebhook: saved.teamsWebhook } : {}), ...(saved.discordWebhook ? { discordWebhook: saved.discordWebhook } : {}), ...(saved.kinds ? { kinds: saved.kinds } : {}), ...(saved.routes?.length ? { routes: saved.routes.map((r) => ({ ...r, emails: (r.emails ?? []).filter((e) => members.has(e)) })) } : {}) };
+          return {
+            emails: (saved.emails ?? []).filter((e) => members.has(e)), slackWebhook: saved.slackWebhook ?? null, webhook: saved.webhook ?? null,
+            ...(Array.isArray(saved.kinds) ? { kinds: saved.kinds } : {}),
+            ...(saved.routes?.length ? { routes: saved.routes.map((r) => ({ ...r, emails: (r.emails ?? []).filter((e) => members.has(e)) })) } : {}),
+          };
         });
-        const { agentName, routeTeam } = a.agentId ? store.read((s) => ({ agentName: s.agents[a.agentId]?.name ?? null, routeTeam: teamFor(Object.values(s.teams ?? {}), a.orgId, a.agentId)?.name ?? null })) : { agentName: null, routeTeam: null };
+        const agentName = a.agentId ? store.read((s) => s.agents[a.agentId]?.name ?? null) : null;
+        // #258: an agent/run/model/anomaly alert routes by the team listing its agent at send time.
+        const routeTeam = !a.team && !a.org && !a.tag && a.agentId ? store.read((s) => teamFor(Object.values(s.teams ?? {}), a.orgId, a.agentId)?.name ?? null) : null;
         result = deliverAlert ? await deliverAlert({ ...a, agentName, ...(routeTeam ? { routeTeam } : {}) }, settings, requested ? { channels: requested } : undefined) : [{ status: "unconfigured" }]; }
       catch { result = [{ status: "failed" }]; }
       store.transaction((s) => {

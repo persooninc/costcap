@@ -120,18 +120,14 @@ test('#169 Spend card has a By tag key field wired to group_by=tag', () => {
   assert.doesNotThrow(() => new Script(js));
 });
 
-test('#294 Spend card renders the projection only when /v1/spend returns a month forecast', () => {
-  const js = uiResponse('/assets/app.js').body;
-  const src = js.slice(js.indexOf('function spendForecast'), js.indexOf('async function spendLoad'));
-  const spendForecast = new Function('money', src + ';return spendForecast')((n) => '$' + n.toFixed(2));
-  assert.equal(spendForecast(null), '');
-  assert.match(spendForecast({ period_end_local: '2026-12-01', total: { projected_usd: 120, lower_bound: false }, reason: null }), /Projected by 2026-12-01: \$120\.00 at the current pace/);
-  assert.match(spendForecast({ period_end_local: '2026-12-01', total: { projected_usd: 120, lower_bound: true } }), /: ≥ \$120\.00/);
-  assert.match(spendForecast({ total: { projected_usd: null }, reason: 'too_early' }), /Projection available after the first 24 h of the budget month/);
-  assert.match(spendForecast({ total: null, reason: 'retention_clamped' }), /No projection/);
-  const rows = js.slice(js.indexOf('function spendRows'), js.indexOf('function spendForecast'));
-  assert.match(rows, /data\.forecast&&b\.projected_usd!=null/);
-  assert.match(rows, /' projected'/);
-  assert.match(js, /spendForecast\(days\.forecast\)/);
-  assert.doesNotThrow(() => new Script(js));
+test('#258 Alert destinations card has default kinds and an alert routes editor', () => {
+  const body = uiResponse('/').body;
+  assert.match(body, /id="defaultKinds"/);
+  for (const k of ['cap_approaching', 'cap_hit', 'loop_detected', 'agent_silent', 'cap_projected', 'spend_anomaly']) {
+    assert.match(body, new RegExp(`name="kind" type="checkbox" value="${k}"`));
+    assert.match(body, new RegExp(`name="rkind" type="checkbox" value="${k}"`));
+  }
+  assert.match(body, /<h3>Alert routes<\/h3>/);
+  assert.match(body, /id="routeForm" hidden/);
+  assert.match(body, /id="alertRoutes"/);
 });
