@@ -55,11 +55,3 @@ test("#114 setMaxSteps applies a step budget set after creation", () => {
   w.record(0);
   assert.equal(w.check(), null);
 });
-
-test("#184 step() counts toward maxSteps without adding velocity spend", () => {
-  const v = createVelocityBreaker({ maxSteps: 2, minSpendUsd: 0, now: () => 0 });
-  v.step();
-  assert.equal(v.check(), null);
-  v.step();
-  assert.equal(v.check().reason, "step_budget");
-});

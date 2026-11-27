@@ -609,15 +609,12 @@ mode 0600. A 401/403 response freezes the wrapper. Redirects are refused to avoi
 forwarding agent credentials to another host. These paths have local test-server
 coverage, not production verification or a finished org dashboard.
 
-**Fleet-wide agent caps (#127):** `/v1/policy` also returns
-`agent_spend: { spent: { day, month }, unknown, as_of }`, the agent's synced
-spend across every host and runner using that identity (settled costs
-included). The wrapper refuses before calling upstream once synced spend plus
-its own unsynced receipts reach the fleet day/month cap (`429 budget_exceeded`,
-`scope: "day"|"month"`), and refuses with `accounting_unavailable` while any
-unknown cost is unsettled. Spend cached from an earlier UTC day/month counts 0
-for that window. A fresh runner or wiped `.costcap/` no longer starts from $0.
-Overshoot is still bounded by unsynced spend on other hosts (one poll interval).
+A fleet policy can also carry `maxSteps`, the most upstream calls one wrapped
+run may make (dashboard: "Max steps per run"). An enrolled wrapper enforces it
+from its cached policy, offline too, with the same `breaker_open` /
+`step_budget` receipt as `--max-steps`. A local `--max-steps` can tighten it,
+never loosen it. `GET /v1/agents/:id/budget?run_id=RUN` reports `max_steps` and
+`steps` for that run.
 
 ## Per-agent budgets
 

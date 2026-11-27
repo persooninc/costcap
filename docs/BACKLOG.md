@@ -141,7 +141,7 @@ Compared the README's promises, category expectations, and the agent-to-agent ne
 
 ### CC-2 Per-agent step budgets in fleet policy — DONE (#114)
 - Acceptance: policy carries `maxSteps`, the dashboard edits it, and an enrolled wrapper enforces it offline from cache. A local value can tighten it, not loosen it.
-- Shipped (#114): optional positive-integer `maxSteps` on hosted policies (`null` clears it), "Max steps per run" dashboard field, wrapper enforces min(local `--max-steps`, fleet) with `breaker_open`/`step_budget`, `GET /v1/agents/:id/budget?run_id=` reports `max_steps` and `steps`.
+- Shipped (#114): `POST /v1/agents/:id/policy` accepts `maxSteps` (positive integer, `null` clears), `resolvePolicy` returns the tighter of fleet and `--max-steps`, the wrapper trips `breaker_open` / `step_budget` per run from the cached policy, the dashboard has a "Max steps per run" field, and `GET /v1/agents/:id/budget?run_id=` reports `max_steps` and `steps`.
 
 ### CC-3 Kill one agent or all from the dashboard, with audit — DONE (#113)
 - Acceptance: both actions write an audit entry with who and why. A wrapper honors them within one poll. Resume is explicit. The UI states that remote kill is not instant and doesn't undo accepted requests.

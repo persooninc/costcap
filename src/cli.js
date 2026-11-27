@@ -228,40 +228,12 @@ export async function wrap(argv) {
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
-  let fleetModels = models ?? null;
-  // #192: effective rate limit = min(flag, --policy agent/default, fleet); re-applied on each fleet sync.
-  const rateLimit = createRateLimiter();
-  let fleetRate = {};
-  let effectiveConcurrent = 1;
-  const applyRate = () => {
-    const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
-    rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
-    // #249: effective concurrency = min(flag, --policy agent/default, fleet ceiling); default 1.
-    effectiveConcurrent = minLimit(maxConcurrentFlag, own?.maxConcurrent, fleetRate.maxConcurrent) ?? 1;
-  };
-  // #207: local --downgrade / --downgrade-at merged with the fleet downgrade (local only adds or lowers).
-  const localDowngrade = downgradeMap ? { map: downgradeMap, at: downgradeAt } : downgradeAt != null ? { at: downgradeAt } : null;
-  let downgradeConfig = mergeDowngrade(null, localDowngrade);
-  let raiseTimer = null;
-  let fleetDowngrade = null;
+  const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   const setPolicy = (p) => {
     fleetPolicy = p;
-    // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
-    clearTimeout(raiseTimer);
-    if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
-    downgradeConfig = mergeDowngrade(p.downgrade ?? null, localDowngrade);
-    // #274/#280: fleet day/week/month caps are not min-merged into the local UTC buckets; they run on the org clock.
-    const resolved = resolvePolicy({ local: { ...caps, day: undefined, week: undefined, month: undefined, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
-    const { day: fleetDay, week: fleetWeekCap, month: fleetMonth, ...rest } = resolved.caps;
-    const own = Object.fromEntries(["day", "week", "month"].filter((k) => caps[k] != null).map((k) => [k, caps[k]]));
-    cap.updateCaps({ ...rest, ...own });
-    cap.setFleetPeriod({ caps: { day: fleetDay ?? null, week: fleetWeekCap ?? null, month: fleetMonth ?? null }, budgetPeriod: fleet?.budgetPeriod() ?? null });
-    checkWarnings();
+    const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, ...(p.maxSteps != null ? { maxSteps: p.maxSteps } : {}) } });
+    cap.updateCaps(resolved.caps);
     velocity.setMaxSteps(resolved.maxSteps);
-    fleetModels = resolved.models;
-    fleetRate = { rpm: p.rpm, tpm: p.tpm };
-    fleetDowngrade = p.downgrade ?? null;
-    applyRate();
   };
   if (enrollmentPath) {
     fleet = createFleetClient({ path: enrollmentPath, receiptsPath, onPolicy: setPolicy, onSettle: (r) => settleReceipt(r) });
@@ -272,10 +244,9 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
-  const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
-  agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
-  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, sharedLedger, preflight });
+  const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
+  const agentBudgets = policy ? createAgentBudgets({ policy, history: loadReceipts(receiptsPath) }) : undefined;
+  const { server, port } = await startMeteringProxy({ receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets });
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

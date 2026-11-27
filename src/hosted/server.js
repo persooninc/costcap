@@ -1068,54 +1068,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const a = s.agents[budgetRoute[1]];
           const orgId = caller.agent?.orgId ?? caller.user.orgId;
           if (!a || a.orgId !== orgId || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
-          const receipts = agentReceipts(s, a.id);
+          const receipts = Object.values(s.receipts).filter((r) => r.agentId === a.id).map((r) => r.receipt);
           const runId = new URL(req.url, origin).searchParams.get("run_id");
-          const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id);
-          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), budgetPeriod: orgPeriod(s, a.orgId), runId: runId || null, team: t ? verdictOf(s, t) : null, orgBudget: orgBudgetOfOrg(s, a.orgId) });
-        }));
-      }
-      // Issue #208: time-boxed cap raise requests.
-      const capReqRoute = /^\/v1\/agents\/([^/]+)\/cap-requests$/.exec(path);
-      if (capReqRoute && req.method === "POST") {
-        const input = parseCapRequest(body);
-        const result = store.transaction((s) => {
-          const caller = req.headers.authorization && !bearerApiKey(req) ? { agent: agentUser(s, req) } : { user: member(s, req) };
-          const a = s.agents[decodeURIComponent(capReqRoute[1])];
-          const orgId = caller.agent?.orgId ?? caller.user.orgId;
-          if (!a || a.orgId !== orgId || a.revoked || (caller.agent && caller.agent.id !== a.id)) fail(404, "Agent not found");
-          const actor = caller.agent?.id ?? caller.user.id;
-          const record = createCapRequest(s, { agent: a, actor, input, id: randomUUID(), nowMs: now() });
-          audit(s, orgId, actor, "cap_request.create", a.id, { request_id: record.id, scope: input.scope, amount_usd: input.amount_usd, duration_hours: input.duration_hours, reason: input.reason, before: { caps: { ...a.policy.caps } }, after: { caps: { ...a.policy.caps } } });
-          return record;
-        });
-        return json(201, result);
-      }
-      if (path === "/v1/cap-requests" && req.method === "GET") {
-        const status = new URL(req.url, origin).searchParams.get("status") ?? "all";
-        if (!CAP_REQUEST_STATUSES.includes(status)) fail(400, `status must be one of ${CAP_REQUEST_STATUSES.join("|")}`);
-        return json(200, store.transaction((s) => {
-          const u = member(s, req);
-          sweepRaises(s);
-          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return { requests: listCapRequests(s, u.orgId, status).map((r) => ({ ...r, agent_name: names[r.agentId] ?? null })), canDecide: ["owner", "admin"].includes(u.role) };
-        }));
-      }
-      const decideRoute = /^\/v1\/cap-requests\/([^/]+)\/(approve|deny)$/.exec(path);
-      if (decideRoute && req.method === "POST") {
-        return json(200, store.transaction((s) => {
-          const u = memberAdmin(s, req);
-          const r = findRequest(s, u.orgId, decodeURIComponent(decideRoute[1]));
-          const a = s.agents[r.agentId];
-          if (decideRoute[2] === "deny") {
-            const note = typeof body?.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 500) : null;
-            denyCapRequest(r, { actor: u.id, note, nowMs: now() });
-            audit(s, u.orgId, u.id, "cap_request.deny", r.agentId, { request_id: r.id, scope: r.scope, reason: r.reason, note, before: { caps: { ...a.policy.caps } }, after: { caps: { ...a.policy.caps } } });
-            return r;
-          }
-          const approval = parseApproval(body, r);
-          const { before, after } = approveCapRequest(s, { request: r, approval, actor: u.id, nowMs: now() });
-          audit(s, u.orgId, u.id, "cap_request.approve", r.agentId, { request_id: r.id, scope: r.scope, amount_usd: approval.amount_usd, duration_hours: approval.duration_hours, expires_at: r.expires_at, reason: r.reason, note: approval.note, before, after });
-          return r;
+          return hostedAgentVerdict({ agent: a, receipts, nowMs: now(), runId: runId || null });
         }));
       }
       if ((path === "/v1/fleet/freeze" || path === "/v1/fleet/resume") && req.method === "POST") {
@@ -1134,21 +1089,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           if (!a || a.orgId !== u.orgId) fail(404, "Agent not found");
           if (update[2] === "revoke") { a.revoked = true; audit(s, u.orgId, u.id, "agent.revoke", a.id); return { revoked: true }; }
           const reason = fleetReason(body.reason, false);
-          // maxSteps: omitted keeps the current value, null clears it (issue #114).
+          // maxSteps: omitted keeps the current value, null clears it.
           const maxSteps = body.maxSteps === undefined ? a.policy.maxSteps : body.maxSteps;
-          // silentAfterHours (issue #134): omitted keeps, null resets to the 6h default, 0 turns silence alerts off.
-          const silentAfterHours = body.silentAfterHours === undefined ? a.policy.silentAfterHours : body.silentAfterHours;
-          // models (issue #153): omitted keeps the allowlist, null clears it.
-          const models = body.models === undefined ? a.policy.models : body.models;
-          // warnFractions (issue #165): omitted keeps, null resets to the [0.8] default, [] turns cap_approaching off.
-          const rawWarn = body.warnFractions === undefined ? a.policy.warnFractions : body.warnFractions;
-          const warnFractions = Array.isArray(rawWarn) && rawWarn.every((f) => typeof f === "number") ? sortWarnFractions(rawWarn) : rawWarn;
-          // rpm/tpm (issue #192): omitted keeps the current value, null clears it.
-          const rpm = body.rpm === undefined ? a.policy.rpm : body.rpm;
-          const tpm = body.tpm === undefined ? a.policy.tpm : body.tpm;
-          // downgrade (issue #207): omitted keeps, null clears.
-          const downgrade = body.downgrade === undefined ? a.policy.downgrade : body.downgrade;
-          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}), ...(rpm != null ? { rpm } : {}), ...(tpm != null ? { tpm } : {}), ...(silentAfterHours != null ? { silentAfterHours } : {}), ...(models != null ? { models } : {}), ...(warnFractions != null ? { warnFractions } : {}), ...(downgrade != null ? { downgrade } : {}), ...(a.policy.raise ? { raise: a.policy.raise } : {}) };
+          const policy = { version: a.policy.version + 1, caps: body.caps ?? a.policy.caps, killed: body.killed ?? a.policy.killed, ...(maxSteps != null ? { maxSteps } : {}) };
           if (validatePolicy(policy).length) fail(400, "Invalid policy");
           const prev = a.policy ?? {};
           const previous = { caps: { ...(prev.caps ?? {}) }, killed: Boolean(prev.killed), maxSteps: prev.maxSteps ?? null, silentAfterHours: prev.silentAfterHours ?? null, models: prev.models ?? null, ...(prev.rpm != null && { rpm: prev.rpm }), ...(prev.tpm != null && { tpm: prev.tpm }), ...(prev.downgrade != null && { downgrade: prev.downgrade }) };
