@@ -13,26 +13,7 @@ import { buildDigest, digestDue, digestKey, digestSettingsError, digestText, new
 import { evaluateAlerts, evaluateRunAlerts, evaluateTeamAlerts, evaluateOrgAlerts, evaluateTagAlerts, evaluateModelAlerts, blocksInCurrentPeriod, armWarnings, claimWarning, capPeriod, sortWarnFractions, auditEntry, silentAfterMsFor, alertOccurrences, activeOccurrence, fireAlert, resolveAlert, filterAlerts, ALERT_STATUSES, ALERT_KINDS } from "./alerts.js";
 import { VERSION } from "../version.js";
 import { stripeHealth } from "./billing.js";
-import { receiptsCsv, parseReceiptsQuery } from "./receipts-csv.js";
-import { pageRuns, parseRunsQuery, runReceipts, summarizeRuns } from "./runs.js";
-import { parseRunEnd, parseOutcomeOverride, upsertRunEnd, runOutcomeFields, outcomeSummary } from "./run-outcome.js";
-import { parseSpendQuery, spendBreakdown, spendCsv } from "./spend.js";
-import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
-import { validTags } from "../tags.js";
-import { labelAudit, auditCsv, parseAuditRange } from "./audit-log.js";
-import { scrubReceiptPath } from "../receipt-path.js";
-import { DEFAULT_PLANS, entitlementsFor, requireLimit, resolveBillingConfig, retentionCutoff } from "../billing/index.js";
-import { onboardingState } from "./onboarding.js";
-import { hostedAgentVerdict } from "./agent-verdict.js";
-import { assertWebhookTarget, maskAlertSettings, newWebhookSecret, validSlackWebhook, MAX_ALERT_ROUTES } from "./delivery.js";
-import { buildMetrics, METRICS_CONTENT_TYPE } from "./metrics.js";
-import { bearerApiKey, parseApiKeyInput, createApiKey, maskApiKey, findApiKey, apiKeyPrincipal } from "./api-keys.js";
-import { parseFleetTagCaps, fleetTagCapsPolicy } from "./tag-caps.js";
-import { normalizeModel } from "../model-cap.js";
-import { expiredReceiptKeys, isExpired, retentionCutoffMs, retentionDaysError, retentionFloorMs, retentionMaxDays, RETENTION_MIN_DAYS } from "./retention.js";
-import { budgetPeriodError, normalizeBudgetPeriod, periodKey } from "../period.js";
-import { parseOrgBudget, orgBudgetOf, orgBudgetVerdict, orgBudgetPolicy } from "./org-budget.js";
-import { parseTeamInput, teamFor, teamKey, teamVerdict, teamPolicy, agentSpendPolicy } from "./teams.js";
+import { receiptsCsv } from "./receipts-csv.js";
 const token = () => randomBytes(32).toString("base64url");
 const ALERT_TEST_LIMIT = 5, ALERT_TEST_WINDOW_MS = 600_000;
 const fail = (status, message) => { const err = new Error(message); err.status = status; throw err; };
@@ -588,25 +569,17 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
       }
       if (path === "/v1/receipts.csv" && req.method === "GET") {
         const csv = store.read((s) => {
-          const u = memberUser(s, req);
-          const orgAgents = new Set(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => a.id));
-          const query = parseReceiptsQuery(new URL(req.url, origin).searchParams, orgAgents, parseAuditRange);
-          const rows = visibleReceipts(s, u.orgId).map((item) => ({
+          const u = sessionUser(s, req);
+          const rows = Object.values(s.receipts).filter((r) => r.orgId === u.orgId).map((item) => ({
             ts: item.receipt?.ts ?? "",
             agent_id: item.agentId,
             receipt_id: item.receipt?.id ?? "",
-            run_id: item.receipt?.run_id ?? "",
             model: item.receipt?.model ?? "",
             cost_usd: item.receipt?.cost_usd == null ? "" : item.receipt.cost_usd,
-            cost_source: item.receipt?.cost_source ?? "",
-            settled_cost_usd: item.settlement?.cost_usd ?? "",
-            settle_source: item.settlement?.source ?? "",
             reason: item.receipt?.reason ?? "",
             scope: item.receipt?.scope ?? "",
-            outcome: item.receipt?.outcome ?? "",
-            tags: item.receipt?.tags ?? null,
           }));
-          return receiptsCsv(rows, query);
+          return receiptsCsv(rows);
         });
         const headers = {
           "content-type": "text/csv; charset=utf-8",
@@ -614,69 +587,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           "x-content-type-options": "nosniff",
           "content-disposition": 'attachment; filename="costcap-receipts.csv"',
         };
-        headers["x-costcap-total"] = String(csv.total);
         if (csv.truncated) headers["x-costcap-truncated"] = "true";
         return res.writeHead(200, headers).end(csv.body);
-      }
-      if (path === "/v1/audit.csv" && req.method === "GET") {
-        const csv = store.read((s) => {
-          const u = memberUser(s, req);
-          const range = parseAuditRange(new URL(req.url, origin).searchParams);
-          return auditCsv(labelAudit(s, u.orgId, s.audit), range);
-        });
-        return res.writeHead(200, {
-          "content-type": "text/csv; charset=utf-8",
-          "cache-control": "no-store",
-          "x-content-type-options": "nosniff",
-          "content-disposition": 'attachment; filename="costcap-audit.csv"',
-        }).end(csv.body);
-      }
-      if (path === "/v1/evidence.json" && req.method === "GET") {
-        return json(200, store.read((s) => {
-          const u = memberUser(s, req);
-          return buildEvidence({ orgId: u.orgId, nowMs: now(), spendFor: (rs) => spendSummary(rs, now()),
-            agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId),
-            receipts: visibleReceipts(s, u.orgId),
-            alerts: filterAlerts(alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId)),
-            audit: labelAudit(s, u.orgId, s.audit),
-            teams: orgTeams(s, u.orgId).map((t) => verdictOf(s, t)), orgBudget: orgBudgetOfOrg(s, u.orgId) });
-        }));
-      }
-      if (path === "/v1/spend" && req.method === "GET") {
-        return json(200, store.read((s) => {
-          const u = memberUser(s, req);
-          const query = parseSpendQuery(new URL(req.url, origin).searchParams);
-          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendBreakdown(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId), now: now() });
-        }));
-      }
-      // #220: Prometheus scrape (viewer/admin cck_ key or member session), org-scoped gauges.
-      if (path === "/v1/metrics" && req.method === "GET") {
-        const by = new URL(req.url, origin).searchParams.get("by");
-        if (by !== null && by !== "model") fail(400, "by must be model");
-        const out = store.read((s) => {
-          const u = member(s, req);
-          return buildMetrics({ agents: Object.values(s.agents).filter((a) => a.orgId === u.orgId), teams: orgTeams(s, u.orgId),
-            receipts: visibleReceipts(s, u.orgId), alerts: alertOccurrences(s.alerts).filter((a) => a.orgId === u.orgId),
-            fleetFrozen: Boolean(s.fleetFreezes?.[u.orgId]?.active), nowMs: now(), budgetPeriod: orgPeriod(s, u.orgId),
-            cutoff: retentionCutoff(entitlements(s, u.orgId), now()), byModel: by === "model" });
-        });
-        return res.writeHead(200, { "content-type": METRICS_CONTENT_TYPE, "cache-control": "no-store", "x-content-type-options": "nosniff" }).end(out.body);
-      }
-      // #213: finance summary CSV, one row per period and group. Viewers and viewer keys may read it.
-      if (path === "/v1/spend.csv" && req.method === "GET") {
-        const csv = store.read((s) => {
-          const u = member(s, req);
-          const query = parseSpendQuery(new URL(req.url, origin).searchParams, { csv: true, budgetPeriod: orgPeriod(s, u.orgId), now: now() });
-          const names = Object.fromEntries(Object.values(s.agents).filter((a) => a.orgId === u.orgId).map((a) => [a.id, a.name]));
-          return spendCsv(visibleReceipts(s, u.orgId), { ...query, cutoff: retentionCutoff(entitlements(s, u.orgId), now()), names, budgetPeriod: orgPeriod(s, u.orgId), teams: orgTeams(s, u.orgId), outcomeOf: outcomeLookup(s, u.orgId) });
-        });
-        return res.writeHead(200, {
-          "content-type": "text/csv; charset=utf-8",
-          "cache-control": "no-store",
-          "x-content-type-options": "nosniff",
-          "content-disposition": 'attachment; filename="costcap-spend.csv"',
-        }).end(csv.body);
       }
       if (path === "/v1/fleet" && req.method === "GET") {
         return json(200, store.read((s) => {
