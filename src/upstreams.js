@@ -111,16 +111,18 @@ export function userPrice(prices, provider, model) {
 export function costForUserPrices(prices, provider, model, usage = {}) {
   const { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, modality_tokens, speed, service_tier } = usage;
   const rate = userPrice(prices, provider, model);
-  const writes = cache_write_input_tokens > 0 || cache_write_1h_input_tokens > 0;
-  const base = { model, input_tokens, output_tokens, cached_input_tokens, ...(writes && { cache_write_input_tokens, cache_write_1h_input_tokens }), pricing_tier: "standard", fallback: false,
+  const base = { model, input_tokens, output_tokens, cached_input_tokens,
+    ...(cache_write_input_tokens > 0 && { cache_write_input_tokens }), ...(cache_write_1h_input_tokens > 0 && { cache_write_1h_input_tokens }), pricing_tier: "standard", fallback: false,
     ...(modality_tokens && { modality_tokens }), ...(typeof speed === "string" && { speed }), ...(typeof service_tier === "string" && { service_tier }) };
   const unpricedReason = !rate || (cached_input_tokens > 0 && rate.cached_input === undefined) ? "upstream_model_unpriced"
     // #235: cache writes are never $0; an entry without the matching cache_write rate is unpriced.
     : (cache_write_input_tokens > 0 && rate.cache_write === undefined) || (cache_write_1h_input_tokens > 0 && rate.cache_write_1h === undefined) ? "user_price_unpriced"
     : modality_tokens ? "modality_unpriced"
-    : premiumTier({ speed, service_tier }) ? "service_tier_unpriced" : null;
+    : premiumTier({ speed, service_tier }) ? "service_tier_unpriced"
+    // #235: cache writes the entry does not price are unknown, never $0.
+    : (cache_write_input_tokens > 0 && rate.cache_write === undefined) || (cache_write_1h_input_tokens > 0 && rate.cache_write_1h === undefined) ? "user_price_unpriced" : null;
   if (unpricedReason) return { ...base, cost_usd: null, reason: unpricedReason };
-  const cost = (input_tokens * rate.input + cached_input_tokens * (rate.cached_input ?? 0) +
-    cache_write_input_tokens * (rate.cache_write ?? 0) + cache_write_1h_input_tokens * (rate.cache_write_1h ?? 0) + output_tokens * rate.output) / 1_000_000;
+  const cost = (input_tokens * rate.input + cached_input_tokens * (rate.cached_input ?? 0) + output_tokens * rate.output
+    + cache_write_input_tokens * (rate.cache_write ?? 0) + cache_write_1h_input_tokens * (rate.cache_write_1h ?? 0)) / 1_000_000;
   return { ...base, cost_usd: Number(cost.toFixed(6)), cost_source: "user_prices", prices_version: prices.version, prices_sha256: prices.sha256 };
 }
