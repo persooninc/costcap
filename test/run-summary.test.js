@@ -191,3 +191,12 @@ test("#160 a pending batch is unknown in the run summary, then known once settle
   const done = buildRunSummary({ ...base, receipts: [pending, { event: "reconciliation", source: "batch_results", receipt_id: "p1", cost_usd: 0.01605 }] });
   assert.deepEqual([done.total_cost_usd, done.unknown_cost_calls], [0.01605, 0]);
 });
+
+test("#239 run summary carries otlp counts and the roll-up line reports them", () => {
+  const s = buildRunSummary({ run_id: "R", started_at: "a", ended_at: "b", receipts: [], otlp: { spans_exported: 3, spans_dropped: 1, extra: 9 } });
+  assert.deepEqual(s.otlp, { spans_exported: 3, spans_dropped: 1 });
+  assert.match(rollupLine(s), / · otlp: 3 exported, 1 dropped$/);
+  const none = buildRunSummary({ run_id: "R", started_at: "a", ended_at: "b", receipts: [] });
+  assert.equal("otlp" in none, false);
+  assert.doesNotMatch(rollupLine(none), /otlp/);
+});

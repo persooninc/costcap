@@ -69,3 +69,16 @@ test("#188: presigned SigV4 query parameters are redacted", () => {
   assert.equal(receiptPath("/model/m/invoke", "?X-Amz-Signature=abc&X-Amz-Credential=AKID%2F20260101&X-Amz-Security-Token=tok&X-Amz-Date=1"),
     "/model/m/invoke?X-Amz-Signature=REDACTED&X-Amz-Credential=REDACTED&X-Amz-Security-Token=REDACTED&X-Amz-Date=1");
 });
+
+test("#239 the exported costcap.path keeps the ?key= redaction (span built from the receipt the proxy hands onReceipt)", async (t) => {
+  const { receiptToSpan, traceIdFor } = await import("../src/otlp.js");
+  const spans = [];
+  const f = await gemini(t, { onReceipt: (r, meta) => spans.push(receiptToSpan(r, { startedAt: meta?.startedAt, traceId: traceIdFor("x") })), cap: createCapEngine({ caps: { run: 100 } }) });
+  assert.equal((await f.call()).status, 200);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(spans.length, 1);
+  const path = spans[0].attributes.find((a) => a.key === "costcap.path").value.stringValue;
+  assert.equal(path, EXPECTED);
+  assert.doesNotMatch(JSON.stringify(spans), /SECRET123/);
+  assert.ok(BigInt(spans[0].startTimeUnixNano) <= BigInt(spans[0].endTimeUnixNano));
+});

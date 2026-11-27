@@ -1,159 +1,185 @@
-// #239 unit: receipt -> OTLP span mapping, trace ids, request shape, headers, URLs, batching bounds.
+// #239 unit: receipt -> span mapping, OTLP JSON shape, headers, URL checks, batch and queue bounds.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { createOtlpExporter, encodeRequest, operationName, parseOtlpHeaders, parseOtlpUrl, receiptToSpan, runSpan, traceIdFor } from "../src/otlp.js";
+import { createOtlpExporter, exportRequest, operationName, parseOtlpEndpoint, parseOtlpHeaders, receiptToSpan, runSpan, traceIdFor } from "../src/otlp.js";
 
-const get = (span, key) => { const a = span.attributes.find((x) => x.key === key); return a && Object.values(a.value)[0]; };
-const base = { id: "r1", ts: "2026-11-16T00:00:01.000Z", provider: "openai", path: "/v1/chat/completions", status: 200, blocked: false, model: "gpt-4o-mini", run_id: "RUN", input_tokens: 10, output_tokens: 5, cost_usd: 0.25 };
+const A = (span) => Object.fromEntries(span.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
+const TS = "2026-11-16T12:00:01.000Z";
+const metered = { id: "r1", ts: TS, run_id: "R", agent_id: "ag", provider: "openai", path: "/v1/chat/completions", status: 200, blocked: false, model: "gpt-4o-mini", input_tokens: 10, output_tokens: 5, cost_usd: 0.25, tags: { team: "x" } };
 
-test("metered receipt maps to a GenAI CLIENT span", () => {
-  const s = receiptToSpan({ ...base, cached_input_tokens: 3, cache_write_input_tokens: 2, cache_write_1h_input_tokens: 1, tags: { team: "x" }, agent_id: "a" }, { startMs: Date.parse(base.ts) - 500, traceId: traceIdFor("RUN"), parentSpanId: "p" });
+test("metered receipt -> CLIENT span with GenAI attributes and ns timestamps", () => {
+  const start = Date.parse(TS) - 1500;
+  const s = receiptToSpan(metered, { startedAt: start, traceId: traceIdFor("R"), parentSpanId: "00000000000000aa" });
   assert.equal(s.name, "chat gpt-4o-mini");
   assert.equal(s.kind, 3);
-  assert.equal(s.parentSpanId, "p");
-  assert.equal(s.startTimeUnixNano, String((Date.parse(base.ts) - 500) * 1e6));
-  assert.equal(s.endTimeUnixNano, String(Date.parse(base.ts)) + "000000");
-  assert.equal(get(s, "gen_ai.usage.input_tokens"), "10");
-  assert.equal(get(s, "gen_ai.usage.output_tokens"), "5");
-  assert.equal(get(s, "gen_ai.usage.cache_read.input_tokens"), "3");
-  assert.equal(get(s, "gen_ai.usage.cache_creation.input_tokens"), "3");
-  assert.equal(get(s, "gen_ai.usage.cost"), 0.25);
-  assert.equal(get(s, "costcap.cost_complete"), true);
-  assert.equal(get(s, "costcap.tag.team"), "x");
-  assert.equal(get(s, "costcap.agent_id"), "a");
-  assert.equal(get(s, "gen_ai.provider.name"), "openai");
-  assert.deepEqual(s.status, { code: 0 });
+  assert.equal(s.parentSpanId, "00000000000000aa");
   assert.match(s.spanId, /^[0-9a-f]{16}$/);
+  assert.equal(s.startTimeUnixNano, String(BigInt(start) * 1_000_000n));
+  assert.equal(s.endTimeUnixNano, String(BigInt(Date.parse(TS)) * 1_000_000n));
+  const a = A(s);
+  assert.equal(a["gen_ai.provider.name"], "openai");
+  assert.equal(a["gen_ai.operation.name"], "chat");
+  assert.equal(a["gen_ai.request.model"], "gpt-4o-mini");
+  assert.equal(a["gen_ai.usage.input_tokens"], "10");
+  assert.equal(a["gen_ai.usage.output_tokens"], "5");
+  assert.equal(a["gen_ai.usage.cost"], 0.25);
+  assert.equal(a["costcap.cost_usd"], 0.25);
+  assert.equal(a["costcap.cost_complete"], true);
+  assert.equal(a["costcap.receipt_id"], "r1");
+  assert.equal(a["costcap.run_id"], "R");
+  assert.equal(a["costcap.agent_id"], "ag");
+  assert.equal(a["costcap.blocked"], false);
+  assert.equal(a["costcap.tag.team"], "x");
+  assert.equal(a["http.response.status_code"], "200");
+  assert.deepEqual(s.status, { code: 0 });
+  // whole-dollar costs stay doubles
+  assert.deepEqual(receiptToSpan({ ...metered, cost_usd: 1 }, {}).attributes.find((x) => x.key === "gen_ai.usage.cost").value, { doubleValue: 1 });
 });
 
-test("unknown cost omits gen_ai.usage.cost; blocked and >=400 are ERROR", () => {
-  const u = receiptToSpan({ ...base, cost_usd: null });
-  assert.equal(get(u, "gen_ai.usage.cost"), undefined);
-  assert.equal(get(u, "costcap.cost_complete"), false);
-  const b = receiptToSpan({ ...base, blocked: true, reason: "budget_exceeded", status: 402, input_tokens: undefined });
-  assert.deepEqual(b.status, { code: 2, message: "budget_exceeded" });
-  assert.equal(get(b, "costcap.blocked"), true);
-  assert.equal(get(b, "gen_ai.usage.input_tokens"), undefined);
-  assert.equal(receiptToSpan({ ...base, status: 500 }).status.message, "status 500");
-  assert.equal(receiptToSpan({ event: "cap_warning" }), null);
-  assert.equal(receiptToSpan(null), null);
-  // start after end / missing start fall back to end; bad ts falls back to now
-  const n = receiptToSpan({ ...base, ts: "bad" }, { startMs: 1 });
-  assert.equal(n.startTimeUnixNano, "1000000");
-  assert.equal(receiptToSpan(base, { startMs: Date.parse(base.ts) + 9 }).startTimeUnixNano, receiptToSpan(base).endTimeUnixNano);
+test("unknown, blocked, upstream-error and cache receipts", () => {
+  const u = A(receiptToSpan({ ...metered, cost_usd: null, reason: "usage_unavailable", input_tokens: undefined, output_tokens: undefined }, {}));
+  assert.equal("gen_ai.usage.cost" in u, false);
+  assert.equal("costcap.cost_usd" in u, false);
+  assert.equal("gen_ai.usage.input_tokens" in u, false);
+  assert.equal(u["costcap.cost_complete"], false);
+  const bs = receiptToSpan({ id: "b", ts: TS, provider: "openai", path: "/v1/chat/completions", blocked: true, reason: "budget_exceeded", cost_usd: 0 }, {});
+  assert.deepEqual(bs.status, { code: 2, message: "budget_exceeded" });
+  assert.equal(A(bs)["costcap.blocked"], true);
+  assert.equal(A(bs)["costcap.reason"], "budget_exceeded");
+  assert.equal(bs.name, "chat unknown");
+  assert.equal(bs.startTimeUnixNano, bs.endTimeUnixNano);
+  assert.equal(receiptToSpan({ ...metered, status: 500, reason: "upstream_rejected" }, {}).status.code, 2);
+  const c = A(receiptToSpan({ ...metered, provider: "anthropic", path: "/v1/messages", cache: "hit", cached_input_tokens: 7, cache_write_input_tokens: 3, cache_write_1h_input_tokens: 2 }, {}));
+  assert.equal(c["gen_ai.usage.cache_read.input_tokens"], "7");
+  assert.equal(c["gen_ai.usage.cache_creation.input_tokens"], "5");
+  assert.equal(c["costcap.cache"], "hit");
+  const d = A(receiptToSpan({ ...metered, requested_model: "gpt-4o", model: "gpt-4o-mini" }, {}));
+  assert.equal(d["gen_ai.request.model"], "gpt-4o");
+  assert.equal(d["gen_ai.response.model"], "gpt-4o-mini");
+  // start after end (clock skew) clamps to end
+  const sk = receiptToSpan(metered, { startedAt: Date.parse(TS) + 10 });
+  assert.equal(sk.startTimeUnixNano, sk.endTimeUnixNano);
 });
 
 test("operation names", () => {
-  assert.equal(operationName("/v1/embeddings"), "embeddings");
-  assert.equal(operationName("/v1/live/sessions"), "live"); // #273
-  assert.equal(operationName("/v1beta/models/gemini:generateContent?key=REDACTED"), "generate_content");
-  assert.equal(operationName("/v1/completions"), "text_completion");
-  assert.equal(operationName("/v1/messages"), "chat");
-  assert.equal(operationName("/v1/realtime"), "realtime");
-  assert.equal(operationName("/v1/live/sessions"), "live");
-  assert.equal(operationName("/v1/files"), "files");
-  assert.equal(operationName(""), "call");
-  assert.equal(operationName(), "call");
+  const op = (path) => operationName({ path });
+  assert.equal(op("/v1/chat/completions"), "chat");
+  assert.equal(op("/v1/messages"), "chat");
+  assert.equal(op("/v1/responses"), "chat");
+  assert.equal(op("/v1/embeddings"), "embeddings");
+  assert.equal(op("/v1beta/models/g:generateContent?key=REDACTED"), "generate_content");
+  assert.equal(op("/v1/completions"), "text_completion");
+  assert.equal(op("/v1/audio/speech"), "speech");
+  assert.equal(op(undefined), "unknown");
 });
 
-test("trace id is stable per run_id and distinct across runs", () => {
-  assert.equal(traceIdFor("a"), traceIdFor("a"));
-  assert.notEqual(traceIdFor("a"), traceIdFor("b"));
-  assert.match(traceIdFor("a"), /^[0-9a-f]{32}$/);
+test("trace id is stable per run_id and differs across runs", () => {
+  assert.equal(traceIdFor("R"), traceIdFor("R"));
+  assert.match(traceIdFor("R"), /^[0-9a-f]{32}$/);
+  assert.notEqual(traceIdFor("R"), traceIdFor("R2"));
 });
 
-test("ExportTraceServiceRequest shape and run span", () => {
-  const root = runSpan({ run_id: "R", total_cost_usd: null, unknown_cost_calls: 1, calls: 2, blocked_calls: 1, stopped_by: "budget_exceeded", exit_code: 0 }, { startMs: 1000, endMs: 2000, traceId: "t", spanId: "s" });
-  assert.equal(get(root, "costcap.total_cost_usd"), undefined);
-  assert.equal(get(root, "costcap.unknown_cost_calls"), "1");
-  assert.equal(get(root, "costcap.stopped_by"), "budget_exceeded");
-  assert.equal(root.status.code, 2);
-  assert.equal(get(runSpan({ total_cost_usd: 0.5, calls: 1 }, { startMs: 1, endMs: 0, traceId: "t", spanId: "s" }), "costcap.total_cost_usd"), 0.5);
-  const req = encodeRequest([root]);
-  const rs = req.resourceSpans[0];
-  assert.equal(rs.resource.attributes.find((a) => a.key === "service.name").value.stringValue, "costcap");
-  assert.ok(rs.resource.attributes.find((a) => a.key === "service.version"));
-  assert.equal(rs.scopeSpans[0].spans.length, 1);
-  assert.equal(typeof root.startTimeUnixNano, "string");
+test("run span and ExportTraceServiceRequest shape", () => {
+  const sum = { run_id: "R", started_at: "2026-11-16T12:00:00.000Z", ended_at: TS, calls: 2, blocked_calls: 1, unknown_cost_calls: 0, total_cost_usd: 0.5, stopped_by: "budget_exceeded", exit_code: 0 };
+  const rs = runSpan(sum, { traceId: traceIdFor("R"), spanId: "0000000000000001" });
+  const a = A(rs);
+  assert.equal(rs.name, "costcap.run");
+  assert.equal(a["costcap.total_cost_usd"], 0.5);
+  assert.equal(a["costcap.calls"], "2");
+  assert.equal(a["costcap.blocked_calls"], "1");
+  assert.equal(a["costcap.unknown_cost_calls"], "0");
+  assert.equal(a["costcap.stopped_by"], "budget_exceeded");
+  assert.equal(a["costcap.exit_code"], "0");
+  assert.equal(rs.status.code, 2);
+  const unk = A(runSpan({ ...sum, total_cost_usd: null, unknown_cost_calls: 1, stopped_by: null }, { traceId: "t", spanId: "s" }));
+  assert.equal("costcap.total_cost_usd" in unk, false);
+  assert.equal(unk["costcap.unknown_cost_calls"], "1");
+  const body = exportRequest([rs], { serviceVersion: "9.9.9" });
+  const res = body.resourceSpans[0];
+  assert.deepEqual(res.resource.attributes, [{ key: "service.name", value: { stringValue: "costcap" } }, { key: "service.version", value: { stringValue: "9.9.9" } }]);
+  assert.equal(res.scopeSpans[0].scope.name, "costcap");
+  assert.equal(res.scopeSpans[0].spans[0], rs);
+  assert.equal(typeof rs.startTimeUnixNano, "string");
 });
 
-test("headers parse k=v,k2=v2 and reject junk", () => {
-  assert.deepEqual(parseOtlpHeaders("Authorization=Bearer x, x-tenant=a%20b"), { authorization: "Bearer x", "x-tenant": "a b" });
-  assert.deepEqual(parseOtlpHeaders(""), {});
-  assert.deepEqual(parseOtlpHeaders("a=%E0%A4%A,,"), { a: "%E0%A4%A" });
-  assert.throws(() => parseOtlpHeaders("novalue"), /k=v/);
-  assert.throws(() => parseOtlpHeaders("bad name=1"), /header name/);
-  assert.throws(() => parseOtlpHeaders("a=%0d%0aX"), /header value/);
+test("headers parse k=v,k2=v2 and never echo values in errors", () => {
+  assert.deepEqual(parseOtlpHeaders("authorization=Bearer s3cret,x-tenant=a"), { authorization: "Bearer s3cret", "x-tenant": "a" });
+  assert.deepEqual(parseOtlpHeaders(" A=b%20c , "), { a: "b c" });
+  assert.deepEqual(parseOtlpHeaders("a=%E0"), { a: "%E0" });
+  assert.deepEqual(parseOtlpHeaders(undefined), {});
+  assert.throws(() => parseOtlpHeaders("nosecretvalue"), (e) => !/nosecretvalue/.test(e.message));
+  assert.throws(() => parseOtlpHeaders("bad name=s3cret"), (e) => !/s3cret/.test(e.message));
 });
 
-test("URL validation", () => {
-  assert.deepEqual(parseOtlpUrl("http://127.0.0.1:4318"), { url: "http://127.0.0.1:4318/v1/traces", insecure: false });
-  assert.deepEqual(parseOtlpUrl("https://otel.example.com/v1/traces"), { url: "https://otel.example.com/v1/traces", insecure: false });
-  assert.equal(parseOtlpUrl("http://otel.example.com/").insecure, true);
-  assert.throws(() => parseOtlpUrl("ftp://x"), /http\(s\)/);
-  assert.throws(() => parseOtlpUrl("not a url"), /http\(s\)/);
-  assert.throws(() => parseOtlpUrl("http://u:p@127.0.0.1:1"), /credentials/);
+test("URL checks", () => {
+  assert.deepEqual(parseOtlpEndpoint("http://127.0.0.1:4318/"), { url: "http://127.0.0.1:4318", tracesUrl: "http://127.0.0.1:4318/v1/traces", insecure: false });
+  assert.equal(parseOtlpEndpoint("http://collector.example:4318").insecure, true);
+  assert.equal(parseOtlpEndpoint("https://collector.example").insecure, false);
+  assert.throws(() => parseOtlpEndpoint("ftp://x"), /http\(s\)/);
+  assert.throws(() => parseOtlpEndpoint("not a url"), /http\(s\)/);
+  assert.throws(() => parseOtlpEndpoint("http://u:p@127.0.0.1:1"), (e) => /user:pass/.test(e.message) && !/u:p@/.test(e.message));
 });
 
-test("exporter batches at most maxBatch spans and bounds the queue", async () => {
+function fakeFetch(status = 200) {
   const posts = [];
-  const ex = createOtlpExporter({ url: "http://x/v1/traces", runId: "R", post: async (u, h, body) => { posts.push(JSON.parse(body)); }, intervalMs: 60_000 });
-  for (let i = 0; i < 250; i++) ex.add({ ...base, id: `r${i}` }, { startMs: 0 });
-  ex.add({ event: "reconciliation" });
-  const c = await ex.finish({ run_id: "R", calls: 250 }, { startMs: 0 });
-  assert.deepEqual(c, { spans_exported: 251, spans_dropped: 0 });
+  const fn = async (url, init) => { posts.push({ url, init, body: JSON.parse(init.body) }); return { status, arrayBuffer: async () => new ArrayBuffer(0) }; };
+  return { fn, posts };
+}
+
+test("exporter batches at most maxBatch per POST, sends headers, adds the root span, no duplicate span ids", async () => {
+  const { fn, posts } = fakeFetch();
+  const ex = createOtlpExporter({ endpoint: "http://127.0.0.1:1", headers: { authorization: "Bearer x" }, runId: "R", serviceVersion: "1", fetchImpl: fn, warn: () => assert.fail("no warning") });
+  for (let i = 0; i < 250; i++) ex.receipt({ ...metered, id: `r${i}` }, { startedAt: Date.parse(TS) - 1 });
+  ex.receipt({ event: "cap_warning", ts: TS }); // events are not spans
+  const stats = await ex.shutdown({ run_id: "R", started_at: TS, ended_at: TS, calls: 250, blocked_calls: 0, unknown_cost_calls: 0, total_cost_usd: 1, stopped_by: null, exit_code: 0 });
+  assert.deepEqual(stats, { spans_exported: 251, spans_dropped: 0 });
   assert.ok(posts.length >= 3);
-  const spans = posts.flatMap((p) => p.resourceSpans[0].scopeSpans[0].spans);
-  assert.ok(posts.every((p) => p.resourceSpans[0].scopeSpans[0].spans.length <= 100));
+  const spans = posts.flatMap((p) => p.body.resourceSpans[0].scopeSpans[0].spans);
+  assert.ok(posts.every((p) => p.body.resourceSpans[0].scopeSpans[0].spans.length <= 100));
+  assert.equal(spans.length, 251);
   assert.equal(new Set(spans.map((s) => s.spanId)).size, 251);
   assert.ok(spans.every((s) => s.traceId === traceIdFor("R")));
-  assert.deepEqual(await ex.finish({}), c); // idempotent
-  ex.add(base); // ignored after finish
-  assert.deepEqual(ex.counts(), c);
-
-  const small = createOtlpExporter({ url: "http://x", runId: "R", maxQueue: 3, maxBatch: 100, post: async () => {}, intervalMs: 60_000 });
-  for (let i = 0; i < 5; i++) small.add({ ...base, id: `q${i}` });
-  assert.deepEqual(await small.finish({}, { startMs: 0 }), { spans_exported: 3, spans_dropped: 3 });
+  const root = spans.find((s) => s.name === "costcap.run");
+  assert.equal(root.spanId, ex.rootSpanId);
+  assert.ok(spans.filter((s) => s !== root).every((s) => s.parentSpanId === root.spanId));
+  assert.equal(posts[0].url, "http://127.0.0.1:1/v1/traces");
+  assert.equal(posts[0].init.headers["content-type"], "application/json");
+  assert.equal(posts[0].init.headers.authorization, "Bearer x");
+  // after shutdown, late receipts are dropped
+  ex.receipt({ ...metered, id: "late" });
+  assert.equal(ex.stats().spans_dropped, 1);
 });
 
-test("exporter failures warn once, count drops, honor the final deadline", async () => {
-  const lines = [];
-  const ex = createOtlpExporter({ url: "http://127.0.0.1:9/v1/traces", runId: "R", onWarning: (l) => lines.push(l), post: async () => { throw new Error("boom"); }, maxBatch: 1, intervalMs: 60_000 });
-  ex.add(base); ex.add({ ...base, id: "r2" });
-  assert.deepEqual(await ex.finish({}, { startMs: 0 }), { spans_exported: 0, spans_dropped: 3 });
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /^costcap: warning: otlp/);
+test("queue bound drops overflow; failures warn once and count drops", async () => {
+  const warns = [];
+  let calls = 0;
+  const ex = createOtlpExporter({ endpoint: "http://127.0.0.1:1", runId: "R", serviceVersion: "1", maxQueue: 5, maxBatch: 100, warn: (l) => warns.push(l),
+    fetchImpl: async () => { calls++; return { status: 500 }; } });
+  for (let i = 0; i < 8; i++) ex.receipt({ ...metered, id: `r${i}` });
+  const stats = await ex.shutdown(null);
+  assert.deepEqual(stats, { spans_exported: 0, spans_dropped: 8 });
+  assert.equal(calls, 1);
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /^costcap: warning: otlp /);
+});
 
-  const hang = createOtlpExporter({ url: "http://x", runId: "R", onWarning: (l) => lines.push(l), post: () => new Promise(() => {}), intervalMs: 60_000 });
-  hang.add(base);
+test("network errors and hung collectors are dropped; final flush is capped", async () => {
+  const warns = [];
+  const ex = createOtlpExporter({ endpoint: "http://127.0.0.1:1", runId: "R", serviceVersion: "1", warn: (l) => warns.push(l), fetchImpl: async () => { throw Object.assign(new Error("x"), { cause: { code: "ECONNREFUSED" } }); } });
+  ex.receipt(metered);
+  assert.deepEqual(await ex.shutdown(null), { spans_exported: 0, spans_dropped: 1 });
+  assert.match(warns[0], /ECONNREFUSED/);
+  const hung = createOtlpExporter({ endpoint: "http://127.0.0.1:1", runId: "R", serviceVersion: "1", finalFlushMs: 50, warn: (l) => warns.push(l),
+    fetchImpl: (u, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted")))) });
+  hung.receipt(metered);
   const t0 = Date.now();
-  assert.deepEqual(await hang.finish({}, { startMs: 0, deadlineMs: 50 }), { spans_exported: 0, spans_dropped: 2 });
+  assert.deepEqual(await hung.shutdown(null), { spans_exported: 0, spans_dropped: 1 });
   assert.ok(Date.now() - t0 < 1000);
-  assert.equal(lines.length, 2);
-
-  const throwsWarn = createOtlpExporter({ url: "http://x", runId: "R", onWarning: () => { throw new Error("x"); }, post: async () => { throw new Error("y"); }, intervalMs: 60_000 });
-  assert.deepEqual(await throwsWarn.finish({}, { startMs: 0 }), { spans_exported: 0, spans_dropped: 1 });
-});
-
-test("interval timer drains the queue", async () => {
-  let n = 0;
-  const ex = createOtlpExporter({ url: "http://x", runId: "R", post: async (u, h, b) => { n += JSON.parse(b).resourceSpans[0].scopeSpans[0].spans.length; }, intervalMs: 20 });
-  ex.add(base);
-  await new Promise((r) => setTimeout(r, 80));
-  assert.equal(n, 1);
-  await ex.finish({}, { startMs: 0 });
-});
-
-test("finish() settles at the deadline even when nothing else keeps the event loop alive", () => {
-  // A hung post with no socket/timer of its own: an unref'd deadline would let the process exit with finish() pending.
-  const src = new URL("../src/otlp.js", import.meta.url).href;
-  const code = `import { createOtlpExporter } from ${JSON.stringify(src)};
-const ex = createOtlpExporter({ url: "http://x", runId: "R", onWarning: () => {}, post: () => new Promise(() => {}), intervalMs: 60000 });
-ex.add(${JSON.stringify(base)});
-const c = await ex.finish({}, { startMs: 0, deadlineMs: 50 });
-console.log(JSON.stringify(c));`;
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 10_000 });
-  assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(JSON.parse(r.stdout.trim()), { spans_exported: 0, spans_dropped: 2 });
+  // per-POST timeout
+  const slow = createOtlpExporter({ endpoint: "http://127.0.0.1:1", runId: "R", serviceVersion: "1", postTimeoutMs: 20, flushMs: 10, warn: () => {},
+    fetchImpl: (u, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted")))) });
+  slow.receipt(metered);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(slow.stats(), { spans_exported: 0, spans_dropped: 1 });
+  await slow.shutdown(null);
 });
