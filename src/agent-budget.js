@@ -6,8 +6,9 @@ import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // using the shared ledger's rows for that agent.
 
 export const UNKNOWN_AGENT = "unknown";
-// #265: total is a lifetime cap (never resets).
 export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month", "total"]);
+// #265: a total cap never resets; its refusal says so and carries no retry hint.
+export const TOTAL_NEVER_RESETS = "This total budget never resets; raise the cap to continue.";
 const HOUR_MS = 60 * 60 * 1000;
 
 const round6 = (n) => Number(n.toFixed(6));
@@ -123,6 +124,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
       const tsMs = Date.parse(r.ts);
+      out.total += cost; // #265: every receipt since the beginning
       if (tsMs > nowMs - HOUR_MS) out.hour += cost;
       if (periodKey("day", tsMs, budgetPeriod) === today.day) out.day += cost;
       if (periodKey("week", tsMs, budgetPeriod) === today.week) out.week += cost;
@@ -145,7 +147,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     entries.sort((a, b) => a[0] - b[0]);
     return retryAfterSeconds(entries, spent, cap, nowMs);
   }
-  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : {});
+  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : scope === "total" ? { message: TOTAL_NEVER_RESETS } : {});
 
   // Effective model allowlist (#153): intersection of the agent's, its team's and the default lists.
   // null = unrestricted; [] = every model refused.

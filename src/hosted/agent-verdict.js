@@ -23,10 +23,10 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   if (maxSteps != null && runId) limits.maxSteps = maxSteps;
   const policy = Object.keys(limits).length ? { agents: { [agent.id]: limits } } : {};
   // Only receipts in the widest window (this budget-period month, #209) count, unknown ones included.
-  // #265: a total cap counts every receipt since the beginning (unknown ones included).
-  const lifetime = limits.total != null;
+  // #265: a total cap counts every receipt the agent ever synced (unknown ones included).
+  const allTime = limits.total != null;
   const history = receipts
-    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod, limits.week != null)))
+    .filter((r) => Number.isFinite(Date.parse(r?.ts)) && (allTime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod)))
     .map((r) => ({ id: r.id, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agent.id, run_id: r.run_id ?? null, ...(r.reason ? { reason: r.reason } : {}) }));
   const budgets = createAgentBudgets({ policy, history, now: () => nowDate, budgetPeriod });
   const remaining = budgetRemaining(budgets, who);
@@ -39,7 +39,7 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
   if ((team || orgBudget) && hit?.verdict === "no_budget_policy") hit = null;
   if (!hit && team && team.verdict !== "ok") {
     hit = { verdict: team.verdict, reason: team.verdict === "accounting_unavailable" ? "unreconciled_receipt" : "budget_exceeded", team: team.name, ...who,
-      ...Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in team).map((k) => [k, team[k]])) };
+      ...Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts", "message"].filter((k) => k in team).map((k) => [k, team[k]])) };
   }
   // Issue #240: the org-wide budget applies after the agent and team caps.
   if (!hit && orgBudget && orgBudget.verdict !== "ok") {
@@ -53,6 +53,6 @@ export function hostedAgentVerdict({ agent, receipts, nowMs, runId = null, team 
     ...(orgBudget ? { org_budget: orgBudget } : {}),
     ...(maxSteps != null || runId ? { max_steps: maxSteps } : {}),
     ...(runId ? { steps: history.filter((r) => r.run_id === runId && !r.blocked).length } : {}),
-    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
+    ...(hit ? Object.fromEntries(["scope", "cap_usd", "spent_usd", "unknown_receipts", "message"].filter((k) => k in hit).map((k) => [k, hit[k]])) : {}),
   };
 }

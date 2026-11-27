@@ -73,6 +73,17 @@ async function contract(open, mode) {
   // #123: org teams survive a restart on both stores.
   assert.deepEqual(reopened.read((s) => s.teams[`${ORG_A}:ops`]), { orgId: ORG_A, name: "ops", agents: ["ag1"], day: 30 });
   assert.equal((await healthOf(reopened)).persistence, mode);
+  // #265: a total-only team and an agent caps.total survive a restart on both stores.
+  reopened.transaction((s) => {
+    s.teams[`${ORG_A}:pilot`] = { orgId: ORG_A, name: "pilot", agents: ["ag-total"], total: 50 };
+    s.agents["ag-total"] = { id: "ag-total", orgId: ORG_A, name: "t", hash: hashToken("ag-total-token"), policy: { version: 1, caps: { total: 200 }, killed: false }, lastSeen: 1, revoked: false };
+  });
+  await reopened.flush();
+  const again = await open();
+  assert.deepEqual(again.read((s) => s.teams[`${ORG_A}:pilot`]), { orgId: ORG_A, name: "pilot", agents: ["ag-total"], total: 50 });
+  assert.equal(again.read((s) => s.agents["ag-total"].policy.caps.total), 200);
+  reopened.transaction((s) => { delete s.teams[`${ORG_A}:pilot`]; delete s.agents["ag-total"]; });
+  await reopened.flush();
   // #127: /v1/policy agent_spend is org-scoped. A same-id agent row planted under org B never counts.
   const day = new Date().toISOString();
   reopened.transaction((s) => {

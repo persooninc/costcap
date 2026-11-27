@@ -52,41 +52,9 @@ export function isExpired(item, cutoffMs, floorMs) {
 
 /**
  * Keys of `receipts` (store map) belonging to `orgId` that a sweep would delete.
- * #265: receipts of agents in `keepAgents` (a Set of agent ids whose own or team
- * total cap counts every receipt) are never deleted.
+ * keepAgents (#265): agent ids under a total cap; their receipts are never deleted.
  */
 export function expiredReceiptKeys(receipts, orgId, cutoffMs, floorMs, keepAgents = null) {
   if (cutoffMs === null) return [];
-  // #286: keepAgents may also be a predicate over the stored item (org, tag and model totals).
-  const kept = typeof keepAgents === "function" ? keepAgents : (item) => Boolean(keepAgents?.has(item.agentId));
-  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !kept(item) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
-}
-
-/**
- * #286: predicate over stored receipt items that count toward any configured
- * total: the agent/team totals (#265), an org total (every org receipt), a fleet
- * tag total rule (every receipt has a value for its key, UNTAGGED included) and a
- * hosted model total (that agent's receipts of that model).
- */
-export function totalCapKeep({ agents, teams, org, orgId }) {
-  const byAgent = totalCapAgents(agents, teams, orgId);
-  const all = org?.orgBudget?.total != null || (org?.tagCaps ?? []).some((r) => r?.scope === "total");
-  const models = new Map();
-  for (const a of agents ?? []) {
-    if (a?.orgId !== orgId) continue;
-    const ms = (a.policy?.modelCaps ?? []).filter((r) => r?.scope === "total").map((r) => normalizeModel(r.model));
-    if (ms.length) models.set(a.id, new Set(ms));
-  }
-  return (item) => all || byAgent.has(item?.agentId) || Boolean(models.get(item?.agentId)?.has(normalizeModel((item?.receipt ?? item)?.model)));
-}
-
-/**
- * #265: agent ids of an org whose receipts count toward a configured total cap:
- * the agent's own caps.total, or the total of the team it belongs to.
- */
-export function totalCapAgents(agents, teams, orgId) {
-  const out = new Set();
-  for (const a of agents ?? []) if (a?.orgId === orgId && a.policy?.caps?.total != null) out.add(a.id);
-  for (const t of teams ?? []) if (t?.orgId === orgId && t.total != null) for (const id of t.agents ?? []) out.add(id);
-  return out;
+  return Object.entries(receipts ?? {}).filter(([, item]) => item?.orgId === orgId && !keepAgents?.has(item.agentId) && isExpired(item, cutoffMs, floorMs)).map(([key]) => key);
 }

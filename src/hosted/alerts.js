@@ -80,8 +80,9 @@ function fractionsFrom(warnFractions, approachFraction) {
 export function capPeriod(scope, nowMs, budgetPeriod = null) {
   // Issue #168: a run-scope period is the run itself ("run:<runId>").
   if (typeof scope === "string" && scope.startsWith("run:")) return scope;
-  // #265: a total cap's period is "total" (it never rolls over).
-  return periodKey(scope === "month" || scope === "week" || scope === "total" ? scope : "day", nowMs, budgetPeriod);
+  if (scope === "total") return "total"; // #265: one period forever
+
+  return periodKey(scope === "month" || scope === "week" ? scope : "day", nowMs, budgetPeriod);
 }
 
 // Issue #245: blocked receipts that count toward cap_hit. Only a block with the

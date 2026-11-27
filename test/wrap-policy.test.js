@@ -112,45 +112,59 @@ test("#114 enrolled wrapper enforces the cached hosted maxSteps per run, offline
   up.close();
 });
 
-// #265: a local `wrap --policy` file accepts `total` for agents and teams. Spend
-// from earlier months counts (it never resets) and the refusal has no Retry-After.
-async function wrapWithPolicy(policy, seed) {
+// #265: a hosted caps.total refuses the next call once synced (all-time) spend
+// plus this host's unsynced spend reaches it; no Retry-After, upstream untouched.
+// A local --policy file accepts `total` for agents too.
+test("#265 enrolled wrapper refuses at caps.total with scope total and no Retry-After; local policy total", async () => {
   let hits = 0;
-  const up = http.createServer((req, res) => { hits++; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 10 } })); });
-  const upPort = await listen(up);
-  const dir = mkdtempSync(join(tmpdir(), "cc-total-"));
-  const receipts = join(dir, "r.jsonl");
-  const policyPath = join(dir, "policy.json");
-  writeFileSync(policyPath, JSON.stringify(policy));
-  writeFileSync(receipts, seed.map((r) => JSON.stringify({ provider: "openai", path: "/chat/completions", ...r })).join("\n") + "\n");
-  const script = `const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) }); console.log(JSON.stringify({ status: r.status, retry: r.headers.get("retry-after"), body: await r.json() }));`;
-  const res = await new Promise((resolve) => {
-    const child = spawn(process.execPath, ["src/cli.js", "wrap", "--agent", "bot", "--policy", policyPath, "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${upPort}` } });
-    let out = "";
-    child.stdout.on("data", (d) => { out += d; });
-    child.on("exit", () => resolve(out));
+  const now = new Date().toISOString();
+  const servedPolicy = { version: 2, caps: { total: 10, month: 100 }, killed: false, agent_spend: { spent: { day: 0, week: 0, month: 3, total: 9.5 }, unknown: 0, pending_batches: 0, as_of: now } };
+  const up = http.createServer((req, res) => {
+    hits++;
+    res.end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 1_000_000, completion_tokens: 0 } }));
   });
-  up.close();
-  const line = res.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n").find((l) => l.startsWith("{"));
-  return { ...JSON.parse(line), hits };
-}
-
-test("#265 wrap --policy: agent total counts earlier months and refuses without Retry-After", async () => {
-  const seed = [{ id: "old", ts: "2025-06-01T00:00:00Z", cost_usd: 6, agent_id: "bot" }, { id: "older", ts: "2024-01-01T00:00:00Z", cost_usd: 4, agent_id: "bot" }];
-  const r = await wrapWithPolicy({ agents: { bot: { total: 10 } } }, seed);
-  assert.equal(r.status, 429);
-  assert.equal(r.hits, 0);
-  assert.equal(r.retry, null);
-  assert.deepEqual([r.body.scope, r.body.cap_usd, r.body.spent_usd], ["total", 10, 10]);
-  assert.match(r.body.message, /does not reset/);
-  // Raised: the call goes through.
-  const ok = await wrapWithPolicy({ agents: { bot: { total: 20 } } }, seed);
-  assert.deepEqual([ok.status, ok.hits], [200, 1]);
-});
-
-test("#265 wrap --policy: team total pools members' spend across months", async () => {
-  const seed = [{ id: "a", ts: "2025-10-01T00:00:00Z", cost_usd: 8, agent_id: "peer" }, { id: "b", ts: "2026-01-01T00:00:00Z", cost_usd: 7.1, agent_id: "bot" }];
-  const r = await wrapWithPolicy({ teams: { pilot: { total: 15, agents: ["bot", "peer"] } } }, seed);
-  assert.equal(r.status, 429);
-  assert.deepEqual([r.body.scope, r.body.team, r.retry], ["total", "pilot", null]);
+  const fleet = http.createServer((req, res) => {
+    let text = "";
+    req.on("data", (chunk) => { text += chunk; });
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/v1/policy") res.end(JSON.stringify(servedPolicy));
+      else if (req.url === "/v1/receipts") res.end(JSON.stringify({ acceptedIds: [] })); // never synced: counts as unsynced
+      else { res.statusCode = 404; res.end("{}"); }
+    });
+  });
+  const upPort = await listen(up);
+  const fleetPort = await listen(fleet);
+  const dir = mkdtempSync(join(tmpdir(), "cc-total-"));
+  const enrollment = join(dir, "enrollment.json");
+  writeFileSync(enrollment, JSON.stringify({ url: `http://127.0.0.1:${fleetPort}`, token: "agent-token", agentId: "agent-1", policy: { version: 1, caps: {}, killed: false }, syncedIds: [] }), { mode: 0o600 });
+  const script = `for (let i = 0; i < 3; i++) { const r = await fetch(process.env.OPENAI_BASE_URL + "/chat/completions", { method: "POST", body: JSON.stringify({ n: i }) }); const b = await r.json(); console.log(r.status, r.headers.get("retry-after"), b.scope ?? b.error?.scope ?? "", b.message ?? b.error?.message ?? ""); if (r.status === 429) break; }`;
+  const run = (args) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--receipts", join(dir, `r-${args.length}.jsonl`), "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", script], { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${upPort}` } });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim().split("\n"), err }));
+  });
+  try {
+    // gpt-4o-mini: 1M input tokens = $0.15; $9.50 + $0.15 < $10 -> first call goes, then 429.
+    servedPolicy.agent_spend.spent.total = 9.9;
+    const hosted = await run(["--enrollment", enrollment]);
+    assert.equal(hosted.code, 0, hosted.err);
+    assert.match(hosted.out[0], /^200 /);
+    assert.match(hosted.out[1], /^429 null total .*never resets/);
+    assert.equal(hits, 1);
+    // Local --policy file with an agent total.
+    hits = 0;
+    const policy = join(dir, "policy.json");
+    writeFileSync(policy, JSON.stringify({ agents: { local: { total: 0.1 } } }));
+    const local = await run(["--policy", policy, "--agent", "local"]);
+    assert.equal(local.code, 0, local.err);
+    assert.match(local.out[0], /^200 /);
+    assert.match(local.out[1], /^429 null total .*never resets/);
+    assert.equal(hits, 1);
+  } finally {
+    up.close();
+    fleet.close();
+  }
 });

@@ -310,11 +310,17 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
   const orgPeriod = (s, orgId) => normalizeBudgetPeriod(s.orgs?.[orgId]?.budgetPeriod);
   // Issue #211: org receipt retention (null = keep). Deleted receipts take their settlement with them.
   const orgRetention = (s, orgId) => { const days = s.orgs?.[orgId]?.receiptRetentionDays; return Number.isInteger(days) ? days : null; };
-  const retentionWindow = (s, orgId) => ({ cutoff: retentionCutoffMs(orgRetention(s, orgId), now()), floor: retentionFloorMs(now(), orgPeriod(s, orgId)), keep: totalCapKeep({ agents: Object.values(s.agents), teams: Object.values(s.teams ?? {}), org: s.orgs?.[orgId], orgId }) });
+  const retentionWindow = (s, orgId) => ({ cutoff: retentionCutoffMs(orgRetention(s, orgId), now()), floor: retentionFloorMs(now(), orgPeriod(s, orgId)) });
+  // #265: agents whose receipts count toward a total cap (own caps.total or a team total); never swept.
+  const totalCapped = (s, orgId) => {
+    const ids = new Set(Object.values(s.agents).filter((a) => a.orgId === orgId && a.policy?.caps?.total != null).map((a) => a.id));
+    for (const t of Object.values(s.teams ?? {})) if (t.orgId === orgId && t.total != null) t.agents.forEach((id) => ids.add(id));
+    return ids;
+  };
   const retentionView = (s, orgId, role) => {
     const days = orgRetention(s, orgId);
-    const { cutoff, floor, keep } = retentionWindow(s, orgId);
-    return { days, cutoff: cutoff === null ? null : new Date(cutoff).toISOString(), protected_since: new Date(floor).toISOString(), eligible_count: expiredReceiptKeys(s.receipts, orgId, cutoff, floor, keep).length,
+    const { cutoff, floor } = retentionWindow(s, orgId);
+    return { days, cutoff: cutoff === null ? null : new Date(cutoff).toISOString(), protected_since: new Date(floor).toISOString(), eligible_count: expiredReceiptKeys(s.receipts, orgId, cutoff, floor, totalCapped(s, orgId)).length,
       min: RETENTION_MIN_DAYS, max: retentionMaxDays(entitlements(s, orgId)), canEdit: ["owner", "admin"].includes(role) };
   };
   // Nightly sweep (run.js): one receipts.purge audit entry per org that lost receipts.
@@ -322,8 +328,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
     return store.transaction((s) => {
       const out = [];
       for (const orgId of Object.keys(s.orgs ?? {})) {
-        const { cutoff, floor, keep } = retentionWindow(s, orgId);
-        const keys = expiredReceiptKeys(s.receipts, orgId, cutoff, floor, keep);
+        const { cutoff, floor } = retentionWindow(s, orgId);
+        const keys = expiredReceiptKeys(s.receipts, orgId, cutoff, floor, totalCapped(s, orgId));
         if (!keys.length) continue;
         for (const key of keys) delete s.receipts[key];
         audit(s, orgId, "retention-sweep", "receipts.purge", orgId, { count: keys.length, cutoff: new Date(cutoff).toISOString() });
@@ -520,20 +526,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         return json(201, result);
       }
       if (path === "/v1/policy" && req.method === "GET") {
-        const p = store.transaction((s) => {
-          const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId);
-          // #268: week scopes travel in additive fields (org_budget_v2, tag_caps_v2,
-          // model_caps_week) so a pre-#268 wrapper keeps accepting the policy.
-          // #271: week raises travel in raise_week, never under raise (a pre-#271 validator rejects raise.week).
-          // #287: total raises likewise travel in raise_total (a b91f36e validator rejects raise.total).
-          const { policy: noTotalRaise, raise_total: raiseTotal } = splitTotalRaise(a.policy);
-          const { policy: legacyPolicy, raise_week: raiseWeek } = splitWeekRaise(noTotalRaise);
-          const { modelCaps: allModelCaps, ...rest } = legacyPolicy;
-          const mc = splitWeekModelCaps(allModelCaps);
-          const orgVerdict = orgBudgetOfOrg(s, a.orgId);
-          const org = orgBudgetPolicy(orgVerdict, now());
-          const orgTotal = totalOrgBudgetPolicy(orgVerdict, now());
-          return { ...rest, ...(mc.legacy.length ? { modelCaps: mc.legacy } : {}), ...(mc.week.length ? { model_caps_week: mc.week } : {}), ...(mc.total.length ? { model_caps_total: mc.total } : {}), ...(raiseWeek ? { raise_week: raiseWeek } : {}), ...(raiseTotal ? { raise_total: raiseTotal } : {}), team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, allModelCaps, { total: a.policy.caps?.total != null, week: effectiveCaps(a.policy, now()).week != null }), settlements: agentSettlements(s, a), ...fleetTagCapsPayload(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), bp), org_budget: legacyOrgBudgetPolicy(org), org_budget_v2: weekOrgBudgetPolicy(org), ...(orgTotal ? { org_budget_total: orgTotal } : {}), budget_period: { ...bp } }; });
+        const p = store.transaction((s) => { const a = agentUser(s, req); a.lastSeen = now(); const t = teamFor(Object.values(s.teams ?? {}), a.orgId, a.id); const bp = orgPeriod(s, a.orgId); return { ...a.policy, team: t ? teamPolicy(verdictOf(s, t), now()) : null, agent_spend: agentSpendPolicy(orgAgentReceipts(s, a.orgId, a.id), now(), bp, a.policy.modelCaps, { allTime: a.policy.caps?.total != null }), settlements: agentSettlements(s, a), tag_caps: fleetTagCapsPolicy(s.orgs[a.orgId]?.tagCaps ?? [], orgReceipts(s, a.orgId), now(), undefined, bp), org_budget: orgBudgetPolicy(orgBudgetOfOrg(s, a.orgId), now()), budget_period: { ...bp } }; });
         return json(200, p);
       }
       if (path === "/v1/receipts" && req.method === "POST") {
@@ -543,6 +536,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           const acceptedIds = [];
           let expired = 0;
           const keep = retentionWindow(s, a.orgId);
+          const keepAll = totalCapped(s, a.orgId).has(a.id);
           for (const r of body.receipts) {
             if (r && typeof r.path === "string") r.path = scrubReceiptPath(r.path);
             if (!r || typeof r.id !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(r.id) || !Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0)) || !validTags(r.tags)) fail(400, "Invalid receipt");
@@ -550,7 +544,8 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
             if ("saved_usd" in r && (r.reason !== "cache_hit" || r.cost_usd !== 0 || typeof r.saved_usd !== "number" || !Number.isFinite(r.saved_usd) || r.saved_usd < 0)) fail(400, "Invalid receipt: saved_usd");
             const key = `${a.id}:${r.id}`;
             // #211: older than the org retention cutoff: acknowledged so the backlog drains, never stored.
-            if (!s.receipts[key] && !keep.keep({ agentId: a.id, receipt: r }) && isExpired({ receipt: r }, keep.cutoff, keep.floor)) { expired++; acceptedIds.push(r.id); continue; }
+            // #265: an agent under a total cap keeps every receipt (they count toward the cap).
+            if (!s.receipts[key] && !keepAll && isExpired({ receipt: r }, keep.cutoff, keep.floor)) { expired++; acceptedIds.push(r.id); continue; }
             if (s.receipts[key] && JSON.stringify(s.receipts[key].receipt) !== JSON.stringify(r)) fail(409, "Receipt ID content conflict");
             s.receipts[key] ??= { orgId: a.orgId, agentId: a.id, receipt: r };
             acceptedIds.push(r.id);
@@ -1327,7 +1322,9 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
           return r.reason ? [r.reason] : [];
         });
         const caps = effectiveCaps(a.policy, now());
-        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: spent.all.usd }, unknown: { month: spent.month.unknown, week: spent.week.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
+        // #265: a total cap's spend is the whole synced history; unknown cost raises no total alert.
+        const totalSpend = spent.all.unknown === 0 ? spent.all.usd : undefined;
+        const alerts = evaluateAlerts({ agentId: a.id, caps, spend: { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: totalSpend }, unknown: { month: spent.month.unknown }, blockedReasons, lastSeenMs: a.lastSeen, nowMs: now() }, { silentAfterMs: silentAfterMsFor(a.policy), warnFractions: a.policy.warnFractions, budgetPeriod: bp });
         // Issue #168: per-run alerts from synced receipts (active runs only).
         const blockedRunIds = recent.filter((r) => r.reason === "budget_exceeded" && r.scope === "run" && typeof r.run_id === "string" && r.run_id).map((r) => r.run_id);
         const runCap = caps.run;
@@ -1356,7 +1353,7 @@ export function createHostedServer({ storePath, store: injectedStore, verifyChal
         // The caller must explicitly route each org's alerts.
         const keys = new Set(alerts.map((x) => x.key));
         for (const prior of Object.values(s.alerts).filter((x) => x.agentId === a.id && !keys.has(x.key))) resolveAlert(prior, now());
-        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: spent.all.usd }, a.policy.warnFractions, bp);
+        const warnOk = gateWarnings(s, a.id, caps, { day: spent.day.usd, week: spent.week.usd, month: spent.month.usd, total: totalSpend }, a.policy.warnFractions, bp);
         const runOk = gateRunWarnings(s, a.id, runCap, activeRuns, a.policy.warnFractions);
         for (const alert of alerts) {
           const prior = activeOccurrence(s.alerts, alert.key);
