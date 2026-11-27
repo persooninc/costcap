@@ -192,19 +192,19 @@ export async function wrap(argv) {
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
   let cap, agentBudgets, tagCaps = null, modelCaps = null, hostedModelCaps = null;
   let proxySettle = () => {}; // #171: bound once the proxy is listening
+  // #181: soft cap warnings after settlements, sibling receipts and cap changes.
+  // Deferred to a microtask so it never runs inside the shared-ledger critical section.
+  let checkWarnings = () => {};
+  const warnSoon = () => queueMicrotask(() => { try { checkWarnings(); } catch { /* best effort */ } });
+  let capWarner;
   // #176: fleet and shared-ledger settlements share one helper (batch_pending aware).
   // #178: settlements of this run's receipts also feed the run summary.
   const runSettlements = [];
-  // #181: bound once the proxy is listening; capWarner once created.
-  let checkWarnings = () => {};
-  let capWarner = null;
-  let downgrader = null;
-  const settleWithWarnings = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle, tagCaps: () => tagCaps, modelCaps: () => modelCaps,
-    onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); } });
-  const settleReceipt = (s, r) => { const applied = settleWithWarnings(s, r); if (applied) checkWarnings(); return applied; };
+  const settleReceipt = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle,
+    onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); warnSoon(); } });
   const sharedLedger = shared ? openSharedLedger(receiptsPath, {
-    onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); tagCaps?.record(r); modelCaps?.record(r); checkWarnings(); },
-    onExternalWarning: (e) => { capWarner?.note(e); downgrader?.note(e); },
+    onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); warnSoon(); },
+    onExternalEvent: (e) => capWarner?.note(e),
     // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
     // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
     onExternalSettle: (s, r) => settleReceipt(s, r),
@@ -223,6 +223,7 @@ export async function wrap(argv) {
     fleetPolicy = p;
     const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, ...(p.maxSteps != null ? { maxSteps: p.maxSteps } : {}) } });
     cap.updateCaps(resolved.caps);
+    warnSoon();
     velocity.setMaxSteps(resolved.maxSteps);
   };
   if (enrollmentPath) {
@@ -237,9 +238,14 @@ export async function wrap(argv) {
   const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   const startedAt = new Date().toISOString();
-  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, onSettlement: (e) => { runReceipts.push(e); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, preflight, ...limits,
+  let priorEvents = [];
+  try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
+  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
+  const { server, port } = await startMeteringProxy({ onReceipt: (r) => { runReceipts.push(r); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.agentCheck() ?? fleet.teamCheck() : undefined, sharedLedger, capWarner, preflight, tags: tags ?? null, ...limits,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
+  proxySettle = (r) => server.settle(r);
+  checkWarnings = () => server.checkWarnings();
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");

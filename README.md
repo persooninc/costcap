@@ -740,6 +740,35 @@ return the same verdict with `budget_remaining`. Run and step budgets are per
 `run_id`, which the wrapper assigns. Figures are estimates, the same limits above
 apply, and the policy file must be protected from the agent it limits.
 
+### Hosted team budgets
+
+In the hosted workspace an owner or admin defines teams with `POST /v1/teams` (`{"name": "ops", "agents": [agentId, ...], "day": 30, "month": 500}`; `{"name": "ops", "remove": true}` deletes). Any member can read `GET /v1/teams`. Viewers get 403 on writes, and an agent from another org gets 400. An agent belongs to at most one team. Every change is audited as `team.change`, with the previous and new values.
+
+Each enrolled wrapper gets its team's caps and the team's synced spend with every `/v1/policy` poll. It enforces them offline from that cache, adding its own unsynced spend on top. Its own caps apply first, then the team's. A refusal reads `budget_exceeded` with `scope: "team:ops:day"`. An unknown cost (`cost_usd: null`) from any member makes the team verdict `accounting_unavailable`. It is never counted as $0.
+
+**Overshoot:** team spend comes from synced receipts. Spend another member has not synced yet (up to one poll interval, 60s) is not seen, so the team can go over its cap by that amount. Removing an agent from a team stops its team enforcement at its next poll. `GET /v1/agents/:id/budget`, `/v1/evidence.json` (`teams[]`, `agents[].team`) and the dashboard's Team budgets card show each team's cap, spend and verdict.
+
+**Team alerts:** each alert sweep checks every team against its own day and month caps. At 80% of a cap (default 80%, configurable per agent/team) it raises `cap_approaching`, and at 100% it raises `cap_hit` (keys `cap_approaching:team:<orgId>:<name>:<scope>` and `cap_hit:team:<orgId>:<name>:<scope>`). A member receipt blocked with `scope: "team:<name>:<scope>"` in the last hour also raises that team's `cap_hit`, even when synced totals lag. A team with unknown cost raises no cap alert. Team alerts fire once, re-arm after the condition clears, go to the org's alert destinations, and carry `team`, `scope`, `cap` and `spent`. Deleting the team deactivates them.
+
+**Warning fractions (hosted):** `cap_approaching` defaults to 80%, configurable per agent/team. Set `warnFractions` on `POST /v1/agents/:id/policy` or `POST /v1/teams` (or "Warn at (%)" in the dashboard), e.g. `[0.5, 0.8, 0.95]`: 1-5 unique fractions between 0 and 1, stored sorted. Omitted keeps the saved value, `null` resets to the default, and `[]` turns `cap_approaching` off (`cap_hit` still fires). Each sweep fires the highest crossed fraction, at most once per UTC day/month cap period; a jump past lower fractions covers them. The 0.8 key stays `cap_approaching:<id>:<scope>`; others append `:p<pct>` (e.g. `:p95`), and the alert carries `fraction`. Raising a cap re-arms only fractions whose threshold moves above current spend. Wrappers ignore `warnFractions`.
+
+**Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
+
+## Soft warnings
+
+`wrap` and `check` warn before the hard stop. By default, a warning fires when run, day or month spend reaches 80% of its cap:
+
+```sh
+costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
+# costcap: warning: day spend $8.0123 is 80% of $10 cap (2026-11-16 UTC)
+```
+
+- `--warn-at F[,F...]` takes fractions with 0 < F < 1. The default is `0.8`, and `--warn-at off` disables warnings. A bad value exits `2`.
+- The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`. The fraction is checked after every spend or cap change, not only the wrapper's own receipts: a dashboard/fleet settlement, a `reconcile --apply` or sibling receipt on `--shared-ledger`, and a fleet policy that lowers the cap all warn too (#181). A sibling's `cap_warning` for the same period counts as already sent.
+- Warnings never block a call and are never spend. Receipts, runs and check totals ignore `cap_warning` lines.
+- When a scope has an unknown-cost receipt, its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
+- `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
+
 ## Run summaries
 
 Every `costcap wrap` run, including one that exits non-zero, hits a cap, trips

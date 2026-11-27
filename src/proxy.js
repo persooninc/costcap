@@ -700,15 +700,20 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     cap?.record({ ...pendingReceipt, cost_usd: fold.cost_usd });
     return line;
   });
-  // Meters a JSONL results body against its pending batch. Returns receipt fields, or null when untracked.
-  const meterBatchResults = (provider, batchId, text) => {
-    if (!batchId || !batches.isTracked(provider, batchId)) return null;
-    const pendingReceipt = batches.pendingFor(provider, batchId);
-    if (!pendingReceipt) return { batch_id: batchId, cost_usd: 0, reason: "batch_results", already_settled: true };
-    const fold = foldBatchResults(provider, text, { extractUsage, costForUsage, isPricedModel, premiumTier, multiplier: batchMultiplier(provider) });
-    if (fold.cost_usd === null) return { batch_id: batchId, cost_usd: 0, reason: fold.reason, settled_receipt_id: null };
-    settleBatch(pendingReceipt, fold);
-    return { batch_id: batchId, cost_usd: 0, reason: "batch_results", settled_receipt_id: pendingReceipt.id, batch_cost_usd: fold.cost_usd };
+  // #164: record spend and queue one cap_warning per newly crossed fraction.
+  // flushWarnings() appends them after the receipt that caused them.
+  let pendingWarnings = [];
+  const recordSpend = (receipt) => {
+    if (!cap) return;
+    cap.record(receipt);
+    queueWarnings();
+  };
+  // #181: level-based, so spend that moved past a fraction by another path
+  // (settlement, sibling receipt, cap change) still warns once.
+  const queueWarnings = () => {
+    if (!cap || !capWarner) return;
+    const spend = cap.spend();
+    pendingWarnings.push(...capWarner.sync({ caps: cap.limits(), spend, lowerBound: spend.unknown > 0 }));
   };
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -1665,10 +1670,8 @@ export function createMeteringProxy({ receiptsPath, upstreams = PROVIDERS, onRec
     return failures.delete(id);
   };
   server.accountingFailure = accountingFailureNow;
-  server.inFlight = () => inFlight;
-  // Upgraded sockets are detached from the HTTP server, so close() shuts open sessions itself.
-  const closeServer = server.close.bind(server);
-  server.close = (cb) => { for (const s of [...sessions]) s.close(); if (killTimer) { clearInterval(killTimer); killTimer = null; } return closeServer(cb); };
+  // #181: re-check soft cap warnings after a spend/cap change outside recordSpend.
+  server.checkWarnings = () => { queueWarnings(); flushWarnings(); };
   return server;
 }
 

@@ -100,14 +100,26 @@ export function createCapWarner({ fractions = DEFAULT_WARN_AT, events = [], runI
     observe({ caps, before, after, lowerBound = false }) {
       return emit(crossedThresholds({ caps, before, after, fractions }), caps, after, lowerBound);
     },
-    // #181: spend or caps changed outside an own receipt (settlement, sibling
-    // receipt, fleet policy): every fraction current spend has reached and that
-    // was not yet warned for this period.
-    reached({ caps, spend, lowerBound = false }) {
+    // #181: level-based check. Returns new cap_warning events for every
+    // (scope, fraction) current spend has reached that is not yet seen for its
+    // period. Used after any spend or cap change (own receipt, settlement,
+    // shared-ledger sibling, fleet cap update), so no path skips a fraction.
+    sync({ caps, spend, lowerBound = false }) {
       if (!fractions.length) return [];
-      return emit(currentWarnings({ caps, spend, fractions }), caps, spend, lowerBound);
+      const at = now();
+      const out = [];
+      for (const w of currentWarnings({ caps, spend, fractions })) {
+        const period = periodKey(w.scope, { runId, now: at });
+        const k = dedupeKey(w.scope, w.fraction, period);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const ev = { event: "cap_warning", scope: w.scope, fraction: w.fraction, cap: w.cap, spent_usd: w.spent_usd, period, run_id: runId, agent_id: agentId, lower_bound: !!lowerBound };
+        out.push(ev);
+        emitted.push(ev);
+      }
+      return out;
     },
-    // #181: a cap_warning another wrapper on the shared ledger already wrote.
+    // #181: a cap_warning another wrapper wrote to the shared ledger is deduped too.
     note(e) { if (e?.event === "cap_warning") seen.add(dedupeKey(e.scope, e.fraction, e.period)); },
   };
 }
