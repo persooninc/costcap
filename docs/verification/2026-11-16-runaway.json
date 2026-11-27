@@ -1,5 +1,5 @@
 {
-  "checkedAt": "2026-11-16T23:59:08.697Z",
+  "checkedAt": "2026-11-16T00:08:18.251Z",
   "command": "npm run acceptance:runaway",
   "provider": "local fake OpenAI",
   "paidCalls": 0,
@@ -18,9 +18,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "0fb49377-b4fd-453e-81d1-4390584c328a",
-          "ts": "2026-11-16T23:58:52.611Z",
-          "run_id": "ab8ea7fe-a195-4d35-bb07-5bca4dddd97a",
+          "id": "7e5580a5-7ba1-4172-8a5f-4d736c5aee83",
+          "ts": "2026-11-16T00:08:16.779Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -32,16 +31,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "6b1753e7-172a-44ea-9fe3-4ce51576aebd",
-          "ts": "2026-11-16T23:58:52.906Z",
-          "run_id": "ab8ea7fe-a195-4d35-bb07-5bca4dddd97a",
+          "id": "593063cc-a469-4e36-861c-4b16946084b2",
+          "ts": "2026-11-16T00:08:16.785Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -51,22 +46,7 @@
           "cap": 0.1,
           "spent": 0.15
         }
-      ],
-      "warnings": [
-        {
-          "ts": "2026-11-16T23:58:52.612Z",
-          "event": "cap_warning",
-          "scope": "run",
-          "fraction": 0.8,
-          "cap": 0.1,
-          "spent_usd": 0.15,
-          "period": "ab8ea7fe-a195-4d35-bb07-5bca4dddd97a",
-          "run_id": "ab8ea7fe-a195-4d35-bb07-5bca4dddd97a",
-          "agent_id": null,
-          "lower_bound": false
-        }
-      ],
-      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run ab8ea7fe-a195-4d35-bb07-5bca4dddd97a)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run ab8ea7fe-a195-4d35-bb07-5bca4dddd97a calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
+      ]
     },
     {
       "scenario": "retry-spiral",
@@ -86,9 +66,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "4b9144f8-b152-4125-aca0-0c3d69618b67",
-          "ts": "2026-11-16T23:58:55.042Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "ca947d60-0e75-44af-96cb-f01767514f71",
+          "ts": "2026-11-16T00:08:17.069Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -100,16 +79,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "ac1a0ba9-1a61-4fdc-b712-4fe957f1df02",
-          "ts": "2026-11-16T23:58:55.125Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "b6afa5f7-7813-4bf4-843e-fd63563779cc",
+          "ts": "2026-11-16T00:08:17.075Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -121,16 +96,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "e29a8a07-60f9-4747-810d-36953f57efe0",
-          "ts": "2026-11-16T23:58:55.171Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "3f6ebd04-39af-4fa9-8d56-00d3813aa836",
+          "ts": "2026-11-16T00:08:17.077Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -142,16 +113,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "b4ff7be5-10e3-4c1f-afb9-bb3050ea7b0c",
-          "ts": "2026-11-16T23:58:55.188Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "cfe2ba2b-d92a-4cf9-bc3e-f81b7464d372",
+          "ts": "2026-11-16T00:08:17.079Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -163,16 +130,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "87a0fdc4-d860-42cc-9084-fdfceaa564da",
-          "ts": "2026-11-16T23:58:55.206Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "745b2791-39c6-4f5f-afb9-c07f6d4389d8",
+          "ts": "2026-11-16T00:08:17.081Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -184,16 +147,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "010dd639-a353-4fb3-bb74-fdbd36fbfa94",
-          "ts": "2026-11-16T23:58:55.215Z",
-          "run_id": "cc29d003-8d1e-4313-962b-ac5a8b73f605",
+          "id": "19a906a6-94a3-4262-9edd-9eb1af28bca3",
+          "ts": "2026-11-16T00:08:17.082Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -203,9 +162,7 @@
           "count": 6,
           "windowMs": 60000
         }
-      ],
-      "warnings": [],
-      "stderr": "costcap: run spend $0.7500\ncostcap: run cc29d003-8d1e-4313-962b-ac5a8b73f605 calls=5 rejected=0 refused=1 models=1 cost=$0.7500 stopped_by=breaker_open\n"
+      ]
     },
     {
       "scenario": "steps",
@@ -223,9 +180,8 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "b8360cc7-a06b-42c7-a9a5-d6b9bc9197eb",
-          "ts": "2026-11-16T23:58:56.900Z",
-          "run_id": "c6b254b2-384d-4b74-8ecb-3d9e79614f18",
+          "id": "02860c7f-2807-4fa5-b409-b2934d4ea5c9",
+          "ts": "2026-11-16T00:08:17.326Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -237,16 +193,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "519c97eb-6aff-48e4-8844-b79e69d170a8",
-          "ts": "2026-11-16T23:58:56.979Z",
-          "run_id": "c6b254b2-384d-4b74-8ecb-3d9e79614f18",
+          "id": "1ad20b5a-da3c-4157-babd-1f76b34781d2",
+          "ts": "2026-11-16T00:08:17.332Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -258,16 +210,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "5b9c91fa-40c9-4bec-986b-dadd274a32ec",
-          "ts": "2026-11-16T23:58:57.031Z",
-          "run_id": "c6b254b2-384d-4b74-8ecb-3d9e79614f18",
+          "id": "222c287e-ff89-4547-8db3-4ae3abd493e2",
+          "ts": "2026-11-16T00:08:17.335Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "status": 200,
@@ -279,16 +227,12 @@
           "cached_input_tokens": 0,
           "cache_write_input_tokens": 0,
           "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
+          "table_version": "2026-11-02",
+          "fallback": false
         },
         {
-          "id": "716c278a-b0e7-4c66-8db3-17e8e02859fd",
-          "ts": "2026-11-16T23:58:57.076Z",
-          "run_id": "c6b254b2-384d-4b74-8ecb-3d9e79614f18",
+          "id": "2887ac62-6f59-4cdb-83aa-5576a9976614",
+          "ts": "2026-11-16T00:08:17.336Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -297,9 +241,7 @@
           "steps": 3,
           "max_steps": 3
         }
-      ],
-      "warnings": [],
-      "stderr": "costcap: run spend $0.4500\ncostcap: run c6b254b2-384d-4b74-8ecb-3d9e79614f18 calls=3 rejected=0 refused=1 models=1 cost=$0.4500 stopped_by=breaker_open\n"
+      ]
     },
     {
       "scenario": "day-cap",
@@ -315,14 +257,13 @@
       "receipts": [
         {
           "id": "seed-day",
-          "ts": "2026-11-16T23:58:58.444Z",
+          "ts": "2026-11-16T00:08:17.355Z",
           "cost_usd": 1,
           "model": "gpt-4o-mini"
         },
         {
-          "id": "19e1253b-e9d4-4e41-bbc7-70828ab1426b",
-          "ts": "2026-11-16T23:59:00.770Z",
-          "run_id": "13c13122-87e7-4ed3-b249-fc22dba11de0",
+          "id": "ae30ff28-08a1-406e-81cb-4f6b3b6d3aa4",
+          "ts": "2026-11-16T00:08:17.572Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -332,22 +273,7 @@
           "cap": 0.5,
           "spent": 1
         }
-      ],
-      "warnings": [
-        {
-          "ts": "2026-11-16T23:58:59.855Z",
-          "event": "cap_warning",
-          "scope": "day",
-          "fraction": 0.8,
-          "cap": 0.5,
-          "spent_usd": 1,
-          "period": "2026-11-16",
-          "run_id": "13c13122-87e7-4ed3-b249-fc22dba11de0",
-          "agent_id": null,
-          "lower_bound": false
-        }
-      ],
-      "stderr": "costcap: warning: day spend $1.0000 is 80% of $0.5 cap (2026-11-16 UTC)\ncostcap: run spend $0.0000\ncostcap: run 13c13122-87e7-4ed3-b249-fc22dba11de0 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:day\n"
+      ]
     },
     {
       "scenario": "month-cap",
@@ -368,9 +294,8 @@
           "model": "gpt-4o-mini"
         },
         {
-          "id": "6ace789d-cbaa-4f7f-8c2a-541a758f91d3",
-          "ts": "2026-11-16T23:59:01.776Z",
-          "run_id": "2546c714-4f40-44f5-9ade-691ed2565acc",
+          "id": "e3ac4f11-e814-4942-809d-665af4865292",
+          "ts": "2026-11-16T00:08:17.801Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -380,22 +305,7 @@
           "cap": 0.5,
           "spent": 1
         }
-      ],
-      "warnings": [
-        {
-          "ts": "2026-11-16T23:59:01.363Z",
-          "event": "cap_warning",
-          "scope": "month",
-          "fraction": 0.8,
-          "cap": 0.5,
-          "spent_usd": 1,
-          "period": "2026-11",
-          "run_id": "2546c714-4f40-44f5-9ade-691ed2565acc",
-          "agent_id": null,
-          "lower_bound": false
-        }
-      ],
-      "stderr": "costcap: warning: month spend $1.0000 is 80% of $0.5 cap (2026-11 UTC)\ncostcap: run spend $0.0000\ncostcap: run 2546c714-4f40-44f5-9ade-691ed2565acc calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=budget_exceeded:month\n"
+      ]
     },
     {
       "scenario": "unknown-cost",
@@ -411,15 +321,14 @@
       "receipts": [
         {
           "id": "seed-unknown",
-          "ts": "2026-11-16T23:58:58.444Z",
+          "ts": "2026-11-16T00:08:17.355Z",
           "cost_usd": null,
           "model": "gpt-4o-mini",
           "reason": "usage_unavailable"
         },
         {
-          "id": "dc74891c-c101-4175-a3ce-8f8d0b19b820",
-          "ts": "2026-11-16T23:59:03.078Z",
-          "run_id": "1cabea0f-ba18-40f4-96b5-546cdcfe995e",
+          "id": "aa759da9-d889-4093-b3dd-2c21081a087f",
+          "ts": "2026-11-16T00:08:18.022Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
@@ -429,9 +338,7 @@
           "cap": 0,
           "spent": 0
         }
-      ],
-      "warnings": [],
-      "stderr": "costcap: run spend $0.0000 of $5 cap\ncostcap: run 1cabea0f-ba18-40f4-96b5-546cdcfe995e calls=0 rejected=0 refused=1 models=0 cost=$0.0000\n"
+      ]
     },
     {
       "scenario": "kill-file",
@@ -446,85 +353,17 @@
       "unknownCostCount": 0,
       "receipts": [
         {
-          "id": "6892a924-90c9-4346-bb8d-c3c1f9968a75",
-          "ts": "2026-11-16T23:59:08.511Z",
-          "run_id": "1b4c5317-53a8-4182-a96b-e774de1e1c15",
+          "id": "9bbac996-a076-475e-a302-8d998714230d",
+          "ts": "2026-11-16T00:08:18.242Z",
           "provider": "openai",
           "path": "/v1/chat/completions",
           "blocked": true,
           "reason": "killed",
           "cost_usd": 0,
-          "kill_scope": "project",
-          "kill_file": "/tmp/cc-runaway-8RIzf8/KILL",
+          "kill_file": "/var/folders/c0/k16w9wkj7nnc9q2mlnk31tf40000gn/T/cc-runaway-aQ6OG8/KILL",
           "note": "synthetic frozen"
         }
-      ],
-      "warnings": [],
-      "stderr": "costcap: run spend $0.0000\ncostcap: run 1b4c5317-53a8-4182-a96b-e774de1e1c15 calls=0 rejected=0 refused=1 models=0 cost=$0.0000 stopped_by=killed:project\n"
-    },
-    {
-      "scenario": "stream-cap",
-      "upstreamCalls": 1,
-      "blockedReason": "budget_exceeded",
-      "scope": "run",
-      "statuses": [
-        "200",
-        "429"
-      ],
-      "receiptCount": 2,
-      "reportedCost": 0.15,
-      "unknownCostCount": 0,
-      "receipts": [
-        {
-          "id": "5a913a42-1c52-4571-bab0-398c8f09dce1",
-          "ts": "2026-11-16T23:59:05.501Z",
-          "run_id": "00d03bf2-a193-4b46-8f72-94042579560a",
-          "provider": "openai",
-          "path": "/v1/chat/completions",
-          "status": 200,
-          "blocked": false,
-          "model": "gpt-4o-mini",
-          "cost_usd": 0.15,
-          "input_tokens": 1000000,
-          "output_tokens": 0,
-          "cached_input_tokens": 0,
-          "cache_write_input_tokens": 0,
-          "cache_write_1h_input_tokens": 0,
-          "pricing_tier": "standard",
-          "table_version": "2026-11-16.16",
-          "table_sha256": "55d278652e160587b5f6ce7bdd9c09f2b468ac5154dbb015bd7360eb63b2742c",
-          "fallback": false,
-          "cost_source": "table"
-        },
-        {
-          "id": "245aa793-1930-452f-a828-e908ef9dfad5",
-          "ts": "2026-11-16T23:59:05.581Z",
-          "run_id": "00d03bf2-a193-4b46-8f72-94042579560a",
-          "provider": "openai",
-          "path": "/v1/chat/completions",
-          "blocked": true,
-          "reason": "budget_exceeded",
-          "cost_usd": 0,
-          "scope": "run",
-          "cap": 0.1,
-          "spent": 0.15
-        }
-      ],
-      "warnings": [
-        {
-          "ts": "2026-11-16T23:59:05.502Z",
-          "event": "cap_warning",
-          "scope": "run",
-          "fraction": 0.8,
-          "cap": 0.1,
-          "spent_usd": 0.15,
-          "period": "00d03bf2-a193-4b46-8f72-94042579560a",
-          "run_id": "00d03bf2-a193-4b46-8f72-94042579560a",
-          "agent_id": null,
-          "lower_bound": false
-        }
-      ],
-      "stderr": "costcap: warning: run spend $0.1500 is 80% of $0.1 cap (run 00d03bf2-a193-4b46-8f72-94042579560a)\ncostcap: run spend $0.1500 of $0.1 cap\ncostcap: run 00d03bf2-a193-4b46-8f72-94042579560a calls=1 rejected=0 refused=1 models=1 cost=$0.1500 stopped_by=budget_exceeded:run\n"
+      ]
     }
   ]
 }
