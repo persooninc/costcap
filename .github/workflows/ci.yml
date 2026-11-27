@@ -14,10 +14,6 @@ concurrency:
 jobs:
   test:
     runs-on: [self-hosted, dev-home-01]
-||||||| cdb2b09
-    runs-on: ubuntu-latest
-
-    runs-on: ${{ vars.USE_HOSTED_RUNNER == 'true' && 'ubuntu-latest' || fromJSON('["self-hosted","mac-docker"]') }}
     timeout-minutes: 30
     strategy:
       matrix:
@@ -98,10 +94,6 @@ jobs:
           test "$NEXT_DELTA" = 0
   e2e:
     runs-on: [self-hosted, dev-home-01]
-||||||| cdb2b09
-    runs-on: ubuntu-latest
-
-    runs-on: ${{ vars.USE_HOSTED_RUNNER == 'true' && 'ubuntu-latest' || fromJSON('["self-hosted","mac-docker"]') }}
     timeout-minutes: 30
     permissions:
       contents: read
