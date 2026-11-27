@@ -68,18 +68,13 @@ export function pricingCommand(args, { tablePath } = {}) {
     // #257: Gemini context caching storage.
     ...(Number.isFinite(r.cache_storage) ? [`${name}: context cache storage ${fmt(r.cache_storage)} per 1M tokens per hour`] : []),
     ...(r.text_rate_modalities?.length ? [`${name}: ${r.text_rate_modalities.join("/")} input at the text rate`] : [])];
+  // #278: non-Anthropic Bedrock rows print per region as bedrock/<id> (<region>).
+  const bedrock = table.bedrock_models?.models ?? {};
+  const bedrockRows = (only) => Object.entries(bedrock).filter(([k]) => !only || k === only)
+    .flatMap(([k, regions]) => Object.entries(regions).map(([r, rr]) => row(`bedrock/${k}`, rr, ` (${r})`)));
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, ...bedrockRows(), row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
-  }
-  // #278: a non-Anthropic Bedrock id (geo prefix stripped) prints one row per region; a `bedrock` entry in --prices wins.
-  const bedrockId = model.replace(/^(?:us|eu|apac|jp|au|ca|us-gov)\./, "");
-  const bUser = prices?.upstreams?.bedrock;
-  if (bUser && Object.hasOwn(bUser, bedrockId) && !("discount" in bUser[bedrockId])) return { code: 0, out: [head, row(`bedrock/${bedrockId}`, bUser[bedrockId], ` (user_prices ${prices.sha256.slice(0, 8)}, every region)`)].join("\n"), err: "" };
-  if (Object.hasOwn(bedrockTable, bedrockId)) {
-    const d = bUser && Object.hasOwn(bUser, bedrockId) ? bUser[bedrockId].discount : bUser && Object.hasOwn(bUser, "*") ? bUser["*"].discount : undefined;
-    const k = d === undefined ? 1 : 1 - d;
-    return { code: 0, out: [head, ...bedrockRows([bedrockId], k, d === undefined ? "" : ` (discount ${d})`)].join("\n"), err: "" };
   }
   // #189: with --prices, the effective row for the first built-in provider that overrides the model.
   // A model-specific entry wins over another provider's "*" discount.
@@ -91,6 +86,8 @@ export function pricingCommand(args, { tablePath } = {}) {
     const eff = effectivePrice(prices, provider, model, `${day}T00:00:00Z`);
     return { code: 0, out: [head, ...(o.absolute ? [row(`${provider}/${model}`, eff, tag)] : rowsFor(`${provider}/${model}`, eff).map((l, i) => (i === 0 ? l.replace(":", `${tag}:`) : l)))].join("\n"), err: "" };
   }
+  const bedrockId = model.replace(/^(?:bedrock\/)?(?:us|eu|apac|jp|au)\./, "").replace(/^bedrock\//, "");
+  if (Object.hasOwn(bedrock, bedrockId)) return { code: 0, out: [head, ...bedrockRows(bedrockId)].join("\n"), err: "" };
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const id = Object.hasOwn(table.models, model) ? model : Object.hasOwn(table.models, base) ? base : null;
   if (id === null) return { code: 0, out: [head, row(model, table.fallback, " (fallback: unknown model, billed at the declared fallback rate)")].join("\n"), err: "" };

@@ -3,11 +3,13 @@
 // or a discount ({discount: d}, 0 < d < 1) scaling every table component by 1-d.
 // Never $0 and never silently lower: built-in rates must be > 0, a discount never touches a
 // fallback-priced model, and an absolute entry prices only the standard text components it lists.
-import { costForUsage, isPricedModel, lookupPrice, promptTokens, premiumTier, toolCallCost, requestWebSearchType } from "./pricing.js";
+import { bedrockModels, costForUsage, isPricedModel, lookupPrice, promptTokens, premiumTier, scalePrice, toolCallCost, requestWebSearchType } from "./pricing.js";
 
+// #278: bedrock keys are base model ids without the geo prefix (amazon.nova-pro-v1:0); vertex keys
+// are the mapped table ids (gemini-2.5-pro, claude-sonnet-4-5).
 export const OVERRIDE_PROVIDERS = Object.freeze(["openai", "anthropic", "gemini", "openrouter", "bedrock", "vertex"]);
-// #278: cloud keys price through cloudCostWithOverrides / bedrock-pricing.js, not the first-party routes.
-const CLOUD_KEYS = new Set(["bedrock", "vertex"]);
+// A table rate exists for this provider/model (any Bedrock region for a listed non-Anthropic id).
+const tablePriced = (provider, model) => isPricedModel(model) || (provider === "bedrock" && bedrockModels().includes(model));
 const RATE_KEYS = ["input", "output", "cached_input", "cache_write", "cache_write_1h"];
 const SNAPSHOT_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/;
 const positive = (v) => typeof v === "number" && Number.isFinite(v) && v > 0;
@@ -33,18 +35,19 @@ export function validateBuiltinPrices(path, provider, models) {
 }
 
 /** The override entry for a built-in provider/model: {discount} | {absolute} | null. */
-export function builtinOverride(prices, provider, model) {
-  if (!prices || !OVERRIDE_PROVIDERS.includes(provider) || CLOUD_KEYS.has(provider) || typeof model !== "string" || !model) return null;
+// opts.priced: whether the table prices this call (cloud routes know it per region); default: the table lookup.
+export function builtinOverride(prices, provider, model, { priced } = {}) {
+  if (!prices || !OVERRIDE_PROVIDERS.includes(provider) || typeof model !== "string" || !model) return null;
   const table = prices.upstreams?.[provider];
   if (!table) return null;
   for (const id of [model, model.replace(SNAPSHOT_SUFFIX, "")]) {
     if (!Object.hasOwn(table, id) || id === "*") continue;
     if (!("discount" in table[id])) return { absolute: table[id] };
     // #197: a discount needs a table rate to scale; on an unpriced model it is ignored (never priced, never lower).
-    return isPricedModel(model) ? { discount: table[id].discount } : null;
+    return (priced ?? isPricedModel(model)) ? { discount: table[id].discount } : null;
   }
   // A provider-wide discount applies only to models with a table rate (never the fallback).
-  if (Object.hasOwn(table, "*") && isPricedModel(model)) return { discount: table["*"].discount };
+  if (Object.hasOwn(table, "*") && (priced ?? isPricedModel(model))) return { discount: table["*"].discount };
   return null;
 }
 
@@ -117,7 +120,7 @@ export function unpricedDiscountWarnings(prices) {
   const out = [];
   for (const p of OVERRIDE_PROVIDERS.filter((x) => !CLOUD_KEYS.has(x))) {
     for (const [m, r] of Object.entries(prices?.upstreams?.[p] ?? {})) {
-      if (m !== "*" && r && "discount" in r && !isPricedModel(m)) out.push(`costcap: warning: discount ignored: ${p}/${m} is not in the pricing table; add absolute rates`);
+      if (m !== "*" && r && "discount" in r && !tablePriced(p, m)) out.push(`costcap: warning: discount ignored: ${p}/${m} is not in the pricing table; add absolute rates`);
     }
   }
   return out;
@@ -165,4 +168,30 @@ export function validateToolPrices(path, tools) {
     if (!TOOL_OVERRIDE_KEYS.includes(k)) throw new Error(`--upstream-prices ${path}: tools: unknown tool "${k}" (allowed: ${TOOL_OVERRIDE_KEYS.join(", ")})`);
     if (!positive(v)) throw new Error(`--upstream-prices ${path}: tools.${k} must be a finite USD per call > 0 (never $0)`);
   }
+}
+
+/**
+ * #278: receipt fields for a Bedrock/Vertex call. `model` is the mapped id, or a Bedrock base id
+ * priced only by an absolute override (tablePriced false). costOpts are costForUsage's cloud
+ * options ({bedrock: region} | {regional, vertex, at} | {regional, undated}). With no override
+ * entry the result is exactly costForUsage's (Claude on Bedrock/Vertex receipts are unchanged).
+ */
+export function costForCloud(prices, provider, model, usage, costOpts, { tablePriced: priced = true } = {}) {
+  const o = builtinOverride(prices, provider, model, { priced });
+  if (!o) return costForUsage(model, usage, costOpts);
+  if (o.absolute) return costForAbsolute(prices, o.absolute, model, usage, costOpts.bedrock !== undefined ? { undated: true } : { at: costOpts.at, undated: costOpts.undated });
+  return { ...costForUsage(model, usage, { ...costOpts, scale: 1 - o.discount }), ...pin(prices), discount: o.discount };
+}
+
+/** #278: a cloud override's effect on a preflight price row (base: the table row, or null when unlisted). */
+export function cloudOverridePrice(prices, provider, model, base) {
+  const o = builtinOverride(prices, provider, model, { priced: base !== null });
+  if (!o) return base;
+  if (o.absolute) return { model, ...o.absolute, fallback: false, user_prices: true };
+  return { ...scalePrice(base, 1 - o.discount), user_prices: true, discount: o.discount };
+}
+
+/** #278: true when an unlisted cloud model has an absolute --upstream-prices rate. */
+export function hasAbsoluteCloudPrice(prices, provider, model) {
+  return Boolean(model && builtinOverride(prices, provider, model, { priced: false })?.absolute);
 }

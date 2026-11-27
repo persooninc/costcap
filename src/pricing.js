@@ -61,14 +61,33 @@ export { dayOf, datedRow, validateSchedules, pricingAt } from "./pricing-schedul
 // opts.undated: price from the base row only (Claude on Bedrock/Vertex stays undated).
 // opts.vertex (#256): Gemini on Vertex AI is dated (rate-only `effective` entries apply at `at`),
 // but `billed_as` entries never do: Vertex keeps its own rows for retired Gemini API ids.
-export function lookupPrice(model, at, { undated = false, vertex = false } = {}) {
+// opts.bedrock (#278): the request's AWS region; a non-Anthropic Bedrock model is priced from
+// its `bedrock_models` row for that region only (no row: the caller never prices it).
+export function lookupPrice(model, at, { undated = false, vertex = false, bedrock } = {}) {
   assertTableIntegrity();
-  const id = resolveModelId(model);
   const pin = { table_version: table.version, table_sha256: TABLE_SHA256 };
+  if (bedrock !== undefined) {
+    const row = bedrockRow(model, bedrock);
+    if (row) return { model, ...row, bedrock_region: bedrock, ...pin, fallback: false };
+  }
+  const id = resolveModelId(model);
   if (id === null) return { model, ...table.fallback, ...pin, fallback: true };
   if (undated) { const { effective, ...base } = table.models[id]; return { model, ...base, ...pin, fallback: false }; }
   const d = datedRow(vertex ? vertexView(id) : table, id, dayOf(at));
   return { model, ...d.row, ...(d.rates_effective_from && { rates_effective_from: d.rates_effective_from }), ...(d.billed_as && { billed_as: d.billed_as }), ...pin, fallback: false };
+}
+
+/** #278: the non-Anthropic Bedrock base model ids the table prices (any region). */
+export function bedrockModels() {
+  return Object.keys(table.bedrock_models?.models ?? {});
+}
+
+/** #278: the on-demand standard row for a Bedrock base model id in one region, or null. */
+export function bedrockRow(model, region) {
+  if (typeof model !== "string" || typeof region !== "string") return null;
+  const m = table.bedrock_models?.models;
+  if (!m || !Object.hasOwn(m, model) || !Object.hasOwn(m[model], region)) return null;
+  return { ...m[model][region] };
 }
 
 // A one-row table view of id without its billed_as effective entries (#256).
@@ -199,8 +218,8 @@ export function modalityAdjustment(price, rates, modality_tokens, multiplier = 1
   return { delta, unpriced: false };
 }
 
-export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false, vertex = false } = {}) {
-  const price = lookupPrice(model, at, { undated, vertex });
+export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cached_input_tokens = 0, cache_write_input_tokens = 0, cache_write_1h_input_tokens = 0, speed, service_tier, modality_tokens } = {}, { batch, regional = false, scale, at, undated = false, vertex = false, bedrock } = {}) {
+  const price = lookupPrice(model, at, { undated, vertex, bedrock });
   // #198: a per-minute / per-character model (whisper-1, tts-1) has no token rate: unknown, never NaN or $0.
   if (!price.fallback && !(Number.isFinite(price.input) && Number.isFinite(price.output))) {
     return { model, cost_usd: null, reason: "unit_unpriced", input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens, cache_write_1h_input_tokens,
@@ -255,6 +274,7 @@ export function costForUsage(model, { input_tokens = 0, output_tokens = 0, cache
     ...(signal.service_tier !== undefined && { service_tier: signal.service_tier }),
     ...(price.rates_effective_from && { rates_effective_from: price.rates_effective_from }),
     ...(price.billed_as && { billed_as: price.billed_as }),
+    ...(price.bedrock_region && { bedrock_region: price.bedrock_region }),
     table_version: price.table_version,
     table_sha256: price.table_sha256,
     fallback: price.fallback,

@@ -2,8 +2,7 @@
 // host derivation, path-model mapping and a real-time AWS eventstream decoder.
 // The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
 // Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
-import { resolveModelId, vertexGeminiModels } from "./pricing.js";
-import { bedrockBaseId, isBedrockThirdParty, isListedBedrockModel } from "./bedrock-pricing.js";
+import { bedrockModels, bedrockRow, resolveModelId, vertexGeminiModels } from "./pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
 export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
@@ -80,11 +79,20 @@ export function bedrockHost(region) {
 
 const BEDROCK_GEO = /^(?:global|us|eu|apac|jp|au)\./;
 
+/** #278: a Bedrock model id without its geo inference-profile prefix (us./eu./global./...). */
+export function bedrockBaseId(rawId) {
+  if (typeof rawId !== "string" || !rawId || rawId.startsWith("arn:")) return null;
+  return rawId.replace(BEDROCK_GEO, "");
+}
+
 /**
- * Maps a raw Bedrock/Vertex model id to the pricing-table id (#278: or a listed non-Anthropic
- * Bedrock base id), or null when it is not a model we can price (non-Anthropic, ARN, unlisted). Never the fallback.
+ * Maps a raw Bedrock/Vertex model id to the pricing-table id, or null when it is not a
+ * model we can price (ARN, unlisted, no row for the region). Never the fallback.
+ * #278: a listed non-Anthropic Bedrock model maps to its base id (geo prefix stripped) when
+ * `region` has a row; with no region (cap/allowlist normalisation) a row in any region counts.
+ * A global. profile of a non-Anthropic model stays unpriced (the table lists none).
  */
-export function mapCloudModel(provider, rawId) {
+export function mapCloudModel(provider, rawId, { region } = {}) {
   if (typeof rawId !== "string" || !rawId) return null;
   let id = rawId;
   if (provider === "bedrock") {
@@ -92,7 +100,10 @@ export function mapCloudModel(provider, rawId) {
     // #278: a listed non-Anthropic model maps to its base id (geo prefix stripped; rates are per region).
     if (isBedrockThirdParty(id)) { const b = bedrockBaseId(id); return isListedBedrockModel(b) ? b : null; }
     id = id.replace(BEDROCK_GEO, "");
-    if (!id.startsWith("anthropic.")) return null;
+    if (!id.startsWith("anthropic.")) {
+      if (rawId.startsWith("global.") || !bedrockModels().includes(id)) return null;
+      return region === undefined || bedrockRow(id, region) ? id : null;
+    }
     id = id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, "");
   } else if (provider === "vertex") {
     if (id.startsWith("google/")) return mapVertexGemini(id.slice("google/".length));

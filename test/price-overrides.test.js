@@ -31,12 +31,10 @@ test("validation: bad built-in entries throw; built-in keys need no --upstream (
   for (const e of bad) assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: { m: e } } }), []), /upstream-prices/, JSON.stringify(e));
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
   assert.throws(() => loadUpstreamPrices(file({ upstreams: { openai: [] } }), []), /object of models/);
-  // #278: bedrock / vertex are built-in override keys with the same validation.
-  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { "meta.llama-x-v1:0": { input: 1, output: 2 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
-  for (const p of ["bedrock", "vertex"]) {
-    assert.throws(() => loadUpstreamPrices(file({ upstreams: { [p]: { m: { input: 0, output: 1 } } } }), []), /never \$0/);
-    assert.throws(() => loadUpstreamPrices(file({ upstreams: { [p]: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
-  }
+  // #278: bedrock/vertex are built-in override keys (no --upstream needed); validated like the others.
+  assert.equal(loadUpstreamPrices(file({ upstreams: { bedrock: { "amazon.nova-pro-v1:0": { discount: 0.1 } }, vertex: { "*": { discount: 0.2 } } } }), []).upstreams.vertex["*"].discount, 0.2);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { bedrock: { m: { input: 0, output: 1 } } } }), []), /never \$0/);
+  assert.throws(() => loadUpstreamPrices(file({ upstreams: { vertex: { "*": { input: 1, output: 1 } } } }), []), /"\*" takes only/);
 });
 
 test("discount scales every tier, including cache and long context (AC1)", () => {

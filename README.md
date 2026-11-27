@@ -270,29 +270,24 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   before `metadata` is `stream_incomplete` (unknown cost, never $0). Preflight reads
   `inferenceConfig.maxTokens`. If `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` is already set, wrap leaves
   it alone and warns once.
-- **Nova, Llama, Mistral, DeepSeek, gpt-oss and Qwen on Bedrock (#278).** Listed non-Anthropic
-  Bedrock models (`bedrock_models` in the pricing table: Amazon Nova Micro/Lite/Pro/Premier/2 Lite,
-  Meta Llama 3.1/3.3/4, Mistral Large 3, DeepSeek R1/V3.1, OpenAI gpt-oss 20b/120b, Qwen3) are
-  priced on invoke, Converse and ConverseStream at AWS on-demand standard rates from the AWS Price
-  List. The rate is the request region's row (the SigV4 region, else `AWS_REGION` /
-  `AWS_DEFAULT_REGION`); a geo profile (`us.` / `eu.` / `apac.` …) bills at that source region, and the
-  Claude 10% regional premium never applies. `costcap pricing show amazon.nova-pro-v1:0` prints every
-  region. These stay `cloud_model_unpriced` (run pauses, never the fallback): an unlisted id, a region
-  with no row, a `global.` profile, an ARN, or a usage component with no rate (e.g. cache writes).
-  A Converse `serviceTier.type` other than `default` is `service_tier_unpriced`.
-  InvokeModel (#288) reads each model's native usage (Nova `usage.inputTokens/outputTokens` and
-  `cacheReadInputTokenCount`, Llama `prompt_token_count/generation_token_count`, OpenAI-style
-  `usage.prompt_tokens/completion_tokens`), else the `X-Amzn-Bedrock-Input-Token-Count` /
-  `-Output-Token-Count` headers; `invoke-with-response-stream` is priced from the final chunk's
-  `amazon-bedrock-invocationMetrics` (cut before it: `stream_incomplete`). No usage at all stays
-  `usage_unavailable`.
-- **`bedrock` / `vertex` keys in `--upstream-prices`.** Same rules as the other built-in keys
-  (#189): `{discount}` scales table rows, absolute rates price an unlisted Bedrock id in any region,
-  `"*"` takes a discount only, rates must be > 0. Bedrock keys are the base id without geo prefix
-  (`amazon.nova-pro-v1:0`, `anthropic.claude-sonnet-4-5-20250929-v1:0`); Vertex keys are the model
-  id (`gemini-2.5-pro`, `claude-sonnet-4-5`). Overridden receipts carry `cost_source: "user_prices"`.
   Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
   `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
+- **Non-Anthropic Bedrock models (#278).** Converse/invoke calls to Amazon Nova (Micro, Lite, Pro,
+  Premier, Nova 2 Lite), Meta Llama 3 / 3.1 / 3.2 / 3.3 / 4, Mistral (7B, Small, Large), DeepSeek R1,
+  OpenAI gpt-oss (20b, 120b) and Qwen3 (32B, Coder 30B) are priced from the table's `bedrock_models`
+  section: AWS on-demand standard rates per region (`us-east-1`, `us-west-2`, `eu-west-1`), read from the
+  public AWS Price List bulk JSON (`node scripts/bedrock-prices.mjs` regenerates it). The rate comes from the
+  request's region (the SigV4 signing region, else `AWS_REGION`/`AWS_DEFAULT_REGION`), so a `us.`/`eu.`/`apac.`
+  geo profile bills at its source region; receipts carry `bedrock_region` and no Claude regional premium.
+  An unlisted id, a region with no row, a `global.` profile, an inference-profile ARN, a usage
+  component with no published rate, and a Converse `serviceTier` other than `default`
+  (`service_tier_unpriced`) are unknown cost (never $0, never the fallback) and pause the run.
+  `--unknown-models refuse`, `--models`, `--model-cap amazon.nova-pro-v1:0:day=…`, `--preflight` and
+  `costcap pricing` use the same base id (geo prefix stripped).
+- **Overrides.** `--upstream-prices` takes `bedrock` and `vertex` as built-in keys (#189 semantics):
+  `{"upstreams": {"bedrock": {"meta.llama-x-v1:0": {"input": 1, "output": 2}, "amazon.nova-pro-v1:0": {"discount": 0.3}},
+  "vertex": {"*": {"discount": 0.2}}}}`. Bedrock keys are base ids without the geo prefix; absolute rates price an
+  unlisted id, `{discount}` scales a table row, `"*"` takes a discount only. Receipts get `cost_source: "user_prices"`.
 - **Gemini on Vertex.** wrap also sets `GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex`
   (read by Google's genai SDKs with `vertexai=True`; for SDKs that don't read it, pass
   `http_options.base_url` with that value). `…/publishers/google/models/{id}:generateContent`,
