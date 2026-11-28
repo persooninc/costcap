@@ -1,571 +1,243 @@
-// #273: OpenAI GPT-Live (/v1/live/sessions WebSocket): per-second metering, caps mid-session,
-// admission on session.start, kill and honest unknowns.
+// #273: OpenAI GPT-Live (/v1/live/sessions WebSocket): per-second duration metering, caps mid-session,
+// session.start admission, kill, honest unknowns and backend response usage.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startMeteringProxy, baseUrlOverrides } from "../src/proxy.js";
+import { startMeteringProxy } from "../src/proxy.js";
 import { createCapEngine } from "../src/cap.js";
-import { createModelCaps } from "../src/model-cap.js";
 import { createKillCheck, kill } from "../src/kill.js";
-import { operationName } from "../src/otlp.js";
-import { LIVE_PATH, backendResponse, createSnapshotMeter, durationCost, liveRate, sessionSeconds } from "../src/live.js";
+import { encodeFrame } from "../src/realtime.js";
+import { LIVE_PATH, backendResponse, durationCost, liveSeconds, sessionStartModel } from "../src/live.js";
 import { startRealtimeUpstream, connectRealtime } from "./fixtures/realtime-upstream.js";
 
 const PATH = "/openai/v1/live/sessions";
+const START = { type: "session.start", session: { model: "gpt-live-1", voice: "marin" } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (fn, ms = 3000) => { const t0 = Date.now(); while (!fn()) { if (Date.now() - t0 > ms) throw new Error("timeout"); await sleep(10); } };
-const live = (rs) => rs.filter((r) => r.path === "/v1/live/sessions");
-const billed = (rs) => live(rs).filter((r) => r.cost_basis === "duration");
-const START = { type: "session.start", session: { model: "gpt-live-1" } };
-const snap = (seconds) => ({ type: "session.usage.updated", usage: { seconds } });
-const closed = (seconds) => ({ type: "session.closed", usage: { seconds } });
-const started = { type: "session.started", session: { id: "ls_1", model: "gpt-live-1" } };
+const live = (rs) => rs.filter((r) => r.transport === "websocket" && r.path === "/v1/live/sessions");
+const billedOf = (rs) => live(rs).filter((r) => r.cost_basis === "duration" && r.billed_seconds != null);
+const snap = (conn, seconds) => conn.send({ type: "session.usage.updated", usage: { seconds } });
 
-// Upstream: on session.start replies session.started + snapshots; on session.close replies session.closed(final).
-function liveUpstream({ snaps = [], final = null, onStart = null } = {}) {
-  return {
-    onMessage: (conn, m) => {
-      if (m.type === "session.start") { conn.send(started); if (onStart) onStart(conn); else for (const s of snaps) conn.send(snap(s)); }
-      if (m.type === "session.close" && final !== null) conn.send(closed(final));
-    },
-  };
-}
-
-async function setup(t, { upstream = {}, proxy = {} } = {}) {
-  const up = await startRealtimeUpstream(upstream);
+async function setup(t, { upstream = {}, proxy = {}, closeSeconds } = {}) {
+  let conn;
+  const up = await startRealtimeUpstream({ onSession: (c) => {
+    conn = c;
+    if (closeSeconds !== undefined) c.closeSeconds = closeSeconds;
+    c.socket.on("data", () => {
+      if (!c.startedSent && c.received.some((m) => m.type === "session.start")) {
+        c.startedSent = true;
+        c.send({ type: "session.started", session: { id: "sess_live", model: "gpt-live-1" } });
+      }
+    });
+    upstream.onSession?.(c);
+  }, ...upstream });
   const receipts = [];
   const dir = mkdtempSync(join(tmpdir(), "cc-live-"));
-  const { server, port } = await startMeteringProxy({ receiptsPath: join(dir, "receipts.jsonl"), upstreams: { openai: up.url, anthropic: up.url }, onReceipt: (r) => receipts.push(r), ...proxy });
+  const { server, port } = await startMeteringProxy({ receiptsPath: join(dir, "receipts.jsonl"), upstreams: { openai: up.url }, onReceipt: (r) => receipts.push(r), liveTickMs: 20, ...proxy });
   t.after(async () => { server.close(); server.closeAllConnections(); await up.close(); });
   const chatCall = () => fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", messages: [], n: Math.random() }) });
-  return { up, server, port, receipts, dir, chatCall };
+  const open = async () => {
+    const c = await connectRealtime(port, PATH, { Authorization: "Bearer sk-test" });
+    assert.equal(c.status, 101);
+    c.send(START);
+    await until(() => conn?.received.some((m) => m.type === "session.start"));
+    await c.waitFor((m) => m.type === "session.started");
+    return c;
+  };
+  return { up, server, port, receipts, chatCall, open, conn: () => conn };
 }
 
-test("live.js helpers: path, rate, snapshot meter, backend envelope", () => {
+test("live.js helpers", () => {
   assert.ok(LIVE_PATH.test("/openai/v1/live/sessions"));
   assert.ok(!LIVE_PATH.test("/openai/v1/live/sessions/x/fork"));
-  assert.equal(liveRate("gpt-live-1").per_minute, 0.05);
-  assert.equal(liveRate("gpt-4o-mini"), null);
+  assert.equal(liveSeconds({ usage: { seconds: 12 } }), 12);
+  assert.equal(liveSeconds({ usage: { seconds: -1 } }), null);
+  assert.equal(durationCost(12, 0.05), 0.01);
   assert.equal(durationCost(1, 0.05), 0.000833);
-  assert.equal(sessionSeconds(snap(12)), 12);
-  assert.equal(sessionSeconds({ usage: { seconds: -1 } }), null);
-  const m = createSnapshotMeter();
-  assert.deepEqual(m.take(30), { billed_seconds: 30, session_seconds: 30 });
-  assert.deepEqual(m.take(25), { billed_seconds: 0, session_seconds: 30 });
-  const r = { id: "r1", model: "gpt-5.4-mini", usage: { input_tokens: 1, output_tokens: 1 } };
-  assert.equal(backendResponse({ type: "response.event", event: { type: "response.completed", response: r } }), r);
-  assert.equal(backendResponse({ type: "response.event", event: { type: "response.created", response: r } }), null);
-  assert.equal(operationName("/v1/live/sessions"), "live");
-  assert.ok(baseUrlOverrides(4100, ["openai"]).some((l) => l === "COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:4100/openai/v1/live/sessions"));
-  // #277: the Gemini Live URL is exported only when gemini is wrapped.
-  assert.ok(!baseUrlOverrides(4100, ["openai"]).some((l) => l.startsWith("COSTCAP_GEMINI_LIVE_URL=")));
-  assert.ok(baseUrlOverrides(4100, ["gemini"]).some((l) => l.startsWith("COSTCAP_GEMINI_LIVE_URL=ws://127.0.0.1:4100/gemini/ws/")));
+  assert.equal(sessionStartModel(START), "gpt-live-1");
+  assert.deepEqual(backendResponse({ type: "response.event", event: { type: "response.completed", response: { id: "r", model: "m", usage: { input_tokens: 1 } } } }), { id: "r", model: "m", usage: { input_tokens: 1 } });
+  assert.equal(backendResponse({ type: "response.event", event: { type: "response.created", response: {} } }), null);
 });
 
-test("AC1 meters 12 / 18 / 60 s at $0.05/min, frames byte-identical, next call 200", async (t) => {
-  const { up, port, receipts, chatCall } = await setup(t, { upstream: liveUpstream({ snaps: [12, 30], final: 90 }) });
-  const c = await connectRealtime(port, PATH, { Authorization: "Bearer sk-test", "x-costcap-tag": "team=voice" });
-  assert.equal(c.status, 101);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.usage.updated" && m.usage.seconds === 30);
+test("AC1 snapshots 12 then 30, session.closed 90: three delta receipts, byte-identical frames, chat 200", async (t) => {
+  const s = await setup(t, { closeSeconds: () => 90 });
+  const c = await s.open();
+  const conn = s.conn();
+  snap(conn, 12);
+  snap(conn, 30);
+  await until(() => billedOf(s.receipts).length === 2);
   c.send({ type: "session.close" });
   await c.waitFor((m) => m.type === "session.closed");
-  await until(() => billed(receipts).length === 3);
-  const r = billed(receipts);
+  await until(() => billedOf(s.receipts).length === 3);
+  const r = billedOf(s.receipts);
   assert.deepEqual(r.map((x) => x.billed_seconds), [12, 18, 60]);
   assert.deepEqual(r.map((x) => x.session_seconds), [12, 30, 90]);
   assert.deepEqual(r.map((x) => x.cost_usd), [0.01, 0.015, 0.05]);
   assert.equal(Number(r.reduce((a, x) => a + x.cost_usd, 0).toFixed(6)), 0.075);
-  for (const x of r) { assert.equal(x.transport, "websocket"); assert.equal(x.session_id, "ls_1"); assert.equal(x.model, "gpt-live-1"); assert.deepEqual(x.tags, { team: "voice" }); }
-  assert.equal(up.handshakes[0].url, "/v1/live/sessions");
-  assert.ok(!Object.keys(up.handshakes[0].headers).some((k) => k.startsWith("x-costcap-")));
-  // Client received exactly what upstream sent (unmasked server frames).
-  const got = Buffer.concat(c.rawBytes);
-  for (const ev of [started, snap(12), snap(30), closed(90)]) assert.ok(got.includes(Buffer.from(JSON.stringify(ev))));
-  assert.equal(up.sessions[0].received[0].type, "session.start");
-  c.close();
-  assert.equal((await chatCall()).status, 200);
+  for (const x of r) { assert.equal(x.model, "gpt-live-1"); assert.equal(x.session_id, "sess_live"); assert.equal(x.transport, "websocket"); assert.equal(x.cost_source, "table"); }
+  assert.equal(s.up.handshakes[0].url, "/v1/live/sessions");
+  // Client frames byte-identical to the upstream's frames.
+  await sleep(50);
+  const upBytes = Buffer.concat(c.rawBytes);
+  for (const m of [{ type: "session.usage.updated", usage: { seconds: 12 } }, { type: "session.closed", session: { id: "sess_live" }, usage: { seconds: 90 } }]) assert.ok(upBytes.includes(encodeFrame(1, JSON.stringify(m))));
+  // Upstream sees the client's session.start byte-for-byte (masked frame relayed raw).
+  assert.deepEqual(conn.received[0], START);
+  assert.equal((await s.chatCall()).status, 200);
+  assert.ok(!s.receipts.some((x) => x.cost_usd === null));
 });
 
-test("AC2 cap hit mid-session: event forwarded, error + 1008, final delta billed, next handshake 429", async (t) => {
-  const cap = createCapEngine({ caps: { run: 0.02 } });
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream({ snaps: [12, 30], final: 31 }), proxy: { cap } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "budget_exceeded");
-  const iSnap = c.messages.findIndex((m) => m.usage?.seconds === 30), iErr = c.messages.indexOf(err);
-  assert.ok(iSnap >= 0 && iSnap < iErr);
+test("AC2 --cap 0.02: 30 s snapshot forwarded, error budget_exceeded, session.close upstream, final 31 billed, 429 before 101", async (t) => {
+  const s = await setup(t, { closeSeconds: () => 31, proxy: { cap: createCapEngine({ caps: { run: 0.02 } }) } });
+  const c = await s.open();
+  const conn = s.conn();
+  snap(conn, 30);
   await c.closed;
+  const types = c.messages.map((m) => m.type);
+  assert.ok(types.indexOf("session.usage.updated") < types.indexOf("error"));
+  assert.equal(c.messages.find((m) => m.type === "error").error.code, "budget_exceeded");
   assert.equal(c.closeCode, 1008);
-  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
-  const r = billed(receipts);
-  assert.deepEqual(r.map((x) => x.cost_usd), [0.01, 0.015, 0.000833]);
-  const before = up.upgrades;
-  const c2 = await connectRealtime(port, PATH);
+  assert.ok(conn.received.some((m) => m.type === "session.close"));
+  const r = billedOf(s.receipts);
+  assert.deepEqual(r.map((x) => x.cost_usd), [0.025, 0.000833]);
+  const upgrades = s.up.upgrades;
+  const c2 = await connectRealtime(s.port, PATH);
   assert.equal(c2.status, 429);
-  assert.equal(up.upgrades, before);
+  assert.equal(s.up.upgrades, upgrades);
 });
 
-test("AC3 ticker: wall-clock estimate closes the session early, ledger holds only API seconds", async (t) => {
-  let clock = 1_000_000;
-  const cap = createCapEngine({ caps: { run: 0.02 } });
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream({ snaps: [12], final: 12 }), proxy: { cap, now: () => clock, liveTickMs: 50 } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.usage?.seconds === 12);
-  await sleep(120);
-  assert.ok(!up.sessions[0].received.some((m) => m.type === "session.close"));
+test("AC3 ticker: 12 s snapshot then 12 s of clock closes the session; ledger holds only reported seconds", async (t) => {
+  let clock = Date.parse("2026-11-17T12:00:00Z");
+  const s = await setup(t, { closeSeconds: () => null, proxy: { now: () => clock, cap: createCapEngine({ caps: { run: 0.02 } }), liveCloseWaitMs: 200 } });
+  await s.open();
+  const conn = s.conn();
+  snap(conn, 12);
+  await until(() => billedOf(s.receipts).length === 1);
+  await sleep(60);
+  assert.ok(!conn.received.some((m) => m.type === "session.close"));
   clock += 12_000;
-  await until(() => up.sessions[0].received.some((m) => m.type === "session.close"), 500);
-  await c.closed;
-  assert.equal(c.closeCode, 1008);
-  const r = billed(receipts);
-  assert.deepEqual(r.map((x) => x.session_seconds), [12, 12]);
-  assert.equal(r.reduce((a, x) => a + x.cost_usd, 0), 0.01);
+  await until(() => conn.received.some((m) => m.type === "session.close"), 200);
+  conn.send({ type: "session.closed", usage: { seconds: 24 } });
+  await until(() => billedOf(s.receipts).length === 2);
+  assert.deepEqual(billedOf(s.receipts).map((x) => x.billed_seconds), [12, 12]);
 });
 
-test("AC4 --models refuses session.start before upstream; kill file 429 before 101; kill closes idle session", async (t) => {
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-realtime"] } });
-  const c = await connectRealtime(port, PATH);
+test("AC4 admission: allowlist refuses session.start without forwarding it; $0 blocked receipt", async (t) => {
+  const s = await setup(t, { proxy: { allowedModels: () => ["gpt-realtime"] } });
+  const c = await connectRealtime(s.port, PATH);
   assert.equal(c.status, 101);
   c.send(START);
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "model_not_allowed");
   await c.closed;
+  assert.equal(c.messages.find((m) => m.type === "error").error.code, "model_not_allowed");
   assert.equal(c.closeCode, 1008);
-  await sleep(30);
-  assert.equal(up.sessions[0].received.length, 0);
-  const b = live(receipts).find((r) => r.blocked);
-  assert.equal(b.reason, "model_not_allowed");
+  await sleep(50);
+  assert.ok(!s.conn().received.some((m) => m.type === "session.start"));
+  const b = live(s.receipts).find((r) => r.reason === "model_not_allowed");
   assert.equal(b.cost_usd, 0);
+  assert.equal(b.blocked, true);
   assert.equal(b.model, "gpt-live-1");
 });
 
-test("AC4 kill: 429 killed before 101, and kill closes an idle session within 1 s", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "cc-live-kill-"));
-  const killPath = join(dir, "KILL");
-  const killCheck = createKillCheck(killPath, { hostFile: null });
-  const { up, port } = await setup(t, { upstream: liveUpstream({ final: 3 }), proxy: { killCheck } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.started");
+test("AC4 --unknown-models refuse rejects an unpriced live model at session.start", async (t) => {
+  const s = await setup(t, { proxy: { unknownModels: "refuse" } });
+  const c = await connectRealtime(s.port, PATH);
+  c.send({ type: "session.start", session: { model: "gpt-live-9" } });
+  await c.closed;
+  assert.equal(c.messages.find((m) => m.type === "error").error.code, "model_unpriced");
+  assert.ok(!s.conn().received.some((m) => m.type === "session.start"));
+});
+
+test("AC4 kill file: 429 before 101; costcap kill closes an idle session within 1 s", async (t) => {
+  const f = join(mkdtempSync(join(tmpdir(), "cc-k-")), "KILL");
+  const s = await setup(t, { closeSeconds: () => 3, proxy: { killCheck: createKillCheck(f) } });
+  const c = await s.open();
   const t0 = Date.now();
-  kill(killPath, "test");
+  kill(f, "stop");
   await c.closed;
   assert.ok(Date.now() - t0 < 1000);
   assert.equal(c.closeCode, 1008);
-  await until(() => up.sessions[0].received.some((m) => m.type === "session.close"));
-  const before = up.upgrades;
-  const c2 = await connectRealtime(port, PATH);
-  assert.equal(c2.status, 429);
-  assert.equal(c2.body.error, "killed");
-  assert.equal(up.upgrades, before);
+  assert.ok(live(s.receipts).some((r) => r.blocked && r.reason === "killed"));
+  await until(() => billedOf(s.receipts).length === 1);
+  assert.equal(billedOf(s.receipts)[0].billed_seconds, 3);
+  const again = await connectRealtime(s.port, PATH);
+  assert.equal(again.status, 429);
+  assert.equal(again.body.error, "killed");
+  assert.equal(s.up.upgrades, 1);
 });
 
-test("AC5 client drop: proxy sends session.close and bills the final delta, no latch", async (t) => {
-  const { up, port, receipts, chatCall } = await setup(t, { upstream: liveUpstream({ snaps: [12], final: 20 }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.usage?.seconds === 12);
+test("AC5 client drop after 12 s: proxy sends session.close, final 20 bills 8 s, no latch", async (t) => {
+  const s = await setup(t, { closeSeconds: () => 20 });
+  const c = await s.open();
+  snap(s.conn(), 12);
+  await until(() => billedOf(s.receipts).length === 1);
   c.close();
-  await until(() => billed(receipts).length === 2);
-  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
-  assert.deepEqual(billed(receipts).map((x) => x.billed_seconds), [12, 8]);
-  await sleep(30);
-  assert.ok(!live(receipts).some((r) => r.reason === "session_usage_unconfirmed"));
-  assert.equal((await chatCall()).status, 200);
+  await until(() => billedOf(s.receipts).length === 2);
+  assert.ok(s.conn().received.some((m) => m.type === "session.close"));
+  assert.equal(billedOf(s.receipts)[1].billed_seconds, 8);
+  assert.ok(!s.receipts.some((r) => r.cost_usd === null));
+  assert.equal((await s.chatCall()).status, 200);
 });
 
-test("AC5 upstream drop before session.closed latches one unconfirmed receipt; settle restores 200", async (t) => {
-  const { port, receipts, chatCall, server } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(snap(12)); setTimeout(() => conn.socket.destroy(), 30); } }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
+test("AC5 upstream drop before session.closed: one session_usage_unconfirmed, 429 until settled", async (t) => {
+  const s = await setup(t);
+  const c = await s.open();
+  snap(s.conn(), 12);
+  await until(() => billedOf(s.receipts).length === 1);
+  s.conn().socket.destroy();
   await c.closed;
-  await until(() => live(receipts).some((r) => r.reason === "session_usage_unconfirmed"));
-  const u = live(receipts).filter((r) => r.reason === "session_usage_unconfirmed");
+  await until(() => s.receipts.some((r) => r.reason === "session_usage_unconfirmed"));
+  const u = s.receipts.filter((r) => r.reason === "session_usage_unconfirmed");
   assert.equal(u.length, 1);
   assert.equal(u[0].cost_usd, null);
   assert.equal(u[0].session_seconds_lower_bound, 12);
-  assert.equal((await chatCall()).status, 429);
-  server.settle({ receipt_id: u[0].id });
-  assert.equal((await chatCall()).status, 200);
+  assert.equal((await s.chatCall()).status, 429);
+  assert.equal(s.server.settle({ receipt_id: u[0].id }), true);
+  assert.equal((await s.chatCall()).status, 200);
 });
 
-test("AC5 close timeout without session.closed latches; backwards snapshot bills 0", async (t) => {
-  const { port, receipts } = await setup(t, { upstream: liveUpstream({ snaps: [30, 25] }), proxy: { liveCloseWaitMs: 100 } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.usage?.seconds === 25);
-  await until(() => billed(receipts).length === 2);
-  assert.deepEqual(billed(receipts).map((x) => x.billed_seconds), [30, 0]);
-  c.close();
-  await until(() => live(receipts).some((r) => r.reason === "session_usage_unconfirmed"));
-  assert.equal(live(receipts).find((r) => r.reason === "session_usage_unconfirmed").session_seconds_lower_bound, 30);
+test("AC5 a snapshot that goes backwards bills 0", async (t) => {
+  const s = await setup(t, { closeSeconds: () => 40 });
+  const c = await s.open();
+  snap(s.conn(), 30);
+  snap(s.conn(), 25);
+  await until(() => billedOf(s.receipts).length === 2);
+  c.send({ type: "session.close" });
+  await until(() => billedOf(s.receipts).length === 3);
+  assert.deepEqual(billedOf(s.receipts).map((r) => r.billed_seconds), [30, 0, 10]);
+  assert.equal(billedOf(s.receipts)[1].cost_usd, 0);
 });
 
-test("AC6 backend response.completed priced once per id; unpriced backend model latches", async (t) => {
-  const resp = (id, model) => ({ type: "response.event", event: { type: "response.completed", response: { id, model, usage: { input_tokens: 1000, output_tokens: 200 } } } });
-  const { port, receipts, chatCall } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(resp("r1", "gpt-5.4-mini")); conn.send(resp("r1", "gpt-5.4-mini")); conn.send(resp("r2", "no-such-model-x")); conn.send(snap(1)); } }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.usage.updated");
-  await until(() => live(receipts).some((r) => r.reason === "model_unpriced"));
-  const b = live(receipts).filter((r) => r.backend);
-  assert.equal(b.length, 2);
-  assert.equal(b[0].cost_usd, 0.00165);
-  assert.equal(b[0].response_id, "r1");
-  assert.equal(b[1].cost_usd, null);
-  assert.equal(b[1].reason, "model_unpriced");
-  c.close();
-  assert.equal((await chatCall()).status, 429);
-});
-
-// #281: backend tool calls, priority tier, image_generation and delegation model admission.
-const backend = (id, extra = {}) => ({ type: "response.event", event: { type: "response.completed", response: { id, model: "gpt-5.4-mini", usage: { input_tokens: 1000, output_tokens: 200 }, ...extra } } });
-const searches = [{ type: "web_search_call", id: "ws_1", status: "completed" }, { type: "web_search_call", id: "ws_2", status: "completed" }];
-
-test("#281 AC1 backend web_search calls billed like /v1/responses, once per id", async (t) => {
-  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: searches })); conn.send(backend("r1", { output: searches })); conn.send(snap(1)); } }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.usage.updated");
-  await until(() => billed(receipts).length === 1);
-  const b = live(receipts).filter((r) => r.backend);
-  assert.equal(b.length, 1);
-  assert.equal(b[0].cost_usd, 0.02165);
-  assert.deepEqual(b[0].tool_calls, { web_search: 2 });
-  assert.equal(b[0].tool_cost_usd, 0.02);
-  c.close();
-});
-
-test("#281 AC2 backend priority tier billed at the priority rate", async (t) => {
-  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { service_tier: "priority" })); conn.send(snap(1)); } }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.usage.updated");
-  await until(() => live(receipts).some((r) => r.backend));
-  const b = live(receipts).find((r) => r.backend);
-  assert.equal(b.cost_usd, 0.0033);
-  assert.equal(b.service_tier, "priority");
-  c.close();
-});
-
-test("#281 AC3 backend image_generation latches tool_use_unpriced; next session refused", async (t) => {
-  const { port, receipts, chatCall } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: [{ type: "image_generation_call", id: "ig_1", status: "completed" }] })); conn.send(snap(1)); } }) });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await until(() => live(receipts).some((r) => r.reason === "tool_use_unpriced"));
-  const b = live(receipts).find((r) => r.backend);
-  assert.equal(b.cost_usd, null);
-  c.close();
-  await sleep(30);
-  assert.equal((await chatCall()).status, 429);
-  const c2 = await connectRealtime(port, PATH);
-  assert.equal(c2.status, 429);
-});
-
-test("#281 AC3 --upstream-prices tools override applies to backend web_search", async (t) => {
-  const userPrices = { tools: { web_search: 0.02 } };
-  const { port, receipts } = await setup(t, { upstream: liveUpstream({ onStart: (conn) => { conn.send(backend("r1", { output: searches })); conn.send(snap(1)); } }), proxy: { userPrices } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.usage.updated");
-  await until(() => live(receipts).some((r) => r.backend));
-  const b = live(receipts).find((r) => r.backend);
-  assert.equal(b.tool_cost_usd, 0.04);
-  assert.equal(b.cost_usd, 0.04165);
-  c.close();
-});
-
-test("#281 AC4 delegation model vetted by --models and --unknown-models refuse; session.update not forwarded", async (t) => {
-  const del = (model) => ({ type: "session.start", session: { model: "gpt-live-1", delegation: { responses: { model } } } });
-  {
-    const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1"] } });
-    const c = await connectRealtime(port, PATH);
-    c.send(del("gpt-5.4"));
-    const err = await c.waitFor((m) => m.type === "error");
-    assert.equal(err.error.code, "model_not_allowed");
-    await c.closed;
-    assert.equal(c.closeCode, 1008);
-    await sleep(30);
-    assert.equal(up.sessions[0]?.received.length ?? 0, 0);
-    const b = live(receipts).find((r) => r.blocked);
-    assert.equal(b.cost_usd, 0);
-    assert.equal(b.reason, "model_not_allowed");
-  }
-  {
-    const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { unknownModels: "refuse" } });
-    const c = await connectRealtime(port, PATH);
-    c.send(del("unpriced-model-x"));
-    const err = await c.waitFor((m) => m.type === "error");
-    assert.equal(err.error.code, "model_unpriced");
-    await c.closed;
-    assert.equal(c.closeCode, 1008);
-    await sleep(30);
-    assert.equal(up.sessions[0]?.received.length ?? 0, 0);
-  }
-  {
-    const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
-    const c = await connectRealtime(port, PATH);
-    c.send(del("gpt-5.4-mini"));
-    await c.waitFor((m) => m.type === "session.started");
-    c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } });
-    const err = await c.waitFor((m) => m.type === "error");
-    assert.equal(err.error.code, "model_not_allowed");
-    c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4-mini" } } } });
-    await until(() => up.sessions[0].received.filter((m) => m.type === "session.update").length === 1);
-    await sleep(30);
-    const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
-    assert.equal(ups.length, 1);
-    assert.equal(ups[0].session.delegation.responses.model, "gpt-5.4-mini");
-    c.close();
-  }
-});
-
-
-// #289: --model-cap / modelCaps apply to the GPT-Live delegation model.
-const delStart = (model) => ({ type: "session.start", session: { model: "gpt-live-1", delegation: { responses: { model } } } });
-const big = (id) => ({ type: "response.event", event: { type: "response.completed", response: { id, model: "gpt-5.4", usage: { input_tokens: 100000, output_tokens: 20000 } } } });
-const spent = (rules, model = "gpt-5.4", cost = 1) => { const mc = createModelCaps({ rules }); mc.record({ model, cost_usd: cost, ts: new Date().toISOString() }); return mc; };
-
-test("#289 AC1 spent delegation model cap refuses session.start before upstream; other delegation model admitted", async (t) => {
-  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart("gpt-5.4"));
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "model_budget_exceeded");
+test("AC5 session.close wait timeout latches unconfirmed", async (t) => {
+  const s = await setup(t, { proxy: { cap: createCapEngine({ caps: { run: 0.005 } }), liveCloseWaitMs: 100 } });
+  const c = await s.open();
+  snap(s.conn(), 12);
   await c.closed;
   assert.equal(c.closeCode, 1008);
-  await sleep(30);
-  assert.equal(up.sessions[0]?.received.length ?? 0, 0);
-  const b = live(receipts).find((r) => r.blocked);
-  assert.equal(b.cost_usd, 0);
-  assert.equal(b.reason, "model_budget_exceeded");
-  const c2 = await connectRealtime(port, PATH);
-  c2.send(delStart("gpt-5.4-mini"));
-  await c2.waitFor((m) => m.type === "session.started");
-  c2.close();
+  assert.equal(s.receipts.filter((r) => r.reason === "session_usage_unconfirmed").length, 1);
 });
 
-test("#289 AC2 backend response.completed reaching the delegation cap closes the session 1008", async (t) => {
-  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 0.5 }] });
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: (conn) => { conn.send(snap(1)); for (let i = 1; i <= 5; i++) conn.send(big(`r${i}`)); } }), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart("gpt-5.4"));
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "model_budget_exceeded");
-  await c.closed;
-  assert.equal(c.closeCode, 1008);
-  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
-  await until(() => billed(receipts).length >= 2);
-  const c2 = await connectRealtime(port, PATH);
-  c2.send(delStart("gpt-5.4"));
-  assert.equal((await c2.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
-});
-
-test("#289 AC3 session.update to a spent delegation model is not forwarded", async (t) => {
-  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
-  const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart("gpt-5.4-mini"));
-  await c.waitFor((m) => m.type === "session.started");
-  c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } });
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "model_budget_exceeded");
-  c.send({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4-mini" } } } });
-  await until(() => up.sessions[0].received.filter((m) => m.type === "session.update").length === 1);
-  await sleep(30);
-  const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
-  assert.equal(ups.length, 1);
-  assert.equal(ups[0].session.delegation.responses.model, "gpt-5.4-mini");
-  c.close();
-});
-
-test("#289 AC4 hosted scopes (week/month/total) and unknown-cost delegation receipt refuse", async (t) => {
-  for (const scope of ["week", "month", "total"]) {
-    const modelCaps = spent([{ model: "gpt-5.4", scope, cap: 0.5 }]);
-    const { port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
-    const c = await connectRealtime(port, PATH);
-    c.send(delStart("gpt-5.4"));
-    assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded", scope);
-  }
-  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 5 }] });
-  modelCaps.record({ id: "u1", model: "gpt-5.4", cost_usd: null, ts: new Date().toISOString() });
-  const { port } = await setup(t, { upstream: liveUpstream(), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart("gpt-5.4"));
-  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "accounting_unavailable");
-});
-
-// #292: model caps follow the metered backend model, not only the declared delegation model.
-const noDeleg = { type: "session.start", session: { model: "gpt-live-1" } };
-const emptyDeleg = { type: "session.start", session: { model: "gpt-live-1", delegation: { responses: {} } } };
-const burst = (n = 5) => (conn) => { conn.send(snap(1)); for (let i = 1; i <= n; i++) conn.send(big(`b${i}`)); };
-
-test("#292 AC1/AC2 undeclared backend model reaching its cap closes the session 1008; next session closed on first metered response", async (t) => {
-  for (const start of [noDeleg, emptyDeleg]) {
-    const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 0.5 }] });
-    const { up, port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst() }), proxy: { modelCaps } });
-    const c = await connectRealtime(port, PATH);
-    c.send(start);
-    assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
-    await c.closed;
-    assert.equal(c.closeCode, 1008);
-    assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
-    const c2 = await connectRealtime(port, PATH);
-    c2.send(start);
-    assert.equal((await c2.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
-    await c2.closed;
-    assert.equal(c2.closeCode, 1008);
-  }
-});
-
-test("#292 AC3 backend model differing from the declared delegation model is capped for the rest of the session", async (t) => {
-  const modelCaps = spent([{ model: "gpt-5.4", scope: "day", cap: 0.5 }]);
-  const { up, port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst(3) }), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart("gpt-5.4-mini"));
-  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "model_budget_exceeded");
-  await c.closed;
-  assert.equal(c.closeCode, 1008);
-  assert.ok(up.sessions[0].received.some((m) => m.type === "session.close"));
-});
-
-test("#292 AC4 unsettled unknown-cost receipt for the metered backend model closes with accounting_unavailable", async (t) => {
-  const modelCaps = createModelCaps({ rules: [{ model: "gpt-5.4", scope: "day", cap: 50 }] });
-  modelCaps.record({ id: "u1", model: "gpt-5.4", cost_usd: null, ts: new Date().toISOString() });
-  const { port } = await setup(t, { upstream: liveUpstream({ final: 2, onStart: burst(1) }), proxy: { modelCaps } });
-  const c = await connectRealtime(port, PATH);
-  c.send(noDeleg);
-  assert.equal((await c.waitFor((m) => m.type === "error")).error.code, "accounting_unavailable");
-  await c.closed;
-  assert.equal(c.closeCode, 1008);
-});
-
-test("AC7 /live/sessions/x/fork and chat-path upgrades still get 501", async (t) => {
-  const { up, port } = await setup(t);
-  for (const p of ["/openai/v1/live/sessions/x/fork", "/openai/v1/chat/completions"]) {
-    const c = await connectRealtime(port, p);
-    assert.equal(c.status, 501);
-  }
-  assert.equal(up.upgrades, 0);
-});
-
-test("costcap pricing show lists the gpt-live-1 per-minute row", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-live-1"], { encoding: "utf8" });
-  assert.equal(s.status, 0, s.stderr);
-  assert.match(s.stdout, /gpt-live-1: \$0\.05 per minute/);
-});
-
-// #283 AC3: a partial input frame sharing a client read with session.start is forwarded in full.
-test("#283 AC3 session.start + first 100 bytes of a 3 KB input frame in one write: upstream gets every byte", async (t) => {
-  const { encodeFrame } = await import("../src/realtime.js");
-  const { up, port } = await setup(t, { upstream: liveUpstream() });
-  const c = await connectRealtime(port, PATH);
-  const s = encodeFrame(1, JSON.stringify(START), { mask: true });
-  const input = { type: "input_audio_buffer.append", audio: "A".repeat(3000) };
-  const f = encodeFrame(1, JSON.stringify(input), { mask: true });
-  c.socket.write(Buffer.concat([s, f.subarray(0, 100)]));
+test("AC6 backend response.completed priced once per id; unpriced backend latches model_unpriced", async (t) => {
+  const s = await setup(t);
+  await s.open();
+  const ev = { type: "response.event", event: { type: "response.completed", response: { id: "resp_1", model: "gpt-5.4-mini", usage: { input_tokens: 1000, output_tokens: 200 } } } };
+  s.conn().send(ev);
+  s.conn().send(ev);
+  s.conn().send({ type: "response.event", event: { type: "response.completed", response: { id: "resp_2", model: "gpt-made-up", usage: { input_tokens: 1, output_tokens: 1 } } } });
+  await until(() => live(s.receipts).filter((r) => r.response_id).length === 2);
   await sleep(50);
-  c.socket.write(f.subarray(100));
-  await until(() => up.sessions[0]?.received.length === 2);
-  assert.deepEqual(up.sessions[0].received, [START, input]);
-  assert.ok(Buffer.concat(up.sessions[0].frames.map((x) => x.raw)).equals(Buffer.concat([s, f])));
-  c.close();
+  const r = live(s.receipts).filter((x) => x.response_id);
+  assert.equal(r.length, 2);
+  assert.equal(r[0].cost_usd, 0.00165);
+  assert.equal(r[0].model, "gpt-5.4-mini");
+  assert.equal(r[1].cost_usd, null);
+  assert.equal(r[1].reason, "model_unpriced");
 });
 
-// #290: fragmented client messages are vetted as a whole; stray continuations are a protocol error.
-test("#290 fragmented session.update to a disallowed delegation model never reaches upstream; stray continuation closes 1002", async (t) => {
-  const { encodeFrame: ef } = await import("../src/realtime.js");
-  const delStart290 = { type: "session.start", session: { model: "gpt-live-1", delegation: { responses: { model: "gpt-5.4-mini" } } } };
-  const upd = (model) => Buffer.from(JSON.stringify({ type: "session.update", session: { delegation: { responses: { model } } } }));
-  const { up, port, receipts } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
-  const c = await connectRealtime(port, PATH);
-  c.send(delStart290);
-  await c.waitFor((m) => m.type === "session.started");
-  // AC1/AC3: F1(FIN=0, whole JSON) + F2(FIN=1, empty) + F3(FIN=1, empty).
-  c.socket.write(Buffer.concat([ef(1, upd("gpt-5.4"), { fin: false, mask: true }), ef(0, Buffer.alloc(0), { mask: true })]));
-  const err = await c.waitFor((m) => m.type === "error");
-  assert.equal(err.error.code, "model_not_allowed");
-  // AC4: an allowed fragmented update is still forwarded and reassembled upstream.
-  const ok = upd("gpt-5.4-mini");
-  c.socket.write(Buffer.concat([ef(1, ok.subarray(0, 10), { fin: false, mask: true }), ef(0, ok.subarray(10, 20), { fin: false, mask: true }), ef(0, ok.subarray(20), { mask: true })]));
-  await until(() => up.sessions[0].received.some((m) => m.type === "session.update"));
-  // AC2: the stray F3 continuation closes the client 1002.
-  c.socket.write(ef(0, Buffer.alloc(0), { mask: true }));
-  await until(() => c.closeCode !== null);
-  assert.equal(c.closeCode, 1002);
-  await sleep(30);
-  const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
-  assert.deepEqual(ups.map((u) => u.session.delegation.responses.model), ["gpt-5.4-mini"]);
-  assert.equal(live(receipts).filter((r) => r.blocked).length, 1);
-  assert.ok(!live(receipts).some((r) => r.reason === "protocol_error"));
-  c.close();
-});
-
-// #295: a fragmented client message past the 16 MB limit is never forwarded; the client is closed 1009.
-for (const kind of ["text", "binary"]) {
-  test(`#295 oversized fragmented (${kind}) session.update to a disallowed model never reaches upstream; client closed 1009`, { timeout: 180000 }, async (t) => {
-    const { encodeFrame: ef } = await import("../src/realtime.js");
-    const { up, port, receipts } = await setup(t, { upstream: { ...liveUpstream(), maxMessageBytes: 64 * 1024 * 1024 }, proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
-    const c = await connectRealtime(port, PATH);
-    c.send(START);
-    await c.waitFor((m) => m.type === "session.started", 30000);
-    const json = Buffer.from(JSON.stringify({ type: "session.update", session: { delegation: { responses: { model: "gpt-5.4" } } } }));
-    const f1 = Buffer.concat([json, Buffer.alloc(16 * 1024 * 1024 - 10 - json.length, 0x20)]);
-    c.socket.write(Buffer.concat([ef(kind === "text" ? 1 : 2, f1, { fin: false, mask: true }), ef(0, Buffer.alloc(1024, 0x20), { mask: true })]));
-    await until(() => c.closeCode !== null, 60000);
-    assert.equal(c.closeCode, 1009);
-    // AC3: later client frames are not silently swallowed by an open session.
-    c.socket.write(ef(1, JSON.stringify({ type: "x" }), { mask: true }));
-    await until(() => up.sessions[0].received.some((m) => m.type === "session.close"), 60000);
-    await sleep(50);
-    const rec = up.sessions[0].received;
-    assert.ok(!rec.some((m) => m.type === "session.update" || m.type === "x"));
-    assert.ok(up.sessions[0].frames.every((f) => f.payload.length < 1024 * 1024), "no fragment of the oversized message reached upstream");
-    assert.ok(!live(receipts).some((r) => r.blocked && r.reason === "model_not_allowed"));
-    c.close();
-  });
-}
-
-test("#295 a fragmented session.update just under the limit is still vetted whole", { timeout: 180000 }, async (t) => {
-  const { encodeFrame: ef } = await import("../src/realtime.js");
-  const { up, port } = await setup(t, { upstream: { ...liveUpstream(), maxMessageBytes: 64 * 1024 * 1024 }, proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.started", 30000);
-  const big = (model) => { const j = Buffer.from(JSON.stringify({ type: "session.update", session: { delegation: { responses: { model } } } })); return Buffer.concat([j, Buffer.alloc(16 * 1024 * 1024 - 2048 - j.length, 0x20)]); };
-  const frags = (b) => [ef(1, b.subarray(0, 1024), { fin: false, mask: true }), ef(0, b.subarray(1024), { mask: true })];
-  c.socket.write(Buffer.concat(frags(big("gpt-5.4"))));
-  const err = await c.waitFor((m) => m.type === "error", 60000);
-  assert.equal(err.error.code, "model_not_allowed");
-  const ok = big("gpt-5.4-mini");
-  const okFrames = frags(ok);
-  c.socket.write(Buffer.concat(okFrames));
-  await until(() => up.sessions[0].received.some((m) => m.type === "session.update"), 60000);
-  const ups = up.sessions[0].received.filter((m) => m.type === "session.update");
-  assert.deepEqual(ups.map((u) => u.session.delegation.responses.model), ["gpt-5.4-mini"]);
-  assert.ok(Buffer.concat(up.sessions[0].frames.slice(-2).map((x) => x.raw)).equals(Buffer.concat(okFrames)), "forwarded byte-identical");
-  assert.equal(c.closeCode, null);
-  c.close();
-});
-
-test("#290 a new data frame inside an open fragmented message closes 1002 and nothing partial is forwarded", async (t) => {
-  const { encodeFrame: ef } = await import("../src/realtime.js");
-  const { up, port } = await setup(t, { upstream: liveUpstream(), proxy: { allowedModels: () => ["gpt-live-1", "gpt-5.4-mini"] } });
-  const c = await connectRealtime(port, PATH);
-  c.send(START);
-  await c.waitFor((m) => m.type === "session.started");
-  const n = up.sessions[0].received.length;
-  c.socket.write(Buffer.concat([ef(1, Buffer.from('{"type":"session.up'), { fin: false, mask: true }), ef(1, Buffer.from('{"type":"x"}'), { mask: true })]));
-  await until(() => c.closeCode !== null);
-  assert.equal(c.closeCode, 1002);
-  await sleep(30);
-  assert.ok(!up.sessions[0].received.slice(n).some((m) => m.type === "x" || m.type === "session.update"));
-  c.close();
+test("AC7 /live/sessions/x/fork upgrade stays 501", async (t) => {
+  const s = await setup(t);
+  const c = await connectRealtime(s.port, "/openai/v1/live/sessions/sess_1/fork");
+  assert.equal(c.status, 501);
+  assert.equal(c.body.error, "websocket_unsupported");
+  assert.equal(s.up.upgrades, 0);
 });

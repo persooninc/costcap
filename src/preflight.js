@@ -1,181 +1,63 @@
-// Opt-in pre-flight budget estimate (CC-9). Off by default. It is an ESTIMATE:
-// input tokens are bounded by request bytes / 4 (UTF-8 bytes; typical
-// tokenizers average about 4 bytes per English token, fewer for some scripts
-// and code), and output tokens by the request's max-output field or a
-// conservative provider default when absent. It prices at the model's
-// published rate and never at the fallback: an unknown model is refused as
-// preflight_unpriced.
-import { geminiBatchRequests } from "./batch.js";
-import { lookupPrice, selectRates, batchMultiplier, toolRate, googleSearchBilling, TABLE_VERSION, TABLE_SHA256 } from "./pricing.js";
+// Opt-in pre-flight budget estimate (CC-9). Off by default.
+// Estimates a request's WORST-CASE cost before it is forwarded, so one large
+// call cannot blow through a tight cap before post-call metering catches it.
+// This is an estimate, not a tokenizer: input tokens are bounded by
+// ceil(request bytes / 4); output tokens are the request's max-output field or,
+// when absent, a conservative per-provider default maximum.
+// An unknown model or a missing rate is refused (preflight_unpriced), never $0.
 
-// #214: Anthropic web search with max_uses caps billed searches per request; the worst case adds
-// max_uses x the per-search rate. Without max_uses the search count is unbounded and not added.
-export function toolWorstCase(provider, req, model) {
-  // #250: Gemini Google Search grounding: a per-prompt family (2.x) bills at most once per request;
-  // per-query families (3+) have an unbounded query count and add nothing (like web search without max_uses).
-  if (provider === "gemini") {
-    const decl = Array.isArray(req?.tools) && req.tools.some((t) => t && typeof t === "object" && (t.googleSearch || t.google_search || t.googleSearchRetrieval || t.google_search_retrieval));
-    if (!decl || googleSearchBilling(model) !== "prompt") return { ok: true, usd: 0, calls: 0 };
-    const rate = toolRate("gemini", "google_search", model);
-    return rate === null ? { ok: false } : { ok: true, usd: rate, calls: 1 };
-  }
-  // #222: Claude on Vertex AI bills web search at the same per-search rate (tools.vertex, Claude only).
-  if ((provider !== "anthropic" && provider !== "vertex") || !Array.isArray(req?.tools)) return { ok: true, usd: 0, calls: 0 };
-  let calls = 0;
-  for (const t of req.tools) if (typeof t?.type === "string" && t.type.startsWith("web_search_") && Number.isInteger(t.max_uses) && t.max_uses > 0) calls += t.max_uses;
-  if (!calls) return { ok: true, usd: 0, calls: 0 };
-  const rate = toolRate(provider, "web_search", model);
-  return rate === null ? { ok: false } : { ok: true, usd: calls * rate, calls };
-}
+import { lookupPrice } from "./pricing.js";
 
-// Conservative default output ceilings when the request sets no limit.
-export const DEFAULT_MAX_OUTPUT = { openai: 16_384, openrouter: 16_384, anthropic: 64_000, bedrock: 64_000, vertex: 64_000, gemini: 65_536 };
+// Used only when the request sets no max-output field.
+export const DEFAULT_MAX_OUTPUT_TOKENS = { openai: 32_768, openrouter: 32_768, anthropic: 64_000, gemini: 65_536 };
 
-export function requestedOutputTokens(provider, req) {
-  const n = provider === "gemini"
-    ? req?.generationConfig?.maxOutputTokens ?? req?.generation_config?.max_output_tokens
-    : req?.max_completion_tokens ?? req?.max_output_tokens ?? req?.max_tokens ?? req?.inferenceConfig?.maxTokens; // #216: Bedrock Converse
-  return Number.isInteger(n) && n > 0 ? { tokens: n, defaulted: false } : { tokens: DEFAULT_MAX_OUTPUT[provider] ?? 65_536, defaulted: true };
-}
+const positiveInt = (v) => (Number.isInteger(v) && v > 0 ? v : undefined);
 
-// Max completions per request the provider accepts; larger values are clamped
-// to it (the provider would reject them) and flagged output_multiplier_clamped.
-export const MAX_OUTPUT_MULTIPLIER = { openai: 128, openrouter: 128, gemini: 8, anthropic: 1, bedrock: 1, vertex: 1 };
-
-// OpenAI-compatible n / best_of (best_of bills every candidate, so the larger
-// wins) and Gemini candidateCount multiply billed output tokens. A missing
-// value is 1; an invalid one (non-integer, <= 0, non-number) is treated as 1
-// and flagged output_multiplier_defaulted.
-export function outputMultiplier(provider, req) {
-  const raw = provider === "gemini"
-    ? [req?.generationConfig?.candidateCount ?? req?.generation_config?.candidate_count]
-    : ["anthropic", "bedrock", "vertex"].includes(provider) ? [] : [req?.n, req?.best_of];
-  let multiplier = 1, defaulted = false;
-  for (const v of raw) {
-    if (v === undefined || v === null) continue;
-    if (!Number.isInteger(v) || v <= 0) { defaulted = true; continue; }
-    multiplier = Math.max(multiplier, v);
-  }
-  const max = MAX_OUTPUT_MULTIPLIER[provider] ?? 128;
-  const clamped = multiplier > max;
-  return { multiplier: clamped ? max : multiplier, defaulted, clamped };
-}
-
-// Returns { ok: true, estimate_usd, ... } or { ok: false, reason: "preflight_unpriced", model }.
-// #167: an OpenRouter `models` fallback list may route to any entry, so the
-// worst case is the max over every candidate (any unpriced candidate refuses).
-// #188: pathModel (cloud routes) is the model from the request path, used over the body.
-export function estimateWorstCase(provider, body, path = "", priceFor, pathModel, at) {
-  // #236: the shipped table prices at the moment of the check.
-  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
+// body: raw request Buffer or string. path: provider-relative path (Gemini carries the model there).
+export function estimateWorstCase(provider, body, path = "") {
   const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
-  let req = {};
-  try { req = JSON.parse(text) ?? {}; } catch { /* malformed body: model unknown */ }
-  const candidates = provider === "openrouter" ? openRouterModels(req) : null;
-  if (pathModel !== undefined) return estimateOne(provider, req, text, path, pathModel ?? "unknown", priceFor);
-  if (!candidates || candidates.length < 2) return estimateOne(provider, req, text, path, candidates?.[0], priceFor);
-  let worst;
-  for (const m of candidates) {
-    const e = estimateOne(provider, req, text, path, m, priceFor);
-    if (!e.ok) return e;
-    if (!worst || e.estimate_usd > worst.estimate_usd) worst = e;
-  }
-  return { ...worst, candidate_models: candidates };
-}
-
-// De-duplicated union of `model` and a `models` array (OpenRouter fallbacks).
-// Returns null when `models` is present but not an array of non-empty strings.
-export function openRouterModels(req) {
-  const out = [];
-  if (typeof req?.model === "string" && req.model) out.push(req.model);
-  if (req && req.models !== undefined) {
-    if (!Array.isArray(req.models) || !req.models.every((m) => typeof m === "string" && m)) return null;
-    for (const m of req.models) if (!out.includes(m)) out.push(m);
-  }
-  return out;
-}
-
-function estimateOne(provider, req, text, path, forcedModel, priceFor) {
-  let model = forcedModel ?? (typeof req.model === "string" ? req.model : undefined);
-  if (!model && provider === "gemini") model = /models\/([^/:]+)/.exec(path)?.[1];
-  // #186: a custom upstream estimates only from user prices (priceFor), never the shipped table.
-  const price = model ? (priceFor ? priceFor(model) : lookupPrice(model)) : null;
-  if (!price || price.fallback || !Number.isFinite(price.input) || !Number.isFinite(price.output)) {
-    return { ok: false, reason: "preflight_unpriced", model: model ?? "unknown" };
-  }
+  let json = {};
+  try { json = JSON.parse(text) ?? {}; } catch { /* malformed body: no max field, model from path */ }
+  let model = typeof json.model === "string" ? json.model : undefined;
+  if (!model && provider === "gemini") model = /models\/([^/:?]+)/.exec(path)?.[1];
+  let max;
+  if (provider === "gemini") max = positiveInt(json.generationConfig?.maxOutputTokens);
+  else if (provider === "openai" || provider === "openrouter") max = positiveInt(json.max_completion_tokens) ?? positiveInt(json.max_tokens) ?? positiveInt(json.max_output_tokens);
+  else max = positiveInt(json.max_tokens);
+  const output_tokens = max ?? DEFAULT_MAX_OUTPUT_TOKENS[provider] ?? 65_536;
   const input_tokens = Math.ceil(Buffer.byteLength(text, "utf8") / 4);
-  // OpenAI (#145), OpenRouter (#202) and Gemini (#200) embeddings bill input only: no output allowance.
-  const pathname = String(path ?? "").split(/[?#]/, 1)[0];
-  const embeddings = ((provider === "openai" || provider === "openrouter") && pathname === "/v1/embeddings")
-    || (provider === "gemini" && /^\/v1(?:beta|alpha)?\/models\/[A-Za-z0-9_.-]+:(?:embedContent|batchEmbedContents)$/.test(pathname));
-  const out = embeddings ? { tokens: 0, defaulted: false } : requestedOutputTokens(provider, req);
-  const mult = outputMultiplier(provider, req);
-  const output_tokens = out.tokens * mult.multiplier;
-  // Long-context tier (#151): a prompt estimated over the threshold budgets at the higher rates.
-  // Premium speed / service tier (#155): fast or priority requests budget at premium rates.
-  // #262: Gemini spells it service_tier or serviceTier, case-insensitive.
-  const tier = provider === "gemini" ? (typeof (req.service_tier ?? req.serviceTier) === "string" ? (req.service_tier ?? req.serviceTier).toLowerCase() : undefined) : req.service_tier;
-  const signal = { ...(typeof req.speed === "string" && { speed: req.speed }), ...(typeof tier === "string" && { service_tier: tier }) };
-  const { pricing_tier, rates } = selectRates(price, input_tokens, signal);
-  if (!rates) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
-  const tools = toolWorstCase(provider, req, model);
-  if (!tools.ok) return { ok: false, reason: "preflight_unpriced", model, pricing_tier };
-  const estimate_usd = Number(((input_tokens * rates.input + output_tokens * rates.output) / 1_000_000 + tools.usd).toFixed(6));
-  const flags = { ...(mult.defaulted && { output_multiplier_defaulted: true }), ...(mult.clamped && { output_multiplier_clamped: true }) };
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: mult.multiplier, ...flags, output_defaulted: out.defaulted, ...(tools.calls && { tool_calls_max: tools.calls, tool_usd_max: Number(tools.usd.toFixed(6)) }), estimate_usd, pricing_tier, ...(price.user_prices || (priceFor && !price.table_version) ? { cost_source: "user_prices" } : { cost_source: "table", table_version: TABLE_VERSION, table_sha256: TABLE_SHA256 }) };
+  return { model: model ?? "unknown", input_tokens, output_tokens, max_tokens_source: max ? "request" : "provider_default" };
 }
 
-// Compares the estimate with the remaining run/hour/day/month budget.
-// Returns null when it fits, else the refusal detail. When `onFit` is given it
-// receives the estimate of a call that fits (for the allowed-call receipt).
-export function preflightCheck(cap, provider, body, path, onFit, priceFor, pathModel, at, reserved = 0) {
-  return checkEstimate(cap, estimateWorstCase(provider, body, path, priceFor, pathModel, at), onFit, reserved);
+// Returns { estimate_usd } or { unpriced: true } for unknown models / missing rates.
+export function priceEstimate({ model, input_tokens, output_tokens }) {
+  const price = lookupPrice(model);
+  if (price.fallback || !Number.isFinite(price.input) || !Number.isFinite(price.output)) return { unpriced: true, model };
+  const usd = (input_tokens * price.input + output_tokens * price.output) / 1_000_000;
+  return { estimate_usd: Number(usd.toFixed(6)), table_version: price.table_version, model };
 }
 
-// #205: an Anthropic Message Batches create is estimated as the SUM of every
-// entry's worst case (requests[].params, same bytes/4 + max_tokens maths as a
-// single call) times the provider batch multiplier. Any unpriced or missing
-// entry model refuses as preflight_unpriced naming that model.
-// #230: a Gemini inline batch (batch.input_config.requests.requests[].request) is estimated the
-// same way, each entry priced at the create's path model.
-export function estimateBatch(provider, body, priceFor, pathModel, at) {
-  if (!priceFor && at !== undefined) priceFor = (m) => lookupPrice(m, at);
-  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body ?? "");
-  let reqs;
-  if (provider === "gemini") {
-    const g = geminiBatchRequests(text);
-    reqs = g?.map((request) => ({ params: request }));
-  } else try { reqs = JSON.parse(text)?.requests; } catch { /* unusable body */ }
-  if (!Array.isArray(reqs) || !reqs.length) return { ok: false, reason: "preflight_unpriced", model: "unknown" };
-  const mult = batchMultiplier(provider) ?? 1;
-  // #218: the batch discount covers tokens only; tool calls (web search) bill at 100%.
-  let usd = 0, toolUsd = 0, toolCalls = 0, input_tokens = 0, output_tokens = 0, model;
-  for (const r of reqs) {
-    const params = r?.params && typeof r.params === "object" ? r.params : {};
-    const e = provider === "gemini"
-      ? estimateOne(provider, params, JSON.stringify(params), `/v1beta/models/${pathModel}:generateContent`, pathModel ?? "unknown", priceFor)
-      : estimateOne(provider, params, JSON.stringify(params), "/v1/messages", undefined, priceFor);
-    if (!e.ok) return e;
-    const t = e.tool_usd_max ?? 0;
-    usd += e.estimate_usd - t; toolUsd += t; toolCalls += e.tool_calls_max ?? 0; input_tokens += e.input_tokens; output_tokens += e.output_tokens; model ??= e.model;
-  }
-  return { ok: true, model, input_tokens, output_tokens, output_multiplier: 1, batch_entries: reqs.length, batch_multiplier: mult,
-    ...(toolCalls && { tool_calls_max: toolCalls, tool_usd_max: Number(toolUsd.toFixed(6)) }),
-    estimate_usd: Number((usd * mult + toolUsd).toFixed(6)) };
-}
-
-// Compares a precomputed estimate (estimateWorstCase / estimateBatch) with the remaining budget.
-// #249: `reserved` is the summed worst case of calls already in flight (--max-concurrent).
-export function checkEstimate(cap, est, onFit, reserved = 0) {
-  if (!est.ok) return { reason: "preflight_unpriced", estimate: true, model: est.model, ...(est.pricing_tier && { pricing_tier: est.pricing_tier }) };
-  const remaining = { ...(cap?.remaining?.() ?? {}) };
-  if (reserved > 0) for (const k of Object.keys(remaining)) if (typeof remaining[k] === "number") remaining[k] = Number(Math.max(remaining[k] - reserved, 0).toFixed(6));
-  for (const scope of ["run", "hour", "day", "week", "month"]) {
-    if (remaining[scope] != null && est.estimate_usd > remaining[scope]) {
-      return { reason: "preflight_estimate", estimate: true, scope, estimate_usd: est.estimate_usd, remaining_usd: remaining, model: est.model, pricing_tier: est.pricing_tier,
-        input_tokens_est: est.input_tokens, output_tokens_est: est.output_tokens, output_multiplier: est.output_multiplier, ...(est.batch_entries && { batch_entries: est.batch_entries }) };
+// cap: a cap engine with remaining(). Returns null when the call may proceed,
+// else { reason, detail } describing the refusal.
+export function preflightCheck({ provider, body, path, cap }) {
+  const est = estimateWorstCase(provider, body, path);
+  const priced = priceEstimate(est);
+  const base = { estimate: true, model: est.model, estimate_input_tokens: est.input_tokens, estimate_output_tokens: est.output_tokens, max_tokens_source: est.max_tokens_source };
+  if (priced.unpriced) return { reason: "preflight_unpriced", detail: { ...base, estimate_usd: null } };
+  const remaining = cap?.remaining?.() ?? {};
+  for (const scope of ["run", "day", "month"]) {
+    if (remaining[scope] != null && priced.estimate_usd > remaining[scope]) {
+      return { reason: "preflight_estimate", detail: { ...base, estimate_usd: priced.estimate_usd, table_version: priced.table_version, scope, remaining_usd: remaining } };
     }
   }
-  onFit?.(est);
   return null;
+}
+
+export function preflightBody(reason, detail) {
+  if (reason === "preflight_unpriced") {
+    return { error: { type: "preflight_unpriced", reason, estimate: true, model: detail.model,
+      message: `CostCap pre-flight: model "${detail.model}" has no published rate, so its worst case cannot be estimated. The upstream call was not made.` } };
+  }
+  return { error: { type: "budget_exceeded", reason, estimate: true, scope: detail.scope, estimate_usd: detail.estimate_usd, remaining_usd: detail.remaining_usd,
+    message: `CostCap pre-flight: estimated worst case $${detail.estimate_usd} exceeds the remaining ${detail.scope} budget ($${detail.remaining_usd[detail.scope]}). This is an estimate. The upstream call was not made.` } };
 }

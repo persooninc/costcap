@@ -193,7 +193,7 @@ test("#145 digest --check passes with embeddings rows and pricing show prints th
   const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "text-embedding-3-small"], { encoding: "utf8" });
   assert.equal(s.status, 0, s.stderr);
   assert.match(s.stdout, /text-embedding-3-small: input \$0\.02, .*output \$0/);
-  assert.equal(TABLE_VERSION, "2026-11-17.3");
+  assert.equal(TABLE_VERSION, "2026-11-16.4");
 });
 
 test("#155 table shape: premium fast / priority rate sets are complete and above standard", () => {
@@ -225,40 +225,12 @@ test("#163: a table with modalities canonicalises, matches its digest, and a tam
   assert.match(r.stderr, /MISMATCH/);
 });
 
-test("#188 the bumped table declares the regional endpoint premium with a source", () => {
-  assert.equal(table.regional_endpoint.multiplier, 1.1);
-  for (const m of table.regional_endpoint.models) assert.ok(Object.hasOwn(table.models, m), m);
-  assert.ok(table.sources.some((s) => /Regional and multi-region endpoint pricing/.test(s)));
-});
-
-test("#194 pricing show lists gpt-realtime audio rates and snapshots resolve", () => {
-  const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-realtime-2025-08-28"], { encoding: "utf8" });
-  assert.equal(s.status, 0, s.stderr);
-  assert.match(s.stdout, /\(audio\): input \$32, cached_input \$0\.4, output \$64/);
-  assert.match(s.stdout, /\(image\): input \$5, cached_input \$0\.5/);
-});
-
-test("#198 AC6: the committed digest covers audio unit rates; a tampered per_minute fails verification", () => {
-  const t = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
-  const recorded = JSON.parse(readFileSync(new URL("../src/pricing-table.sha256.json", import.meta.url), "utf8"));
-  assert.equal(verifyTableDigest(t, recorded).ok, true);
-  t.models["whisper-1"].per_minute = 0.0001;
-  assert.deepEqual([verifyTableDigest(t, recorded).ok, verifyTableDigest(t, recorded).reason], [false, "digest_mismatch"]);
-});
-
-test("#230 the bumped table declares batch.gemini 0.5 with a source, and the digest covers it", () => {
-  assert.equal(table.batch.gemini, 0.5);
-  assert.ok(table.sources.some((s) => s.includes("ai.google.dev/gemini-api/docs/batch-mode")));
-  assert.equal(JSON.parse(readFileSync(digestPathFor(tablePath), "utf8")).sha256, tableDigest(table));
-  const { p } = tempTable((t) => { t.batch.gemini = 0.4; });
-  assert.equal(verifyTableDigest(JSON.parse(readFileSync(p, "utf8")), JSON.parse(readFileSync(digestPathFor(p), "utf8"))).ok, false);
-});
-
-test("#276 pricing show gpt-realtime-2 prints the audio rates; digest --check passes", () => {
-  const c = spawnSync(process.execPath, ["scripts/pricing-digest.mjs", "--check"], { encoding: "utf8" });
-  assert.equal(c.status, 0, c.stderr);
-  const s = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-realtime-2"], { encoding: "utf8" });
-  assert.equal(s.status, 0, s.stderr);
-  assert.match(s.stdout, /audio/);
-  assert.match(s.stdout, /\$64/);
+test("#188: the bumped table carries regional_endpoint with a source and verifies", () => {
+  const t = JSON.parse(readFileSync(tablePath, "utf8"));
+  assert.equal(t.regional_endpoint.multiplier, 1.1);
+  assert.ok(t.regional_endpoint.models.includes("claude-sonnet-4-5"));
+  for (const m of t.regional_endpoint.models) assert.ok(Object.hasOwn(t.models, m), m);
+  assert.ok(t.sources.some((s) => /Regional and multi-region endpoint pricing/.test(s)));
+  assert.equal(tableIntegrity().ok, true);
+  assert.equal(digestScript(["--check"], tablePath).code, 0);
 });

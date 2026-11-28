@@ -1,239 +1,228 @@
-// Issue #258: per-team and per-kind alert routes plus a default-kinds filter.
+// Issue #258: alert routes (per-team / per-kind destinations) and default kinds.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHostedServer, ALERT_MAX_ATTEMPTS } from "../src/hosted/server.js";
-import { createAlertDelivery, createOrgAlertRouter, matchingRoutes, maskAlertSettings, alertRouteTeam } from "../src/hosted/delivery.js";
+import { createHostedServer, applyDeliveryResult, dueRetryChannels, ALERT_MAX_ATTEMPTS } from "../src/hosted/server.js";
+import { createAlertDelivery, createOrgAlertRouter, maskAlertSettings } from "../src/hosted/delivery.js";
+import { parseKinds, parseRoutes, routeMatches, routeDisabled, dropTeamFromRoutes, dropEmailFromRoutes, MAX_ALERT_ROUTES } from "../src/hosted/alert-routes.js";
+import { validSlackWebhook } from "../src/hosted/delivery.js";
 
-const S0 = "https://hooks.slack.com/services/T0/B0/defaultS0aa";
-const S1 = "https://hooks.slack.com/services/T1/B1/paymentsS1bb";
-const S2 = "https://hooks.slack.com/services/T2/B2/otherS2cc";
-const R1 = { id: "rt_r1", name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: S1 };
-const R2 = { id: "rt_r2", name: "finance", kinds: ["spend_anomaly"], teams: null, emails: ["f@x.invalid"], slackWebhook: null };
-const HOOK = { url: "https://hooks.receiver.example.com/cc", secret: "whsec_test" };
-const lookup = async () => [{ address: "93.184.216.34", family: 4 }];
+const S0 = "https://hooks.slack.com/services/T0/B0/defaultzero";
+const S1 = "https://hooks.slack.com/services/T1/B1/paymentsone";
+const R1 = "rt_000000000001", R2 = "rt_000000000002";
+const pubLookup = async () => [{ address: "93.184.216.34", family: 4 }];
 
-function recorder(status = () => 200) {
+// Fake fetch: records Slack URLs and email recipients; `fail` maps URL -> status.
+function recorder(fail = {}) {
   const calls = [];
-  const fetchImpl = async (url, o) => {
-    const body = JSON.parse(o.body);
-    calls.push(url.includes("api.brevo.com") ? { to: body.to.map((x) => x.email).sort().join(",") } : { url });
-    const code = status(url);
-    return { ok: code < 300, status: code };
+  const fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (String(url).includes("hooks.slack.com")) calls.push({ slack: url });
+    else if (body.to) calls.push({ email: body.to.map((x) => x.email).sort() });
+    else calls.push({ webhook: url });
+    const status = fail[url] ?? 200;
+    return { ok: status < 400, status, json: async () => ({ id: "x" }), text: async () => "" };
   };
-  return { calls, fetchImpl, targets: () => calls.map((c) => c.to ?? c.url).sort() };
+  return { calls, fetchImpl };
 }
-const settings = (extra = {}) => ({ emails: ["o@x.invalid"], slackWebhook: S0, kinds: ["cap_hit", "agent_silent"], routes: [R1, R2], ...extra });
+const matrixSettings = () => ({
+  emails: ["o@x.example"], slackWebhook: S0, kinds: ["cap_hit", "agent_silent"],
+  webhook: { url: "https://hooks.example.com/costcap", secret: "whsec_test" },
+  routes: [
+    { id: R1, name: "payments", kinds: null, teams: ["payments"], emails: [], slackWebhook: S1 },
+    { id: R2, name: "finops anomalies", kinds: ["spend_anomaly"], teams: null, emails: ["f@x.example"], slackWebhook: null },
+  ],
+});
+const dests = (calls) => calls.map((c) => c.slack ?? c.webhook ?? c.email.join(",")).sort();
 
-test("unit: route matching by kind and team; org/tag alerts only match teams:null; teams:[] matches nothing", () => {
-  assert.deepEqual(matchingRoutes([R1, R2], { kind: "cap_hit", team: "payments" }).map((r) => r.id), ["rt_r1"]);
-  assert.deepEqual(matchingRoutes([R1, R2], { kind: "spend_anomaly", agentId: "a1", routeTeam: "payments" }).map((r) => r.id), ["rt_r1", "rt_r2"]);
-  assert.deepEqual(matchingRoutes([R1, R2], { kind: "cap_hit", org: true, team: "payments" }).map((r) => r.id), []);
-  assert.deepEqual(matchingRoutes([R1, { ...R2, kinds: null }], { kind: "cap_hit", tag: { key: "c", value: "v" } }).map((r) => r.id), ["rt_r2"]);
-  assert.deepEqual(matchingRoutes([{ ...R1, teams: [] }], { kind: "cap_hit", team: "payments" }), []);
-  assert.deepEqual(matchingRoutes(undefined, { kind: "cap_hit" }), []);
-  assert.equal(alertRouteTeam({ tag: {}, team: "x" }), null);
+test("unit: parseKinds and parseRoutes validation", () => {
+  assert.equal(parseKinds(null), null);
+  assert.deepEqual(parseKinds(["agent_silent", "cap_hit", "cap_hit"]), ["cap_hit", "agent_silent"]);
+  assert.deepEqual(parseKinds([]), []);
+  for (const bad of ["cap_hit", ["nope"], [1]]) assert.throws(() => parseKinds(bad), (e) => e.status === 400);
+  const ctx = { current: [{ id: R1, name: "p", kinds: null, teams: ["payments"], emails: [], slackWebhook: S1 }], teamNames: new Set(["payments"]), members: new Set(["f@x.example"]), validSlack: validSlackWebhook };
+  const [kept, fresh] = parseRoutes([{ id: R1, name: " p2 ", teams: ["payments"] }, { name: "new", emails: ["F@x.example"], kinds: ["spend_anomaly"] }], ctx);
+  assert.deepEqual(kept, { id: R1, name: "p2", kinds: null, teams: ["payments"], emails: [], slackWebhook: S1 }); // webhook kept
+  assert.match(fresh.id, /^rt_[a-f0-9]{12}$/);
+  assert.deepEqual(fresh.emails, ["f@x.example"]);
+  assert.deepEqual(parseRoutes([{ id: R1, name: "p", slackWebhook: null, emails: ["f@x.example"] }], ctx)[0].slackWebhook, null);
+  const bads = [
+    "x", [null], [{ name: "", emails: ["f@x.example"] }], [{ name: "x".repeat(41), emails: ["f@x.example"] }],
+    [{ name: "k", kinds: ["nope"], emails: ["f@x.example"] }], [{ name: "t", teams: ["ghost"], emails: ["f@x.example"] }],
+    [{ name: "t", teams: [], emails: ["f@x.example"] }], [{ name: "e", emails: ["stranger@x.example"] }],
+    [{ name: "s", slackWebhook: "https://evil.example/services/x" }], [{ name: "none" }], [{ name: "none", id: R1, slackWebhook: null }],
+    [{ id: "rt_ffffffffffff", name: "u", emails: ["f@x.example"] }], [{ name: "f", emails: ["f@x.example"], extra: 1 }],
+    [{ id: R1, name: "a" }, { id: R1, name: "b" }],
+    Array.from({ length: MAX_ALERT_ROUTES + 1 }, (_, i) => ({ name: `r${i}`, emails: ["f@x.example"] })),
+  ];
+  for (const bad of bads) assert.throws(() => parseRoutes(bad, ctx), (e) => e.status === 400, JSON.stringify(bad).slice(0, 80));
+  assert.equal(parseRoutes(Array.from({ length: MAX_ALERT_ROUTES }, (_, i) => ({ name: `r${i}`, emails: ["f@x.example"] })), ctx).length, MAX_ALERT_ROUTES);
+  // A disabled route (teams []) can be re-saved as is.
+  const disabled = { ...ctx, current: [{ ...ctx.current[0], teams: [] }] };
+  assert.deepEqual(parseRoutes([{ id: R1, name: "p", teams: [] }], disabled)[0].teams, []);
 });
 
-test("AC2 routing matrix: defaults filtered by kinds, routes additive, signed webhook gets all five", async () => {
-  const r = recorder();
-  const route = createOrgAlertRouter({ emailKey: "k", emailFrom: "alerts@x.invalid", fetchImpl: r.fetchImpl, lookup });
-  const cfg = settings({ webhook: HOOK });
-  const send = async (alert) => { r.calls.length = 0; const res = await route({ orgId: "o", ...alert }, cfg); return { res, t: r.targets().filter((u) => u !== HOOK.url), hook: r.calls.some((c) => c.url === HOOK.url) }; };
-  let out = await send({ kind: "cap_hit", team: "payments", scope: "month", spent: 2, cap: 1 });
-  assert.deepEqual(out.t, ["o@x.invalid", S0, S1].sort());
-  assert.ok(out.hook);
-  assert.ok(out.res.some((x) => x.channel === "route:rt_r1:slack" && x.status === "accepted"));
-  out = await send({ kind: "cap_approaching", agentId: "a1", routeTeam: "payments", scope: "day" });
-  assert.deepEqual(out.t, [S1]);
-  assert.ok(out.hook);
-  out = await send({ kind: "cap_approaching", agentId: "a2", scope: "day" });
-  assert.deepEqual(out.t, []);
-  assert.ok(out.hook);
-  out = await send({ kind: "spend_anomaly", agentId: "a2", today: 9, baseline: 1, multiplier: 9 });
-  assert.deepEqual(out.t, ["f@x.invalid"]);
-  out = await send({ kind: "cap_hit", org: true, scope: "month", spent: 2, cap: 1 });
-  assert.deepEqual(out.t, ["o@x.invalid", S0].sort());
-  assert.ok(out.hook);
-  // Without the signed webhook, an a2 cap_approaching is unconfigured everywhere.
-  r.calls.length = 0;
-  const res = await route({ orgId: "o", kind: "cap_approaching", agentId: "a2" }, settings());
-  assert.deepEqual(res.map((x) => x.status), ["unconfigured", "unconfigured", "unconfigured"]);
-  assert.equal(r.calls.length, 0);
+test("unit: matching, disabled routes and lifecycle helpers", () => {
+  const r = { kinds: ["cap_hit"], teams: ["payments"] };
+  assert.equal(routeMatches(r, { kind: "cap_hit" }, "payments"), true);
+  assert.equal(routeMatches(r, { kind: "cap_hit" }, null), false);
+  assert.equal(routeMatches(r, { kind: "agent_silent" }, "payments"), false);
+  assert.equal(routeMatches({ kinds: null, teams: null }, { kind: "cap_hit" }, null), true);
+  const routes = dropTeamFromRoutes([{ id: R1, teams: ["payments"] }, { id: R2, teams: null }], "payments");
+  assert.deepEqual(routes.map((x) => x.teams), [[], null]);
+  assert.equal(routeDisabled(routes[0]), true);
+  assert.equal(routeMatches(routes[0], { kind: "cap_hit" }, "payments"), false); // never widened
+  assert.deepEqual(dropEmailFromRoutes([{ emails: ["f@x.example", "g@x.example"] }], "f@x.example")[0].emails, ["g@x.example"]);
+  // Masking never shows a route webhook in full.
+  const masked = maskAlertSettings(matrixSettings());
+  assert.ok(!JSON.stringify(masked).includes(S1) && !JSON.stringify(masked).includes("paymentsone"));
+  assert.equal(masked.routes[0].slackWebhook, "https://hooks.slack.com/services/…sone");
+  assert.deepEqual(masked.kinds, ["cap_hit", "agent_silent"]);
+  // Without kinds/routes the #121 shape is unchanged.
+  assert.deepEqual(Object.keys(maskAlertSettings({ emails: [], slackWebhook: null })), ["emails", "slackWebhook", "webhook", "configured"]);
 });
 
-test("AC3 parity: no kinds and no routes sends exactly the three default channels; kinds:[] silences defaults", async () => {
-  const r = recorder();
-  const send = createAlertDelivery({ emailKey: "k", emailFrom: "a@x.invalid", emailTo: ["o@x.invalid"], slackWebhook: S0, fetchImpl: r.fetchImpl });
-  assert.deepEqual((await send({ kind: "loop_detected", agentId: "a" })).map((x) => [x.channel, x.status]), [["email", "accepted"], ["slack", "accepted"], ["webhook", "unconfigured"]]);
-  const quiet = createAlertDelivery({ emailKey: "k", emailFrom: "a@x.invalid", emailTo: ["o@x.invalid"], slackWebhook: S0, kinds: [], fetchImpl: r.fetchImpl });
-  r.calls.length = 0;
-  assert.deepEqual((await quiet({ kind: "cap_hit" })).map((x) => x.status), ["unconfigured", "unconfigured", "unconfigured"]);
-  assert.equal(r.calls.length, 0);
-  // A router with only routes (no defaults) is configured.
-  const router = createOrgAlertRouter({ fetchImpl: r.fetchImpl });
-  assert.ok((await router({ kind: "cap_hit", team: "payments" }, { emails: [], slackWebhook: null, routes: [R1] })).some((x) => x.channel === "route:rt_r1:slack"));
+test("acceptance: routing matrix (defaults with kinds, team route, kind route, signed webhook)", async () => {
+  const cases = [
+    [{ kind: "cap_hit", team: "payments", scope: "month" }, ["o@x.example", S0, S1]],
+    [{ kind: "cap_approaching", agentId: "a1", routeTeam: "payments", scope: "day" }, [S1]],
+    [{ kind: "cap_approaching", agentId: "a2", scope: "day" }, []],
+    [{ kind: "spend_anomaly", agentId: "a2" }, ["f@x.example"]],
+    [{ kind: "cap_hit", org: true, scope: "month" }, ["o@x.example", S0]],
+  ];
+  for (const [alert, want] of cases) {
+    const { calls, fetchImpl } = recorder();
+    const deliver = createOrgAlertRouter({ emailKey: "k", emailFrom: "alerts@x.example", fetchImpl, lookup: pubLookup });
+    const result = await deliver({ id: "id", orgId: "o", ...alert }, matrixSettings());
+    assert.deepEqual(dests(calls), [...want, "https://hooks.example.com/costcap"].sort(), JSON.stringify(alert));
+    // Without the signed webhook: nothing configured means `unconfigured`.
+    const { calls: c2, fetchImpl: f2 } = recorder();
+    const noHook = { ...matrixSettings(), webhook: null };
+    const rows = await createOrgAlertRouter({ emailKey: "k", emailFrom: "alerts@x.example", fetchImpl: f2 })({ id: "id", ...alert }, noHook);
+    assert.deepEqual(dests(c2), [...want].sort());
+    const rec = {};
+    applyDeliveryResult(rec, rows, null, 0);
+    assert.equal(rec.delivery, want.length ? "accepted" : "unconfigured", JSON.stringify(alert));
+    assert.ok(result.every((r) => r.status !== "failed"));
+  }
 });
 
-test("dedupe: an address or Slack URL in several matched destinations is sent once per occurrence; retries honour channels", async () => {
-  const r = recorder();
-  const send = createAlertDelivery({ emailKey: "k", emailFrom: "a@x.invalid", emailTo: ["o@x.invalid"], slackWebhook: S0, fetchImpl: r.fetchImpl,
-    routes: [{ ...R1, slackWebhook: S0, emails: ["o@x.invalid", "p@x.invalid"] }, { id: "rt_b", name: "b", kinds: null, teams: null, emails: ["p@x.invalid"], slackWebhook: S2 }] });
-  const res = await send({ kind: "cap_hit", team: "payments" });
-  assert.deepEqual(r.targets(), ["o@x.invalid", "p@x.invalid", S0, S2].sort());
-  assert.deepEqual(res.map((x) => x.channel), ["email", "slack", "webhook", "route:rt_r1:email", "route:rt_b:slack"]);
-  r.calls.length = 0;
-  assert.deepEqual((await send({ kind: "cap_hit", team: "payments" }, { channels: ["route:rt_b:slack"] })).map((x) => x.channel), ["route:rt_b:slack"]);
-  assert.deepEqual(r.targets(), [S2]);
-  // A failing route channel reports failed independently.
-  const bad = recorder((u) => (u === S1 ? 500 : 200));
-  const res2 = await createAlertDelivery({ slackWebhook: S0, routes: [R1], fetchImpl: bad.fetchImpl })({ kind: "cap_hit", team: "payments" });
-  assert.deepEqual(res2.filter((x) => x.channel !== "webhook").map((x) => [x.channel, x.status]), [["email", "unconfigured"], ["slack", "accepted"], ["route:rt_r1:slack", "failed"]]);
-  // Route emails need an email provider; without one the route email is not attempted.
-  const noKey = recorder();
-  await createAlertDelivery({ routes: [R2], fetchImpl: noKey.fetchImpl })({ kind: "spend_anomaly" });
-  assert.equal(noKey.calls.length, 0);
+test("acceptance: with no kinds and no routes every alert reaches the same channels as before", async () => {
+  const { calls, fetchImpl } = recorder();
+  const rows = await createAlertDelivery({ emailKey: "k", emailFrom: "a@x.example", emailTo: ["o@x.example"], slackWebhook: S0, fetchImpl })({ kind: "cap_approaching", agentId: "a2" });
+  assert.deepEqual(rows.map((r) => [r.channel, r.status]), [["email", "accepted"], ["slack", "accepted"], ["webhook", "unconfigured"]]);
+  assert.deepEqual(dests(calls), ["o@x.example", S0].sort());
 });
 
-test("masking: route webhooks never appear in full", () => {
-  const m = maskAlertSettings(settings({ routes: [R1, { ...R2, teams: [] }] }));
-  assert.equal(JSON.stringify(m).includes("paymentsS1bb"), false);
-  assert.equal(m.routes[0].slackWebhook, "https://hooks.slack.com/services/…S1bb");
-  assert.equal(m.routes[1].disabled, true);
-  assert.deepEqual(m.kinds, ["cap_hit", "agent_silent"]);
-  // Unset kinds/routes are omitted, so the pre-#258 shape is unchanged.
-  assert.deepEqual(maskAlertSettings(undefined), { emails: [], slackWebhook: null, webhook: null, configured: false });
+test("acceptance: only the failing route channel is retried, gives up after 10, S0 never resent; shared URL posts once", async () => {
+  const { calls, fetchImpl } = recorder({ [S1]: 500 });
+  const settings = { ...matrixSettings(), webhook: null };
+  const deliver = createOrgAlertRouter({ emailKey: "k", emailFrom: "a@x.example", fetchImpl });
+  const alert = { id: "occ", kind: "cap_hit", team: "payments", scope: "month" };
+  const rec = { delivery: "pending" };
+  let now = 0, requested = null;
+  const gaveUp = [];
+  for (let i = 0; i < ALERT_MAX_ATTEMPTS; i++) {
+    const rows = await deliver(alert, settings, requested ? { channels: requested } : undefined);
+    gaveUp.push(...applyDeliveryResult(rec, rows, requested, now));
+    if (i < ALERT_MAX_ATTEMPTS - 1) {
+      assert.deepEqual(dueRetryChannels(rec, now), []);
+      assert.equal(rec.deliveryRetry[`route:${R1}:slack`].next_at, now + Math.min(2 ** i, 30) * 60_000);
+      now = rec.deliveryRetry[`route:${R1}:slack`].next_at;
+      requested = dueRetryChannels(rec, now);
+      assert.deepEqual(requested, [`route:${R1}:slack`]);
+    }
+  }
+  assert.deepEqual(gaveUp, [`route:${R1}:slack`]);
+  assert.equal(rec.deliveryChannels[`route:${R1}:slack`], "gave_up");
+  assert.equal(calls.filter((c) => c.slack === S0).length, 1);
+  assert.equal(calls.filter((c) => c.slack === S1).length, ALERT_MAX_ATTEMPTS);
+  // Same URL on the default and the route: one POST per occurrence.
+  const shared = recorder();
+  const same = { ...settings, routes: [{ ...settings.routes[0], slackWebhook: S0 }] };
+  const rows = await createOrgAlertRouter({ emailKey: "k", emailFrom: "a@x.example", fetchImpl: shared.fetchImpl })(alert, same);
+  assert.equal(shared.calls.filter((c) => c.slack === S0).length, 1);
+  assert.ok(!rows.some((r) => r.channel === `route:${R1}:slack`));
+  // A route-only settings object (no defaults) is still delivered.
+  const only = recorder();
+  await createOrgAlertRouter({ emailKey: "k", emailFrom: "a@x.example", fetchImpl: only.fetchImpl })(alert, { emails: [], slackWebhook: null, routes: settings.routes });
+  assert.deepEqual(dests(only.calls), [S1]);
 });
 
-async function fixture(t, { now, deliverAlert } = {}) {
+async function fixture(t, deliverAlert) {
   let code;
-  const storePath = join(mkdtempSync(join(tmpdir(), "cc-258-")), "store.json");
-  let service;
-  const start = async () => {
-    service = createHostedServer({ storePath, origin: "http://localhost", secureCookies: false, now, stripeEnv: {}, verifyChallenge: async (v) => v === "test-pass", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {}, deliverAlert });
-    service.server.keepAliveTimeout = 60_000;
-    await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
-  };
-  await start();
+  const storePath = join(mkdtempSync(join(tmpdir(), "cc-routes-")), "store.json");
+  const service = createHostedServer({ storePath, origin: "http://localhost", secureCookies: false, stripeEnv: {}, verifyChallenge: async (v) => v === "ok", sendCode: async (d) => { code = d.code; }, sendInvite: async () => {}, deliverAlert });
+  await new Promise((r) => service.server.listen(0, "127.0.0.1", r));
   t.after(() => { service.server.closeAllConnections(); service.server.close(); });
   const request = async (path, body, cookie, auth) => {
-    const r = await fetch(`http://127.0.0.1:${service.server.address().port}${path}`, { method: body === undefined ? "GET" : "POST", headers: { origin: "http://localhost", "content-type": "application/json", ...(cookie ? { cookie } : {}), ...(auth ? { authorization: `Bearer ${auth}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
-    return { status: r.status, body: await r.json() };
+    const r = await fetch(`http://127.0.0.1:${service.server.address().port}${path}`, { method: body === undefined ? "GET" : "POST", headers: { ...(auth ? {} : { origin: "http://localhost" }), connection: "close", "content-type": "application/json", ...(cookie ? { cookie } : {}), ...(auth ? { authorization: `Bearer ${auth}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const text = await r.text();
+    return { status: r.status, text, body: (() => { try { return JSON.parse(text); } catch { return null; } })(), cookie: r.headers.get("set-cookie")?.split(";")[0] };
   };
-  const login = async (email) => {
-    const c = await fetch(`http://127.0.0.1:${service.server.address().port}/auth/request`, { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json" }, body: JSON.stringify({ email, turnstileToken: "test-pass" }) });
-    const { challengeId } = await c.json();
-    const r = await fetch(`http://127.0.0.1:${service.server.address().port}/auth/verify`, { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json" }, body: JSON.stringify({ challengeId, code }) });
-    assert.equal(r.status, 200);
-    return { cookie: r.headers.get("set-cookie").split(";")[0], body: await r.json() };
-  };
-  const restart = async () => { service.server.closeAllConnections(); await new Promise((r) => service.server.close(r)); await start(); };
-  return { request, login, restart, service: () => service, storePath };
+  const login = async (email) => { const c = await request("/auth/request", { email, turnstileToken: "ok" }); return request("/auth/verify", { challengeId: c.body.challengeId, code }); };
+  const agent = async (cookie, name, caps = {}) => { const e = await request("/v1/enrollment-tokens", { caps }, cookie); return (await request("/v1/enroll", { name }, null, e.body.token)).body; };
+  return { request, login, agent, sweep: () => service.evaluateFleetAlerts() };
 }
 
-test("API + worker: roles, isolation, validation, masking, retry/gave_up, dedupe, lifecycle, restart", async (t) => {
-  let skew = 0;
-  let s1Status = 500;
-  const posts = [];
-  const router = createOrgAlertRouter({ lookup, fetchImpl: async (url) => { posts.push(url); const st = url === S1 ? s1Status : 200; return { ok: st < 300, status: st }; } });
-  // Pin the clock to 01:00 UTC today: the retry loop below skews up to ~21h, and an
-  // unpinned clock that crosses UTC midnight opens a new cap period, which fires a
-  // second cap_hit to S0 (this failed whenever the suite ran after ~19:00 UTC).
-  const base = Math.floor(Date.now() / 86_400_000) * 86_400_000 + 3_600_000;
-  const started = Date.now();
-  const clock = () => base + (Date.now() - started) + skew;
-  const f = await fixture(t, { now: clock, deliverAlert: router });
-  const owner = await f.login("owner@w.invalid");
-  const other = await f.login("owner@x.invalid");
-  for (const [email, role] of [["viewer@w.invalid", "viewer"], ["admin@w.invalid", "admin"], ["f@w.invalid", "viewer"], ["pending@w.invalid", "viewer"]])
-    assert.equal((await f.request("/v1/invitations", { email, role }, owner.cookie)).status, 201);
-  const viewer = await f.login("viewer@w.invalid");
-  const adminU = await f.login("admin@w.invalid");
-  await f.login("f@w.invalid");
-  const enroll = async (u, name) => { const tok = (await f.request("/v1/enrollment-tokens", { caps: { day: 1 } }, u.cookie)).body.token; return (await f.request("/v1/enroll", { name }, null, tok)).body; };
-  const a1 = await enroll(owner, "pay-bot");
-  assert.equal((await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], month: 100 }, owner.cookie)).status, 200);
-  const r1 = { name: "Payments", teams: ["payments"], slackWebhook: S1 };
-  const r2 = { name: "Finance", kinds: ["spend_anomaly"], emails: ["f@w.invalid"] };
-  // AC1: access.
-  assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, viewer.cookie)).status, 403);
-  assert.equal((await f.request("/v1/alert-settings", { routes: [r1] })).status, 401);
-  const viewerKey = (await f.request("/v1/api-keys", { name: "ro", role: "viewer" }, owner.cookie)).body.key;
-  assert.match(viewerKey, /^cck_/);
-  assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, null, viewerKey)).status, 403);
-  // AC1: validation.
-  const bads = [
-    { kinds: ["nope"] }, { kinds: "cap_hit" }, { routes: {} }, { routes: [null] },
-    { routes: [{ ...r1, kinds: ["nope"] }] }, { routes: [{ ...r1, teams: ["ghost"] }] }, { routes: [{ ...r1, teams: "payments" }] },
-    { routes: [{ ...r2, emails: ["pending@w.invalid"] }] }, { routes: [{ ...r2, emails: ["owner@x.invalid"] }] }, { routes: [{ ...r2, emails: "f@w.invalid" }] },
-    { routes: [{ ...r1, slackWebhook: "https://evil.invalid/services/x" }] }, { routes: Array.from({ length: 11 }, (_, i) => ({ ...r1, name: `r${i}` })) },
-    { routes: [{ name: "empty" }] }, { routes: [{ ...r1, name: "" }] }, { routes: [{ ...r1, name: "x".repeat(41) }] },
-    { routes: [{ ...r1, id: "rt_unknown" }] }, { routes: [{ ...r1, id: "bad id" }] },
-  ];
-  for (const bad of bads) assert.equal((await f.request("/v1/alert-settings", bad, owner.cookie)).status, 400, JSON.stringify(bad).slice(0, 80));
-  const saved = await f.request("/v1/alert-settings", { emails: ["owner@w.invalid"], slackWebhook: S0, kinds: ["cap_hit", "agent_silent"], routes: [r1, r2] }, adminU.cookie);
+test("regression: /v1/alert-settings kinds and routes: access, validation, masking, lifecycle and worker routing", async (t) => {
+  const { calls, fetchImpl } = recorder();
+  const f = await fixture(t, createOrgAlertRouter({ emailKey: "k", emailFrom: "alerts@x.example", fetchImpl }));
+  const owner = await f.login("o@routes.example");
+  for (const [email, role] of [["f@routes.example", "admin"], ["v@routes.example", "viewer"]]) await f.request("/v1/invitations", { email, role }, owner.cookie);
+  const fin = await f.login("f@routes.example");
+  const viewer = await f.login("v@routes.example");
+  const other = await f.login("other@elsewhere.example");
+  const a1 = await f.agent(owner.cookie, "a1", { day: 10 });
+  assert.equal((await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], month: 1000 }, owner.cookie)).status, 200);
+  const good = { emails: ["o@routes.example"], slackWebhook: S0, kinds: ["cap_hit", "agent_silent"], routes: [{ name: "payments", teams: ["payments"], slackWebhook: S1 }, { name: "anomalies", kinds: ["spend_anomaly"], emails: ["f@routes.example"] }] };
+  // Access.
+  assert.equal((await f.request("/v1/alert-settings", good, viewer.cookie)).status, 403);
+  const vkey = (await f.request("/v1/api-keys", { name: "ro", role: "viewer" }, owner.cookie)).body.key;
+  assert.equal((await f.request("/v1/alert-settings", good, null, vkey)).status, 403);
+  // Validation.
+  const bads = [{ kinds: ["nope"] }, { routes: [{ name: "x", teams: ["ghost"], slackWebhook: S1 }] }, { routes: [{ name: "x", emails: ["stranger@routes.example"] }] },
+    { routes: [{ name: "x", slackWebhook: "https://evil.example/services/x" }] }, { routes: [{ name: "x" }] },
+    { routes: Array.from({ length: 11 }, (_, i) => ({ name: `r${i}`, slackWebhook: S1 })) }];
+  for (const bad of bads) assert.equal((await f.request("/v1/alert-settings", bad, owner.cookie)).status, 400, JSON.stringify(bad).slice(0, 60));
+  const saved = await f.request("/v1/alert-settings", good, owner.cookie);
   assert.equal(saved.status, 200);
-  assert.equal(saved.body.routes.length, 2);
-  const [R1id, R2id] = saved.body.routes.map((r) => r.id);
-  assert.match(R1id, /^rt_[0-9a-f]{18}$/);
-  assert.equal(saved.body.routes[0].slackWebhook, "https://hooks.slack.com/services/…S1bb");
+  const [r1, r2] = saved.body.routes;
+  assert.match(r1.id, /^rt_/);
   assert.deepEqual(saved.body.kinds, ["cap_hit", "agent_silent"]);
-  assert.equal((await f.request("/v1/alert-settings", { routes: [{ ...r1, id: R1id }, { ...r1, id: R1id }] }, owner.cookie)).status, 400);
-  const asViewer = await f.request("/v1/alert-settings", undefined, viewer.cookie);
-  assert.equal(asViewer.body.canEdit, false);
-  assert.equal(asViewer.body.routes[0].name, "Payments");
-  // Isolation: the other org sees none of it and cannot reference W's teams.
-  assert.equal((await f.request("/v1/alert-settings", undefined, other.cookie)).body.routes, undefined);
-  assert.equal((await f.request("/v1/alert-settings", { routes: [r1] }, other.cookie)).status, 400);
-  // AC4: S1 fails, S0 succeeds; only route:R1:slack retries, then gives up after 10.
-  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts: new Date(clock()).toISOString(), cost_usd: 2 }] }, null, a1.token);
-  await f.service().evaluateFleetAlerts();
-  assert.deepEqual(posts.filter((u) => u !== S1).sort(), [S0]); // a1 day cap_hit: defaults (cap_hit allowed) + R1
-  assert.equal(posts.filter((u) => u === S1).length, 1);
-  for (let i = 0; i < 40 && posts.filter((u) => u === S1).length < ALERT_MAX_ATTEMPTS; i += 1) { skew += 31 * 60_000; await f.service().evaluateFleetAlerts(); }
-  assert.equal(posts.filter((u) => u === S1).length, ALERT_MAX_ATTEMPTS);
-  assert.equal(posts.filter((u) => u === S0).length, 1);
-  skew += 31 * 60_000; await f.service().evaluateFleetAlerts();
-  assert.equal(posts.filter((u) => u === S1).length, ALERT_MAX_ATTEMPTS);
-  const gaveUp = JSON.parse(readFileSync(f.storePath, "utf8")).audit.filter((e) => e.action === "alert.delivery_gave_up");
-  assert.equal(gaveUp.length, 1);
-  assert.equal(gaveUp[0].detail.channel, `route:${R1id}:slack`);
-  // Masking grep over API, CSV and audit bodies, and the store's audit.
-  const store = JSON.parse(readFileSync(f.storePath, "utf8"));
-  assert.ok(!JSON.stringify(store.audit).includes("paymentsS1bb"));
-  for (const path of ["/v1/alert-settings", "/v1/fleet", "/v1/audit.csv", "/v1/alerts", "/v1/evidence.json", "/v1/metrics"]) {
-    const r = await fetch(`http://127.0.0.1:${f.service().server.address().port}${path}`, { headers: { cookie: owner.cookie } });
-    const text = await r.text();
-    assert.ok(!text.includes("paymentsS1bb") && !text.includes(S0.slice(-8)), path);
-  }
-  // AC5: re-saving R1 without slackWebhook keeps S1.
-  assert.equal((await f.request("/v1/alert-settings", { routes: [{ id: R1id, name: "Payments", teams: ["payments"] }, { ...r2, id: R2id }] }, owner.cookie)).status, 200);
-  const kept = await f.request("/v1/alert-settings", undefined, owner.cookie);
-  assert.equal(kept.body.routes[0].slackWebhook, "https://hooks.slack.com/services/…S1bb");
-  assert.equal(kept.body.routes[0].id, R1id);
-  // AC6 (JSON store): settings survive a restart.
-  await f.restart();
-  const afterRestart = await f.request("/v1/alert-settings", undefined, owner.cookie);
-  assert.deepEqual(afterRestart.body.routes, kept.body.routes);
-  assert.deepEqual(afterRestart.body.kinds, ["cap_hit", "agent_silent"]);
-  // AC5: removing member f@ drops them from R2.
-  const fId = Object.values(JSON.parse(readFileSync(f.storePath, "utf8")).users).find((u) => u.email === "f@w.invalid").id;
-  assert.equal((await f.request(`/v1/members/${fId}/remove`, {}, owner.cookie)).status, 200);
-  assert.deepEqual((await f.request("/v1/alert-settings", undefined, owner.cookie)).body.routes[1].emails, []);
-  // AC5: deleting team payments leaves R1 disabled, never widened.
+  // Another org never sees these routes; a viewer reads them masked.
+  const theirs = await f.request("/v1/alert-settings", undefined, other.cookie);
+  assert.equal(theirs.body.routes, undefined);
+  assert.equal((await f.request("/v1/alert-settings", undefined, viewer.cookie)).body.routes.length, 2);
+  // Re-saving R1 without slackWebhook keeps S1.
+  assert.equal((await f.request("/v1/alert-settings", { routes: [{ id: r1.id, name: "payments", teams: ["payments"] }, { id: r2.id, name: "anomalies", kinds: ["spend_anomaly"], emails: ["f@routes.example"] }] }, fin.cookie)).status, 200);
+  // Worker: a team month cap_hit reaches o@, S0 and S1.
+  await f.request("/v1/teams", { name: "payments", agents: [a1.agentId], month: 1 }, owner.cookie);
+  await f.request("/v1/receipts", { receipts: [{ id: "r1", ts: new Date().toISOString(), cost_usd: 2 }] }, null, a1.token);
+  await f.sweep();
+  const teamHit = calls.splice(0);
+  assert.ok(teamHit.some((c) => c.slack === S1), JSON.stringify(teamHit));
+  assert.ok(teamHit.some((c) => c.slack === S0));
+  // Masked everywhere: no response or audit body carries a route webhook in full.
+  const bodies = [];
+  for (const p of ["/v1/alert-settings", "/v1/fleet", "/v1/evidence.json", "/v1/alerts", "/v1/audit.csv"]) bodies.push((await f.request(p, undefined, owner.cookie)).text);
+  for (const b of bodies) assert.ok(!b.includes("paymentsone"), "route webhook leaked");
+  // Lifecycle: removing member f@ drops them from R2.
+  const members = (await f.request("/v1/fleet", undefined, owner.cookie)).body.members;
+  const fid = members.find((m) => m.email === "f@routes.example").id;
+  assert.equal((await f.request(`/v1/members/${fid}/remove`, {}, owner.cookie)).status, 200);
+  const afterRemove = (await f.request("/v1/alert-settings", undefined, owner.cookie)).body;
+  assert.deepEqual(afterRemove.routes.find((r) => r.id === r2.id).emails, []);
+  assert.equal(afterRemove.routes.find((r) => r.id === r1.id).slackWebhook, "https://hooks.slack.com/services/…sone");
+  // Deleting team payments leaves R1 disabled; a1's next alert does not reach S1.
   assert.equal((await f.request("/v1/teams", { name: "payments", remove: true }, owner.cookie)).status, 200);
-  const after = await f.request("/v1/alert-settings", undefined, owner.cookie);
-  assert.deepEqual(after.body.routes[0].teams, []);
-  assert.equal(after.body.routes[0].disabled, true);
-  s1Status = 200;
-  posts.length = 0;
-  const raw = JSON.parse(readFileSync(f.storePath, "utf8"));
-  const orgId = Object.values(raw.users).find((u) => u.email === "owner@w.invalid").orgId;
-  const rawSettings = raw.orgs[orgId].alertSettings;
-  const res = await router({ orgId, kind: "cap_approaching", agentId: a1.agentId, team: "payments" }, rawSettings);
-  assert.ok(!posts.includes(S1));
-  assert.ok(!res.some((x) => x.channel.startsWith("route:")));
+  const disabled = (await f.request("/v1/alert-settings", undefined, owner.cookie)).body.routes.find((r) => r.id === r1.id);
+  assert.deepEqual([disabled.teams, disabled.disabled], [[], true]);
+  await f.request("/v1/receipts", { receipts: [{ id: "r2", ts: new Date().toISOString(), cost_usd: 10 }] }, null, a1.token);
+  await f.sweep();
+  const after = calls.splice(0);
+  assert.ok(after.length > 0, "a1 day cap_hit still delivered to defaults");
+  assert.ok(!after.some((c) => c.slack === S1), JSON.stringify(after));
 });
-

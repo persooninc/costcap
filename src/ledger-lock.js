@@ -119,9 +119,7 @@ function breakStale(lock, host) {
 // settles an unknown-cost receipt (incl. batch_pending) this wrapper folded in
 // from the ledger or wrote itself and passed to track() (#178); settlements of
 // already-costed or untracked receipts are ignored.
-// onExternalWarning(event) (#181) sees every cap_warning line read from the ledger,
-// before the settlements and receipts of the same chunk.
-export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, onExternalWarning = () => {}, timeoutMs } = {}) {
+export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle = () => {}, onExternalEvent = () => {}, timeoutMs } = {}) {
   mkdirSync(dirname(path), { recursive: true });
   const dir = `${path}.shared`;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -182,9 +180,12 @@ export function openSharedLedger(path, { onExternal = () => {}, onExternalSettle
       let release;
       try { release = acquireCriticalSection(path, { timeoutMs }); } catch (e) { depth -= 1; throw e; }
       try {
-        const { receipts, settled } = fold(readNew());
+        const lines = readNew();
+        const { receipts, settled } = fold(lines);
+        const events = lines.filter((l) => l?.event === "cap_warning"); // #181
         for (const [e, r] of settled) onExternalSettle(e, r);
         for (const r of receipts) onExternal(r);
+        for (const e of events) onExternalEvent(e);
         const out = fn();
         // Our own append (if any) is already accounted for by the caller.
         if (existsSync(path)) { const size = statSync(path).size; if (size > offset) { offset = size; pending = ""; } }

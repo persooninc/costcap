@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { mkdtempSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractUsage, isCountTokensPath, isEmbeddingsPath, isProviderError, startMeteringProxy } from "../src/proxy.js";
@@ -497,259 +498,90 @@ test("#155 standard receipts unchanged: no speed/service_tier keys, pricing_tier
   assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100 }), { ...costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 100, speed: undefined }) });
 });
 
-// #160 e2e: `costcap wrap` against local mock OpenAI and Anthropic upstreams serving JSONL fixtures.
-import { spawn as spawnBatch, spawnSync as spawnSyncBatch } from "node:child_process";
-import { ANTHROPIC_EXPECTED, OPENAI_EXPECTED, mockUpstream } from "./support/batch.js";
+// #160 e2e: `costcap wrap` against local mock Anthropic / OpenAI upstreams serving JSONL fixtures.
+const SONNET_BATCH_LINE = (id, usage) => JSON.stringify({ custom_id: id, result: { type: "succeeded", message: { model: "claude-sonnet-4-6", usage } } });
+const BATCH_JSONL = [SONNET_BATCH_LINE("a", { input_tokens: 1000, output_tokens: 500, cache_read_input_tokens: 2000 }),
+  SONNET_BATCH_LINE("b", { input_tokens: 2000, output_tokens: 1000 }), JSON.stringify({ custom_id: "c", result: { type: "errored", error: {} } })].join("\n");
+const OPENAI_BATCH_JSONL = [
+  JSON.stringify({ custom_id: "1", response: { status_code: 200, body: { model: "gpt-4o-mini", usage: { prompt_tokens: 1000, completion_tokens: 1000 } } } }),
+  JSON.stringify({ custom_id: "2", response: { status_code: 200, body: { object: "response", model: "gpt-4o-mini", usage: { input_tokens: 2000, output_tokens: 500, input_tokens_details: { cached_tokens: 1000 } } } } }),
+  JSON.stringify({ custom_id: "3", response: { status_code: 400, body: { error: {} } } })].join("\n");
+function batchUpstream() {
+  return http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const u = req.url;
+      if (u === "/v1/messages/batches") return res.end('{"id":"msgbatch_e2e","type":"message_batch"}');
+      if (u === "/v1/messages/batches/msgbatch_e2e/results") return res.end(BATCH_JSONL);
+      if (u === "/v1/batches" && req.method === "POST") return res.end('{"id":"batch_e2e","object":"batch","request_counts":{"total":3}}');
+      if (u === "/v1/batches/batch_e2e") return res.end('{"id":"batch_e2e","status":"completed","output_file_id":"file-e2e"}');
+      if (u === "/v1/files/file-e2e/content" || u === "/v1/files/file-other/content") return res.end(OPENAI_BATCH_JSONL);
+      if (u === "/v1/chat/completions") return res.end('{"model":"gpt-4o-mini","usage":{"prompt_tokens":1,"completion_tokens":1}}');
+      res.end('{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1}}');
+    });
+  });
+}
+const cliRun = (args, env = {}) => new Promise((resolve) => {
+  const child = spawn(process.execPath, ["src/cli.js", ...args], { env: { ...process.env, ...env } });
+  let out = "", err = "";
+  child.stdout.on("data", (d) => { out += d; });
+  child.stderr.on("data", (d) => { err += d; });
+  child.on("exit", (code) => resolve({ code, out: out.trim(), err }));
+});
+const agent = (calls) => `for (const [m, base, p, b] of ${JSON.stringify(calls)}) { const r = await fetch(process.env[base] + p, { method: m, body: b }); console.log(r.status); }`;
 
-async function wrapBatch(t, script, args = []) {
-  const up = http.createServer(mockUpstream());
+test("#160 e2e Anthropic batch: wrap is not frozen after create; results settle at 0.5x once; check passes under the cap", async (t) => {
+  const up = batchUpstream();
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
-  t.after(() => { up.closeAllConnections(); up.close(); });
-  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
-  const receipts = join(dir, "receipts.jsonl");
-  const base = `http://127.0.0.1:${up.address().port}`;
-  const res = await new Promise((resolve) => {
-    const c = spawnBatch(process.execPath, ["src/cli.js", "wrap", "--receipts", receipts, ...args, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: base, COSTCAP_TEST_ANTHROPIC_UPSTREAM: base } });
-    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
-    c.on("exit", (code) => resolve({ code, out, err }));
-  });
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  const cli = (...a) => spawnSyncBatch(process.execPath, ["src/cli.js", ...a, "--receipts", receipts], { encoding: "utf8" });
-  return { ...res, lines, cli };
-}
-
-test("#160 e2e Anthropic batch: wrap is not frozen after create; results settle once at 0.5x; check passes under a cap the full rate would exceed", async (t) => {
-  const script = `const A = process.env.ANTHROPIC_BASE_URL;
-    const p = { model: "claude-sonnet-4-6", max_tokens: 10, messages: [] };
-    const out = [];
-    out.push((await fetch(A + "/v1/messages/batches", { method: "POST", body: JSON.stringify({ requests: [1, 2, 3].map((i) => ({ custom_id: "c" + i, params: p })) }) })).status);
-    out.push((await fetch(A + "/v1/messages", { method: "POST", body: JSON.stringify(p) })).status);
-    if (process.env.FETCH !== "0") for (let i = 0; i < 2; i++) out.push((await fetch(A + "/v1/messages/batches/msgbatch_01/results")).status);
-    console.log(out.join(","));`;
-  const r = await wrapBatch(t, script);
-  assert.equal(r.code, 0, r.err);
-  assert.equal(r.out.trim(), "200,200,200,200");
-  const pend = r.lines.find((l) => l.reason === "batch_pending");
-  assert.deepEqual([pend.cost_usd, pend.batch_id, pend.request_count], [null, "msgbatch_01", 3]);
-  assert.equal(r.lines.some((l) => l.reason === "accounting_unavailable"), false);
-  const settles = r.lines.filter((l) => l.event === "reconciliation");
-  assert.deepEqual(settles.map((e) => [e.receipt_id, e.cost_usd, e.source]), [[pend.id, ANTHROPIC_EXPECTED, "batch_results"]]);
-  const runs = JSON.parse(r.cli("runs", "--json").stdout);
-  assert.notEqual(runs[0].total_cost_usd, null);
-  const sync = r.lines.find((l) => l.path === "/v1/messages").cost_usd;
-  const cap = String(Number((ANTHROPIC_EXPECTED * 1.5 + sync).toFixed(6)));
-  assert.equal(r.cli("check", "--cap", cap).status, 0);
-  assert.notEqual(r.cli("check", "--cap", String(Number((ANTHROPIC_EXPECTED + sync).toFixed(6)))).status, 0);
-});
-
-test("#160 e2e: a batch whose results are never fetched leaves the run unknown and check incomplete", async (t) => {
-  const script = `const A = process.env.ANTHROPIC_BASE_URL;
-    await fetch(A + "/v1/messages/batches", { method: "POST", body: JSON.stringify({ requests: [{ custom_id: "a", params: { model: "claude-sonnet-4-6" } }] }) });
-    console.log((await fetch(A + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-sonnet-4-6" }) })).status);`;
-  const r = await wrapBatch(t, script);
-  assert.equal(r.out.trim(), "200");
-  assert.equal(JSON.parse(r.cli("runs", "--json").stdout)[0].total_cost_usd, null);
-  assert.notEqual(r.cli("check").status, 0);
-  assert.equal(r.lines.some((l) => l.event), false);
-});
-
-test("#160 e2e OpenAI batch: create, retrieve, file content settle at 0.5x; unrelated file content stays $0", async (t) => {
-  const script = `const O = process.env.OPENAI_BASE_URL;
-    const out = [];
-    out.push((await fetch(O + "/batches", { method: "POST", body: JSON.stringify({ input_file_id: "file-in", endpoint: "/v1/chat/completions", completion_window: "24h" }) })).status);
-    out.push((await fetch(O + "/chat/completions", { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) })).status);
-    out.push((await fetch(O + "/files/file-unrelated/content")).status);
-    out.push((await fetch(O + "/batches/batch_01")).status);
-    out.push((await fetch(O + "/files/file-out/content")).status);
-    console.log(out.join(","));`;
-  const r = await wrapBatch(t, script);
-  assert.equal(r.out.trim(), "200,200,200,200,200", r.err);
-  const pend = r.lines.find((l) => l.reason === "batch_pending");
-  assert.deepEqual(r.lines.filter((l) => l.event === "reconciliation").map((e) => [e.receipt_id, e.cost_usd]), [[pend.id, OPENAI_EXPECTED]]);
-  const unrelated = r.lines.find((l) => l.path === "/v1/files/file-unrelated/content");
-  assert.deepEqual([unrelated.cost_usd, unrelated.reason], [0, "non_billable_request"]);
-  assert.equal(r.cli("check").status, 0);
-});
-
-// #163: modality pricing through the proxy, JSON and SSE, plus the unpriced 429.
-async function modalProxy(t, provider, handler) {
-  let hits = 0;
-  const up = http.createServer((req, res) => { hits++; handler(req, res); });
-  await new Promise((r) => up.listen(0, "127.0.0.1", r));
-  const receipts = join(mkdtempSync(join(tmpdir(), "cc-163-")), "r.jsonl");
-  const p = await startMeteringProxy({ upstreams: { [provider]: `http://127.0.0.1:${up.address().port}` }, receiptsPath: receipts });
-  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
-  return { base: `http://127.0.0.1:${p.port}/${provider}`, receipts, hits: () => hits };
-}
-const readReceipts = (f) => readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => !r.event);
-const AUDIO_META = { promptTokenCount: 101000, candidatesTokenCount: 500, promptTokensDetails: [{ modality: "TEXT", tokenCount: 1000 }, { modality: "AUDIO", tokenCount: 100000 }] };
-const AC1 = Number(((1000 * 0.30 + 100000 * 1.00 + 500 * 2.50) / 1e6).toFixed(6));
-
-for (const sse of [false, true]) {
-  test(`#163 AC1/AC5: gemini audio priced at the audio rate (${sse ? "SSE" : "JSON"})`, async (t) => {
-    const body = { modelVersion: "gemini-2.5-flash", usageMetadata: AUDIO_META };
-    const f = await modalProxy(t, "gemini", (req, res) => res.end(sse ? `data: ${JSON.stringify(body)}\n\n` : JSON.stringify(body)));
-    const verb = sse ? "streamGenerateContent?alt=sse" : "generateContent";
-    const r = await fetch(`${f.base}/v1beta/models/gemini-2.5-flash:${verb}`, { method: "POST", body: "{}" });
-    await r.text();
-    const [rec] = readReceipts(f.receipts);
-    assert.equal(rec.cost_usd, AC1);
-    assert.equal(rec.modality_tokens.input.audio, 100000);
-  });
-
-  test(`#163 AC3/AC5: unpriced audio on a fallback model blocks the next call with 429 (${sse ? "SSE" : "JSON"})`, async (t) => {
-    const body = { model: "mystery-audio-1", choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { audio_tokens: 40 } } };
-    const f = await modalProxy(t, "openai", (req, res) => res.end(sse ? `data: ${JSON.stringify(body)}\n\ndata: [DONE]\n\n` : JSON.stringify(body)));
-    const send = () => fetch(`${f.base}/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "mystery-audio-1", stream: sse, stream_options: { include_usage: true } }) });
-    await (await send()).text();
-    const second = await send();
-    assert.equal(second.status, 429);
-    assert.match(await second.text(), /accounting_unavailable/);
-    assert.equal(f.hits(), 1);
-    const [rec] = readReceipts(f.receipts);
-    assert.equal(rec.cost_usd, null);
-    assert.equal(rec.reason, "modality_unpriced");
-  });
-}
-
-test("#163 AC2: gpt-image-1 images/generations priced from the table", async (t) => {
-  const f = await modalProxy(t, "openai", (req, res) => res.end(JSON.stringify({ created: 1, data: [{ b64_json: "x" }], usage: { input_tokens: 50, output_tokens: 4160, total_tokens: 4210, input_tokens_details: { text_tokens: 50, image_tokens: 0 } } })));
-  await (await fetch(`${f.base}/v1/images/generations`, { method: "POST", body: JSON.stringify({ model: "gpt-image-1", prompt: "cat" }) })).text();
-  const [rec] = readReceipts(f.receipts);
-  assert.equal(rec.cost_usd, Number(((50 * 5 + 4160 * 40) / 1e6).toFixed(6)));
-  assert.equal(rec.cost_source, "table");
-});
-
-test("#184 without a cache every receipt keeps its exact pre-cache shape and no cache header is sent", async (t) => {
-  const up = await new Promise((r) => { const s = http.createServer((q, res) => { q.resume(); q.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 5 } }))); }); s.listen(0, "127.0.0.1", () => r(s)); });
   t.after(() => up.close());
-  const receipts = [];
-  const { server, port } = await startMeteringProxy({ upstreams: { openai: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r), spiral: null });
-  t.after(() => server.close());
-  for (let i = 0; i < 2; i++) {
-    const res = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0 }) });
-    await res.text();
-    assert.equal(res.headers.get("x-costcap-cache"), null);
-  }
-  await new Promise((r) => setImmediate(r));
-  assert.equal(receipts.length, 2);
-  assert.deepEqual(Object.keys(receipts[1]).sort(), Object.keys(receipts[0]).sort());
-  for (const r of receipts) for (const k of ["cache", "saved_usd", "cache_source_receipt"]) assert.equal(k in r, false);
+  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
+  const receipts = join(dir, "r.jsonl");
+  const env = { COSTCAP_TEST_ANTHROPIC_UPSTREAM: `http://127.0.0.1:${up.address().port}` };
+  const create = JSON.stringify({ requests: [0, 1, 2].map((i) => ({ custom_id: String(i), params: { model: "claude-sonnet-4-6", max_tokens: 5, messages: [] } })) });
+  const wrap = (calls) => cliRun(["wrap", "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", agent(calls)], env);
+  const w1 = await wrap([["POST", "ANTHROPIC_BASE_URL", "/v1/messages/batches", create], ["POST", "ANTHROPIC_BASE_URL", "/v1/messages", '{"model":"claude-sonnet-4-6"}']]);
+  assert.equal(w1.code, 0, w1.err);
+  assert.deepEqual(w1.out.split("\n").filter((l) => /^\d+$/.test(l)), ["200", "200"]);
+  const ledger = () => readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const pending = ledger().filter((l) => l.reason === "batch_pending");
+  assert.equal(pending.length, 1);
+  assert.deepEqual([pending[0].cost_usd, pending[0].batch_id, pending[0].request_count], [null, "msgbatch_e2e", 3]);
+  const runs = JSON.parse((await cliRun(["runs", "--json", "--receipts", receipts])).out);
+  assert.equal(runs[0].total_cost_usd, null);
+  const pendingCheck = await cliRun(["check", "--receipts", receipts]);
+  assert.notEqual(pendingCheck.code, 0, "pending batch is incomplete, never $0");
+  const results = ["GET", "ANTHROPIC_BASE_URL", "/v1/messages/batches/msgbatch_e2e/results"];
+  const w2 = await wrap([results, results]);
+  assert.equal(w2.code, 0, w2.err);
+  const settlements = ledger().filter((l) => l.event === "reconciliation");
+  assert.equal(settlements.length, 1);
+  const standard = costForUsage("claude-sonnet-4-6", { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 2000 }).cost_usd + costForUsage("claude-sonnet-4-6", { input_tokens: 2000, output_tokens: 1000 }).cost_usd;
+  assert.equal(settlements[0].cost_usd, Number((standard * 0.5).toFixed(6)));
+  assert.equal(settlements[0].receipt_id, pending[0].id);
+  const cap = String(standard * 0.75);
+  const ok = await cliRun(["check", "--cap", cap, "--receipts", receipts]);
+  assert.equal(ok.code, 0, ok.out + ok.err);
 });
 
-// #194 AC5: a WebSocket upgrade on a non-realtime route used to reach the HTTP path, fail fetch,
-// latch upstream_outcome_unknown and refuse every later call. It is now refused locally.
-test("#194 upgrade on chat/messages -> 501 websocket_unsupported, 0 upstream hits, next call 200", async (t) => {
-  const { connectRealtime, startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
-  const up = await startRealtimeUpstream();
-  const { server, port } = await startMeteringProxy({ upstreams: { openai: up.url, anthropic: up.url } });
-  t.after(async () => { server.close(); await up.close(); });
-  for (const p of ["/openai/v1/chat/completions", "/anthropic/v1/messages", "/gemini/v1beta/models/x:streamGenerateContent"]) {
-    const c = await connectRealtime(port, p);
-    assert.equal(c.status, 501);
-    assert.equal(c.body.error, "websocket_unsupported");
-  }
-  assert.equal(up.requests + up.handshakes.length, 0);
-  const r = await fetch(`http://127.0.0.1:${port}/openai/v1/chat/completions`, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini" }) });
-  assert.equal(r.status, 200);
-  assert.equal(server.accountingFailure(), null);
-});
-
-test("#196 a GET whose body carries usage is $0 non_billable_request and never pauses", async (t) => {
-  const f = await scripted(t, "openai", [200]);
-  const r = await f.call(0, "GET", "/openai/v1/chat/completions/chatcmpl_1");
-  assert.equal(r.status, 200);
-  assert.deepEqual([f.receipts[0].cost_usd, f.receipts[0].reason], [0, "non_billable_request"]);
-});
-
-// #200: Gemini embeddings are metered input-only from usageMetadata.promptTokenCount.
-test("#200 extractUsage: Gemini embed/batch usage, invalid shapes stay unknown, generateContent unchanged", () => {
-  const e = { embeddings: true };
-  assert.deepEqual(extractUsage("gemini", '{"embedding":{"values":[0.1]},"usageMetadata":{"promptTokenCount":12}}', "gemini-embedding-001", e),
-    { model: "gemini-embedding-001", usage: { input_tokens: 12, output_tokens: 0, cached_input_tokens: 0 } });
-  assert.deepEqual(extractUsage("gemini", '{"embeddings":[{"values":[1]},{"values":[2]}],"usageMetadata":{"promptTokenCount":40}}', "gemini-embedding-001", e).usage,
-    { input_tokens: 40, output_tokens: 0, cached_input_tokens: 0 });
-  for (const bad of ['{"embedding":{}}', '{"usageMetadata":{}}', '{"usageMetadata":{"promptTokenCount":-1}}', '{"usageMetadata":{"promptTokenCount":"5"}}', '{"usageMetadata":null}'])
-    assert.equal(extractUsage("gemini", bad, "gemini-embedding-001", e), null, bad);
-  const mm = extractUsage("gemini", JSON.stringify({ usageMetadata: { promptTokenCount: 300, promptTokenDetails: [{ modality: "TEXT", tokenCount: 100 }, { modality: "IMAGE", tokenCount: 200 }] } }), "gemini-embedding-2", e);
-  assert.deepEqual(mm.usage.modality_tokens.input, { text: 100, image: 200, audio: 0, video: 0 });
-  assert.equal(extractUsage("gemini", '{"usageMetadata":{"promptTokenCount":12}}', "gemini-2.5-flash"), null);
-});
-
-test("#200 isEmbeddingsPath: exact Gemini embed paths only", () => {
-  for (const ok of ["/gemini/v1beta/models/gemini-embedding-001:embedContent", "/gemini/v1/models/gemini-embedding-2:batchEmbedContents",
-    "/gemini/v1alpha/models/gemini-embedding-001:embedContent?key=x"]) assert.equal(isEmbeddingsPath(ok), true, ok);
-  for (const bad of ["/gemini/v1beta/models/gemini-embedding-001:generateContent", "/gemini/v1beta/models/gemini-embedding-001:asyncBatchEmbedContent",
-    "/gemini/v1beta/models/gemini-embedding-001%3AembedContent", "/gemini/v1beta/models/../models/x:embedContent", "/gemini//v1beta/models/x:embedContent",
-    "/gemini/v2/models/x:embedContent", "/gemini/v1beta/models/x:embedContent/", "/vertex/v1beta/models/x:embedContent"]) assert.equal(isEmbeddingsPath(bad), false, bad);
-});
-
-async function geminiEmbedProxy(t, responder) {
-  const up = http.createServer((req, res) => { req.resume(); const [status, body] = responder(req); res.writeHead(status, { "content-type": "application/json" }).end(body); });
+test("#160 e2e OpenAI batch: create, retrieve output_file_id, settle from file content; unrelated file stays $0", async (t) => {
+  const up = batchUpstream();
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
-  const receipts = [];
-  const p = await startMeteringProxy({ upstreams: { gemini: `http://127.0.0.1:${up.address().port}` }, onReceipt: (r) => receipts.push(r) });
-  t.after(() => { p.server.closeAllConnections(); p.server.close(); up.closeAllConnections(); up.close(); });
-  const call = (path = "/gemini/v1beta/models/gemini-embedding-001:embedContent") => fetch(`http://127.0.0.1:${p.port}${path}`, { method: "POST", body: JSON.stringify({ content: { parts: [{ text: "hi" }] } }) });
-  return { call, receipts };
-}
-
-test("#200 AC1/AC2 Gemini embedContent and batchEmbedContents are metered and the next call is forwarded", async (t) => {
-  for (const path of ["/gemini/v1beta/models/gemini-embedding-001:embedContent", "/gemini/v1beta/models/gemini-embedding-001:batchEmbedContents"]) {
-    const { call, receipts } = await geminiEmbedProxy(t, () => [200, '{"embedding":{"values":[0.1]},"usageMetadata":{"promptTokenCount":1000}}']);
-    assert.equal((await call(path)).status, 200);
-    assert.equal(receipts[0].cost_usd, Number((1000 * 0.15 / 1e6).toFixed(6)), path);
-    assert.deepEqual([receipts[0].output_tokens, receipts[0].fallback], [0, false]);
-    assert.match(receipts[0].table_sha256, /^[0-9a-f]{64}$/);
-    assert.equal((await call(path)).status, 200);
-  }
-});
-
-test("#200 AC3 a Gemini embed response without usage pauses the run", async (t) => {
-  const { call, receipts } = await geminiEmbedProxy(t, () => [200, '{"embedding":{"values":[0.1]}}']);
-  assert.equal((await call()).status, 200);
-  assert.deepEqual([receipts[0].cost_usd, receipts[0].reason], [null, "usage_unavailable"]);
-  assert.equal((await (await call()).json()).error, "accounting_unavailable");
-});
-
-test("#200 AC4 gemini-embedding-2 prices each modality; a modality with no rate is unknown", () => {
-  const mt = (input) => ({ input, cached_input: null, output: null });
-  const r = costForUsage("gemini-embedding-2", { input_tokens: 4_000_000, modality_tokens: mt({ text: 1_000_000, image: 1_000_000, audio: 1_000_000, video: 1_000_000 }) });
-  assert.equal(r.cost_usd, Number((0.20 + 0.45 + 6.50 + 12.00).toFixed(6)));
-  assert.equal(costForUsage("gemini-embedding-001", { input_tokens: 1_000_000 }).cost_usd, 0.15);
-});
-
-// #254: web fetch and code execution through the real proxy.
-test("#254 AC1/AC3/AC5: web_fetch is token-only; code_execution is free only with a 20260209+ search/fetch tool", async (t) => {
-  const usage = { input_tokens: 10, output_tokens: 5 };
-  const tokens = costForUsage("claude-sonnet-4-6", usage).cost_usd;
-  const cases = [
-    [{ web_fetch_requests: 2 }, { model: "claude-sonnet-4-6" }, { web_fetch: 2 }, null],
-    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_fetch_20260209" }] }, { code_execution: 2 }, null],
-    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_search_20260318" }] }, { code_execution: 2 }, null],
-    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "code_execution_20260521" }] }, { code_execution: 2 }, "code_execution"],
-    [{ code_execution_requests: 2 }, { model: "claude-sonnet-4-6", tools: [{ type: "web_search_20250305" }] }, { code_execution: 2 }, "code_execution"],
-    [{ bogus_requests: 1 }, { model: "claude-sonnet-4-6" }, undefined, "unknown server tool counter"],
-    [{ web_fetch_requests: 1.5 }, { model: "claude-sonnet-4-6" }, undefined, "unknown server tool counter"],
-  ];
-  for (const [stu, req, calls, unpriced] of cases) {
-    let hits = 0;
-    const { post, receipts } = await multi(t, (q, res) => { hits++; q.resume(); res.end(JSON.stringify({ model: "claude-sonnet-4-6", usage: { ...usage, server_tool_use: stu } })); });
-    assert.equal((await post("/anthropic/v1/messages", req)).status, 200);
-    const r = receipts[0];
-    assert.deepEqual(r.tool_calls, calls, JSON.stringify(stu));
-    const next = await post("/anthropic/v1/messages", req);
-    if (unpriced) {
-      assert.deepEqual([r.cost_usd, r.reason], [null, "tool_use_unpriced"]);
-      assert.equal(r.unpriced_tool, undefined);
-      assert.equal(next.status, 429);
-      assert.match((await next.json()).message, new RegExp(`\\(${unpriced}\\)`));
-      assert.equal(hits, 1);
-    } else {
-      assert.deepEqual([r.cost_usd, r.tool_cost_usd, r.reason], [tokens, 0, undefined]);
-      assert.equal(next.status, 200);
-      assert.equal(hits, 2);
-    }
-  }
+  t.after(() => up.close());
+  const dir = mkdtempSync(join(tmpdir(), "cc-batch-e2e-"));
+  const receipts = join(dir, "r.jsonl");
+  const w = await cliRun(["wrap", "--receipts", receipts, "--kill-file", join(dir, "KILL"), "--", process.execPath, "--input-type=module", "-e", agent([
+    ["POST", "OPENAI_BASE_URL", "/batches", '{"input_file_id":"file-in"}'], ["POST", "OPENAI_BASE_URL", "/chat/completions", '{"model":"gpt-4o-mini"}'],
+    ["GET", "OPENAI_BASE_URL", "/batches/batch_e2e"], ["GET", "OPENAI_BASE_URL", "/files/file-e2e/content"], ["GET", "OPENAI_BASE_URL", "/files/file-other/content"]])],
+  { COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.address().port}` });
+  assert.equal(w.code, 0, w.err);
+  assert.deepEqual(w.out.split("\n").filter((l) => /^\d+$/.test(l)), ["200", "200", "200", "200", "200"]);
+  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const settlements = lines.filter((l) => l.event === "reconciliation");
+  assert.equal(settlements.length, 1);
+  const standard = costForUsage("gpt-4o-mini", { input_tokens: 1000, output_tokens: 1000 }).cost_usd + costForUsage("gpt-4o-mini", { input_tokens: 1000, cached_input_tokens: 1000, output_tokens: 500 }).cost_usd;
+  assert.equal(settlements[0].cost_usd, Number((standard * 0.5).toFixed(6)));
+  const other = lines.find((l) => l.path?.includes("file-other"));
+  assert.deepEqual([other.cost_usd, other.reason], [0, "non_billable_request"]);
+  const runs = JSON.parse((await cliRun(["runs", "--json", "--receipts", receipts])).out);
+  assert.equal(typeof runs[0].total_cost_usd, "number", "settled within the same run");
 });

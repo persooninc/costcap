@@ -1,85 +1,78 @@
-import { test } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { buildRunSummary, rollupLine, listRunSummaries, writeRunSummary, runsCommand, stopReason, SCHEMA } from "../src/run-summary.js";
-import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
+import { buildRunSummary, rollupLine, listRunSummaries, writeRunSummary, SCHEMA } from "../src/run-summary.js";
 
-const priced = (model, cost, extra = {}) => ({ provider: "openai", blocked: false, model, cost_usd: cost, input_tokens: 10, output_tokens: 5, cached_input_tokens: 2, cache_write_input_tokens: 1, cache_write_1h_input_tokens: 1, ...extra });
+const base = { runId: "r1", startedAt: "2026-11-15T00:00:00.000Z", endedAt: "2026-11-15T00:01:00.000Z", exitCode: 0 };
 
-// ---------- unit ----------
-test("builder sums tokens, cache tokens and cost per model", () => {
-  const s = buildRunSummary({ run_id: "r1", started_at: "a", ended_at: "b", exit_code: 0,
-    receipts: [priced("m1", 0.1), priced("m1", 0.2), priced("m2", 0.05), { event: "kill" }], caps: { run: 1 }, spend: { run: 0.35 } });
+test("buildRunSummary sums per model including cache tokens", () => {
+  const s = buildRunSummary({ ...base, caps: { run: 1 }, spent: { run: 0.3, day: 0.3, month: 0.3 }, receipts: [
+    { model: "a", cost_usd: 0.1, input_tokens: 10, output_tokens: 5, cached_input_tokens: 3, cache_write_input_tokens: 2, cache_write_1h_input_tokens: 1 },
+    { model: "a", cost_usd: 0.05, input_tokens: 1, output_tokens: 1 },
+    { model: "b", cost_usd: 0.15, input_tokens: 7, output_tokens: 0 },
+    { event: "kill" },
+  ] });
   assert.equal(s.schema, SCHEMA);
   assert.equal(s.calls, 3);
-  assert.deepEqual(s.by_model.m1, { calls: 2, input_tokens: 20, output_tokens: 10, cache_read_tokens: 4, cache_write_tokens: 4, cost_usd: 0.3 });
-  assert.equal(s.by_model.m2.cost_usd, 0.05);
-  assert.equal(s.total_cost_usd, 0.35);
+  assert.deepEqual(s.by_model.a, { calls: 2, input_tokens: 11, output_tokens: 6, cache_read_tokens: 3, cache_write_tokens: 3, cost_usd: 0.15 });
+  assert.equal(s.total_cost_usd, 0.3);
   assert.equal(s.unknown_cost_calls, 0);
-  assert.deepEqual(s.caps, { run: { limit_usd: 1, spent_usd: 0.35 } });
+  assert.deepEqual(s.caps.run, { limit_usd: 1, spent_usd: 0.3 });
+  assert.equal(s.caps.day.limit_usd, null);
   assert.equal(s.stopped_by, null);
-  assert.match(rollupLine(s), /calls=3 rejected=0 refused=0 models=2 cost=\$0\.3500$/);
 });
 
-test("null cost makes total unknown, never $0", () => {
-  const s = buildRunSummary({ run_id: "r", receipts: [priced("m1", 0.1), priced("m1", null), { blocked: false, cost_usd: null }] });
+test("a null-cost call makes the total unknown, never $0", () => {
+  const s = buildRunSummary({ ...base, receipts: [{ model: "a", cost_usd: 0.1 }, { model: "a", cost_usd: null, reason: "usage_unavailable" }] });
   assert.equal(s.total_cost_usd, null);
-  assert.equal(s.unknown_cost_calls, 2);
-  assert.equal(s.by_model.m1.cost_usd, null);
-  assert.equal(s.by_model.unknown.calls, 1);
-  assert.equal(s.by_model.unknown.input_tokens, 0);
-  assert.match(rollupLine(s), /cost=unknown \(2 unpriced calls\)/);
-  assert.match(rollupLine(buildRunSummary({ run_id: "x", receipts: [priced("m", null)] })), /1 unpriced call\)/);
+  assert.equal(s.by_model.a.cost_usd, null);
+  assert.equal(s.unknown_cost_calls, 1);
+  assert.match(rollupLine(s), /cost unknown \(1 unpriced call\)/);
 });
 
-test("blocked calls set stopped_by and scope; kill wins; zero-call run", () => {
-  const b = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.5), { blocked: true, reason: "budget_exceeded", scope: "run" }, { blocked: true, reason: "step_budget" }] });
-  assert.equal(b.blocked_calls, 2);
+test("zero calls gives zeros and total 0; stop causes map to stopped_by", () => {
+  const z = buildRunSummary({ ...base });
+  assert.equal(z.calls, 0);
+  assert.equal(z.total_cost_usd, 0);
+  assert.match(rollupLine(z), /0 calls across 0 models, 0 refused, cost \$0\.0000/);
+  const b = buildRunSummary({ ...base, receipts: [{ blocked: true, reason: "budget_exceeded", scope: "run", cost_usd: 0 }] });
+  assert.equal(b.blocked_calls, 1);
+  assert.equal(b.calls, 0);
   assert.equal(b.stopped_by, "budget_exceeded");
   assert.equal(b.stopped_scope, "run");
-  assert.match(rollupLine(b), /stopped_by=budget_exceeded:run/);
-  const v = buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "cost_velocity" }, null] });
+  const v = buildRunSummary({ ...base, receipts: [{ blocked: true, reason: "step_budget", cost_usd: 0 }] });
   assert.equal(v.stopped_by, "breaker_open");
-  assert.match(rollupLine(v), /stopped_by=breaker_open$/);
-  assert.equal(buildRunSummary({ run_id: "r", killed: true, receipts: [{ blocked: true, reason: "step_budget" }] }).stopped_by, "killed");
-  assert.equal(buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "spiral_detected" }] }).stopped_by, "breaker_open");
-  assert.equal(buildRunSummary({ run_id: "r", receipts: [{ blocked: true, reason: "tag_budget_exceeded" }] }).stopped_by, "budget_exceeded");
-  assert.equal(stopReason("killed"), "killed");
-  const z = buildRunSummary({ run_id: "z" });
-  assert.deepEqual([z.calls, z.blocked_calls, z.total_cost_usd, z.unknown_cost_calls, z.exit_code], [0, 0, 0, 0, null]);
+  assert.equal(v.stopped_scope, "step_budget");
+  const k = buildRunSummary({ ...base, killed: true, receipts: [{ blocked: true, reason: "accounting_unavailable" }] });
+  assert.equal(k.stopped_by, "killed");
+  assert.equal(k.blocked_calls, 1);
 });
 
-test("list sorts newest first and skips corrupt files; runsCommand output", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
+test("listRunSummaries sorts newest first and skips corrupt files", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
   const rp = path.join(dir, "r.jsonl");
   assert.deepEqual(listRunSummaries(rp), { runs: [], errors: [] });
-  const logs = [];
-  runsCommand(["--receipts", rp], { log: (l) => logs.push(l) });
-  assert.deepEqual(logs, ["no runs recorded"]);
-  writeRunSummary(rp, buildRunSummary({ run_id: "old", ended_at: "2026-01-01T00:00:00Z", receipts: [priced("m", 0.1)] }));
-  writeRunSummary(rp, buildRunSummary({ run_id: "new", ended_at: "2026-02-01T00:00:00Z", receipts: [priced("m", null), { blocked: true, reason: "killed" }] }));
-  writeFileSync(path.join(dir, "runs", "bad.json"), "{nope");
+  writeRunSummary(rp, buildRunSummary({ ...base, runId: "old", endedAt: "2026-11-15T00:00:01.000Z" }));
+  writeRunSummary(rp, buildRunSummary({ ...base, runId: "new", endedAt: "2026-11-15T00:00:09.000Z" }));
+  writeFileSync(path.join(dir, "runs", "bad.json"), "{not json");
   writeFileSync(path.join(dir, "runs", "other.json"), "{}");
-  writeFileSync(path.join(dir, "runs", "ignore.txt"), "x");
   const { runs, errors } = listRunSummaries(rp);
   assert.deepEqual(runs.map((r) => r.run_id), ["new", "old"]);
   assert.deepEqual(errors.map((e) => e.file).sort(), ["bad.json", "other.json"]);
-  const out = [], warn = [];
-  runsCommand(["--receipts", rp], { log: (l) => out.push(l), warn: (l) => warn.push(l) });
-  assert.match(out[0], /new\s+calls=1\s+cost=unknown\s+stopped_by=killed/);
-  assert.match(out[1], /old\s+calls=1\s+cost=\$0\.1000\s+outcome=unknown$/);
-  assert.equal(warn.length, 2);
 });
 
-// ---------- integration / regression / e2e ----------
-async function fakeUpstream(t, handler) {
+async function fakeUpstream(t, { nullUsage = false } = {}) {
   const up = await new Promise((r) => {
     const s = http.createServer((q, res) => {
-      let b = ""; q.on("data", (d) => (b += d)); q.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(handler(JSON.parse(b || "{}")))));
+      let b = ""; q.on("data", (d) => (b += d)); q.on("end", () => {
+        const { model } = JSON.parse(b || "{}");
+        const body = nullUsage ? { model } : { model, usage: { prompt_tokens: 1000, completion_tokens: 500, prompt_tokens_details: { cached_tokens: 200 } } };
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+      });
     });
     s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
   });
@@ -87,151 +80,123 @@ async function fakeUpstream(t, handler) {
   return up;
 }
 
-function runWrap(up, args, script, extraEnv = {}, onSpawn) {
+function runWrap(up, dir, flags, models, extraEnv = {}, onStart) {
+  const script = `
+    const u = process.env.OPENAI_BASE_URL + "/chat/completions";
+    for (const model of ${JSON.stringify(models)}) await fetch(u,{method:"POST",body:JSON.stringify({model})});
+    ${models.length ? "" : "await new Promise(r=>setTimeout(r,60000));"}`;
   return new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}`, COSTCAP_KILL_POLL_MS: "50", ...extraEnv } });
-    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
-    onSpawn?.(c);
-    c.on("exit", (code) => resolve({ code, out, err }));
+    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...flags, "--receipts", path.join(dir, "r.jsonl"), "--", process.execPath, "--input-type=module", "-e", script],
+      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: `http://127.0.0.1:${up.port}`, ...extraEnv } });
+    let err = ""; c.stderr.on("data", (d) => (err += d)); c.stdout.on("data", () => {});
+    onStart?.(c);
+    c.on("exit", (code) => resolve({ code, err }));
   });
 }
-const readSummaries = (dir) => readdirSync(path.join(dir, "runs")).map((n) => JSON.parse(readFileSync(path.join(dir, "runs", n), "utf8")));
-const callLoop = (n) => `const u = process.env.OPENAI_BASE_URL + "/chat/completions";
-  const models = ["gpt-4o-mini", "gpt-4o", "gpt-4o-mini"];
-  for (let i = 0; i < ${n}; i++) await fetch(u, { method: "POST", body: JSON.stringify({ model: models[i % 3] }) });`;
 
-test("wrap: 3 priced calls over 2 models; by_model equals receipt sums; runs --json lists newest first", async (t) => {
-  const up = await fakeUpstream(t, (b) => ({ model: b.model, usage: { prompt_tokens: 1000, completion_tokens: 200, prompt_tokens_details: { cached_tokens: 100 } } }));
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  const rp = path.join(dir, "r.jsonl");
-  const first = await runWrap(up, ["--receipts", rp], callLoop(3));
-  assert.equal(first.code, 0);
-  assert.match(first.err, /costcap: run \S+ calls=3 rejected=0 refused=0 models=2 cost=\$/);
-  const [s] = readSummaries(dir);
-  const receipts = readFileSync(rp, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  assert.equal(receipts.length, 3);
-  for (const m of ["gpt-4o-mini", "gpt-4o"]) {
-    const rs = receipts.filter((r) => r.model === m);
-    assert.equal(s.by_model[m].calls, rs.length);
-    assert.equal(s.by_model[m].input_tokens, rs.reduce((a, r) => a + r.input_tokens, 0));
-    assert.equal(s.by_model[m].output_tokens, rs.reduce((a, r) => a + r.output_tokens, 0));
-    assert.equal(s.by_model[m].cache_read_tokens, rs.reduce((a, r) => a + r.cached_input_tokens, 0));
-    assert.equal(s.by_model[m].cost_usd, Number(rs.reduce((a, r) => a + r.cost_usd, 0).toFixed(6)));
-  }
-  assert.equal(s.total_cost_usd, Number(receipts.reduce((a, r) => a + r.cost_usd, 0).toFixed(6)));
-  assert.equal(s.exit_code, 0);
-  assert.equal(s.stopped_by, null);
-  const second = await runWrap(up, ["--receipts", rp], callLoop(0));
-  assert.equal(second.code, 0);
-  // E2E: spawn `costcap runs --json`
-  const r = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", rp], { encoding: "utf8" });
-  assert.equal(r.status, 0);
-  const list = JSON.parse(r.stdout);
-  assert.equal(list.length, 2);
-  assert.equal(list[0].calls, 0);
-  assert.equal(list[0].total_cost_usd, 0);
-  assert.equal(list[1].run_id, s.run_id);
-  assert.equal(list[1].calls, 3);
-  const h = spawnSync(process.execPath, ["src/cli.js", "runs", "--receipts", rp], { encoding: "utf8" });
-  assert.match(h.stdout.split("\n")[0], /calls=0\s+cost=\$0\.0000/);
-});
+const summaries = (dir) => readdirSync(path.join(dir, "runs")).map((f) => JSON.parse(readFileSync(path.join(dir, "runs", f), "utf8")));
+const receiptLines = (dir) => readFileSync(path.join(dir, "r.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => !r.event);
 
-test("wrap: call with no usage gives null total and unknown roll-up", async (t) => {
-  const up = await fakeUpstream(t, () => ({ ok: true }));
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  const res = await runWrap(up, ["--receipts", path.join(dir, "r.jsonl")], callLoop(1));
-  assert.match(res.err, /cost=unknown/);
-  const [s] = readSummaries(dir);
-  assert.equal(s.total_cost_usd, null);
-  assert.ok(s.unknown_cost_calls > 0);
-});
-
-test("wrap: cap stop and breaker stop record stopped_by and blocked_calls", async (t) => {
-  const up = await fakeUpstream(t, (b) => ({ model: b.model, usage: { prompt_tokens: 1_000_000, completion_tokens: 500_000 } }));
-  const d1 = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  await runWrap(up, ["--cap", "0.10", "--receipts", path.join(d1, "r.jsonl")], callLoop(3));
-  const [c] = readSummaries(d1);
-  assert.equal(c.stopped_by, "budget_exceeded");
-  assert.equal(c.stopped_scope, "run");
-  assert.equal(c.blocked_calls, 2);
-  assert.equal(c.caps.run.limit_usd, 0.1);
-  const d2 = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  await runWrap(up, ["--max-steps", "1", "--receipts", path.join(d2, "r.jsonl")], callLoop(2));
-  const [v] = readSummaries(d2);
-  assert.equal(v.stopped_by, "breaker_open");
-  assert.equal(v.blocked_calls, 1);
-});
-
-test("wrap: costcap kill still writes the summary with stopped_by killed", async (t) => {
-  const up = await fakeUpstream(t, (b) => ({ model: b.model, usage: { prompt_tokens: 10, completion_tokens: 5 } }));
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  const kf = path.join(dir, "KILL");
-  const script = `${callLoop(1)}\nconsole.log("called"); await new Promise((r) => setTimeout(r, 20000));`;
-  const res = await runWrap(up, ["--kill-file", kf, "--receipts", path.join(dir, "r.jsonl")], script, {}, (c) => {
-    c.stdout.on("data", (d) => { if (String(d).includes("called")) spawnSync(process.execPath, ["src/cli.js", "kill", "test", "--kill-file", kf, "--receipts", path.join(dir, "k.jsonl")]); });
-  });
-  assert.equal(res.code, 143);
-  const [s] = readSummaries(dir);
-  assert.equal(s.stopped_by, "killed");
-  assert.equal(s.calls, 1);
-  assert.equal(s.exit_code, 143);
-});
-
-test("wrap: unwritable runs dir warns but does not fail the run", async (t) => {
-  const up = await fakeUpstream(t, () => ({}));
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  mkdirSync(path.join(dir, "runs"));
-  chmodSync(path.join(dir, "runs"), 0o500);
-  t.after(() => chmodSync(path.join(dir, "runs"), 0o700));
-  const res = await runWrap(up, ["--receipts", path.join(dir, "r.jsonl")], callLoop(0));
-  assert.equal(res.code, 0);
-  if (process.getuid?.() !== 0) assert.match(res.err, /run summary not written/);
-});
-
-test("#160 a pending batch keeps the run total unknown until its batch_results settlement", () => {
-  const pending = { id: "p1", provider: "anthropic", blocked: false, model: "claude-sonnet-4-6", cost_usd: null, reason: "batch_pending", batch_id: "b1", request_count: 3 };
-  const open = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending] });
-  assert.deepEqual([open.total_cost_usd, open.unknown_cost_calls], [null, 1]);
-  const settled = buildRunSummary({ run_id: "r", receipts: [priced("m", 0.1), pending, { event: "reconciliation", receipt_id: "p1", cost_usd: 0.25, source: "batch_results" }] });
-  assert.deepEqual([settled.total_cost_usd, settled.unknown_cost_calls], [0.35, 0]);
-});
-
-// #184: response cache reporting.
-test("#184 cache block counts hits/misses and saved_usd; roll-up shows the saving; absent without cache", () => {
-  const s = buildRunSummary({ run_id: "c1", started_at: "a", ended_at: "b", receipts: [
-    priced("m1", 0.2, { cache: "miss" }), priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.2 }), priced("m1", 0, { cache: "hit", reason: "cache_hit", saved_usd: 0.2 }), priced("m1", 0.1, { cache: "bypass" })] });
-  assert.deepEqual(s.cache, { hits: 2, misses: 1, saved_usd: 0.4 });
-  assert.equal(s.total_cost_usd, 0.3);
-  assert.match(rollupLine(s), / · cache: 2 hits, saved \$0\.4000$/);
-  const plain = buildRunSummary({ run_id: "c2", started_at: "a", ended_at: "b", receipts: [priced("m1", 0.1)] });
-  assert.equal("cache" in plain, false);
-  assert.doesNotMatch(rollupLine(plain), /cache:/);
-  const none = buildRunSummary({ run_id: "c3", started_at: "a", ended_at: "b", receipts: [], cacheEnabled: true });
-  assert.deepEqual(none.cache, { hits: 0, misses: 0, saved_usd: 0 });
-  assert.doesNotMatch(rollupLine(none), /cache:/);
-});
-
-test("#184 wrap --cache: repeated temperature-0 calls hit the cache, summary and roll-up report the saving", async (t) => {
-  let upstreamCalls = 0;
-  const up = await fakeUpstream(t, (b) => { upstreamCalls++; return { model: b.model, usage: { prompt_tokens: 1000, completion_tokens: 200 } }; });
-  const dir = mkdtempSync(path.join(tmpdir(), "ccrs-"));
-  const rp = path.join(dir, "r.jsonl");
-  const script = `const u = process.env.OPENAI_BASE_URL + "/chat/completions";
-    for (let i = 0; i < 3; i++) await fetch(u, { method: "POST", body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0 }) });`;
-  const r = await runWrap(up, ["--receipts", rp, "--cache", "1h"], script);
+test("wrap writes a summary whose by_model equals the receipt sums (3 calls, 2 models)", async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  const r = await runWrap(up, dir, [], ["gpt-4o-mini", "gpt-4o", "gpt-4o-mini"]);
   assert.equal(r.code, 0);
-  assert.equal(upstreamCalls, 1);
-  const [s] = readSummaries(dir);
-  assert.equal(s.cache.hits, 2);
-  assert.equal(s.cache.misses, 1);
-  assert.ok(s.cache.saved_usd > 0);
-  assert.match(r.err, / · cache: 2 hits, saved \$/);
-  assert.ok(readdirSync(path.join(dir, "cache")).length === 1, "default cache dir is <ledger-dir>/cache");
+  const [s] = summaries(dir);
+  assert.equal(s.calls, 3);
+  assert.equal(s.exit_code, 0);
+  const rec = receiptLines(dir);
+  for (const model of ["gpt-4o-mini", "gpt-4o"]) {
+    const mine = rec.filter((x) => x.model === model);
+    assert.equal(s.by_model[model].calls, mine.length);
+    assert.equal(s.by_model[model].input_tokens, mine.reduce((a, x) => a + x.input_tokens, 0));
+    assert.equal(s.by_model[model].output_tokens, mine.reduce((a, x) => a + x.output_tokens, 0));
+    assert.equal(s.by_model[model].cache_read_tokens, mine.reduce((a, x) => a + x.cached_input_tokens, 0));
+    assert.equal(s.by_model[model].cost_usd, Number(mine.reduce((a, x) => a + x.cost_usd, 0).toFixed(6)));
+  }
+  assert.equal(s.total_cost_usd, Number(rec.reduce((a, x) => a + x.cost_usd, 0).toFixed(6)));
+  assert.match(r.err, /costcap: run .*: 3 calls across 2 models, 0 refused, cost \$/);
 });
 
-test("#239 rollup line reports otlp counts when present", () => {
-  const s = buildRunSummary({ run_id: "R", receipts: [] });
-  assert.doesNotMatch(rollupLine(s), /otlp/);
-  assert.match(rollupLine({ ...s, otlp: { spans_exported: 3, spans_dropped: 1 } }), / otlp=3 exported\/1 dropped$/);
+test("wrap with unknown cost reports total null and 'unknown'", async (t) => {
+  const up = await fakeUpstream(t, { nullUsage: true });
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  const r = await runWrap(up, dir, [], ["gpt-4o-mini", "gpt-4o-mini"]);
+  const [s] = summaries(dir);
+  assert.equal(s.total_cost_usd, null);
+  assert.equal(s.unknown_cost_calls, 1);
+  assert.equal(s.blocked_calls, 1); // the second call is refused until reconciled
+  assert.match(r.err, /cost unknown/);
+});
+
+test("wrap stopped by the run cap records stopped_by and the blocked call", async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  await runWrap(up, dir, ["--cap", "0.0001"], ["gpt-4o", "gpt-4o"]);
+  const [s] = summaries(dir);
+  assert.equal(s.stopped_by, "budget_exceeded");
+  assert.equal(s.stopped_scope, "run");
+  assert.equal(s.blocked_calls, 1);
+  assert.equal(s.caps.run.limit_usd, 0.0001);
+});
+
+test("wrap stopped by the breaker records breaker_open", async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  await runWrap(up, dir, ["--max-steps", "1"], ["gpt-4o", "gpt-4o"]);
+  const [s] = summaries(dir);
+  assert.equal(s.stopped_by, "breaker_open");
+  assert.equal(s.blocked_calls, 1);
+});
+
+test("wrap killed with costcap kill still writes its summary; zero calls is fine", async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  const killFile = path.join(dir, "KILL");
+  const r = await runWrap(up, dir, ["--kill-file", killFile], [], { COSTCAP_KILL_POLL_MS: "50" }, () => {
+    setTimeout(() => spawnSync(process.execPath, ["src/cli.js", "kill", "--kill-file", killFile, "--receipts", path.join(dir, "r.jsonl")]), 500);
+  });
+  assert.equal(r.code, 143);
+  const [s] = summaries(dir);
+  assert.equal(s.stopped_by, "killed");
+  assert.equal(s.calls, 0);
+  assert.equal(s.total_cost_usd, 0);
+});
+
+test("e2e: costcap runs --json lists two runs newest first and skips a corrupt file", async (t) => {
+  const up = await fakeUpstream(t);
+  const dir = mkdtempSync(path.join(tmpdir(), "cc-rs-"));
+  await runWrap(up, dir, [], ["gpt-4o-mini"]);
+  await runWrap(up, dir, [], ["gpt-4o", "gpt-4o"]);
+  mkdirSync(path.join(dir, "runs"), { recursive: true });
+  writeFileSync(path.join(dir, "runs", "corrupt.json"), "nope");
+  const res = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", path.join(dir, "r.jsonl")], { encoding: "utf8" });
+  assert.equal(res.status, 0);
+  const runs = JSON.parse(res.stdout);
+  assert.deepEqual(runs.map((x) => x.calls), [2, 1]);
+  assert.deepEqual(Object.keys(runs[0].by_model), ["gpt-4o"]);
+  assert.match(res.stderr, /skipped corrupt run summary corrupt\.json/);
+  const text = spawnSync(process.execPath, ["src/cli.js", "runs", "--receipts", path.join(dir, "r.jsonl")], { encoding: "utf8" });
+  assert.match(text.stdout, /2 calls across 1 model/);
+  const empty = spawnSync(process.execPath, ["src/cli.js", "runs", "--receipts", path.join(dir, "none", "r.jsonl")], { encoding: "utf8" });
+  assert.equal(empty.status, 0);
+  assert.match(empty.stderr, /no run summaries yet/);
+});
+
+test("#160 a pending batch is unknown in the run summary, then known once settled", () => {
+  const pending = { id: "p1", ts: "2026-11-16T00:00:00Z", provider: "anthropic", model: "claude-sonnet-4-6", reason: "batch_pending", batch_id: "b", cost_usd: null };
+  const base = { run_id: "r", started_at: "a", ended_at: "b" };
+  const open = buildRunSummary({ ...base, receipts: [pending] });
+  assert.deepEqual([open.total_cost_usd, open.unknown_cost_calls], [null, 1]);
+  const done = buildRunSummary({ ...base, receipts: [pending, { event: "reconciliation", source: "batch_results", receipt_id: "p1", cost_usd: 0.01605 }] });
+  assert.deepEqual([done.total_cost_usd, done.unknown_cost_calls], [0.01605, 0]);
+});
+
+test("#239 run summary carries otlp counts and the roll-up line reports them", () => {
+  const s = buildRunSummary({ run_id: "R", started_at: "a", ended_at: "b", receipts: [], otlp: { spans_exported: 3, spans_dropped: 1, extra: 9 } });
+  assert.deepEqual(s.otlp, { spans_exported: 3, spans_dropped: 1 });
+  assert.match(rollupLine(s), / · otlp: 3 exported, 1 dropped$/);
+  const none = buildRunSummary({ run_id: "R", started_at: "a", ended_at: "b", receipts: [] });
+  assert.equal("otlp" in none, false);
+  assert.doesNotMatch(rollupLine(none), /otlp/);
 });

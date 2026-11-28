@@ -1,7 +1,7 @@
-# costcap-183 follow-up (2026-11-16)
+# costcap-183 (2026-11-16)
 
-a8211a2 fixed the cached verdicts and agentSpendPolicy. The server-side
-`teamVerdict` and `hostedAgentVerdict` still dropped `reason`, so after a sync a
-member's pending batch came back as team `unknown` and the cached team cap
-refused again. Both now keep `reason`; team spend reports `pending_batch_count`.
-Tests: test/hosted-team-pending-batch.test.js.
+Enrolled fleet/team cached caps no longer freeze the agent after a batch create.
+`src/hosted/teams.js` skips `batch_pending` receipts when counting unknown (cached
+verdicts and server-side `agentSpendPolicy`/`teamVerdict`); `hostedAgentVerdict`
+passes `reason` through. Fleet view reports pending batches separately.
+Tests: `test/fleet-batch-pending.test.js` (unit + proxy-wired enrolled agent and team flows).

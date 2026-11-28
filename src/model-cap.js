@@ -8,6 +8,7 @@ import { totalCapMessage } from "./agent-budget.js";
 import { HOUR_MS, isPendingBatch, retryAfterSeconds } from "./cap.js";
 import { resolveModelId } from "./pricing.js";
 import { mapCloudModel } from "./cloud.js";
+import { samePeriod } from "./period.js";
 
 export const MODEL_CAP_SCOPES = Object.freeze(["hour", "day", "month"]);
 export const MODEL_CAP_RULE = "--model-cap is MODEL:SCOPE=USD with SCOPE hour|day|month and USD > 0, each MODEL:SCOPE once";
@@ -201,6 +202,58 @@ export function createModelCaps({ rules = [], history = [], now = () => new Date
   };
   for (const r of history) engine.record(r);
   return engine;
+}
+
+// Issue #244: hosted day/month modelCaps are enforced fleet-wide. The server's
+// agent_spend.models snapshot (every host, org budget period) plus this host's
+// unsynced receipts; hour rules stay in the local engine.
+export const isFleetModelScope = (scope) => scope === "day" || scope === "month";
+
+/**
+ * Offline fleet model verdict for the request's candidate models. rules: hosted
+ * {model, scope, usd}; snapshot: agent_spend (null = no server snapshot, so only
+ * `pending` counts); pending: unsynced settled-aware local receipts. Returns null,
+ * a model_budget_exceeded hit (fleet: true) or accounting_unavailable for that model only.
+ */
+export function cachedFleetModelVerdict(rules, snapshot, models, pending, nowMs, budgetPeriod = null) {
+  const fleetRules = (rules ?? []).filter((r) => isFleetModelScope(r.scope)).map((r) => ({ ...r, norm: normalizeModel(r.model) }));
+  if (!fleetRules.length) return null;
+  const asOfMs = snapshot ? Date.parse(snapshot.as_of) : NaN;
+  for (const m of models ?? []) {
+    const norm = normalizeModel(m);
+    const rs = fleetRules.filter((r) => r.norm === norm);
+    if (!rs.length) continue;
+    const e = snapshot?.models?.[norm] ?? { day: 0, month: 0, unknown: 0 };
+    const synced = (scope) => (Number.isFinite(asOfMs) && samePeriod(scope, nowMs, asOfMs, budgetPeriod) ? e[scope] : 0);
+    let unknown = Number.isFinite(asOfMs) && samePeriod("month", nowMs, asOfMs, budgetPeriod) ? e.unknown : 0;
+    const total = { day: synced("day"), month: synced("month") };
+    for (const r of pending ?? []) {
+      if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts)) || isPendingBatch(r) || normalizeModel(r.model) !== norm) continue;
+      const tsMs = Date.parse(r.ts);
+      if (!samePeriod("month", tsMs, nowMs, budgetPeriod)) continue;
+      if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+      total.month += r.cost_usd;
+      if (samePeriod("day", tsMs, nowMs, budgetPeriod)) total.day += r.cost_usd;
+    }
+    if (unknown > 0) return { verdict: "accounting_unavailable", reason: "accounting_unavailable", model: m, unknown_receipts: unknown, fleet: true,
+      message: `CostCap: model "${m}" has a fleet model cap and ${unknown} receipt(s) with unknown cost. Reconcile them before calling this model again.` };
+    for (const r of rs) if (total[r.scope] >= r.usd) return { model: m, rule_model: r.model, scope: r.scope, spend_usd: round(total[r.scope]), cap_usd: r.usd, fleet: true };
+  }
+  return null;
+}
+
+/** The local engine (local rules + hosted hour rules) first, then the fleet verdict. */
+export function withFleetModelCaps(local, fleet) {
+  return {
+    rules: () => local?.rules() ?? [],
+    setRules: (next) => local?.setRules(next),
+    record: (r) => local?.record(r),
+    settle: (id, cost) => local?.settle(id, cost) ?? false,
+    check: (models) => local?.check(models) ?? fleet.modelCheck(models),
+    remaining: (models) => local?.remaining(models) ?? [],
+    preflight: (models, est) => local?.preflight(models, est) ?? null,
+    over: () => local?.over() ?? [],
+  };
 }
 
 export function modelBudgetExceededBody(hit) {

@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { lookupPrice, costForUsage, TABLE_VERSION } from "../src/pricing.js";
-import "./support/pinned-clock.js"; // #237: prices below are pre-2026-12-01
+import { lookupPrice, costForUsage, batchMultiplier, TABLE_VERSION } from "../src/pricing.js";
 
 const table = JSON.parse(readFileSync(new URL("../src/pricing-table.json", import.meta.url), "utf8"));
 
@@ -108,39 +107,20 @@ test("#145 embeddings rates are input-only at published prices", () => {
   assert.ok(table.sources.some((u) => u.includes("openai.com/api/pricing")));
 });
 
-test("#160 batch multiplier is 0.5 per provider and stacks with caching and long_context", async () => {
-  const { batchMultiplier } = await import("../src/pricing.js");
+test("#160 batch multiplier: 0.5 for openai/anthropic with sources, stacks with caching and long_context", () => {
   assert.equal(batchMultiplier("openai"), 0.5);
   assert.equal(batchMultiplier("anthropic"), 0.5);
-  assert.equal(batchMultiplier("gemini"), 0.5); // #230
-  assert.equal(batchMultiplier("openrouter"), null);
-  const usage = { input_tokens: 1000, output_tokens: 500, cached_input_tokens: 4000, cache_write_input_tokens: 300, cache_write_1h_input_tokens: 200 };
-  const std = costForUsage("claude-sonnet-4-6", usage);
-  const b = costForUsage("claude-sonnet-4-6", usage, { batch: "anthropic" });
-  assert.equal(b.batch_multiplier, 0.5);
-  assert.ok(Math.abs(b.cost_usd - std.cost_usd * 0.5) < 1e-6);
-  const big = { ...usage, input_tokens: 250000 };
-  const lc = costForUsage("claude-sonnet-4-6", big, { batch: "anthropic" });
-  assert.equal(lc.pricing_tier, "long_context");
-  assert.ok(Math.abs(lc.cost_usd - costForUsage("claude-sonnet-4-6", big).cost_usd * 0.5) < 1e-6);
-  assert.equal(costForUsage("gpt-4o", { input_tokens: 10 }).batch_multiplier, undefined);
-  assert.throws(() => costForUsage("gemini-2.5-pro", { input_tokens: 1 }, { batch: "openrouter" }), /no batch rate/);
-  // #230: Gemini batch stacks with long_context like the other providers.
-  const g = { input_tokens: 250000, output_tokens: 1000, cached_input_tokens: 1000 };
-  const gb = costForUsage("gemini-2.5-pro", g, { batch: "gemini" });
-  assert.deepEqual([gb.batch_multiplier, gb.pricing_tier], [0.5, "long_context"]);
-  assert.ok(Math.abs(gb.cost_usd - costForUsage("gemini-2.5-pro", g).cost_usd * 0.5) < 1e-6);
-});
-
-test("#163: text-only costs are unchanged by the modality breakdown", () => {
-  for (const model of ["gpt-4o", "gemini-2.5-flash", "claude-sonnet-4-6", "gpt-image-1", "unknown-xyz"]) {
-    const u = { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200 };
-    const text = { input: { text: 1000, image: 0, audio: 0, video: 0 }, cached_input: null, output: null };
-    assert.equal(costForUsage(model, { ...u, modality_tokens: text }).cost_usd, costForUsage(model, u).cost_usd, model);
-  }
-});
-
-test("#200 gemini-embedding rows are in the table", () => {
-  assert.equal(lookupPrice("gemini-embedding-001").input, 0.15);
-  assert.equal(lookupPrice("gemini-embedding-2").modalities.video.input, 12);
+  assert.equal(batchMultiplier("gemini"), null);
+  for (const p of ["openai", "anthropic"]) assert.match(table.batch[p].source, /^https:\/\//);
+  const cached = { input_tokens: 1000, cached_input_tokens: 2000, cache_write_input_tokens: 400, cache_write_1h_input_tokens: 100, output_tokens: 500 };
+  const std = costForUsage("claude-sonnet-4-6", cached);
+  const half = costForUsage("claude-sonnet-4-6", cached, { multiplier: 0.5 });
+  assert.equal(half.cost_usd, Number((std.cost_usd / 2).toFixed(6)));
+  assert.equal(half.pricing_tier, "standard");
+  const long = { input_tokens: 250000, cached_input_tokens: 1000, output_tokens: 1000 };
+  const lstd = costForUsage("claude-sonnet-4-6", long);
+  const lhalf = costForUsage("claude-sonnet-4-6", long, { multiplier: 0.5 });
+  assert.equal(lhalf.pricing_tier, "long_context");
+  assert.equal(lhalf.cost_usd, Number((lstd.cost_usd / 2).toFixed(6)));
+  assert.deepEqual(costForUsage("gpt-4o-mini", { input_tokens: 7, output_tokens: 3 }), costForUsage("gpt-4o-mini", { input_tokens: 7, output_tokens: 3 }, {}), "default multiplier leaves receipts unchanged");
 });

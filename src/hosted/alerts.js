@@ -1,4 +1,5 @@
 import { periodBounds, periodKey } from "../period.js";
+import { normalizeModel } from "../model-cap.js";
 // Alert rules for the hosted dashboard (story #14). Pure logic: given an
 // agent's state, returns the alerts that should fire now. The caller sends
 // them (Brevo email, Slack) and writes the audit log. Dedupe: an alert
@@ -80,8 +81,9 @@ function fractionsFrom(warnFractions, approachFraction) {
 export function capPeriod(scope, nowMs, budgetPeriod = null) {
   // Issue #168: a run-scope period is the run itself ("run:<runId>").
   if (typeof scope === "string" && scope.startsWith("run:")) return scope;
-  // #265: a total cap's period is "total" (it never rolls over).
-  return periodKey(scope === "month" || scope === "week" || scope === "total" ? scope : "day", nowMs, budgetPeriod);
+  if (scope === "total") return "total"; // #265: one period forever
+
+  return periodKey(scope === "month" || scope === "week" ? scope : "day", nowMs, budgetPeriod);
 }
 
 // Issue #245: blocked receipts that count toward cap_hit. Only a block with the
@@ -319,6 +321,32 @@ export function evaluateTagAlerts({ orgId, rules = [], spend = {}, blockedHits =
           if (projected !== null && projected >= rule.usd) out.push({ kind: "cap_projected", key: `cap_projected:${id}:month`, ...base, projected: Number(projected.toFixed(6)) });
         }
       }
+    }
+  }
+  return out;
+}
+
+// Issue #244: hosted per-model cap alerts for one agent. rules: hosted modelCaps;
+// models: agent_spend.models ({<normalized>: {day, month, unknown}}); blockedHits:
+// synced model_budget_exceeded receipts from the last hour in the current period
+// (hour-scope blocks included). Key: <kind>:<agentId>:model:<normalized>:<scope>.
+// A model with unknown-cost receipts this period raises nothing (never $0).
+export function evaluateModelCapAlerts({ agentId, rules = [], models = {}, blockedHits = [] }, { warnFractions } = {}) {
+  const out = [];
+  const fractions = Array.isArray(warnFractions) ? warnFractions : DEFAULT_WARN_FRACTIONS;
+  for (const rule of rules ?? []) {
+    const norm = normalizeModel(rule.model);
+    if (!norm) continue;
+    const e = models?.[norm] ?? { day: 0, month: 0, unknown: 0 };
+    if (e.unknown > 0) continue;
+    const blocked = blockedHits.some((h) => normalizeModel(h?.model) === norm && h?.scope === rule.scope && isFleetTagBlock(h, rule));
+    const spent = rule.scope === "hour" ? null : e[rule.scope];
+    const id = `${agentId}:model:${norm}`;
+    const base = { model: norm, scope: rule.scope, cap: rule.usd, ...(typeof spent === "number" ? { spent } : {}) };
+    if (blocked || (typeof spent === "number" && spent >= rule.usd)) out.push({ kind: "cap_hit", key: `cap_hit:${id}:${rule.scope}`, ...base });
+    else if (typeof spent === "number") {
+      const warn = approaching(id, rule.scope, rule.usd, spent, fractions, true, {});
+      if (warn) out.push({ kind: warn.kind, key: warn.key, ...base, fraction: warn.fraction });
     }
   }
   return out;

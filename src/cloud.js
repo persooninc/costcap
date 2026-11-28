@@ -1,119 +1,78 @@
-// Claude on Amazon Bedrock and Google Vertex AI (#188): route classification, upstream
-// host derivation, path-model mapping and a real-time AWS eventstream decoder.
-// The Anthropic Messages wire format (invoke / rawPredict and their streaming forms) and
-// Bedrock Converse / ConverseStream (#216) are metered. Anything else is answered locally with 404 cloud_route_unsupported.
-import { resolveModelId, vertexGeminiModels } from "./pricing.js";
-import { bedrockBaseId, isBedrockThirdParty, isListedBedrockModel } from "./bedrock-pricing.js";
+// Claude on Amazon Bedrock and Google Vertex AI (#188): route parsing, upstream
+// host derivation, path-model mapping and the binary AWS eventstream decoder.
+// Portable: pure functions plus one stateful decoder; no globals, no deps.
+import { resolveModelId } from "./pricing.js";
 
 export const CLOUD_PROVIDERS = Object.freeze(["bedrock", "vertex"]);
 export const isCloudProvider = (p) => CLOUD_PROVIDERS.includes(p);
 
-// Placeholder upstreams: the real host depends on the region (Bedrock) or path location (Vertex).
-export const BEDROCK_UPSTREAM = "aws:bedrock-runtime";
-export const VERTEX_UPSTREAM = "gcp:aiplatform";
-
-const BEDROCK_ROUTE = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens|converse|converse-stream)$/;
-const VERTEX_ROUTE = /^\/v1(?:beta1)?\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):(rawPredict|streamRawPredict|generateContent|streamGenerateContent|countTokens)$/;
-const GEMINI_VERBS = new Set(["generateContent", "streamGenerateContent", "countTokens"]);
-const REGION = /^[a-z]+-[a-z]+\d+$/; // GCP regions: us-east5, europe-west1
-
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return null; } };
 
+// Bedrock: geo prefix (cross-region inference profiles), "anthropic." vendor prefix, -vN[:M] version.
+const BEDROCK_GEO = /^(global|us|eu|apac|jp|au)\./;
+const BEDROCK_PATH = /^\/model\/([^/]+)\/(invoke|invoke-with-response-stream|count-tokens)$/;
+// Vertex: single-region locations look like us-east5 / europe-west1; "global" is the global endpoint.
+const VERTEX_REGION = /^[a-z]+-[a-z]+\d+$/;
+const VERTEX_PATH = /^\/v1(?:beta1)?\/projects\/[^/]+\/locations\/([^/]+)\/publishers\/([^/]+)\/models\/([^/:]+):([A-Za-z]+)$/;
+
+/** Maps a raw Bedrock model id to a pricing-table id, or null (non-Anthropic, ARN, unlisted). */
+export function mapBedrockModel(raw) {
+  if (typeof raw !== "string" || !raw || raw.startsWith("arn:")) return null;
+  const id = raw.replace(BEDROCK_GEO, "");
+  if (!id.startsWith("anthropic.")) return null;
+  return resolveModelId(id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, ""));
+}
+
+/** Maps a raw Vertex model id (claude-opus-4-5@20251101) to a pricing-table id, or null. */
+export function mapVertexModel(raw) {
+  if (typeof raw !== "string" || !raw.startsWith("claude-")) return null;
+  return resolveModelId(raw.replace(/@\d{8}$/, ""));
+}
+
 /**
- * Classifies a cloud path (the part after /bedrock or /vertex, no query).
- * Returns null for unsupported routes, else
- * { modelId, stream, countTokens, scope: "global"|"regional", location? }.
+ * Parses a cloud route. `rawPath` is the path after /bedrock or /vertex, still
+ * percent-encoded. Returns { ok: false } for anything outside the supported
+ * surface (answered locally with 404 cloud_route_unsupported), else
+ * { ok: true, provider, rawModel, model, scope, countTokens, stream, region?, location? }.
  */
-export function classifyCloudRoute(provider, method, pathname) {
-  if (method !== "POST") return null;
-  if (/\/\.{1,2}(?:\/|$)|\/\/|\\/.test(pathname)) return null;
+export function parseCloudRoute(provider, rawPath) {
   if (provider === "bedrock") {
-    const m = BEDROCK_ROUTE.exec(pathname);
-    if (!m) return null;
-    const modelId = safeDecode(m[1]);
-    if (!modelId) return null;
-    return { modelId, stream: m[2] === "invoke-with-response-stream" || m[2] === "converse-stream", countTokens: m[2] === "count-tokens",
-      ...(m[2].startsWith("converse") && { converse: true }), scope: /^global\./.test(modelId) ? "global" : "regional" };
+    const m = BEDROCK_PATH.exec(rawPath);
+    if (!m) return { ok: false };
+    const rawModel = safeDecode(m[1]);
+    if (rawModel === null) return { ok: false };
+    const countTokens = m[2] === "count-tokens";
+    return { ok: true, provider, rawModel, model: mapBedrockModel(rawModel), scope: rawModel.startsWith("global.") ? "global" : "regional",
+      countTokens, stream: m[2] === "invoke-with-response-stream" };
   }
   if (provider === "vertex") {
-    const m = VERTEX_ROUTE.exec(pathname);
-    if (!m) return null;
-    const location = m[2];
-    if (location !== "global" && !REGION.test(location)) return null; // multi-region hosts are out of scope
-    if (GEMINI_VERBS.has(m[5])) {
-      // #217: Gemini on Vertex (publisher google only); the model id is in the path.
-      if (m[3] !== "google") return null;
-      const modelId = safeDecode(m[4]);
-      if (!modelId) return null;
-      return { modelId: `google/${modelId}`, publisher: "google", gemini: true, stream: m[5] === "streamGenerateContent",
-        countTokens: m[5] === "countTokens", scope: location === "global" ? "global" : "regional", location };
-    }
-    const countTokens = m[4] === "count-tokens";
-    if (countTokens && m[5] !== "rawPredict") return null;
-    return { modelId: countTokens ? null : `${m[3] === "anthropic" ? "" : `${m[3]}/`}${m[4]}`, publisher: m[3], stream: m[5] === "streamRawPredict",
-      countTokens, scope: location === "global" ? "global" : "regional", location };
+    const m = VERTEX_PATH.exec(rawPath);
+    if (!m) return { ok: false };
+    const [, location, publisher, rawModelEnc, method] = m;
+    if (location !== "global" && !VERTEX_REGION.test(location)) return { ok: false };
+    if (!["rawPredict", "streamRawPredict"].includes(method)) return { ok: false };
+    const rawModel = safeDecode(rawModelEnc);
+    if (rawModel === null) return { ok: false };
+    const countTokens = publisher === "anthropic" && rawModel === "count-tokens";
+    return { ok: true, provider, location, rawModel, model: publisher === "anthropic" && !countTokens ? mapVertexModel(rawModel) : null,
+      scope: location === "global" ? "global" : "regional", countTokens, stream: method === "streamRawPredict" };
   }
+  return { ok: false };
+}
+
+/** Real upstream origin for a cloud route. `override` (test hook) wins when set. */
+export function cloudUpstream(provider, { region, location, override } = {}) {
+  if (override) return override;
+  if (provider === "bedrock") return region && /^[a-z0-9-]+$/.test(region) ? `https://bedrock-runtime.${region}.amazonaws.com` : null;
+  if (provider === "vertex") return location === "global" ? "https://aiplatform.googleapis.com" : `https://${location}-aiplatform.googleapis.com`;
   return null;
 }
 
-/**
- * #216: Bedrock Converse usage ({inputTokens, outputTokens, cacheReadInputTokens,
- * cacheWriteInputTokens}) in Anthropic Messages shape, or null when the counters are missing.
- */
-export function converseUsage(u) {
-  if (!u || typeof u !== "object") return null;
-  const ok = (v) => Number.isInteger(v) && v >= 0;
-  if (!ok(u.inputTokens) || !ok(u.outputTokens)) return null;
-  return { input_tokens: u.inputTokens, output_tokens: u.outputTokens,
-    ...(u.cacheReadInputTokens != null && { cache_read_input_tokens: u.cacheReadInputTokens }),
-    ...(u.cacheWriteInputTokens != null && { cache_creation_input_tokens: u.cacheWriteInputTokens }) };
-}
-
-/** Real upstream origin for a Vertex location. */
-export function vertexHost(location) {
-  return location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
-}
-
-export function bedrockHost(region) {
-  return `bedrock-runtime.${region}.amazonaws.com`;
-}
-
-const BEDROCK_GEO = /^(?:global|us|eu|apac|jp|au)\./;
-
-/**
- * Maps a raw Bedrock/Vertex model id to the pricing-table id (#278: or a listed non-Anthropic
- * Bedrock base id), or null when it is not a model we can price (non-Anthropic, ARN, unlisted). Never the fallback.
- */
-export function mapCloudModel(provider, rawId) {
-  if (typeof rawId !== "string" || !rawId) return null;
-  let id = rawId;
-  if (provider === "bedrock") {
-    if (id.startsWith("arn:")) return null;
-    // #278: a listed non-Anthropic model maps to its base id (geo prefix stripped; rates are per region).
-    if (isBedrockThirdParty(id)) { const b = bedrockBaseId(id); return isListedBedrockModel(b) ? b : null; }
-    id = id.replace(BEDROCK_GEO, "");
-    if (!id.startsWith("anthropic.")) return null;
-    id = id.slice("anthropic.".length).replace(/-v\d+(?::\d+)?$/, "");
-  } else if (provider === "vertex") {
-    if (id.startsWith("google/")) return mapVertexGemini(id.slice("google/".length));
-    if (id.includes("/")) return null; // non-Anthropic publisher
-    id = id.replace(/@(?:\d{8}|latest)$/, "");
-  } else return null;
-  if (!id.startsWith("claude-")) return null;
-  return resolveModelId(id);
-}
-
-/**
- * #217: a Vertex Gemini model id (gemini-2.5-pro, gemini-2.5-flash@001, gemini-2.0-flash-001)
- * mapped to its pricing-table id, only when the table lists a Vertex rate for it. Else null.
- */
-export function mapVertexGemini(rawId) {
-  if (typeof rawId !== "string" || !rawId.startsWith("gemini-")) return null;
-  const listed = vertexGeminiModels();
-  for (const id of [rawId, rawId.replace(/@[A-Za-z0-9._-]+$/, ""), rawId.replace(/@[A-Za-z0-9._-]+$/, "").replace(/-\d{3}$/, "")]) {
-    if (listed.includes(id)) return id;
-  }
-  return null;
+/** One stderr note when Claude Code is set to Bedrock but the proxy can neither re-sign nor pass a bearer token. */
+export function bedrockStartupNote(env = {}) {
+  if (env.CLAUDE_CODE_USE_BEDROCK !== "1") return null;
+  if ((env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY) || env.AWS_BEARER_TOKEN_BEDROCK) return null;
+  return 'costcap: CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials or AWS_BEARER_TOKEN_BEDROCK are set; signed Bedrock calls will be refused. Run eval "$(aws configure export-credentials --format env)" first.';
 }
 
 // ---- AWS eventstream (application/vnd.amazon.eventstream) ----
@@ -134,8 +93,7 @@ export function crc32(buf, start = 0, end = buf.length) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-const HEADER_FIXED = { 0: 0, 1: 0, 2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16 };
-
+/** Parses eventstream headers into { name: value } (strings, numbers, booleans; others as Buffers). */
 export function parseEventHeaders(buf) {
   const out = {};
   let i = 0;
@@ -143,123 +101,78 @@ export function parseEventHeaders(buf) {
     const nameLen = buf[i]; i += 1;
     const name = buf.subarray(i, i + nameLen).toString("utf8"); i += nameLen;
     const type = buf[i]; i += 1;
-    if (type === 6 || type === 7) {
-      const len = buf.readUInt16BE(i); i += 2;
-      const raw = buf.subarray(i, i + len); i += len;
-      out[name] = type === 7 ? raw.toString("utf8") : raw;
-    } else if (type in HEADER_FIXED) {
-      out[name] = type === 0 ? true : type === 1 ? false : null;
-      i += HEADER_FIXED[type];
-    } else throw new Error("bad header type");
-    if (i > buf.length) throw new Error("truncated header");
+    let value;
+    switch (type) {
+      case 0: value = true; break;
+      case 1: value = false; break;
+      case 2: value = buf.readInt8(i); i += 1; break;
+      case 3: value = buf.readInt16BE(i); i += 2; break;
+      case 4: value = buf.readInt32BE(i); i += 4; break;
+      case 5: value = Number(buf.readBigInt64BE(i)); i += 8; break;
+      case 6: case 7: { const len = buf.readUInt16BE(i); i += 2; const v = buf.subarray(i, i + len); i += len; value = type === 7 ? v.toString("utf8") : v; break; }
+      case 8: value = Number(buf.readBigInt64BE(i)); i += 8; break;
+      case 9: value = buf.subarray(i, i + 16); i += 16; break;
+      default: throw new Error("eventstream_bad_header");
+    }
+    out[name] = value;
   }
   return out;
 }
 
-/** Encodes one frame (used by tests and fakes). Headers are string-valued. */
+/** Encodes one eventstream frame with string headers (tests and fakes). */
 export function encodeEventFrame(headers, payload) {
-  const hparts = [];
-  for (const [k, v] of Object.entries(headers)) {
-    const name = Buffer.from(k, "utf8"), val = Buffer.from(String(v), "utf8");
-    const h = Buffer.alloc(1 + name.length + 1 + 2 + val.length);
-    h[0] = name.length; name.copy(h, 1); h[1 + name.length] = 7;
-    h.writeUInt16BE(val.length, 2 + name.length); val.copy(h, 4 + name.length);
-    hparts.push(h);
+  const parts = [];
+  for (const [name, value] of Object.entries(headers)) {
+    const n = Buffer.from(name), v = Buffer.from(String(value));
+    const h = Buffer.alloc(1 + n.length + 1 + 2 + v.length);
+    h[0] = n.length; n.copy(h, 1); h[1 + n.length] = 7; h.writeUInt16BE(v.length, 2 + n.length); v.copy(h, 4 + n.length);
+    parts.push(h);
   }
-  const hbuf = Buffer.concat(hparts), body = Buffer.from(payload);
-  const total = 12 + hbuf.length + body.length + 4;
+  const hb = Buffer.concat(parts), pb = Buffer.from(payload);
+  const total = 12 + hb.length + pb.length + 4;
   const frame = Buffer.alloc(total);
-  frame.writeUInt32BE(total, 0); frame.writeUInt32BE(hbuf.length, 4);
-  frame.writeUInt32BE(crc32(frame, 0, 8), 8);
-  hbuf.copy(frame, 12); body.copy(frame, 12 + hbuf.length);
+  frame.writeUInt32BE(total, 0); frame.writeUInt32BE(hb.length, 4); frame.writeUInt32BE(crc32(frame, 0, 8), 8);
+  hb.copy(frame, 12); pb.copy(frame, 12 + hb.length);
   frame.writeUInt32BE(crc32(frame, 0, total - 4), total - 4);
   return frame;
 }
 
-/** A ConverseStream event frame (messageStart, contentBlockDelta, messageStop, metadata, ...). */
-export function converseEventFrame(type, payload) {
-  return encodeEventFrame({ ":event-type": type, ":content-type": "application/json", ":message-type": "event" }, JSON.stringify(payload));
-}
-
-/** A Bedrock chunk frame wrapping one Anthropic stream event. */
-export function bedrockChunkFrame(event) {
-  return encodeEventFrame({ ":event-type": "chunk", ":content-type": "application/json", ":message-type": "event" },
-    JSON.stringify({ bytes: Buffer.from(JSON.stringify(event)).toString("base64") }));
-}
+/** A Bedrock invoke-with-response-stream "chunk" frame wrapping one Anthropic event. */
+export const bedrockChunkFrame = (event) => encodeEventFrame({ ":event-type": "chunk", ":content-type": "application/json", ":message-type": "event" },
+  JSON.stringify({ bytes: Buffer.from(JSON.stringify(event)).toString("base64") }));
 
 /**
- * Incremental decoder. push(bytes) accepts arbitrary splits; each complete, CRC-valid
- * chunk frame's decoded Anthropic event is passed to onEvent. A bad CRC, a malformed
- * frame or an exception frame marks the stream corrupt (never priced).
+ * Incremental eventstream decoder. push() accepts arbitrary byte chunks (frames
+ * may split anywhere); every complete Bedrock chunk payload is decoded and handed
+ * to onEvent(json). A CRC mismatch, malformed frame or exception message marks
+ * the stream `corrupt` and stops decoding (bytes are still forwarded by the caller).
  */
-export function createEventStreamDecoder(onEvent, { converse = false } = {}) {
+export function createEventStreamDecoder(onEvent) {
   let pending = Buffer.alloc(0);
   let corrupt = false;
-  const frame = (f) => {
-    const total = f.readUInt32BE(0), hlen = f.readUInt32BE(4);
-    if (crc32(f, 0, 8) !== f.readUInt32BE(8) || crc32(f, 0, total - 4) !== f.readUInt32BE(total - 4) || 12 + hlen + 4 > total) { corrupt = true; return; }
-    let headers;
-    try { headers = parseEventHeaders(f.subarray(12, 12 + hlen)); } catch { corrupt = true; return; }
-    if (headers[":message-type"] !== "event") { corrupt = true; return; }
-    if (converse) {
-      // #216: ConverseStream frames carry their event JSON directly, typed by :event-type.
-      try { onEvent(JSON.parse(f.subarray(12 + hlen, total - 4).toString("utf8")), headers[":event-type"]); } catch { corrupt = true; }
-      return;
-    }
-    if (headers[":event-type"] !== "chunk") return;
-    try {
-      const outer = JSON.parse(f.subarray(12 + hlen, total - 4).toString("utf8"));
-      onEvent(JSON.parse(Buffer.from(outer.bytes, "base64").toString("utf8")));
-    } catch { corrupt = true; }
-  };
+  const fail = () => { corrupt = true; pending = Buffer.alloc(0); };
   return {
     push(chunk) {
       if (corrupt) return;
       pending = pending.length ? Buffer.concat([pending, chunk]) : Buffer.from(chunk);
-      while (!corrupt && pending.length >= 12) {
-        const total = pending.readUInt32BE(0);
-        if (total < 16 || total > 16 * 1024 * 1024) { corrupt = true; break; }
-        if (pending.length < total) break;
-        frame(pending.subarray(0, total));
+      while (pending.length >= 12) {
+        const total = pending.readUInt32BE(0), hlen = pending.readUInt32BE(4);
+        if (crc32(pending, 0, 8) !== pending.readUInt32BE(8) || total < 16 || hlen > total - 16) return fail();
+        if (pending.length < total) return;
+        if (crc32(pending, 0, total - 4) !== pending.readUInt32BE(total - 4)) return fail();
+        let headers;
+        try { headers = parseEventHeaders(pending.subarray(12, 12 + hlen)); } catch { return fail(); }
+        const payload = pending.subarray(12 + hlen, total - 4);
         pending = pending.subarray(total);
+        if (headers[":message-type"] !== "event") return fail();
+        if (headers[":event-type"] !== "chunk") continue;
+        try {
+          const outer = JSON.parse(payload.toString("utf8"));
+          if (typeof outer?.bytes === "string") onEvent(JSON.parse(Buffer.from(outer.bytes, "base64").toString("utf8")));
+        } catch { /* non-JSON payload is forwarded unmetered */ }
       }
     },
+    end() { if (pending.length) corrupt = true; },
     get corrupt() { return corrupt; },
-    /** True when bytes remain that never formed a whole frame. */
-    get partial() { return pending.length > 0; },
   };
-}
-
-/**
- * #288: usage from a non-Anthropic Bedrock InvokeModel response, in Anthropic Messages shape, or null.
- * Native body fields first (Nova `usage.inputTokens/outputTokens` + `cacheRead/WriteInputTokenCount`;
- * Llama `prompt_token_count/generation_token_count`; OpenAI-style `usage.prompt_tokens/completion_tokens`
- * (Mistral, DeepSeek, gpt-oss, Qwen); a stream chunk's `amazon-bedrock-invocationMetrics`), then the
- * `X-Amzn-Bedrock-Input-Token-Count` / `-Output-Token-Count` response headers.
- */
-export function bedrockInvokeUsage(body, headers = null) {
-  const ok = (v) => Number.isInteger(v) && v >= 0;
-  const shape = (i, o, cr, cw) => (ok(i) && ok(o) ? { input_tokens: i, output_tokens: o,
-    ...(ok(cr) && cr > 0 && { cache_read_input_tokens: cr }), ...(ok(cw) && cw > 0 && { cache_creation_input_tokens: cw }) } : null);
-  if (body && typeof body === "object") {
-    const m = body["amazon-bedrock-invocationMetrics"];
-    if (m && typeof m === "object") {
-      const r = shape(m.inputTokenCount, m.outputTokenCount, m.cacheReadInputTokenCount, m.cacheWriteInputTokenCount);
-      if (r) return r;
-    }
-    const u = body.usage;
-    if (u && typeof u === "object") {
-      const r = shape(u.inputTokens, u.outputTokens, u.cacheReadInputTokenCount ?? u.cacheReadInputTokens, u.cacheWriteInputTokenCount ?? u.cacheWriteInputTokens)
-        ?? shape(u.prompt_tokens, u.completion_tokens);
-      if (r) return r;
-    }
-    const r = shape(body.prompt_token_count, body.generation_token_count);
-    if (r) return r;
-  }
-  if (headers && typeof headers.get === "function") {
-    const n = (k) => { const v = headers.get(k); return v != null && /^\d+$/.test(v.trim()) ? Number(v.trim()) : null; };
-    return shape(n("x-amzn-bedrock-input-token-count"), n("x-amzn-bedrock-output-token-count"),
-      n("x-amzn-bedrock-cache-read-input-token-count"), n("x-amzn-bedrock-cache-write-input-token-count"));
-  }
-  return null;
 }

@@ -85,37 +85,22 @@ export function loadEvents(path) {
   return loadLines(path).filter((r) => r.event);
 }
 
-export const CAP_SCOPES = Object.freeze(["run", "hour", "day", "week", "month"]);
-export const HOUR_MS = 60 * 60 * 1000;
+// A submitted batch whose results have not been metered yet (#160): unknown cost, never $0.
+export const isPendingBatch = (r) => !!r && r.cost_usd === null && r.reason === "batch_pending";
 
-// caps: { run, hour, day, week, month } in USD; week (#264) is the ISO week, UTC Monday start; any may be undefined.
-// hour (#172) is a rolling window: spend with now - 60min < ts <= now. It never latches.
-// runId (#178): this wrapper's run id; a settlement of a receipt with that run_id
-// also counts toward the run cap.
-// fleetWeek (#274): { cap, budgetPeriod } — an enrolled fleet caps.week, bucketed on the
-// org budget-period timezone (Monday 00:00 there), enforced next to a local UTC week cap.
-// fleetPeriod (#280): { caps: { day, week, month }, budgetPeriod } — the same for the fleet
-// caps.day and caps.month (org timezone day, org monthStartDay month). Each fleet cap runs
-// on the org clock next to the local UTC cap of the same scope; the stricter verdict wins.
-export const FLEET_PERIOD_SCOPES = Object.freeze(["day", "week", "month"]);
-const pad2 = (n) => String(n).padStart(2, "0");
-export function createCapEngine({ caps = {}, history = [], now = () => new Date(), runId = null, fleetWeek = null, fleetPeriod = null } = {}) {
-  for (const scope of CAP_SCOPES) {
+// caps: { run, day, month } in USD; any may be undefined.
+// pendingBatchesBlock: false lets `costcap wrap` keep serving synchronous calls while a
+// batch is pending (#160); read-only checks keep the default and report it as unknown.
+export function createCapEngine({ caps = {}, history = [], now = () => new Date(), pendingBatchesBlock = true } = {}) {
+  for (const scope of ["run", "day", "month"]) {
     if (caps[scope] != null && (!Number.isFinite(caps[scope]) || caps[scope] <= 0)) throw new Error(`Invalid ${scope} cap`);
   }
   for (const r of history) {
     if (!Number.isFinite(Date.parse(r.ts)) || (r.cost_usd !== null && (!Number.isFinite(r.cost_usd) || r.cost_usd < 0))) throw new Error("Invalid receipt history; reconcile before running");
   }
   let run = 0;
-  const settledIds = new Set();
-  // A pending batch (#160) is unknown until its results settle it, but it does not
-  // stop synchronous calls: its cost arrives through a batch_results settlement.
-  let unknown = history.filter((r) => r.cost_usd === null && !isPendingBatch(r)).length;
-  // #187: pending batches do not stop calls, but while any is open spend is a lower bound.
-  const pendingBatches = new Set();
-  let anonPending = 0;
-  const notePending = (r) => { if (typeof r.id === "string" && r.id) pendingBatches.add(r.id); else anonPending += 1; };
-  for (const r of history) if (isPendingBatch(r)) notePending(r);
+  const blocksUnknown = (r) => r.cost_usd === null && (pendingBatchesBlock || !isPendingBatch(r));
+  let unknown = history.filter(blocksUnknown).length;
   // Null cost is unknown. It is omitted from sums so it is not treated as $0.
   // Spend is bucketed by UTC day and month key once, at record time, so check()
   // stays O(1) per call instead of rescanning the whole ledger (stress suite).
@@ -230,12 +215,11 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
       for (const scope of CAP_SCOPES) if (next[scope] != null && (!Number.isFinite(next[scope]) || next[scope] <= 0)) throw new Error("Invalid updated caps");
       caps = { ...next };
     },
-    // Remaining USD per capped scope (uncapped scopes omitted). Used by preflight (CC-9).
+    // Remaining USD per capped scope (null where uncapped). Used by pre-flight (CC-9).
     remaining() {
       const s = spend();
-      const lim = limits();
       const out = {};
-      for (const scope of CAP_SCOPES) if (lim[scope] != null) out[scope] = Number(Math.max(0, lim[scope] - s[scope]).toFixed(6));
+      for (const scope of ["run", "day", "month"]) out[scope] = caps[scope] == null ? null : Number(Math.max(0, caps[scope] - s[scope]).toFixed(6));
       return out;
     },
     // Returns null if the call may proceed, else a budget-exceeded descriptor.
@@ -276,8 +260,7 @@ export function createCapEngine({ caps = {}, history = [], now = () => new Date(
     // external: a receipt another wrapper sharing this ledger wrote. It counts
     // toward day/month (and unknown) but not toward this wrapper's run cap.
     record(receipt, { external = false } = {}) {
-      if (isPendingBatch(receipt)) { notePending(receipt); return; }
-      if (receipt.cost_usd === null) { unknown += 1; return; }
+      if (receipt.cost_usd === null) { if (blocksUnknown(receipt)) unknown += 1; return; }
       if (!external) run += receipt.cost_usd;
       add(receipt.ts ?? now(), receipt.cost_usd);
     },

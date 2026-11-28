@@ -1,5 +1,8 @@
 name: verify
 on: [push, pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 # One running + one pending run per ref. A newer push replaces the older

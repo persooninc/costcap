@@ -562,252 +562,54 @@ test("wrap exits 2 and spawns nothing for a bad --upstream or prices file", () =
   assert.throws(() => readFileSync(marker));
 });
 
-// #188: spawned wrap against local fake Bedrock / Vertex upstreams.
-const SIGV4 = new URL("../src/sigv4.js", import.meta.url).href;
-async function fakeBedrock(t) {
-  const { verifyRequest } = await import(SIGV4);
-  const hits = [];
-  const s = http.createServer((q, res) => {
+test("#188 wrap: Bedrock SigV4 + Vertex through the proxy, env vars, 1.1x regional receipt, cap hit, startup note", async (t) => {
+  const { verifyRequest } = await import("../src/sigv4.js");
+  const CREDS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" };
+  const msg = { model: "claude-sonnet-4-5-20250929", usage: { input_tokens: 2000, output_tokens: 6000 } }; // $0.096 global
+  const sigs = [];
+  const start = (handler) => new Promise((r) => { const s = http.createServer(handler); s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port })); });
+  const bed = await start((q, res) => {
     const chunks = []; q.on("data", (c) => chunks.push(c));
     q.on("end", () => {
-      const [p, qs = ""] = q.url.split("?");
-      const v = verifyRequest({ method: q.method, path: p, search: qs ? `?${qs}` : "", headers: q.headers, body: Buffer.concat(chunks) },
-        { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" });
-      hits.push({ url: q.url, ok: v.ok, region: v.region });
-      res.writeHead(v.ok ? 200 : 403, { "content-type": "application/json" })
-        .end(JSON.stringify(v.ok ? { usage: { input_tokens: 40_000, output_tokens: 1000 } } : { message: "bad signature" }));
+      const [p, ...qs] = q.url.split("?");
+      sigs.push(verifyRequest({ method: q.method, path: p, search: qs.join("?"), headers: q.headers, body: Buffer.concat(chunks).toString(), credentials: CREDS }));
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(msg));
     });
   });
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  t.after(() => s.close());
-  return { hits, url: `http://127.0.0.1:${s.address().port}` };
-}
-function cloudWrap(args, env, script) {
-  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AWS_|^CLAUDE_CODE_USE_/.test(k)));
-  return new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", ...args, "--", process.execPath, "--input-type=module", "-e", script], { env: { ...base, ...env } });
-    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
-    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "").trim(), err }));
-  });
-}
-const signedCallScript = (ids) => `
-  import { signRequest } from ${JSON.stringify(SIGV4)};
-  const base = new URL(process.env.ANTHROPIC_BEDROCK_BASE_URL);
-  const creds = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" };
-  const out = [process.env.ANTHROPIC_BEDROCK_BASE_URL.endsWith("/bedrock"), process.env.ANTHROPIC_VERTEX_BASE_URL.endsWith("/vertex/v1")];
-  for (const id of ${JSON.stringify(ids)}) {
-    const path = base.pathname + "/model/" + encodeURIComponent(id) + "/invoke";
-    const body = JSON.stringify({ anthropic_version: "bedrock-2023-05-31", max_tokens: 1000, messages: [] });
-    const headers = signRequest({ method: "POST", path, headers: { "content-type": "application/json" }, body, host: base.host, region: "us-east-1", service: "bedrock" }, creds);
-    delete headers.host;
-    const r = await fetch(base.origin + path, { method: "POST", headers, body });
-    out.push(r.status);
-  }
-  console.log(out.join(" "));`;
-
-test("#188 wrap: child sees the Bedrock/Vertex base URLs, SigV4 call is re-signed and priced 1.1x/1.0x, cap hit is 429", async (t) => {
-  const up = await fakeBedrock(t);
+  const vtx = await start((q, res) => { q.resume(); q.on("end", () => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...msg, usage: { input_tokens: 1, output_tokens: 1 } }))); });
+  t.after(() => { bed.s.close(); vtx.s.close(); });
   const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
-  const receipts = path.join(dir, "r.jsonl");
-  const id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
-  const res = await cloudWrap(["--cap", "0.25", "--receipts", receipts],
-    { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, AWS_REGION: "us-east-1", AWS_ACCESS_KEY_ID: "AKIDEXAMPLE", AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" },
-    signedCallScript([id, id.replace(/^us\./, "global."), id]));
-  assert.equal(res.out, "true true 200 200 429");
-  assert.deepEqual(up.hits.map((h) => [h.ok, h.region]), [[true, "us-east-1"], [true, "us-east-1"]]);
-  const rows = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).filter((r) => "cost_usd" in r);
-  // 40k in * $3 + 1k out * $15 = $0.135 global; regional is 1.1x.
-  assert.deepEqual(rows.slice(0, 2).map((r) => [r.provider, r.model, r.endpoint_scope, r.cost_usd]),
-    [["bedrock", "claude-sonnet-4-5", "regional", 0.1485], ["bedrock", "claude-sonnet-4-5", "global", 0.135]]);
-  assert.equal(rows[2].reason, "budget_exceeded");
-  assert.ok(!readFileSync(receipts, "utf8").includes("wJalrXUtnFEMI"));
-});
-
-test("#188 wrap: CLAUDE_CODE_USE_BEDROCK without static creds prints a note; a signed call gets 502 and never reaches the fake", async (t) => {
-  const up = await fakeBedrock(t);
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
-  const res = await cloudWrap(["--receipts", path.join(dir, "r.jsonl")],
-    { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, AWS_REGION: "us-east-1", CLAUDE_CODE_USE_BEDROCK: "1" },
-    signedCallScript(["us.anthropic.claude-sonnet-4-5-20250929-v1:0"]));
-  assert.equal(res.out, "true true 502");
-  assert.match(res.err, /CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials/);
-  assert.match(res.err, /aws configure export-credentials/);
-  assert.equal(up.hits.length, 0);
-  const quiet = await cloudWrap(["--receipts", path.join(dir, "r2.jsonl")], { COSTCAP_TEST_BEDROCK_UPSTREAM: up.url, CLAUDE_CODE_USE_BEDROCK: "1", AWS_BEARER_TOKEN_BEDROCK: "x" }, "console.log(1)");
-  assert.doesNotMatch(quiet.err, /CLAUDE_CODE_USE_BEDROCK/);
-});
-
-test("#188 wrap: Vertex rawPredict through COSTCAP_TEST_VERTEX_UPSTREAM keeps the path and Authorization", async (t) => {
-  const hits = [];
-  const s = http.createServer((q, res) => { q.resume(); hits.push([q.url, q.headers.authorization]);
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } })); });
-  await new Promise((r) => s.listen(0, "127.0.0.1", r));
-  t.after(() => s.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-"));
-  const receipts = path.join(dir, "r.jsonl");
-  const res = await cloudWrap(["--receipts", receipts], { COSTCAP_TEST_VERTEX_UPSTREAM: `http://127.0.0.1:${s.address().port}` }, `
-    const r = await fetch(process.env.ANTHROPIC_VERTEX_BASE_URL + "/projects/p/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict",
-      { method: "POST", headers: { authorization: "Bearer ya29.x" }, body: "{}" });
-    console.log(r.status);`);
-  assert.equal(res.out, "200");
-  assert.deepEqual(hits, [["/v1/projects/p/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict", "Bearer ya29.x"]]);
-  const row = readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse).find((r) => r.provider === "vertex");
-  assert.deepEqual([row.model, row.endpoint_scope, row.regional_multiplier], ["claude-haiku-4-5", "global", undefined]);
-});
-
-test("#189 wrap --upstream-prices with a bad built-in entry exits 2 before spawning (AC4)", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
-  const marker = path.join(dir, "spawned");
-  for (const [i, entry] of [{ discount: 1 }, { discount: 0 }, { input: 0, output: 1 }, { input: -1, output: 1 }, { discount: 0.2, input: 1 }, { input: 1, ouput: 2 }].entries()) {
-    const f = path.join(dir, `p${i}.json`);
-    writeFileSync(f, JSON.stringify({ upstreams: { openai: { "gpt-4o": entry } } }));
-    const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--upstream-prices", f, "--", process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`], { encoding: "utf8" });
-    assert.equal(r.status, 2, JSON.stringify(entry));
-    assert.match(r.stderr, /upstream-prices/);
-  }
-  const star = path.join(dir, "star.json");
-  writeFileSync(star, JSON.stringify({ upstreams: { anthropic: { "*": { input: 1, output: 1 } } } }));
-  assert.equal(spawnSync(process.execPath, ["src/cli.js", "wrap", "--upstream-prices", star, "--", process.execPath, "-e", "0"]).status, 2);
-  assert.equal(existsSync(marker), false);
-});
-
-test("#189 costcap pricing show --prices prints the discounted row (AC5)", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
-  const f = path.join(dir, "p.json");
-  writeFileSync(f, JSON.stringify({ upstreams: { anthropic: { "claude-sonnet-4-5": { discount: 0.2 } } } }));
-  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "claude-sonnet-4-5", "--prices", f], { encoding: "utf8" });
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /\(discount 0\.2\): input \$2\.4,/);
-});
-
-// #194 AC6: a real `costcap wrap` child reads COSTCAP_OPENAI_REALTIME_URL; its session is metered,
-// closed at the cap, and `costcap runs` shows the realtime spend.
-test("#194 wrap exports COSTCAP_OPENAI_REALTIME_URL; realtime session metered and closed at the cap", async (t) => {
-  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
-  const usage = { input_tokens: 1300, output_tokens: 600,
-    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
-    output_token_details: { text_tokens: 100, audio_tokens: 500 } };
-  const up = await startRealtimeUpstream({ onSession: (conn) => {
-    conn.socket.on("data", () => {
-      const n = conn.received.filter((m) => m.type === "response.create").length;
-      if (n > (conn.answered ?? 0)) { conn.answered = n; conn.send({ type: "response.done", response: { id: `r${n}`, usage } }); }
-    });
-  } });
-  t.after(() => up.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt-cli-"));
-  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
+  const sig = new URL("../src/sigv4.js", import.meta.url).href;
   const script = `
-    import { connectRealtime } from ${JSON.stringify(fixture)};
-    const u = new URL(process.env.COSTCAP_OPENAI_REALTIME_URL);
-    const c = await connectRealtime(Number(u.port), u.pathname + "?model=gpt-realtime");
-    for (let i = 0; i < 3 && c.closeCode === null; i++) { c.send({ type: "response.create" }); await new Promise((r) => setTimeout(r, 150)); }
-    await c.closed;
-    console.log(u.protocol, c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
+    const { signRequest } = await import(${JSON.stringify(sig)});
+    const base = new URL(process.env.ANTHROPIC_BEDROCK_BASE_URL);
+    const call = async (id) => {
+      const p = base.pathname + "/model/" + encodeURIComponent(id) + "/invoke", body = JSON.stringify({ max_tokens: 10 });
+      const h = signRequest({ method: "POST", host: base.host, path: p, body, headers: { "content-type": "application/json" }, extraSigned: ["content-type"],
+        credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY }, region: process.env.AWS_REGION, service: "bedrock" });
+      delete h.host;
+      return (await fetch(base.origin + p, { method: "POST", headers: { ...h, "content-type": "application/json" }, body })).status;
+    };
+    const v = await fetch(process.env.ANTHROPIC_VERTEX_BASE_URL + "/projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict", { method: "POST", headers: { authorization: "Bearer t" }, body: "{}" });
+    console.log(process.env.ANTHROPIC_VERTEX_BASE_URL.endsWith("/vertex/v1"), v.status, await call("us.anthropic.claude-sonnet-4-5-20250929-v1:0"), await call("global.anthropic.claude-sonnet-4-5-20250929-v1:0"));`;
   const receipts = path.join(dir, "r.jsonl");
   const res = await new Promise((resolve) => {
     const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
-    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
-    c.on("exit", (code) => resolve({ code, out }));
+      { env: { ...process.env, COSTCAP_TEST_BEDROCK_UPSTREAM: `http://127.0.0.1:${bed.port}`, COSTCAP_TEST_VERTEX_UPSTREAM: `http://127.0.0.1:${vtx.port}`,
+        AWS_REGION: "us-east-1", AWS_ACCESS_KEY_ID: CREDS.accessKeyId, AWS_SECRET_ACCESS_KEY: CREDS.secretAccessKey, AWS_SESSION_TOKEN: "", CLAUDE_CODE_USE_BEDROCK: "1" } });
+    let out = "", err = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (err += d));
+    c.on("exit", (code) => resolve({ code, out, err }));
   });
-  assert.equal(res.code, 0);
-  assert.equal(res.out.trim(), "ws: 101 2 budget_exceeded 1008");
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.transport === "websocket");
-  assert.equal(lines.length, 2);
-  assert.ok(lines.every((r) => r.cost_usd === 0.0538 && r.run_id));
-  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
-  assert.equal(runs.status, 0);
-  assert.match(runs.stdout, /0\.1076/);
-});
-
-// #276: the same wrap path on gpt-realtime-2 (priced since #276), and pricing show for gpt-audio-1.5.
-test("#276 wrap --cap 0.10 closes a gpt-realtime-2 session; runs shows spend; pricing show gpt-audio-1.5", async (t) => {
-  const { startRealtimeUpstream } = await import("./fixtures/realtime-upstream.js");
-  const usage = { input_tokens: 1300, output_tokens: 600,
-    input_token_details: { text_tokens: 300, audio_tokens: 1000, cached_tokens: 500, cached_tokens_details: { text_tokens: 100, audio_tokens: 400 } },
-    output_token_details: { text_tokens: 100, audio_tokens: 500 } };
-  const up = await startRealtimeUpstream({ onSession: (conn) => {
-    conn.socket.on("data", () => {
-      const n = conn.received.filter((m) => m.type === "response.create").length;
-      if (n > (conn.answered ?? 0)) { conn.answered = n; conn.send({ type: "response.done", response: { id: `r${n}`, usage } }); }
-    });
-  } });
-  t.after(() => up.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-rt2-cli-"));
-  const fixture = new URL("./fixtures/realtime-upstream.js", import.meta.url).href;
-  const script = `
-    import { connectRealtime } from ${JSON.stringify(fixture)};
-    const u = new URL(process.env.COSTCAP_OPENAI_REALTIME_URL);
-    const c = await connectRealtime(Number(u.port), u.pathname + "?model=gpt-realtime-2");
-    for (let i = 0; i < 3 && c.closeCode === null; i++) { c.send({ type: "response.create" }); await new Promise((r) => setTimeout(r, 150)); }
-    await c.closed;
-    console.log(c.status, c.messages.filter((m) => m.type === "response.done").length, c.messages.at(-1).error.code, c.closeCode);`;
-  const receipts = path.join(dir, "r.jsonl");
-  const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.10", "--unknown-models", "refuse", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, COSTCAP_TEST_OPENAI_UPSTREAM: up.url } });
-    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
-    c.on("exit", (code) => resolve({ code, out }));
-  });
-  assert.equal(res.code, 0);
-  assert.equal(res.out.trim(), "101 2 budget_exceeded 1008");
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.transport === "websocket");
-  assert.ok(lines.length === 2 && lines.every((r) => r.cost_usd === 0.0546 && r.model === "gpt-realtime-2"));
-  const runs = spawnSync(process.execPath, ["src/cli.js", "runs", "--json", "--receipts", receipts], { encoding: "utf8" });
-  assert.equal(runs.status, 0);
-  assert.match(runs.stdout, /0\.1092/);
-  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-audio-1.5"], { encoding: "utf8" });
-  assert.equal(show.status, 0, show.stderr);
-  assert.match(show.stdout, /audio/);
-  assert.match(show.stdout, /\$32/);
-});
-
-test("#197 wrap warns once per ignored {discount} on an unpriced model and still starts", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-po-cli-"));
-  const f = path.join(dir, "p.json");
-  writeFileSync(f, JSON.stringify({ upstreams: { openai: { "gpt-6-preview": { discount: 0.2 }, "gpt-4o": { discount: 0.1 } } } }));
-  const r = spawnSync(process.execPath, ["src/cli.js", "wrap", "--receipts", path.join(dir, "r.jsonl"), "--upstream-prices", f, "--", process.execPath, "-e", "process.stdout.write('ran')"], { encoding: "utf8" });
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(r.stdout, "ran");
-  const warns = r.stderr.split("\n").filter((l) => l.includes("discount ignored"));
-  assert.deepEqual(warns, ["costcap: warning: discount ignored: openai/gpt-6-preview is not in the pricing table; add absolute rates"]);
-  const show = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-6-preview", "--prices", f], { encoding: "utf8" });
-  assert.equal(show.status, 0);
-  assert.doesNotMatch(show.stdout, /discount/);
-});
-
-test("#257 wrap --cap 0.15: a Gemini cachedContents create bills storage, the cached generate is refused at the cap", async (t) => {
-  const seen = [];
-  const T0 = "2026-11-16T12:00:00Z";
-  const up = await new Promise((r) => {
-    const s = http.createServer((req, res) => {
-      req.resume();
-      seen.push(`${req.method} ${req.url}`);
-      res.setHeader("content-type", "application/json");
-      res.end(req.url.endsWith("/cachedContents")
-        ? JSON.stringify({ name: "cachedContents/abc123", model: "models/gemini-2.5-flash", createTime: T0, expireTime: "2026-11-16T13:00:00Z", usageMetadata: { totalTokenCount: 200000 } })
-        : '{"modelVersion":"gemini-2.5-flash","usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1}}');
-    });
-    s.listen(0, "127.0.0.1", () => r({ s, port: s.address().port }));
-  });
-  t.after(() => up.s.close());
-  const dir = mkdtempSync(path.join(tmpdir(), "cc-257-"));
-  const receipts = path.join(dir, "r.jsonl");
-  const script = `
-    const b = process.env.GOOGLE_GEMINI_BASE_URL + "/v1beta";
-    const h = { "x-goog-api-key": "k", "content-type": "application/json" };
-    const a = await fetch(b + "/cachedContents", { method: "POST", headers: h, body: JSON.stringify({ model: "models/gemini-2.5-flash", contents: [], ttl: "3600s" }) });
-    const g = await fetch(b + "/models/gemini-2.5-flash:generateContent", { method: "POST", headers: h, body: JSON.stringify({ cachedContent: "cachedContents/abc123", contents: [] }) });
-    console.log("STATUS", a.status, g.status, (await g.json()).error?.type);`;
-  const res = await new Promise((resolve) => {
-    const c = spawn(process.execPath, ["src/cli.js", "wrap", "--cap", "0.15", "--receipts", receipts, "--", process.execPath, "--input-type=module", "-e", script],
-      { env: { ...process.env, GOOGLE_GEMINI_BASE_URL: "https://generativelanguage.googleapis.com", COSTCAP_TEST_GEMINI_UPSTREAM: `http://127.0.0.1:${up.port}` } });
-    let out = ""; c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", () => {});
-    c.on("exit", (code) => resolve({ code, out: out.replace(/\x1b\[[0-9;]*m/g, "") }));
-  });
-  assert.match(res.out, /^STATUS 200 429 budget_exceeded$/m);
-  assert.deepEqual(seen, ["POST /v1beta/cachedContents"]);
-  const lines = readFileSync(receipts, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  const r = lines.find((x) => x.kind === "cache_storage");
-  assert.deepEqual([r.cost_usd, r.model, r.cache_name], [0.2, "gemini-2.5-flash", "cachedContents/abc123"]);
+  assert.equal(res.out.replace(/\x1b\[[0-9;]*m/g, "").trim(), "true 200 200 429");
+  assert.doesNotMatch(res.err, /export-credentials/);
+  assert.equal(sigs.length, 1); assert.equal(sigs[0].ok, true);
+  const lines = readFileSync(receipts, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.provider);
+  const b = lines.find((r) => r.provider === "bedrock" && !r.blocked);
+  assert.equal(b.model, "claude-sonnet-4-5"); assert.equal(b.endpoint_scope, "regional"); assert.equal(b.regional_multiplier, 1.1);
+  assert.ok(Math.abs(b.cost_usd - 0.1056) < 1e-6);
+  assert.doesNotMatch(readFileSync(receipts, "utf8"), /wJalrXUtnFEMI/);
+  // Startup note: Bedrock on, no creds or bearer token.
+  const note = spawnSync(process.execPath, ["src/cli.js", "wrap", "--receipts", path.join(dir, "n.jsonl"), "--", process.execPath, "-e", ""],
+    { encoding: "utf8", env: { ...process.env, CLAUDE_CODE_USE_BEDROCK: "1", AWS_ACCESS_KEY_ID: "", AWS_SECRET_ACCESS_KEY: "", AWS_BEARER_TOKEN_BEDROCK: "" } });
+  assert.match(note.stderr, /CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials/);
 });

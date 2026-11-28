@@ -4,8 +4,9 @@
 import { readFileSync } from "node:fs";
 import { loadPricingTable, datedRow, dayOf } from "./pricing.js";
 import { auditReceipts } from "./pricing-digest.js";
+import { mapCloudModel } from "./cloud.js";
 import { loadUpstreamPrices } from "./upstreams.js";
-import { builtinOverride, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
+import { builtinOverride, CLOUD_OVERRIDE_PROVIDERS, effectivePrice, OVERRIDE_PROVIDERS } from "./price-overrides.js";
 
 function option(args, name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
 
@@ -58,7 +59,7 @@ export function pricingCommand(args, { tablePath } = {}) {
   // A long-context tier (#151) prints as a second row for the same model.
   // Premium speed / service tiers (#155) print as (fast) / (priority) rows.
   // #198: per-minute / per-character audio models print their unit rate instead of token rates.
-  const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of audio`
+  const unitRow = (name, r) => (Number.isFinite(r.per_minute) ? `${name}: ${fmt(r.per_minute)} per minute of ${/^gpt-live-/.test(name) ? "session time (#273)" : "audio"}`
     : `${name}: ${fmt(r.per_million_characters)} per 1M characters of input text`);
   const rowsFor = (name, r) => (Number.isFinite(r.per_minute) || Number.isFinite(r.per_million_characters)) && !Number.isFinite(r.input) ? [unitRow(name, r)] : [row(name, r), ...(r.long_context ? [row(name, r.long_context, ` (>${r.long_context.threshold_input_tokens} input tokens)`)] : []),
     ...["fast", "priority", "ultrafast"].filter((t) => r[t]).map((t) => row(name, r[t], ` (${t})`)),
@@ -68,28 +69,32 @@ export function pricingCommand(args, { tablePath } = {}) {
     // #257: Gemini context caching storage.
     ...(Number.isFinite(r.cache_storage) ? [`${name}: context cache storage ${fmt(r.cache_storage)} per 1M tokens per hour`] : []),
     ...(r.text_rate_modalities?.length ? [`${name}: ${r.text_rate_modalities.join("/")} input at the text rate`] : [])];
+  // #278: non-Anthropic Bedrock rows print per region as bedrock/<id> (<region>).
+  const bedrock = table.bedrock_models?.models ?? {};
+  const bedrockRows = (only) => Object.entries(bedrock).filter(([k]) => !only || k === only)
+    .flatMap(([k, regions]) => Object.entries(regions).map(([r, rr]) => row(`bedrock/${k}`, rr, ` (${r})`)));
   if (!model) {
     const rows = Object.entries(table.models).flatMap(([k, r]) => rowsFor(k, r));
     return { code: 0, out: [head, ...rows, ...bedrockRows(), row("fallback", table.fallback, " (fallback for unknown models)")].join("\n"), err: "" };
   }
-  // #278: a non-Anthropic Bedrock id (geo prefix stripped) prints one row per region; a `bedrock` entry in --prices wins.
-  const bedrockId = model.replace(/^(?:us|eu|apac|jp|au|ca|us-gov)\./, "");
-  const bUser = prices?.upstreams?.bedrock;
-  if (bUser && Object.hasOwn(bUser, bedrockId) && !("discount" in bUser[bedrockId])) return { code: 0, out: [head, row(`bedrock/${bedrockId}`, bUser[bedrockId], ` (user_prices ${prices.sha256.slice(0, 8)}, every region)`)].join("\n"), err: "" };
-  if (Object.hasOwn(bedrockTable, bedrockId)) {
-    const d = bUser && Object.hasOwn(bUser, bedrockId) ? bUser[bedrockId].discount : bUser && Object.hasOwn(bUser, "*") ? bUser["*"].discount : undefined;
-    const k = d === undefined ? 1 : 1 - d;
-    return { code: 0, out: [head, ...bedrockRows([bedrockId], k, d === undefined ? "" : ` (discount ${d})`)].join("\n"), err: "" };
-  }
   // #189: with --prices, the effective row for the first built-in provider that overrides the model.
   // A model-specific entry wins over another provider's "*" discount.
   const listed = (p) => [model, model.replace(/-(?:\d{4}-\d{2}-\d{2}|20\d{6})$/, "")].some((id) => Object.hasOwn(prices.upstreams[p] ?? {}, id));
-  const provider = prices && (OVERRIDE_PROVIDERS.find((p) => listed(p) && builtinOverride(prices, p, model)) ?? OVERRIDE_PROVIDERS.find((p) => builtinOverride(prices, p, model)));
+  // #278: bedrock / vertex overrides apply on cloud routes only; `show` prints first-party overrides.
+  const FIRST_PARTY = OVERRIDE_PROVIDERS.filter((p) => !CLOUD_OVERRIDE_PROVIDERS.includes(p));
+  const provider = prices && (FIRST_PARTY.find((p) => listed(p) && builtinOverride(prices, p, model)) ?? FIRST_PARTY.find((p) => builtinOverride(prices, p, model)));
   if (provider) {
     const o = builtinOverride(prices, provider, model);
     const tag = o.absolute ? ` (user_prices ${prices.sha256.slice(0, 8)})` : ` (discount ${o.discount})`;
     const eff = effectivePrice(prices, provider, model, `${day}T00:00:00Z`);
     return { code: 0, out: [head, ...(o.absolute ? [row(`${provider}/${model}`, eff, tag)] : rowsFor(`${provider}/${model}`, eff).map((l, i) => (i === 0 ? l.replace(":", `${tag}:`) : l)))].join("\n"), err: "" };
+  }
+  // #278: a non-Anthropic Bedrock model prints one row per region the table lists.
+  const bedrockId = mapCloudModel("bedrock", model);
+  if (bedrockId && Object.hasOwn(table.bedrock_models ?? {}, bedrockId)) {
+    const regions = table.bedrock_models[bedrockId].regions;
+    return { code: 0, out: [head, `bedrock/${bedrockId} (on-demand standard; other regions and service tiers are unpriced)`,
+      ...Object.entries(regions).map(([r, rr]) => row(`bedrock/${bedrockId} ${r}`, rr))].join("\n"), err: "" };
   }
   const base = model.replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const id = Object.hasOwn(table.models, model) ? model : Object.hasOwn(table.models, base) ? base : null;

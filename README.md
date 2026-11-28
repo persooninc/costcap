@@ -77,7 +77,7 @@ CostCap. The local proxy binds to 127.0.0.1.
 
 | Provider | Variables set for the child |
 | --- | --- |
-| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1`, `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` and `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions` |
+| OpenAI | `OPENAI_BASE_URL=http://127.0.0.1:<port>/openai/v1` `COSTCAP_OPENAI_REALTIME_URL=ws://127.0.0.1:<port>/openai/v1/realtime` and `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions` |
 | Anthropic | `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/anthropic` |
 | OpenRouter | `OPENROUTER_BASE_URL=http://127.0.0.1:<port>/openrouter` |
 | Gemini | `GOOGLE_GEMINI_BASE_URL` (read by go-genai, `@google/genai` and Gemini CLI) and `GEMINI_BASE_URL` (legacy), both `http://127.0.0.1:<port>/gemini` |
@@ -111,46 +111,35 @@ read is `cache_read_unpriced`).
 
 A response cut before `response.done`, audio on a model with no audio rate and a billed input transcription are recorded as
 unknown cost (`stream_incomplete`, `modality_unpriced`, `transcription_unpriced`) and
-pause the run until reconciled. Upgrades on any path other than Realtime, GPT-Live and Gemini Live
-get `501 websocket_unsupported`.
+pause the run until reconciled. Upgrades on any other path (including
+`/v1/live/sessions/{id}/fork`) get `501 websocket_unsupported`.
 
-#### GPT-Live (`gpt-live-1`)
+### GPT-Live
 
-`wrap` also exports `COSTCAP_OPENAI_LIVE_URL=ws://127.0.0.1:<port>/openai/v1/live/sessions`.
-Sessions are billed per second at $0.05/min from each `session.usage.updated` snapshot (only
-the growth since the last snapshot is billed) and the final `session.closed`. The model in
-`session.start`, and its `session.delegation.responses.model` backend, are checked against `--models` and `--unknown-models refuse` before it reaches Fragmented client messages are held until their final fragment and vetted whole; a stray continuation frame closes the session with 1002, and a client message over the 16 MB limit is never forwarded (the client is closed with 1009 `frame_too_large`).
-OpenAI. Caps are re-checked after every metered event and by a 1 s wall-clock estimate; on a hit
-the proxy sends `session.close`, bills the final duration and closes the client with `1008`.
-`costcap kill` closes a session within 1 s. Backend `response.completed` usage is priced once per
-response id exactly like `/v1/responses`: `web_search`/`file_search` calls, the priority tier
-and `--upstream-prices` `tools` overrides apply, and an `image_generation_call` is
-`tool_use_unpriced`. A `session.update` switching to a disallowed backend model is not forwarded. A session that ends without `session.closed` is recorded as
-`session_usage_unconfirmed` (with `session_seconds_lower_bound`) and pauses the run until
-settled. WebRTC/SIP (`POST /live/sessions`) stays `usage_unavailable`; `/live/sessions/{id}/fork`
-stays `501`.
+GPT-Live voice sessions (`gpt-live-1`, `/v1/live/sessions` WebSocket) are proxied at
+`COSTCAP_OPENAI_LIVE_URL` and billed per second of session time, silence included, at
+$0.05/minute. Kill, agent/team, tag and spend caps run before the `101`. The model is read
+from the client's `session.start`. If it fails `--models` or `--unknown-models refuse`, that
+frame is never forwarded: the client gets an `error` event and close `1008`, and a `$0`
+blocked receipt is written.
 
-#### Gemini Live API
-
-`wrap` also exports `COSTCAP_GEMINI_LIVE_URL=ws://127.0.0.1:<port>/gemini/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`.
-`@google/genai`'s `ai.live.connect()` works as is: it derives `ws://…/gemini/ws/…BidiGenerateContent`
-(or `…Constrained?access_token=` for ephemeral tokens) from `GOOGLE_GEMINI_BASE_URL`. Python
-`google-genai` forces `wss:` and is unsupported, like OpenAI's Node SDK.
-
-Admission (kill, agent/team, run, tag and model caps) runs before `101`; client frames are held
-until the first `setup` message, whose `model` is checked against `--models`, `--unknown-models
-refuse` and `--model-cap` before anything reaches Google. Each server message carrying
-`usageMetadata` is one receipt priced at the Live modality rates (`gemini-3.8-live`,
-`-extended-thinking`, `gemini-3.1-flash-live-preview`, `gemini-2.5-flash-native-audio-preview-12-2025`);
-thinking tokens bill as text output. Caps are re-checked after each turn: on a hit the message is
-forwarded, then the client is closed `1008` (`costcap: <reason>`). `costcap kill` closes a session
-within 1 s. A close after client input but before that turn's usage (`stream_incomplete`), a
-modality with no rate (`modality_unpriced`), a cache read (`cache_read_unpriced`) and a grounded
-turn (`tool_use_unpriced`) are unknown cost and pause the run until settled. Trailing mic input after
-the last usage is not a cut turn: streamed `realtimeInput` audio/video and `audioStreamEnd` followed by a
-normal client close write nothing, while `clientContent{turnComplete}`, `activityEnd`, `toolResponse` or
-server output without usage still latch `stream_incomplete`. Live on Vertex AI stays
-`404 cloud_route_unsupported`.
+- **Metering:** each `session.usage.updated` and the final `session.closed` writes one
+  receipt for the seconds since the last billed snapshot (`cost_basis: "duration"`,
+  `billed_seconds` = delta, `session_seconds` = cumulative). A snapshot that goes backwards
+  bills 0. Backend model usage (`response.completed` inside `response.event`) is priced like a
+  Responses call, once per response id.
+- **Caps mid-session:** after each metered event the caps are re-checked. A 1 s ticker also
+  estimates the unbilled time since the last snapshot and closes early when it could pass the
+  smallest remaining cap; estimates are never written as spend. On a hit the client gets
+  `error` with the reason, CostCap sends `session.close` upstream, waits up to 5 s for
+  `session.closed`, bills the final seconds and closes the client with `1008`. `costcap kill`
+  closes the client within a second.
+- **Unknowns:** if the client drops, CostCap closes the session itself and still bills the
+  final seconds. Only a missing `session.closed` (upstream drop or the 5 s timeout) is
+  recorded as `cost_usd: null`, `reason: "session_usage_unconfirmed"` with
+  `session_seconds_lower_bound`, which pauses the run until settled.
+- **Not proxied:** WebRTC/SIP (`POST /v1/live/sessions` stays `usage_unavailable`, since the
+  media never passes through CostCap) and a hardcoded `wss://api.openai.com`.
 
 ### Other OpenAI-compatible providers
 
@@ -189,148 +178,65 @@ per 1M tokens; snapshot date suffixes are stripped):
 A priced receipt carries `cost_source: "user_prices"`, `prices_version` and
 `prices_sha256`. A model missing from the file (or cached tokens with no
 `cached_input` rate) records `cost_usd: null, reason: "upstream_model_unpriced"`
-and pauses the run until `costcap reconcile --apply` settles it.
-An entry may also set `cache_write` and `cache_write_1h` (USD per 1M tokens) for
-OpenAI-style `prompt_tokens_details.cache_write_tokens`; cache writes on an entry
-without the matching rate record `cost_usd: null, reason: "user_price_unpriced"`,
-never $0. Groq's `service_tier` values `on_demand` (its default) and `default`
-price at the standard rates; `performance`, `priority`, `fast` and other premium or
-unknown tiers have no user rate and are unpriced. On OpenRouter, a numeric
-`usage.cost` settles the receipt (`cost_source: "provider"`) even when the table
-has no cache-write or service-tier rate.
+and pauses the run until `costcap reconcile --apply` settles it. An entry may add
+optional `cache_write` and `cache_write_1h` rates for gateways that pass OpenAI's
+`prompt_tokens_details.cache_write_tokens` through; cache writes with no matching
+rate record `cost_usd: null, reason: "user_price_unpriced"`, never $0. Groq reports
+`service_tier` `on_demand` (its default), `auto`, `flex`, `performance` or `default`:
+`on_demand`, `auto`, `flex` and `default` price at the file's standard rates;
+`performance` (and `priority` / `fast` / `ultrafast`) has no rate in the file and
+records `service_tier_unpriced`.
 `--unknown-models refuse`, `--models` and `--preflight` use the same prices; a
 request with no body `model` (Azure deployments) is model-less and refused when
-an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere v2)
-and embeddings/batch/files billing on custom upstreams stay unknown. Claude on
-Bedrock and Vertex has its own built-in routes (next section).
+an allowlist is set. Native non-OpenAI wire formats on custom upstreams (Cohere
+v2) and embeddings/batch/files billing on custom upstreams stay unknown; Claude
+on Bedrock and Vertex has its own built-in routes (below).
 
-## Negotiated rates and new models
+### Claude on Amazon Bedrock / Google Vertex AI
 
-The same `--upstream-prices FILE` can override the shipped table for the built-in
-providers `openai`, `anthropic`, `gemini` and `openrouter`. These keys need no `--upstream`:
+`wrap` also sets the variables Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` /
+`CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic Bedrock/Vertex SDKs read:
 
-```json
-{ "version": "acme-2026-11", "upstreams": {
-  "anthropic": { "claude-sonnet-4-5": { "discount": 0.2 } },
-  "openai": { "gpt-6-preview": { "input": 3, "output": 12 }, "*": { "discount": 0.1 } } } }
-```
+| Provider | Child env | Upstream |
+|---|---|---|
+| Bedrock | `ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:<port>/bedrock` | `https://bedrock-runtime.<region>.amazonaws.com` |
+| Vertex AI | `ANTHROPIC_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex/v1` | `https://<location>-aiplatform.googleapis.com` (`global`: `aiplatform.googleapis.com`) |
 
-- `{discount: d}` (0 < d < 1) scales every table component of the model (standard,
-  long context, fast/priority, modalities, batch) by `1-d`. `"*"` applies a discount to
-  every model in the table for that provider; a model-specific entry wins over it.
-- Absolute rates (`input`, `output`, optional `cached_input`, `cache_write`, `cache_write_1h`,
-  USD per 1M tokens) can price a model that isn't in the table. They price only the
-  standard text components they list.
-- **Never $0, never silently lower.** Rates must be > 0. `wrap` exits 2 before spawning on
-  a discount outside (0,1), rates mixed with a discount, an unknown key, or `"*"` with rates.
-  A discount never applies to a fallback-priced model: a `{discount}` entry for a model not in the
-  pricing table is ignored (`wrap` warns "discount ignored: …"), so `--unknown-models refuse` still refuses it and
-  `pricing show`/`--preflight` quote the full fallback rate. If a call needs a component that an
-  absolute entry doesn't list (a cache write with no rate, long context over the table
-  threshold, fast/priority, non-text tokens or a batch line), the receipt is
-  `cost_usd: null, reason: "user_price_unpriced"` and the run pauses. The table rate is never used instead.
-- Receipts record `cost_source: "user_prices"`, `prices_version`, `prices_sha256` and the
-  table pin. `--unknown-models refuse`, `--preflight` and `--models` use the same rates.
-  OpenRouter's reported `usage.cost` still wins.
-- `costcap pricing show MODEL --prices FILE` prints the effective row. `costcap pricing verify
-  --receipts R --prices FILE` counts `user_prices` receipts and exits 1 when their
-  `prices_sha256` doesn't match the file. The hosted Spend card shows "$X at your prices".
-
-## Gemini context caching
-
-`costcap wrap` meters the Gemini API's explicit cache (`/v1beta/cachedContents`). A create
-(`POST`) is billed for storage from the response: `usageMetadata.totalTokenCount` × the
-model's `cache_storage` rate (USD per 1M tokens per hour) × hours from `createTime` to
-`expireTime`. A TTL update (`PATCH`) bills only the extension past the last expiry this
-wrapper saw; for a cache it never saw it bills `updateTime → expireTime` with
-`storage_upper_bound: true`, and a shorter TTL is $0 (no refund). `DELETE`, `GET` and list
-are $0. Receipts carry `kind: "cache_storage"`, `cache_name`, `cache_tokens` and
-`storage_hours`, and count toward every cap. The create's `models/{id}` is checked as `{id}`
-by `--models`, `--unknown-models refuse` and `--model-cap`; `--preflight` lets it through
-(`preflight_estimate: false`) and `--downgrade` never rewrites it. Storage rates are dated
-like token rates (a TTL across a price change is split at the boundary); `costcap pricing
-show <model>` prints them. Gemini 4 has no published storage rate, so a create on it, or a
-response without a token count or expiry, is `cache_storage_unpriced` and pauses the run
-until reconciled. Receipts are an upper bound: Google documents no refund for early deletes.
-Vertex `cachedContents` stays unsupported.
-
-## Claude on Bedrock / Vertex, Gemini on Vertex
-
-`costcap wrap` sets `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and
-`ANTHROPIC_VERTEX_BASE_URL`, so boto3 / AWS SDK v3 Bedrock callers, Claude Code (`CLAUDE_CODE_USE_BEDROCK=1` / `CLAUDE_CODE_USE_VERTEX=1`) and the Anthropic
-Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
-
-- **Routes.** Bedrock `POST /model/{id}/invoke`, `invoke-with-response-stream` and
-  `count-tokens`, plus Converse `POST /model/{id}/converse` and `converse-stream`
-  (boto3 `converse`/`converse_stream`, LangChain `ChatBedrockConverse`, Strands), go to `bedrock-runtime.<region>.amazonaws.com`. Vertex
-  `…/locations/<loc>/publishers/anthropic/models/{id}:rawPredict` and `:streamRawPredict`
-  go to `<loc>-aiplatform.googleapis.com` (`global` goes to `aiplatform.googleapis.com`).
-  Converse is metered from `usage` (`inputTokens`, `outputTokens`, `cacheReadInputTokens`,
-  `cacheWriteInputTokens`) and ConverseStream from the final `metadata` event; a stream cut
-  before `metadata` is `stream_incomplete` (unknown cost, never $0). Preflight reads
-  `inferenceConfig.maxTokens`. If `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` is already set, wrap leaves
-  it alone and warns once.
-- **Nova, Llama, Mistral, DeepSeek, gpt-oss and Qwen on Bedrock (#278).** Listed non-Anthropic
-  Bedrock models (`bedrock_models` in the pricing table: Amazon Nova Micro/Lite/Pro/Premier/2 Lite,
-  Meta Llama 3.1/3.3/4, Mistral Large 3, DeepSeek R1/V3.1, OpenAI gpt-oss 20b/120b, Qwen3) are
-  priced on invoke, Converse and ConverseStream at AWS on-demand standard rates from the AWS Price
-  List. The rate is the request region's row (the SigV4 region, else `AWS_REGION` /
-  `AWS_DEFAULT_REGION`); a geo profile (`us.` / `eu.` / `apac.` …) bills at that source region, and the
-  Claude 10% regional premium never applies. `costcap pricing show amazon.nova-pro-v1:0` prints every
-  region. These stay `cloud_model_unpriced` (run pauses, never the fallback): an unlisted id, a region
-  with no row, a `global.` profile, an ARN, or a usage component with no rate (e.g. cache writes).
-  A Converse `serviceTier.type` other than `default` is `service_tier_unpriced`.
-  InvokeModel (#288) reads each model's native usage (Nova `usage.inputTokens/outputTokens` and
-  `cacheReadInputTokenCount`, Llama `prompt_token_count/generation_token_count`, OpenAI-style
-  `usage.prompt_tokens/completion_tokens`), else the `X-Amzn-Bedrock-Input-Token-Count` /
-  `-Output-Token-Count` headers; `invoke-with-response-stream` is priced from the final chunk's
-  `amazon-bedrock-invocationMetrics` (cut before it: `stream_incomplete`). No usage at all stays
-  `usage_unavailable`.
-- **`bedrock` / `vertex` keys in `--upstream-prices`.** Same rules as the other built-in keys
-  (#189): `{discount}` scales table rows, absolute rates price an unlisted Bedrock id in any region,
-  `"*"` takes a discount only, rates must be > 0. Bedrock keys are the base id without geo prefix
-  (`amazon.nova-pro-v1:0`, `anthropic.claude-sonnet-4-5-20250929-v1:0`); Vertex keys are the model
-  id (`gemini-2.5-pro`, `claude-sonnet-4-5`). Overridden receipts carry `cost_source: "user_prices"`.
-  Any other path (`GET /inference-profiles`, multi-region Vertex hosts such as
-  `locations/us`) is answered locally with `404 cloud_route_unsupported` and never forwarded.
-- **Gemini on Vertex.** wrap also sets `GOOGLE_VERTEX_BASE_URL=http://127.0.0.1:<port>/vertex`
-  (read by Google's genai SDKs with `vertexai=True`; for SDKs that don't read it, pass
-  `http_options.base_url` with that value). `…/publishers/google/models/{id}:generateContent`,
-  `:streamGenerateContent` (`?alt=sse` or the default JSON-array stream) and `:countTokens`
-  (free) are metered from `usageMetadata` exactly like `/gemini` calls, with caps, kill switch,
-  allowlist and preflight (`generationConfig.maxOutputTokens`). Receipts have provider `vertex`.
-  `@version` / `-NNN` suffixes price as the base id; only Gemini models listed under
-  `vertex_gemini` in the pricing table are priced, any other id is unknown (never $0).
-  That list covers Gemini 2.5 Pro / Flash / Flash-Lite, Gemini 4 Carbon / Argon / Hydrogen,
-  3.8 / 3.6 Flash, 3.5 Flash-Lite and 3.1 Pro Preview (#256). Their global rates are the same as
-  the Gemini API rates, and they are priced at the request instant (`COSTCAP_PRICING_CLOCK` pins it),
-  so dated rate changes apply (Carbon/Argon from 2026-12-01, 3.8/3.6 Flash from 2027-01-01, with
-  `rates_effective_from` on the receipt). Gemini API `billed_as` remaps never apply on Vertex.
-  A regional (non-global) endpoint adds Vertex's +10% on GA Gemini 3+ models (`regional_multiplier: 1.1`,
-  on every component including cached input and long context). 3.1 Pro Preview and 2.5 have no premium.
-  Batch prediction, `cachedContents`, tuning, Imagen, Veo, embeddings and Live stay
-  `404 cloud_route_unsupported`.
-- **Bedrock credentials.** A `Bearer` Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) passes
-  through unchanged; the region comes from `AWS_REGION`, then `AWS_DEFAULT_REGION`. A SigV4
-  request is signed by the child for the local proxy, so CostCap verifies it with the static
-  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` in wrap's environment
-  (bad signature: `403 bedrock_signature_invalid`) and re-signs it for the real host. Without
-  static credentials a signed call gets `502 bedrock_credentials_unavailable` and nothing is
-  forwarded. Profiles, SSO and IMDS are not resolved inside the proxy; export them first:
-  `eval "$(aws configure export-credentials --format env)"`. Keys never reach receipts.
-- **Vertex credentials.** The OAuth `Authorization` header passes through unchanged.
-- **Metering.** JSON, Vertex SSE and Bedrock's binary `application/vnd.amazon.eventstream`
-  are metered in real time (frames forwarded byte-for-byte, CRC-checked). A cut stream or a
+- **Routes.** Bedrock `/model/{id}/invoke`, `/invoke-with-response-stream` and
+  `/count-tokens`; Vertex `…/publishers/anthropic/models/{id}:rawPredict` /
+  `:streamRawPredict` on a single-region or `global` location. Anything else
+  (Converse, `GET /inference-profiles`, multi-region `locations/us|eu`) is
+  answered locally with `404 cloud_route_unsupported`: never forwarded, never
+  unmetered, no receipt, no pause.
+- **Bedrock credentials.** A Bedrock API key (`Authorization: Bearer`,
+  `AWS_BEARER_TOKEN_BEDROCK`) passes through; the region is `AWS_REGION`, then
+  `AWS_DEFAULT_REGION`. A SigV4-signed request is verified with wrap's own
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+  (`403 bedrock_signature_invalid` on mismatch) and re-signed for the real host
+  (region from the credential scope). The proxy does not resolve `AWS_PROFILE`,
+  SSO or IMDS: without static credentials a signed call gets
+  `502 bedrock_credentials_unavailable`. Export them first:
+  `eval "$(aws configure export-credentials --format env)"`.
+- **Vertex credentials.** The OAuth bearer `Authorization` header passes through unchanged.
+- **Metering.** JSON and Vertex SSE use the Anthropic usage rules (cache
+  read/write, 1h writes, fast mode, long context). Bedrock's binary
+  `application/vnd.amazon.eventstream` is forwarded byte-for-byte in real time
+  and decoded on the side (CRC-checked); a stream cut before `message_stop` or a
   bad CRC is `stream_incomplete`. `count-tokens` is free.
-- **Models.** The model comes from the path: Bedrock geo prefixes (`global.`, `us.`, `eu.`,
-  `apac.`, `jp.`, `au.`), `anthropic.` and `-vN[:M]` are stripped; Vertex `@YYYYMMDD` is
-  stripped. Receipts carry `provider`, `model` (table id), `provider_model` (raw id) and
-  `endpoint_scope`. A non-Anthropic id, an ARN or an unlisted id records
-  `cost_usd: null, reason: "cloud_model_unpriced"` and pauses; it never uses the fallback rate.
-- **Regional premium.** Claude 4.5+ on regional endpoints costs 10% over global (Bedrock
-  `global.` ids and Vertex `locations/global` are global). The table's `regional_endpoint`
-  multiplier stacks with long context and batch; receipts record `regional_multiplier`.
-- Cloud routes always bypass the response cache (`x-costcap-cache: bypass`).
+- **Model ids** come from the path. Bedrock strips the geo prefix
+  (`global.|us.|eu.|apac.|jp.|au.`), `anthropic.` and `-vN[:M]`; Vertex strips
+  `@YYYYMMDD`. Non-Anthropic ids, inference-profile ARNs and unlisted ids record
+  `cost_usd: null, reason: "cloud_model_unpriced"` (never the fallback rate) and
+  pause the run. `--models`, policy allowlists, `--unknown-models refuse` and
+  `--preflight` use the mapped id.
+- **Regional premium.** Claude 4.5+ on regional (non-global) endpoints costs
+  10% more than global (table key `regional_endpoint`). Bedrock `global.` ids and
+  Vertex `locations/global` are global; every other request is regional and is
+  billed at 1.1x on every rate component, stacking with long context. Receipts
+  carry `provider: "bedrock"|"vertex"`, `model` (table id), `provider_model`,
+  `endpoint_scope` and `regional_multiplier`.
+- Cloud routes never use the response cache (`x-costcap-cache: bypass`).
+  Private-offer / negotiated cloud rates are not modelled.
 
 ## Enforcement limits
 
@@ -360,44 +266,22 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   is provably gone; any other holder (another host, unreadable owner) is waited
   on for 5s and then the wrapper refuses calls with `receipt_ledger_unavailable`.
   Shared and exclusive (default) wrappers refuse to run on the same ledger.
-  Sharing across hosts is the hosted fleet's job (fleet-wide agent caps, #127).
-- `--preflight` (or `COSTCAP_PREFLIGHT=1`, off by default) refuses a call whose
-  **estimated** worst case cannot fit the remaining run/day/month budget, before
-  any upstream call, with `budget_exceeded` / `reason: "preflight_estimate"`.
-  It also covers `--policy` agent and team budgets (the tighter remainder) and
-  every matching `--tag-cap` (`tag_budget_exceeded`). With `--enrollment` it also
-  covers the enrolled fleet agent day/month caps and the hosted team budget,
-  against fleet-wide synced spend plus this host's unsynced receipts
-  (`fleet: true`, and `team` for a team budget).
-  It is an estimate, not a tokenizer: input tokens = request bytes / 4, output
-  tokens = `max_tokens` (or `max_completion_tokens`, Gemini
-  `generationConfig.maxOutputTokens`), else a conservative provider default,
-  times the completion count: OpenAI-compatible `n` / `best_of` (the larger,
-  since `best_of` bills every candidate) or Gemini `candidateCount`
-  (`candidate_count`). An invalid count is treated as 1 and flagged
-  `output_multiplier_defaulted`; a count above the provider maximum (128 for
-  OpenAI/OpenRouter, 8 for Gemini) is clamped to it and flagged
-  `output_multiplier_clamped`. Allowed calls record `output_tokens_est` and
-  `output_multiplier` on their receipt.
-  Text that tokenizes denser than 4 bytes/token can still overshoot. Models
-  with no published rate are refused with `preflight_unpriced`, never priced at
-  the fallback. The blocked receipt has `estimate: true`, `estimate_usd` and
-  `scope`, and costs $0 toward spend.
-  Which endpoints are estimated (#205): chat, responses, messages, embeddings
-  and other generating POSTs use the maths above. An Anthropic Message Batches
-  create is estimated as the **sum** of every `requests[].params` worst case
-  times the batch rate (0.5x); the batch preflight discounts tokens only, and
-  each entry's tool worst case (`max_uses` x rate) is added at 100%
-  (`tool_calls_max` / `tool_usd_max` are summed across entries, #218); any unpriced entry refuses with
-  `preflight_unpriced` naming it. These pass through preflight unestimated
-  (still subject to caps, allowlists and rpm; the receipt has
-  `preflight_estimate: false`): `GET`/`HEAD` (background polls, batch and file
-  retrieves, `/v1/models`), `/v1/files` and `/v1/uploads`, and OpenAI batch
-  creates (their models live in the uploaded file; results are metered at
-  settle). Audio (`/v1/audio/*`) is checked against the extracted `model`
-  only: a priced model (e.g. `whisper-1`) passes, an unpriced one refuses with
-  `preflight_unpriced` naming it.
-- Local `wrap`/`check` daily and monthly periods use UTC; hosted caps follow the org budget period (below). Pricing is a versioned estimate, not the
+  Sharing across hosts is the hosted fleet's job.
+- `--preflight` (or `COSTCAP_PREFLIGHT=1`, or `"preflight": true` in a
+  `--policy` file) is **off by default**. Before forwarding, it estimates the
+  call's **worst case** and refuses it with `budget_exceeded`,
+  `reason: "preflight_estimate"` when that can't fit the remaining run, day or
+  month budget. **It is an estimate, not a tokenizer:** input tokens are
+  bounded by `ceil(request bytes / 4)` (images, tool schemas and unusual
+  tokenization can exceed this), output tokens are `max_tokens` /
+  `max_completion_tokens` / `generationConfig.maxOutputTokens`, or a
+  conservative per-provider default maximum when absent (OpenAI/OpenRouter
+  32,768; Anthropic 64,000; Gemini 65,536). Cache discounts and reasoning
+  tokens beyond the max are not modelled. A model with no rate in the table is
+  refused with `preflight_unpriced`, never forwarded as free. Blocked receipts
+  carry `estimate: true`, `estimate_usd` and `scope`, and cost $0 in totals.
+  Post-call metering is unchanged.
+- Daily and monthly periods use UTC. Pricing is a versioned estimate, not the
   provider bill. The table prices common OpenAI, Anthropic, Gemini, and
   OpenRouter model ids. Announced price changes ship as effective-dated rows (#236):
   from 00:00 UTC on the date the new rate applies with no upgrade (Gemini 4 Carbon/Argon
@@ -470,8 +354,10 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   rates. The receipt records `pricing_tier: "fast" | "priority" | "ultrafast"` plus the raw
   `speed` / `service_tier`. Fast over 272K uses 2x the long-context rates where the model page
   states it (every new row except `gpt-5.5`); any other premium tier over 272K is unpriced.
-  `default`, `auto`, `flex`, `scale`, `standard` and `batch` price at standard; any other
-  `service_tier` value is `service_tier_unpriced`.
+  `default`, `auto`, `flex`, `scale`, `standard`, `batch` and `on_demand` (Groq, OpenRouter)
+  price at standard; any other `service_tier` value is `service_tier_unpriced`. On OpenRouter a
+  numeric `usage.cost` is the receipt cost (`cost_source: "provider"`) even when the table
+  cannot price a cache write or service tier.
   These rates count toward caps and the velocity breaker. `default` and `flex` tiers are priced at
   standard (flex over-counts, which is the safe direction), and the value is recorded. A premium
   tier on a model with no published premium rate, including fallback models and cache
@@ -531,34 +417,18 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   `non_billable_request`: Anthropic documents "Files API operations are free"; file
   content is billed as input tokens when used in a Messages call. 5xx, 2xx without usage and cut streams stay unknown
   and still pause. Repeated identical 429s still trip the retry-spiral breaker.
-- Retrieves never create spend: any GET/HEAD (for example `GET /v1/responses/{id}` or a
-  stored `GET /v1/chat/completions/{id}`) is `cost_usd: 0, reason: "non_billable_request"`
-  even when the body carries usage, unless it settles a pending background response.
-- OpenAI Responses background mode (`POST /openai/v1/responses` with
-  `background: true`): a 2xx `queued`/`in_progress` reply writes a
-  `reason: "background_pending"` receipt with `response_id` at `cost_usd: null`. Like a
-  pending batch it does not pause the run, spend is a lower bound and `costcap check`
-  fails until it settles. A cut `background: true, stream: true` stream that already
-  sent `response.created` is also `background_pending`. Polling `queued`/`in_progress`
-  costs $0. The first terminal (`completed`, `incomplete`, `failed`, `cancelled`) read
-  through the proxy (`GET /v1/responses/{id}`, a resumed `?stream=true` stream, or
-  `POST /v1/responses/{id}/cancel`) appends one
-  `{"event":"reconciliation","source":"background_result","response_id"}` at the
-  create's `ts` (once, including across restarts). A terminal reply with null or
-  unpriceable usage appends `{"event":"background_unpriced"}`: the receipt becomes an
-  unknown `background_unpriced` and the run pauses.
-  Another run's background settle counts toward day/month and `--policy`/`--tag-cap`
-  budgets, never toward this run's velocity breaker (matching batches).
 - Batch APIs (`POST /v1/messages/batches` on Anthropic, `POST /v1/batches` on
   OpenAI): a 2xx create writes a `reason: "batch_pending"` receipt with `batch_id`
   (and `request_count` for Anthropic) at `cost_usd: null`. It does not pause the
   run, but the run total stays unknown and `costcap check` fails until the batch
-  settles. Enrolled fleet day/month caps and hosted team caps (`costcap wrap
-  --enrollment`) follow the same rule: a pending batch is shown as pending, not as an
-  unreconciled unknown, and its settled cost counts toward the fleet/team total.
-  Reading the results through the proxy settles it: Anthropic
+  settles. Reading the results through the proxy settles it: Anthropic
   `GET /v1/messages/batches/{id}/results`, or OpenAI `GET /v1/batches/{id}` (which
   links its `output_file_id`) then `GET /v1/files/{output_file_id}/content`.
+  Enrolled fleet day/month caps and hosted-team caps (`wrap --enrollment`) follow
+  the same rule: a pending batch is not an unreconciled unknown, so the next call
+  and the results read are allowed, and once settled its cost counts toward the
+  fleet/team cap. The fleet view shows it as `pending_batches` /
+  `pending_batch_count`, not as unknown.
   Succeeded lines are priced at the published 50% batch rate (pricing table
   `batch`, applied to every component including cache reads/writes and on top of
   long_context); errored, canceled, expired and non-2xx lines cost $0. One
@@ -569,28 +439,9 @@ Bedrock/Vertex SDKs are metered, capped and killable like `api.anthropic.com`.
   Anthropic `requests[].params.model` is checked against `--models` and
   `--unknown-models refuse`; an OpenAI batch names its models only inside the
   input file, so an OpenAI batch create is refused whenever an allowlist is set.
-  Gemini Batch Mode (#230): a 2xx `POST /gemini/v1beta/models/{m}:batchGenerateContent`
-  writes the same `batch_pending` receipt (`batch_id` from `name: "batches/{id}"`,
-  `request_count` for inline requests, the path model checked against `--models`
-  and `--unknown-models refuse`). A `GET /gemini/v1beta/batches/{id}` that is
-  `done` with inlined responses settles it; one that names a `responsesFile`
-  links the file, and `GET /gemini/download/v1beta/files/{f}:download` settles it.
-  Lines are priced like interactive Gemini calls (cache, thoughts, modality and
-  long-context rules) at `batch.gemini` 0.5; error lines are $0. Cancel
-  (`POST …/batches/{id}:cancel`) and `DELETE …/batches/{id}` are $0 and never pause;
-  Batch management calls (#233) are $0 `non_billable_request` receipts that never
-  pause and skip `--models`, `--unknown-models refuse` and `--preflight`: OpenAI
-  `POST /openai/v1/batches/{id}/cancel`, Anthropic `POST /anthropic/v1/messages/batches/{id}/cancel`
-  and `DELETE /anthropic/v1/messages/batches/{id}`, Gemini `POST /gemini/v1beta/batches/{id}:cancel`
-  and `DELETE /gemini/v1beta/batches/{id}`, plus Gemini Files upload
-  (`POST /gemini/upload/v1beta/files`, resumable start and chunks) and
-  `DELETE /gemini/v1beta/files/{name}`. A cancel does not settle a pending batch;
-  a failed, cancelled or expired batch with no output stays pending (unknown).
-  With `--preflight`, an inline Gemini create is estimated as the sum of each
-  request's worst case x 0.5; a file-input create passes unestimated.
-  Not covered: Gemini batch embeddings (`:asyncBatchEmbedContent`), Vertex batch
-  prediction, OpenRouter batches, and polling the provider (costcap only sees
-  results you fetch through it).
+  Not covered: pre-flight reservation for batches, Gemini batch mode and
+  OpenRouter batches, and polling the provider (costcap only sees results you
+  fetch through it).
 - SSE (`text/event-stream`) responses are passed through in real time, chunk by
   chunk with backpressure, and usage is metered from the stream as it passes.
   OpenAI and OpenRouter chat completions only send usage in a stream when
@@ -723,15 +574,12 @@ mode 0600. A 401/403 response freezes the wrapper. Redirects are refused to avoi
 forwarding agent credentials to another host. These paths have local test-server
 coverage, not production verification or a finished org dashboard.
 
-**Fleet-wide agent caps (#127):** `/v1/policy` also returns
-`agent_spend: { spent: { day, month }, unknown, as_of }`, the agent's synced
-spend across every host and runner using that identity (settled costs
-included). The wrapper refuses before calling upstream once synced spend plus
-its own unsynced receipts reach the fleet day/month cap (`429 budget_exceeded`,
-`scope: "day"|"month"`), and refuses with `accounting_unavailable` while any
-unknown cost is unsettled. Spend cached from an earlier UTC day/month counts 0
-for that window. A fresh runner or wiped `.costcap/` no longer starts from $0.
-Overshoot is still bounded by unsynced spend on other hosts (one poll interval).
+A fleet policy can also carry `maxSteps`, the most upstream calls one wrapped
+run may make (dashboard: "Max steps per run"). An enrolled wrapper enforces it
+from its cached policy, offline too, with the same `breaker_open` /
+`step_budget` receipt as `--max-steps`. A local `--max-steps` can tighten it,
+never loosen it. `GET /v1/agents/:id/budget?run_id=RUN` reports `max_steps` and
+`steps` for that run.
 
 ## Per-agent budgets
 
@@ -757,6 +605,8 @@ node src/cli.js agent-status --agent release-bot --policy .costcap/policy.json
 
 **Org, tag and model totals (#286):** the same never-resetting budget for the org budget (`PUT /v1/org-budget {"total": 5000}`, `null` clears it, a budget with only `total` is valid, `GET` reports `spend.total_usd`), fleet tag rules (`PUT /v1/tag-caps` with `{key: "customer", scope: "total", usd: 500}`: "$500 total for `customer=acme`", per value, 10-rule limit, top 1000 values with unlisted values bounded by the lowest listed total) and hosted model caps (`modelCaps: [{model: "gpt-6", scope: "total", usd: 20}]`, the agent's lifetime spend on that model). Spend is every synced receipt since the beginning (revoked agents included for the org), settlements applied. They travel in additive `/v1/policy` fields that an older wrapper ignores: `org_budget_total`, `tag_caps_total`, `model_caps_total` plus `agent_spend.models[*].total`/`unknown_total`; `org_budget*`, `tag_caps*` and `modelCaps` keep their old shape, and a policy with no totals is byte-identical. Enrolled wrappers add their unsynced receipts and refuse with 429 `budget_exceeded` + `scope: "org:total"`, `tag_budget_exceeded` + `scope: "total"`, or `model_budget_exceeded` + `scope: "total"`, with no `Retry-After` and the does-not-reset message. An unsettled unknown-cost receipt anywhere in the capped history (org, tag value or model) makes that verdict `accounting_unavailable` (only when a total is set). `cap_approaching`/`cap_hit` fire once per cap value with period key `total` and resolve when the cap is raised above spend or removed. Retention never deletes a receipt that counts toward an org, tag or model total. The dashboard has "Total (never resets)" in the org budget form and the tag Window select, and shows `total $X of $Y` for the org, each tag value and model cap rows. Local `--tag-cap`/`--model-cap` still reject `total`.
 
+**Total caps that never reset (#265):** `caps.total` (agent) and `total` on `POST /v1/teams` set a fixed USD budget that applies until it is used up, such as "$200 for this research project". Spend is every synced receipt of the agent (for a team, its current members) since the beginning, with settlements applied; it ignores the budget period and the plan's spend-query window. A team may have only a `total`. Enrolled wrappers enforce it from `agent_spend.spent.total` / `team.spent.total` in `/v1/policy` plus their own unsynced receipts and refuse with 429 `budget_exceeded`, `scope: "total"` (agent) or `team:<name>:total`, no `Retry-After`, and a message saying the budget does not reset. Any unsettled `cost_usd: null` receipt in the history makes the verdict `accounting_unavailable` (never $0). `GET /v1/agents/:id/budget` adds `budget_remaining.total_usd`, teams report `spend.total_usd`, the dashboard has a "Total (never resets)" field on the agent card and team form, and `cap_approaching`/`cap_hit` fire once per cap value (period `total`), resolving when the cap is raised above spend or removed. Retention never deletes a receipt that counts toward a configured total cap. To top up, raise the cap. Local `wrap --policy` files accept `total` for agents and teams. Out of scope for now: total tag/model/org caps, local `--total-cap`, total cap raises, `cap_projected` and `--preflight` against the total remainder.
+
 Enrolled agents can also get a fleet step budget: an admin sets "Max steps per run" in the dashboard (`maxSteps` on `POST /v1/agents/:id/policy`). The wrapper enforces it per run from its cached policy, even offline. A local `--max-steps` can tighten it, never loosen it.
 
 ### Model allowlist
@@ -773,9 +623,7 @@ The same `models: [...]` limit works in a `--policy` file (`default`, `agents.<i
 
 Cap one expensive model without stopping the others: `costcap wrap --model-cap claude-opus-4-8:day=20 -- node agent.js` (repeatable, SCOPE `hour|day|month`; the split is on the last `:` so Bedrock ids like `anthropic.claude-opus-4-8-v1:0:day=5` work). Models are matched the way pricing resolves them, so a rule on `claude-opus-4-8` also covers its dated snapshots, `anthropic/claude-opus-4-8` and OpenRouter's dotted form `anthropic/claude-opus-4.8` (variant suffixes like `:thinking` or `:online` included; likewise `openai/gpt-4o` under `gpt-4o` and `google/gemini-2.5-pro` under `gemini-2.5-pro`) and the Bedrock/Vertex ids; an id with no pricing row matches exactly. Once the model's spend in the window reaches the cap, calls to it get `429 {"error":"model_budget_exceeded","model","scope","spend_usd","cap_usd"}` (plus `retry_after_s` and `Retry-After` for `hour`) and are never forwarded; other models keep working and the run is not frozen. Every OpenRouter `models` fallback entry is checked, a #207 downgrade counts against the model actually sent, `--preflight` also checks the worst case against the model's remaining headroom, and an unsettled unknown-cost receipt for a capped model returns `accounting_unavailable` for that model only until it is reconciled.
 
-`costcap check --model-cap claude-opus-4-8:day=20` lists rules at or over their cap in `model_caps` and fails (the Action takes `model-caps: "claude-opus-4-8:day=20"` and outputs `model-caps`). Hosted: `POST /v1/agents/:id/policy` takes `modelCaps: [{"model":"claude-opus-4-8","scope":"day","usd":20}]` (null clears); enrolled wrappers enforce `day` and `month` rules fleet-wide (#244): `GET /v1/policy` ships `agent_spend.models` (`{<model>: {day, month, unknown}}`, the agent's settled-aware synced spend on every host in the org budget period), and each wrapper adds its own unsynced receipts, so a 3-host agent cannot spend 3x the cap. Over the cap, calls to that model get `429 model_budget_exceeded` with `fleet: true`; unknown cost for that model gives `accounting_unavailable` for that model only. Hosted `hour` rules and local `--model-cap` rules stay local (UTC, local ledger); where a local and a hosted rule both apply, either one refuses. The alert worker pages each hosted rule per agent: `cap_approaching` at the agent's `warnFractions` (once per fraction per period), `cap_hit` at the cap or on a synced `model_budget_exceeded` block (hour blocks included), keyed `<kind>:<agentId>:model:<model>:<scope>`; email/Slack say `agent <name>, model <id>, <scope>` and the signed webhook carries `model`. A model with unknown-cost receipts raises no spend alert. The agent card's "Model caps" line shows fleet spend against each cap (`claude-opus-4-8 day $4.10 / $5`). OpenAI batch creates and Files uploads are not pre-checked; their settled spend still counts under the receipt's model.
-
-**Weekly model caps (#268).** Hosted `modelCaps` also take `"scope":"week"` (ISO week, Monday 00:00 in the org budget-period timezone). Week rules are enforced fleet-wide only: `GET /v1/policy` sends them in the additive `model_caps_week` list (never in `modelCaps`, so a pre-#268 wrapper keeps accepting the policy) and `agent_spend.models[*]` adds `week` and `unknown_week`. A week that starts in the previous month counts both months. Over the cap, calls get `429 model_budget_exceeded` with `scope: "week"` and `fleet: true`; unknown cost inside the week refuses that model with `accounting_unavailable`. Alerts fire once per week, and the agent card shows week spend. The local `--model-cap` flag still accepts only `hour`, `day` and `month` (#264).
+`costcap check --model-cap claude-opus-4-8:day=20` lists rules at or over their cap in `model_caps` and fails (the Action takes `model-caps: "claude-opus-4-8:day=20"` and outputs `model-caps`). Hosted: `POST /v1/agents/:id/policy` takes `modelCaps: [{"model":"claude-opus-4-8","scope":"day","usd":20}]` (null clears); enrolled wrappers enforce hosted `day`/`month` rules fleet-wide (#244): `GET /v1/policy` adds `agent_spend.models` (`{<normalized model>: {day, month, unknown}}` for the capped models, from the agent's synced receipts on every host, settlement-aware, in the org budget period, pending batches excluded), and the wrapper adds its own unsynced receipts on top. Over the cap is 429 `model_budget_exceeded` with `fleet: true`; an unknown-cost receipt for that model makes only that model `accounting_unavailable`; other models keep working and the run is not latched. Hosted `hour` rules stay local. Local `--model-cap` rules keep their local UTC behaviour, and where both a local and a hosted rule exist either one refuses. The alert worker pages each hosted rule per agent: `cap_approaching` at the agent's `warnFractions` (once per fraction per period) and `cap_hit` at or over the cap or on a synced `model_budget_exceeded` refusal in the last hour (hour scope too), keyed `<kind>:<agentId>:model:<model>:<scope>`; alerts resolve when the condition clears, the rule is removed, the period rolls over or the agent is revoked, and a model with unknown-cost receipts this period raises none. Email/Slack text says `agent <name>, model <id>, <scope>` and the signed webhook payload adds `model`. The agent card's "Model caps" line shows fleet spend against each cap (`claude-opus-4-8 day $3.20 / $5`). OpenAI batch creates and Files uploads are not pre-checked; their settled spend still counts under the receipt's model.
 
 An agent entry replaces the default. An agent with no entry and no default is
 refused (`no_budget_policy`).
@@ -899,40 +747,11 @@ Each enrolled wrapper gets its team's caps and the team's synced spend with ever
 
 **Overshoot:** team spend comes from synced receipts. Spend another member has not synced yet (up to one poll interval, 60s) is not seen, so the team can go over its cap by that amount. Removing an agent from a team stops its team enforcement at its next poll. `GET /v1/agents/:id/budget`, `/v1/evidence.json` (`teams[]`, `agents[].team`) and the dashboard's Team budgets card show each team's cap, spend and verdict.
 
-**Team alerts:** each alert sweep checks every team against its own day and month caps. At 80% of a cap (default 80%, configurable per agent/team) it raises `cap_approaching`, and at 100% it raises `cap_hit` (keys `cap_approaching:team:<orgId>:<name>:<scope>` and `cap_hit:team:<orgId>:<name>:<scope>`). A member receipt blocked with `scope: "team:<name>:<scope>"` in the last hour also raises that team's `cap_hit`, even when synced totals lag. A team with unknown cost raises no cap alert. Team alerts fire once, re-arm after the condition clears, go to the org's alert destinations, and carry `team`, `scope`, `cap` and `spent`. Deleting the team deactivates them. A team with a month cap also gets a month `cap_projected` (key `cap_projected:team:<orgId>:<name>:month`, carrying `projected`) when its linear run rate for the org budget period reaches the cap, from 24h into the period and only while no month `cap_hit` fires. It fires at most once per period: it stays active if the rate dips, and resolves on `cap_hit`, team removal or period rollover.
+**Team alerts:** each alert sweep checks every team against its own day and month caps. At 80% of a cap (default 80%, configurable per agent/team) it raises `cap_approaching`, and at 100% it raises `cap_hit` (keys `cap_approaching:team:<orgId>:<name>:<scope>` and `cap_hit:team:<orgId>:<name>:<scope>`). A member receipt blocked with `scope: "team:<name>:<scope>"` in the last hour also raises that team's `cap_hit`, even when synced totals lag. A team with unknown cost raises no cap alert. Team alerts fire once, re-arm after the condition clears, go to the org's alert destinations, and carry `team`, `scope`, `cap` and `spent`. Deleting the team deactivates them.
 
 **Warning fractions (hosted):** `cap_approaching` defaults to 80%, configurable per agent/team. Set `warnFractions` on `POST /v1/agents/:id/policy` or `POST /v1/teams` (or "Warn at (%)" in the dashboard), e.g. `[0.5, 0.8, 0.95]`: 1-5 unique fractions between 0 and 1, stored sorted. Omitted keeps the saved value, `null` resets to the default, and `[]` turns `cap_approaching` off (`cap_hit` still fires). Each sweep fires the highest crossed fraction, at most once per UTC day/month cap period; a jump past lower fractions covers them. The 0.8 key stays `cap_approaching:<id>:<scope>`; others append `:p<pct>` (e.g. `:p95`), and the alert carries `fraction`. Raising a cap re-arms only fractions whose threshold moves above current spend. Wrappers ignore `warnFractions`.
 
 **Run alerts (hosted):** set a per-run cap (`caps.run`, "Per run" on the agent card) and each alert sweep checks every run synced in the last hour by `run_id`. At the warning fraction (default 80%) it raises `cap_approaching` keyed `cap_approaching:<id>:run:<runId>`, and at the cap `cap_hit:<id>:run:<runId>`, each at most once per run. Unknown cost is never $0: an all-unknown run raises nothing, a partial one alerts on known spend with `lower_bound: true`. A blocked run receipt with the same `run_id` does not page twice. Alerts carry `run_id` in the dashboard and `/v1/evidence.json`.
-
-### Hosted org budget
-
-One hard day and/or month cap for every agent in the workspace together ("all our agents never spend more than $2,000 this month"), including agents enrolled later and agents in no team (#240).
-
-- `GET /v1/org-budget` (any member, viewers included) returns `{ org_budget, canEdit }`; `org_budget` is `null` when unset.
-- `PUT /v1/org-budget` with `{ "day"?: usd, "week"?: usd, "month"?: usd, "warnFractions"?: [0.5, 0.9] }`. USD must be > 0; `null` clears a field; an unknown field or an `hour`/`run` scope returns 400. Owners, admins and admin API keys can write; a viewer session or viewer key gets 403. Every change is audited as `org_budget.change` with `before`/`after`.
-- `/v1/policy` carries `org_budget: { caps, spend: { day_usd, month_usd, unknown_count }, verdict, as_of }`, summed from all of the org's synced receipts (revoked agents' spend still counts) in the org budget period (#209). Settled receipts count at their settled value; a pending batch is pending, not unknown; any unknown cost makes the verdict `accounting_unavailable`, never $0.
-- Each enrolled wrapper adds its own unsynced spend and checks the org cap after its agent cap and team cap (`wrap`, `check`, the MCP budget tool and `--preflight`). A refusal is HTTP 429 `budget_exceeded` with `scope: "org:day"` or `"org:month"` and `org: true`; the upstream never sees the call. An agent or team cap that is hit first is reported with its own scope. Like teams, hosts coordinate through the 60s poll, so the org can overshoot by what other hosts spend between polls.
-- Alerts: `cap_approaching` (default 80%, or `warnFractions`), `cap_hit` and a month `cap_projected`, keyed `<kind>:org:<orgId>:<scope>` and carrying `org: true`. They go to the org's alert destinations, fire once per period, and resolve when the cap is raised or the period rolls over in the org timezone.
-- `GET /v1/agents/:id/budget` and `/v1/evidence.json` include `org_budget`; the dashboard has an **Org budget** card (read-only for viewers).
-- **Week (#268):** `PUT /v1/org-budget` also takes `"week"` (an ISO week, reset Monday 00:00 in the org budget-period timezone; a week that starts in the previous month counts both months). A budget with only `week` is valid. Old wrappers get the `org_budget` block with day/month only (`null` when only `week` is set); the full budget with `caps.week` and `spend.week_usd` goes in the additive `org_budget_v2` block, sent only when a week cap is set. A refusal is `budget_exceeded` with `scope: "org:week"`. `cap_approaching`/`cap_hit` fire once per week. The card has **Week USD** and shows `week: $X of $Y`.
-- Week (#271): the org week budget projects (`cap_projected:org:<orgId>:week`) and `--preflight` refuses against the org week remainder (`scope: "org:week"`).
-- Out of scope: hour/run org caps, automatic fleet freeze (the fleet freeze stays manual).
-
-## Model downgrade
-
-Degrade, don't die: past a fraction of a cap, a wrapped agent's expensive model calls go upstream on a cheaper model instead of stopping at 100%.
-
-```sh
-costcap wrap --day-cap 10 --downgrade gpt-4o=gpt-4o-mini,claude-opus-4-1=claude-sonnet-4-5 --downgrade-at 0.8 -- node agent.js
-```
-
-- **Trigger:** the first run/hour/day/month scope whose spend is at or above `F` (default `0.8`, 0 < F ≤ 1) of its cap. That can be a local cap, a `--policy` agent or team budget, or an enrolled fleet agent or team cap. Unknown cost is never counted as $0: known spend is a lower bound and still triggers.
-- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes (streamed requests included). Under `F`, requests are byte-identical. The allowlist, `--unknown-models refuse`, preflight, tag caps and the cache key all see the new model. A disallowed or unpriced target is refused as usual, never sent as the original. An unpriced `--downgrade` target exits `2` at wrap start.
-- **Not rewritten:** Gemini (model in the path), Bedrock/Vertex, batches, multipart audio and OpenRouter `models[]`. These pass through unchanged, with receipt `downgrade: "unsupported_route"`.
-- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction}`, and the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line are written per scope and period, never counted as spend. The run summary and `costcap runs` show `downgraded_calls`.
-- **Hard stop:** at 100% the cap still refuses. A downgrade never raises or bypasses any cap.
-- **Fleet:** `downgrade: {at, map}` on `POST /v1/agents/:id/policy` ("Downgrade models" / "Downgrade at (%)" on the agent card; `null` clears it). A bad fraction, an empty map or FROM equal to TO returns `400`. Enrolled wrappers use the cached map offline. Local `--downgrade` can only add models the fleet does not map, and local `--downgrade-at` can only lower `at`.
 
 ## Rate limits
 
@@ -948,19 +767,20 @@ node src/cli.js wrap --rpm 60 --tpm 200000 -- node your-agent.js
 - **TPM** adds the metered tokens (input + cached input + cache writes + output) when a call completes. It is checked before each call, so one in-flight call can overshoot it. Unknown usage adds 0 tokens.
 - **Refusal:** CostCap never queues. It returns `429` with `Retry-After` (seconds, at least 1) and `{error:{type:"rate_limited", source:"costcap", limit:"rpm"|"tpm", limit_value, observed, window_s:60, retry_after_s, message}}`, which the OpenAI and Anthropic SDKs retry. Each refusal writes a $0 `blocked:true, reason:"rate_limited"` receipt. It never latches and never counts toward `maxSteps`, velocity, spiral, caps or alerts.
 
-## Parallel calls
+## Model downgrade
 
-By default a wrapper forwards one model call at a time. An agent that fans out (parallel tool calls, sub-agents, `asyncio.gather`) can run several at once:
+Degrade, don't die: past a fraction of a cap, send a cheaper model instead of stopping at 100%.
 
 ```sh
-node src/cli.js wrap --cap 5 --max-concurrent 8 -- node your-agent.js
+node src/cli.js wrap --day-cap 20 --downgrade gpt-4o=gpt-4o-mini,claude-sonnet-4-5=claude-haiku-4-5 --downgrade-at 0.8 -- node your-agent.js
 ```
 
-- **Where:** `--max-concurrent N` (integer 1–64, default 1), `maxConcurrent` on `default` or an agent in a `--policy` file, or `maxConcurrent` on `POST /v1/agents/:id/policy` (API only, audited as `policy.change`; a dashboard save keeps it). The minimum of all three applies; the fleet value is a ceiling and the cached value is enforced offline.
-- **Admission stays serialized.** Requests beyond N wait in FIFO order (never a 429 for concurrency). When a slot frees, the next request runs the full verdict (kill, accounting failure, allowlist, caps, tag/model caps, preflight, rate, velocity, spiral) against every completed receipt. Only the upstream fetch and forwarding run in parallel; receipt append, spend recording, cap warnings and the `--shared-ledger` critical section stay serialized.
-- **Bounds.** `--max-steps` counts in-flight calls, so it is never exceeded. The RPM slot is reserved before forwarding, as before. With `--preflight`, the worst-case estimates of in-flight calls are subtracted from the remaining budget first. An unknown-cost receipt or the kill switch stops new admissions; calls already in flight finish and are recorded.
-- **Overshoot:** at most N in-flight calls per wrapper, so recorded spend stays within `cap + Σ(N per wrapper) × max single-call cost`. Without `--preflight`, no dollars are reserved for in-flight calls.
-- The run summary, rollup line and `costcap runs` show `max_concurrent` when it is above 1.
+- **Trigger:** the first run/hour/day/month scope whose spend is at or above F (`--downgrade-at`, default 0.8) of its cap, from a local cap, a `--policy` agent or team budget, or an enrolled fleet agent/team cap. Unknown-cost receipts are left out of spend (a lower bound, never $0).
+- **Rewrite:** only the JSON `model` field changes, on the openai, anthropic, openrouter and custom `--upstream` routes, streamed or not (stream usage injection still applies). Under F, requests are byte-identical. Gemini path models, Bedrock/Vertex, batches, multipart audio, Realtime and OpenRouter `models[]` pass through unchanged with receipt `downgrade: "unsupported_route"`.
+- **Checks use TO:** the allowlist, `--unknown-models refuse`, preflight, tag caps and the response-cache key. A disallowed or unpriced TO is refused, never sent as FROM. `wrap` exits 2 at start when a `--downgrade` TO has no published rate (or `--upstream-prices` row).
+- **Records:** the receipt has `model: TO`, `requested_model: FROM` and `downgrade: {scope, fraction[, source]}`; the response carries `x-costcap-model-downgraded: FROM->TO`. One `{"event":"model_downgrade"}` ledger line and one stderr line per source, scope and period (never spend). The run summary, rollup and `costcap runs` show `downgraded=N`.
+- **Never a loosening:** the hard stop at 100% still refuses; a downgrade never raises or bypasses a cap.
+- **Fleet:** `downgrade: {at?, map: {FROM: TO}}` on `POST /v1/agents/:id/policy` ("Downgrade models" / "Downgrade at (%)" on the agent card; `null` clears). A bad fraction, empty map or FROM equal to TO returns 400. An enrolled wrapper applies the cached fleet map offline; local `--downgrade` pairs add to it (a fleet pair wins on the same FROM) and a local `--downgrade-at` can lower `at`, never raise it.
 
 ## Soft warnings
 
@@ -972,36 +792,27 @@ costcap wrap --day-cap 10 --warn-at 0.5,0.8 -- node agent.js
 ```
 
 - `--warn-at F[,F...]` takes fractions with 0 < F < 1. The default is `0.8`, and `--warn-at off` disables warnings. A bad value exits `2`.
-- The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`.
+- The first time a capped scope crosses a fraction, `wrap` prints one stderr line and appends one ledger event: `{"event":"cap_warning","scope","fraction","cap","spent_usd","period","run_id","agent_id","lower_bound"}`. Warnings are deduped per scope, fraction and period (`run_id` for run, the UTC `YYYY-MM-DD` for day, `YYYY-MM` for month), so a second wrap on the same day does not warn again. The run summary lists them under `warnings`. The fraction is checked after every spend or cap change, not only the wrapper's own receipts: a dashboard/fleet settlement, a `reconcile --apply` or sibling receipt on `--shared-ledger`, and a fleet policy that lowers the cap all warn too (#181). A sibling's `cap_warning` for the same period counts as already sent.
 - Warnings never block a call and are never spend. Receipts, runs and check totals ignore `cap_warning` lines.
-- `wrap` also checks once at startup: a fraction already reached (including from a cached fleet cap) warns once if this period has no matching `cap_warning` yet.
-- When a scope has an unknown-cost receipt (a pending batch included), its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
+- When a scope has an unknown-cost receipt, its spend is a lower bound: `lower_bound: true`, and the stderr line says "(lower bound)". Unknown cost is never counted as $0.
 - `costcap check` adds `warnings: [{scope, fraction, cap, spent_usd, lower_bound}]` without changing `ok`. With `--github-output`, it also writes a `warnings` output (for example `day:0.8,month:0.5`) and a warnings row in the job summary.
-
-## Response cache
-
-`costcap wrap --cache TTL` (off by default; `30s`, `10m`, `24h`, `7d`, at most `7d`) answers repeated identical deterministic requests from a local disk cache. A hit makes no upstream call, costs $0, and still writes a receipt: `{cost_usd: 0, reason: "cache_hit", cache: "hit", saved_usd, cache_source_receipt}`.
-
-- **Cached:** `POST` non-streaming generation requests whose JSON body sets `temperature` (Gemini: `generationConfig.temperature`) to exactly `0`, and embeddings requests. Only a `2xx` response with a known, numeric `cost_usd` is stored.
-- **Never cached** (`x-costcap-cache: bypass`): streams (`stream: true`, `:streamGenerateContent`, `alt=sse`, any `text/event-stream` response), batches, Files, count-tokens, GET/HEAD and `n > 1`. Provider errors, unknown or unpriced cost `batch_pending` and `background_pending` responses are never stored.
-- **Key:** SHA-256 of provider, upstream, method, path and query, the exact body bytes, `anthropic-version`, `anthropic-beta`, `openai-organization`, `openai-project`, and a hash of the API key headers and any `key=` query value. Different keys never share entries.
-- **Order:** the lookup runs after every check (kill file, caps, allowlist, preflight, breaker, spiral). A hit never bypasses a refusal. Hits count toward `--max-steps` and policy `maxSteps`, never toward velocity spend, caps, alerts or billing.
-- **Storage:** `--cache-dir DIR` (default `<ledger-dir>/cache`, mode `0700`, entries `0600`). `--cache-max-mb N` (default 256) evicts least recently used entries; a response over 1/10 of the cap is not stored. Entries hold status, content-type, response body, model, original cost, source receipt id and a timestamp. They never hold request bodies, headers or keys. Delete the directory to purge.
-- **Per call:** send `x-costcap-cache: bypass` to skip lookup and store. CostCap always strips the header before forwarding. Responses carry `x-costcap-cache: hit|miss|bypass`.
-- **Reporting:** the run summary gains `cache: {hits, misses, saved_usd}`, the roll-up line adds ` · cache: N hits, saved $X`, and hosted `/v1/spend` reports `cache_hits` and `saved_usd` per bucket and in the total.
-
-Cached answers can be stale for up to the TTL. Use a short TTL, or the bypass header, where freshness matters.
 
 ## Run summaries
 
-Every `costcap wrap` run writes `<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`) when it ends, including after a cap stop, breaker stop or `costcap kill`. It holds `calls`, `blocked_calls`, `by_model` (calls, input/output/cache-read/cache-write tokens, `cost_usd`), `total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope) and `stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`, plus `stopped_scope`). If any call has unknown cost, `total_cost_usd` is `null`, never a silent $0. A one-line roll-up is printed to stderr.
+Every `costcap wrap` run, including one that exits non-zero, hits a cap, trips
+the breaker or is stopped by `costcap kill`, writes
+`<ledger-dir>/runs/<run_id>.json` (`costcap.run-summary/v1`): `run_id`,
+`started_at`, `ended_at`, `exit_code`, `calls`, `blocked_calls`, `by_model`
+(calls, input/output/cache read/cache write tokens, cost per model),
+`total_cost_usd`, `unknown_cost_calls`, `caps` (limit and spent per scope),
+`stopped_by` (`null`, `budget_exceeded`, `breaker_open` or `killed`) and
+`stopped_scope`. If any call has unknown cost, `total_cost_usd` is `null`, never
+$0. A one-line roll-up is printed to stderr when the run ends.
 
 ```sh
-node src/cli.js runs                 # newest first
-node src/cli.js runs --json --receipts .costcap/receipts.jsonl
+node src/cli.js runs            # recent runs, newest first
+node src/cli.js runs --json     # the summaries as JSON; corrupt files are reported and skipped
 ```
-
-Corrupt summary files are reported and skipped. No account is needed.
 
 ## CI check and local MCP
 
@@ -1208,30 +1019,33 @@ Requires: Node 20+, and access to `gitdhillonai/dotenv` for `.env.local`.
 
 ## OpenTelemetry export
 
-`costcap wrap --otlp URL` (or `COSTCAP_OTLP_ENDPOINT=URL`) pushes OTLP/HTTP JSON traces to
-`<URL>/v1/traces`: one `CLIENT` span per metered, unknown-cost or refused call (named
-`"<gen_ai.operation.name> <model>"`, with `gen_ai.usage.input_tokens`/`output_tokens`/`cache_read.input_tokens`,
-`gen_ai.usage.cost` when the cost is known, and `costcap.*` attributes), plus one `costcap.run` root span
-at exit (`costcap.total_cost_usd` is omitted when any call has unknown cost). All spans of a run share a
-trace id derived from `run_id`. No prompt, completion or request body is ever exported.
+`costcap wrap --otlp URL` (or `COSTCAP_OTLP_ENDPOINT=URL`) pushes traces to any OTLP/HTTP endpoint (an OpenTelemetry Collector, Grafana Tempo, Honeycomb, Datadog, Langfuse). It is off by default. CostCap does not read `OTEL_EXPORTER_OTLP_*`; those belong to your agent's own SDK.
+
+- Transport: OTLP/HTTP JSON, `POST <URL>/v1/traces`. No protobuf, no gRPC, no `@opentelemetry/*` dependency.
+- Headers: only from `COSTCAP_OTLP_HEADERS` (`k=v,k2=v2`, the `OTEL_EXPORTER_OTLP_HEADERS` format). Values are never logged, stored or exported.
+- A URL that is not http(s), or that contains `user:pass@`, exits 2 before the agent starts. Plain http to a non-loopback host prints a warning.
+- One `CLIENT` span per metered, unknown-cost or refused call, named `"<gen_ai.operation.name> <model>"`, from request arrival to receipt time. Attributes: `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.usage.cost` (USD, only when known), `costcap.cost_usd`, `costcap.cost_complete`, `costcap.receipt_id`, `costcap.run_id`, `costcap.agent_id`, `costcap.blocked`, `costcap.reason`, `costcap.path` (credentials redacted), `costcap.tag.<k>`, `http.response.status_code`. Refusals and upstream errors have status `ERROR`.
+- One `costcap.run` root span per run with `costcap.total_cost_usd` (absent, never `0`, when any call has unknown cost), `costcap.unknown_cost_calls`, `costcap.calls`, `costcap.blocked_calls`, `costcap.stopped_by`, `costcap.exit_code`. All spans of a run share one trace id derived from `run_id`.
+- Delivery never slows a call or a cap decision: batches of up to 100 spans or every 5 s, a 10,000-span queue, 10 s per POST, no retries, at most 5 s (4.5 s) of final flush at exit. The first failure prints one `costcap: warning: otlp ...` line; the run summary and roll-up report `otlp: {spans_exported, spans_dropped}`.
+- No prompt, completion or request body is ever exported.
+
+Collector example:
 
 ```bash
-# Collector or Langfuse (OTLP endpoint); headers come only from the environment and are never logged
-export COSTCAP_OTLP_HEADERS="authorization=Basic <base64 pk:sk>,x-tenant=team-a"
-npx costcap wrap --cap 5 --otlp https://cloud.langfuse.com/api/public/otel -- node agent.js
+COSTCAP_OTLP_HEADERS="authorization=Bearer $COLLECTOR_TOKEN" \
+  costcap wrap --cap 5 --otlp http://127.0.0.1:4318 -- python agent.py
 ```
 
-- Opt-in only; CostCap ignores `OTEL_EXPORTER_OTLP_*` (those belong to your agent's SDK).
-- `--otlp` must be http(s) without `user:pass@`; plain http to a non-loopback host prints a warning.
-- Export never delays a call or a cap decision: batches of at most 100 spans every 5 s, a 10,000-span
-  queue, 10 s per POST with no retries, final flush capped at 5 s. The first failure prints one
-  `costcap: warning: otlp` line; the run summary records `otlp: {spans_exported, spans_dropped}`.
-- Not included: metrics/logs signals, protobuf/gRPC, retries across runs, re-export on later settlement.
+Langfuse (OTLP ingest maps `gen_ai.usage.cost` to cost):
+
+```bash
+COSTCAP_OTLP_HEADERS="authorization=Basic $(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 -w0)" \
+  costcap wrap --otlp https://cloud.langfuse.com/api/public/otel -- node agent.js
+```
 
 ## Environment
 
-See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`.
-`COSTCAP_OTLP_ENDPOINT` and `COSTCAP_OTLP_HEADERS` enable OpenTelemetry export (see above).
+See `env.example`. Pull real values with `bash scripts/pull-secrets.sh`. `costcap wrap` also reads `COSTCAP_OTLP_ENDPOINT` and `COSTCAP_OTLP_HEADERS` (see [OpenTelemetry export](#opentelemetry-export)).
 
 ## Docs
 
@@ -1282,16 +1096,7 @@ npm test
 
 **Unknown-cost pages (`cost_unknown`, #279).** CostCap pauses instead of counting an unpriced call as $0, and now it pages when it does. One sweep fires `cost_unknown:<agentId>` while an agent holds an unsettled unknown-cost receipt in the current period (pending batches excluded), with `unknown_count`, `first: {receipt_id, ts, model, reason}` and `blocked_calls_1h`. A team or org budget whose verdict is `accounting_unavailable` fires `cost_unknown:team:<orgId>:<name>` / `cost_unknown:org:<orgId>` with `source_agents` (who holds the receipts) and `paused_agents` (distinct agents refused with `unreconciled_receipt` in the last hour). Each fires once, resolves when the receipts are settled (`POST /v1/receipts/:id/settle`), the agent is revoked, the team is deleted or the period rolls over, and re-fires only after resolving. Email/Slack text names the agent, model and paused count and links to the dashboard's *Unknown-cost receipts* card (`#unknownCard`); the signed webhook adds `first_receipt_id`, `source_agents` and `paused_agents`. Routes and default `kinds` accept `cost_unknown`. Team/org cap alerts stay muted while unknown cost exists (never $0).
 
-**Alert destinations.** `GET /v1/alert-settings` (any member) returns the org's alert emails and the Slack webhook masked (`https://hooks.slack.com/services/…` + last 4). `POST /v1/alert-settings` (owner or admin) takes `{ "emails": [...verified member emails], "slackWebhook": "https://hooks.slack.com/services/..." | null }`; an omitted field keeps its value. Each org's alerts go only to its own destinations; changes are audited as `alert_settings.change` with masked values. **Send test alert (#259):** `POST /v1/alert-settings/test` (owner or admin session; API keys are refused) with optional `{ "channels": ["email"|"slack"|"webhook"] }` sends a synthetic `kind: "test"` alert to the saved destinations (verified members only) and returns `{ results: [{ channel, status: "accepted"|"failed"|"unconfigured", error?, destination }] }` with masked destinations. It is never stored as an alert, never retried, and never appears in `/v1/alerts`, evidence or metrics. Each call is audited as `alert_settings.test` with masked results; the limit is 5 per org per 10 minutes (then `429` with `Retry-After`). The dashboard card has a "Send test alert" button for owners and admins.
-
-**Native PagerDuty, Microsoft Teams and Discord destinations (#282).** `POST /v1/alert-settings` (owner or admin session) also takes three optional fields; `null` removes one and omitting it keeps the saved value:
-- `pagerduty: { "routingKey": "<32-char Events v2 integration key>", "region": "us"|"eu", "kinds": null | [...] }`. Events go to `https://events.pagerduty.com/v2/enqueue` (`us`, default) or `https://events.eu.pagerduty.com/v2/enqueue` (`eu`); you never supply a URL. `kinds` filters PagerDuty only (`null` = all kinds). Each alert is a `trigger` with `dedup_key: "costcap:<alert id>"` (a retry never opens a second incident), `summary` = the alert text (max 1024 chars), `source: "costcap"`, `class` = kind, `component` = agent, team, `org` or `tag:k=v`, `group` = team, `custom_details` = the signed-webhook payload and a dashboard link. Severity: `cap_hit` → `critical`; `loop_detected`, `agent_silent` → `error`; `test` → `info`; every other kind → `warning`.
-- `teamsWebhook`: a Teams **Workflows** webhook (`https`, port 443, no credentials, host `*.logic.azure.com` or `*.api.powerplatform.com`). Retired Office 365 connector URLs (`*.webhook.office.com`) get `400`. Alerts post an Adaptive Card (title, alert text, a fact set with kind, target, scope, spent/cap and projected/anomaly values, and an "Open dashboard" button).
-- `discordWebhook`: `https://discord.com/api/webhooks/<id>/<token>` (or `discordapp.com`), no query or fragment. Alerts post `{ content (max 2000 chars), username: "CostCap", allowed_mentions: { parse: [] } }`, so they never ping anyone.
-
-Teams and Discord follow the default `kinds` filter like email and Slack. Any 2xx (including Teams `202` and Discord `204`) is `accepted`; redirects are refused and each send times out after 5s. Failed channels retry alone (#206). The secrets never leave the server: `GET`, audit entries and test-send results show the routing key as `…` + last 4, the Teams URL as its origin + `/…`, and the Discord URL as `https://discord.com/api/webhooks/…` + last 4. Transport errors are scrubbed. Send test alert accepts `pagerduty`, `teams` and `discord` in `channels`; without `channels`, the configured ones are included. The dashboard's Alert destinations card has fields for all three, each with a "Remove" checkbox. Resolve/acknowledge events back to PagerDuty are not sent.
-
-**Alert routes and default kinds (#258).** `POST /v1/alert-settings` also takes `kinds` (null or omitted = all kinds; `[]` = none), which limits which alert kinds reach the default email and Slack; the signed webhook still receives every alert. `routes` (a full replacement list, at most 10) adds destinations: each route is `{ id?, name (1-40), kinds: [...] | null, teams: [...team names] | null, emails: [...verified members], slackWebhook }` and needs at least one destination. An alert matches a route when its kind is in `kinds` and its team is in `teams`; an agent, run, model or anomaly alert's team is the team listing the agent when it is sent, and org-budget and tag alerts match only `teams: null` routes. Routes are additive to the defaults, and within one alert an address or Slack URL is sent once. Route channels (`route:<id>:email`, `route:<id>:slack`) retry and give up independently, like the defaults. Re-saving a route with its `id` and no `slackWebhook` keeps the stored webhook; route webhooks are always masked. Deleting a team removes it from routes, and a route left with no teams is shown as disabled and matches nothing; removing a member removes their email from routes.
+**Alert routes (#258).** Two optional fields on `POST /v1/alert-settings` (owner or admin session; API keys get `403`) send a team's alerts, or chosen kinds, to their own destinations. `kinds` (`null` or omitted = all kinds, today's behaviour; `[]` = none) limits which alert kinds (`cap_approaching`, `cap_hit`, `loop_detected`, `agent_silent`, `cap_projected`, `spend_anomaly`) reach the default email and Slack. The signed webhook always receives every alert. `routes` is a full replacement list of at most 10 `{ id?, name, kinds, teams, emails, slackWebhook }`: `id` is server-generated (`rt_…`) and is sent back to keep a route; `name` is 1-40 characters; `kinds` and `teams` are `null` for "any"; `emails` must be verified members; `slackWebhook` must be `https://hooks.slack.com/services/…`, and omitting it on a kept route keeps the stored one. Each route needs an email or a Slack webhook. An alert matches a route when its kind is in `kinds` and its team is in `teams`. The team is `team` for a team alert, or the team that lists the alert's agent at send time. Org-budget and tag alerts have no team, so they match only `teams: null` routes. Routes add to the defaults. Within one alert an email address or Slack URL is sent once, with defaults first, then routes in order. Route channels are `route:<id>:email` and `route:<id>:slack` in `deliveryChannels`, with the same per-channel retry, 10-attempt `gave_up` and claim lease as the defaults. Deleting a team removes it from every route; a route left with `teams: []` is shown as disabled and matches nothing (it is never widened to all teams). Removing a member removes their email from routes. Route Slack webhooks are masked everywhere (`…` + last 4). Weekly digests stay on the defaults.
 
 **Signed webhook.** Owners and admins can also set one generic HTTPS endpoint per org: `POST /v1/alert-settings` with `{ "webhook": "https://alerts.example.com/costcap" }` (or `null` to remove), and `{ "rotateWebhookSecret": true }` to issue a new signing secret. CostCap generates the secret and returns it in full only in that create or rotate response, as `webhookSecret`. Everywhere else it is masked (`whsec_…` + last 4), and the URL shows only its origin. The URL must be `https` on port 443, with no credentials and no IP literal or `localhost`/`.local`/`.internal` host. It must also resolve to a public address, and it is checked again at every send. Redirects are refused, and each send times out after 5s. Every hosted alert is POSTed once as JSON with `id` (the alert occurrence, use it for idempotency), `kind`, `org_id`, `agent_id`, `agent_name`, `team`, `org` (true for an org budget alert), `tag` (`{key, value}` for a fleet tag cap alert, else null), `run_id`, `scope`, `period`, `fraction`, `spent_usd`, `cap_usd`, `unknown_count` (null when not known, never 0), `fired_at` and `dashboard_url`. A test send (#259) has `kind: "test"` and `test: true`, signed with the current secret; verify it, then ignore it. Retries are per channel (email, Slack, webhook): a non-2xx response, a timeout or a send error retries **only that channel** for that alert occurrence, with backoff of 1, 2, 4, 8, 16, then 30 minutes between attempts and at most 10 attempts per channel. After that the channel is marked `gave_up` and one `alert.delivery_gave_up` audit row is written. A channel that answered 2xx (or accepted the email) is never resent for that occurrence, even while another channel is still retrying; it fires again only when the alert clears and re-arms as a new occurrence. A channel configured after the alert fired is not back-filled for that occurrence. Each queued send holds a 2-minute claim (`delivery_claimed_at`), so overlapping sweeps never page twice. An alert interrupted by a restart (deploy, SIGTERM, crash) mid-send stays `pending`; the first sweep after the claim expires re-sends every channel (counted toward the 10-attempt cap) and writes an `alert.delivery` audit row with `recovered: true`, so webhook consumers should dedupe on `id`. The alert's `delivery` field is `accepted` when every configured channel accepted, otherwise `failed`; per-channel state is in `deliveryChannels`. Verify the `x-costcap-signature: t=<unix>,v1=<hex>` header:
 
@@ -1321,9 +1126,51 @@ curl -X POST https://app.costcap.dev/v1/fleet/freeze -H "Authorization: Bearer $
   -H 'content-type: application/json' -d '{"reason":"cap_hit webhook"}'
 ```
 
+### Prometheus metrics (hosted, #220)
+
+`GET /v1/metrics` serves Prometheus text exposition (`text/plain; version=0.0.4`) for your org, so Grafana, Datadog or Prometheus can scrape agent spend next to your other service metrics. Authenticate with a viewer or admin `cck_` key (or a member session); no key, or a revoked or expired one, gets `401`, and a key only ever sees its own org.
+
+Series (all gauges for the current budget period, #209): `costcap_spend_usd{agent,team,window}` (`window` is `day` or `month`), `costcap_spend_complete{agent,window}` (`0` when the window holds unsettled unknown-cost receipts, so spend is a lower bound, never a silent $0), `costcap_unknown_cost_receipts{agent}`, `costcap_cap_usd` / `costcap_cap_remaining_usd{scope="agent|team",name,window}` (omitted when there is no cap), `costcap_alerts_open{kind,scope,scope_name}` for every alert kind, `costcap_agent_frozen{agent}`, `costcap_agent_last_sync_timestamp_seconds{agent}` and `costcap_metrics_truncated`. Spend matches `/v1/spend` for the same period and excludes receipts past the retention cutoff (#211).
+
+`?by=model` replaces each agent's `costcap_spend_usd` total with per-model series (they sum to the total). The response is capped at 5,000 series: past the cap it drops the per-model and optional series first, keeps every agent total and sets `costcap_metrics_truncated 1`.
+
+The values are gauges for the current period, not monotonic counters: retention deletes old receipts and periods roll over, so use `max_over_time`/`last_over_time`, not `rate()`. Prometheus keeps the history.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: costcap
+    scheme: https
+    metrics_path: /v1/metrics
+    scrape_interval: 60s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/costcap_api_key   # a viewer cck_ key
+    static_configs:
+      - targets: ["app.costcap.dev"]
+```
+
 ### Fleet freeze (kill switch)
 
-`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin [API key](#org-api-keys), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
+`POST /v1/fleet/freeze` and `POST /v1/fleet/resume` (owner or admin session, or an admin org API key (see below), body `{ "reason": "..." }`, 1-500 characters) kill or revive the whole org's fleet. Freeze bumps the policy version of every non-revoked agent that is not already killed and sets `killed: true`. Repeating it while frozen is a no-op (`alreadyFrozen: true`). Resume only revives the agents that freeze killed, so an agent killed on its own stays killed. Each action writes one `fleet.freeze` / `fleet.resume` audit entry with actor, reason and agent ids; `POST /v1/agents/:id/policy` also accepts an optional `reason`. Wrappers apply the freeze at their next policy poll. It is not instant and does not undo requests already accepted. The dashboard has a "Freeze all agents" card with a required reason and a confirm step.
+
+### Org API keys (#203)
+
+Owners and admins create revocable bearer keys for CI, incident tooling and BI from the dashboard "API keys" card or the API (signed-in session only):
+
+- `POST /v1/api-keys` `{ "name": "pagerduty", "role": "viewer" | "admin", "expires_at"?: "<ISO time>" }` returns the full `cck_…` key once (`secret`). Only its SHA-256 hash is stored.
+- `GET /v1/api-keys` lists keys masked (`cck_…` + last 4) with `status` (active, expired, revoked) and `last_used_at`.
+- `POST /v1/api-keys/:id/revoke` revokes a key at once.
+
+Send `Authorization: Bearer cck_…` (no `Origin` header needed). A viewer key reads `/v1/spend`, `/v1/receipts.csv`, `/v1/audit.csv`, `/v1/evidence.json` and `/v1/alerts`. An admin key can also `POST /v1/fleet/freeze|resume`, agent policy/revoke, alert ack and receipt settle. Actions taken with a key are audited with actor `apikey:<id>` (label `api-key:<name>`); `api_key.create` and `api_key.revoke` are audited too. A key never manages keys, members, invitations or billing, never reads `/v1/fleet`, and is never accepted as an agent token; agent tokens stay rejected on human routes. Unknown, expired, revoked and other-org keys get 401 (or 404 for another org's resources).
+
+Turn a #199 alert webhook into an automatic freeze:
+
+```sh
+curl -sX POST https://app.costcap.dev/v1/fleet/freeze -H "Authorization: Bearer $COSTCAP_API_KEY" \
+  -H 'content-type: application/json' -d '{"reason":"cap_hit webhook"}'
+```
+
 
 ### Time-boxed cap raise requests
 

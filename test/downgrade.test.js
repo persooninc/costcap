@@ -1,118 +1,132 @@
-// Issue #207: budget-triggered model downgrade, unit level.
+// Issue #207: budget-triggered model downgrade, pure helpers.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_DOWNGRADE_AT, createDowngrader, downgradeError, downgradeLine, downgradeRoute, downgradeTrigger, mergeDowngrade, parseDowngradeAt, parseDowngradeMap, rewriteModel, scopeUsage } from "../src/downgrade.js";
-import { parseWrapArgs } from "../src/cli.js";
-import { validatePolicy } from "../src/hosted/policy.js";
-import { buildRunSummary, rollupLine } from "../src/run-summary.js";
+import { DEFAULT_DOWNGRADE_AT, createDowngradeNotifier, downgradeError, downgradeLine, downgradePeriod, downgradeTrigger, isRewritableProvider, mergeDowngrade, parseDowngradeAt, parseDowngradeMap, rewriteModel } from "../src/downgrade.js";
+import { isDowngradeTargetPriced, parseWrapArgs } from "../src/cli.js";
+import { resolvePolicy, validatePolicy } from "../src/hosted/policy.js";
+import { buildRunSummary, rollupLine, runsCommand } from "../src/run-summary.js";
 
 test("parseDowngradeMap / parseDowngradeAt", () => {
-  assert.deepEqual(parseDowngradeMap("gpt-4o=gpt-4o-mini"), { "gpt-4o": "gpt-4o-mini" });
-  assert.deepEqual(parseDowngradeMap(" a=b , c=d ,"), { a: "b", c: "d" });
-  for (const bad of ["", ",", "a", "=b", "a=", "a=a", "a=b,a=c"]) assert.throws(() => parseDowngradeMap(bad), /--downgrade/, bad);
+  assert.deepEqual(parseDowngradeMap("gpt-4o=gpt-4o-mini, claude-sonnet-4-5=claude-haiku-4-5"), { "gpt-4o": "gpt-4o-mini", "claude-sonnet-4-5": "claude-haiku-4-5" });
+  for (const bad of ["", ",", "gpt-4o", "=x", "x=", "a=a", "a=b,a=c", "a b=c"]) assert.throws(() => parseDowngradeMap(bad), /--downgrade/, bad);
   assert.equal(parseDowngradeAt("0.5"), 0.5);
-  assert.equal(parseDowngradeAt("1"), 1);
-  for (const bad of ["", "0", "-0.1", "1.01", "x", "NaN"]) assert.throws(() => parseDowngradeAt(bad), /--downgrade-at/, bad);
+  for (const bad of ["0", "1", "-1", "", "x", "1.5"]) assert.throws(() => parseDowngradeAt(bad), /--downgrade-at/, bad);
   assert.equal(DEFAULT_DOWNGRADE_AT, 0.8);
 });
 
-test("wrap flags: --downgrade, --downgrade-at, unpriced target exits at parse", () => {
-  const o = parseWrapArgs(["--day-cap", "5", "--downgrade", "gpt-4o=gpt-4o-mini", "--downgrade-at", "0.7", "--", "x"]);
-  assert.deepEqual(o.downgradeMap, { "gpt-4o": "gpt-4o-mini" });
-  assert.equal(o.downgradeAt, 0.7);
-  assert.equal(parseWrapArgs(["--", "x"]).downgradeMap, undefined);
-  assert.throws(() => parseWrapArgs(["--downgrade", "gpt-4o=no-such-model-xyz", "--", "x"]), /no published rate/);
-  assert.throws(() => parseWrapArgs(["--downgrade-at", "2", "--", "x"]), /--downgrade-at/);
+test("wrap flags: --downgrade and --downgrade-at, unpriced TO exits before spawning", () => {
+  const o = parseWrapArgs(["--downgrade", "gpt-4o=gpt-4o-mini", "--downgrade", "o3=o4-mini", "--downgrade-at", "0.6", "--", "true"]);
+  assert.deepEqual(o.downgradeMap, { "gpt-4o": "gpt-4o-mini", o3: "o4-mini" });
+  assert.equal(o.downgradeAt, 0.6);
+  assert.throws(() => parseWrapArgs(["--downgrade", "gpt-4o=not-a-real-model-xyz", "--", "true"]), /no published rate/);
+  assert.equal(isDowngradeTargetPriced("gpt-4o-mini"), true);
+  assert.equal(isDowngradeTargetPriced("nope-model"), false);
+  const userPrices = { upstreams: { local: { "my-small": { input: 0.1, output: 0.2 } }, openai: { "ft:custom": { input: 1, output: 2 } } } };
+  assert.equal(isDowngradeTargetPriced("nope-model", { userPrices: { upstreams: {} }, upstreams: [] }), false);
+  assert.equal(isDowngradeTargetPriced("my-small", { userPrices, upstreams: [{ name: "local" }] }), true);
+  assert.equal(isDowngradeTargetPriced("my-small", { userPrices, upstreams: [] }), false);
+  assert.equal(isDowngradeTargetPriced("ft:custom", { userPrices }), true);
 });
 
-test("trigger math per scope: first scope at or above F, in order", () => {
-  assert.equal(downgradeTrigger([], 0.8), null);
-  assert.equal(downgradeTrigger([{ scope: "run", cap: 10, spent: 7.99 }], 0.8), null);
-  assert.deepEqual(downgradeTrigger([{ scope: "run", cap: 10, spent: 8 }], 0.8), { scope: "run", fraction: 0.8, cap: 10, spent_usd: 8 });
-  const rows = [{ scope: "run", cap: 10, spent: 1 }, { scope: "hour", cap: 1, spent: 0.9 }, { scope: "day", cap: 2, spent: 1.9 }];
-  assert.equal(downgradeTrigger(rows, 0.8).scope, "hour");
-  assert.equal(downgradeTrigger([{ scope: "day", cap: null, spent: 9 }, { scope: "month", cap: 0, spent: 9 }, { scope: "x", cap: 1 }], 0.5), null);
-  assert.deepEqual(scopeUsage({ run: 1, day: 2, hour: 3 }, { run: 0.5, day: 1, hour: 0, month: 4 }), [
-    { scope: "run", cap: 1, spent: 0.5 }, { scope: "hour", cap: 3, spent: 0 }, { scope: "day", cap: 2, spent: 1 }]);
-  assert.deepEqual(scopeUsage({ day: 2 }, { day: 1 }, "agent"), [{ scope: "agent:day", cap: 2, spent: 1 }]);
+test("downgradeTrigger: first scope at or above F, per source; unknown-cost spend is a lower bound", () => {
+  assert.equal(downgradeTrigger({ at: 0.8, sources: [] }), null);
+  assert.equal(downgradeTrigger({ at: 0, sources: [{ kind: "local", caps: { run: 1 }, spend: { run: 1 } }] }), null);
+  const local = { kind: "local", caps: { run: 10, day: 10 }, spend: { run: 7.99, day: 9 } };
+  assert.deepEqual(downgradeTrigger({ at: 0.8, sources: [local] }), { scope: "day", kind: "local", cap: 10, spent_usd: 9, fraction: 0.9 });
+  const agent = { kind: "agent", caps: { run: 1, hour: 2 }, spend: { run: 0.8, hour: 0 } };
+  assert.equal(downgradeTrigger({ at: 0.8, sources: [local, agent] }).scope, "run");
+  assert.equal(downgradeTrigger({ at: 0.8, sources: [local, agent] }).kind, "agent");
+  assert.equal(downgradeTrigger({ at: 0.95, sources: [local, agent] }), null);
+  // Uncapped / missing / non-numeric spend never triggers.
+  assert.equal(downgradeTrigger({ at: 0.1, sources: [{ kind: "x", caps: { day: null, month: 5 }, spend: { day: 9, month: NaN } }, null] }), null);
+  assert.equal(downgradeTrigger({ at: 0.5, sources: [{ kind: "fleet_team", caps: { month: 4 }, spend: { month: 2 } }] }).kind, "fleet_team");
 });
 
-test("body rewrite changes only model; route support", () => {
-  const parsed = { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], temperature: 0.2, stream: true };
-  const out = JSON.parse(rewriteModel(parsed, "gpt-4o-mini"));
-  assert.deepEqual(out, { ...parsed, model: "gpt-4o-mini" });
-  assert.deepEqual(Object.keys(out), Object.keys(parsed));
-  const body = { model: "gpt-4o" };
-  for (const provider of ["openai", "anthropic", "openrouter"]) assert.equal(downgradeRoute({ provider, parsedBody: body }), true);
-  assert.equal(downgradeRoute({ provider: "u", custom: true, parsedBody: body }), true);
-  assert.equal(downgradeRoute({ provider: "gemini", parsedBody: body }), false);
-  assert.equal(downgradeRoute({ provider: "bedrock", cloud: true, parsedBody: body }), false);
-  assert.equal(downgradeRoute({ provider: "openai", batch: true, parsedBody: body }), false);
-  assert.equal(downgradeRoute({ provider: "openai", multipart: true, parsedBody: body }), false);
-  assert.equal(downgradeRoute({ provider: "openrouter", routerModels: ["a", "b"], parsedBody: body }), false);
-  assert.equal(downgradeRoute({ provider: "openai", parsedBody: [body] }), false);
-  assert.equal(downgradeRoute({ provider: "openai", parsedBody: null }), false);
-});
-
-test("policy validation and merge: local only adds or lowers", () => {
-  const ok = { at: 0.8, map: { "gpt-4o": "gpt-4o-mini" } };
-  assert.equal(downgradeError(ok), null);
-  assert.deepEqual(validatePolicy({ version: 1, caps: {}, downgrade: ok }), []);
-  assert.deepEqual(validatePolicy({ version: 1, caps: {}, downgrade: null }), []);
-  for (const bad of [[], "x", { at: 0, map: ok.map }, { at: 1.5, map: ok.map }, { at: "0.8", map: ok.map }, { at: 0.8, map: {} }, { at: 0.8, map: [] },
-    { at: 0.8, map: { a: "a" } }, { at: 0.8, map: { a: "" } }, { at: 0.8, map: { a: 3 } }, { at: 0.8 }]) {
-    assert.equal(validatePolicy({ version: 1, caps: {}, downgrade: bad }).length, 1, JSON.stringify(bad));
+test("rewriteModel: only the model field changes; unsupported routes are marked", () => {
+  const map = { "gpt-4o": "gpt-4o-mini" };
+  const parsed = { model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }], temperature: 0 };
+  const rw = rewriteModel({ provider: "openai", body: Buffer.from(JSON.stringify(parsed)), parsed, model: "gpt-4o", map });
+  assert.equal(rw.to, "gpt-4o-mini");
+  assert.deepEqual(JSON.parse(rw.body), { ...parsed, model: "gpt-4o-mini" });
+  assert.equal(rewriteModel({ provider: "openai", parsed, model: "gpt-4o-mini", map }), null);
+  assert.equal(rewriteModel({ provider: "openai", parsed, model: undefined, map }), null);
+  assert.equal(rewriteModel({ provider: "openai", parsed, model: "gpt-4o", map: null }), null);
+  for (const [provider, route, p] of [["gemini", {}, parsed], ["bedrock", {}, parsed], ["vertex", {}, parsed], ["openai", { batch: true }, parsed], ["openai", { audio: true }, parsed],
+    ["openai", { realtime: true }, parsed], ["openrouter", {}, { ...parsed, models: ["gpt-4o"] }], ["openai", {}, null], ["openai", {}, [1]], ["openai", {}, { model: "other" }]]) {
+    assert.deepEqual(rewriteModel({ provider, parsed: p, model: "gpt-4o", map, route }), { unsupported: true, from: "gpt-4o" }, provider);
   }
-  assert.equal(mergeDowngrade(null, null), null);
-  assert.equal(mergeDowngrade(null, { at: 0.5 }), null);
-  assert.deepEqual(mergeDowngrade(null, { map: { a: "b" } }), { at: 0.8, map: { a: "b" } });
-  assert.deepEqual(mergeDowngrade({ at: 0.9, map: { a: "b" } }, { at: 0.6, map: { a: "x", c: "d" } }), { at: 0.6, map: { a: "b", c: "d" } });
-  // A local --downgrade-at can lower but never raise the fleet fraction.
-  assert.equal(mergeDowngrade({ at: 0.5, map: { a: "b" } }, { at: 0.9 }).at, 0.5);
+  for (const p of ["openai", "anthropic", "openrouter", "u/local"]) assert.equal(isRewritableProvider(p), true);
+  assert.equal(isRewritableProvider("gemini"), false);
 });
 
-test("downgrader: decide, one notice per scope and period, rebuilt from ledger", () => {
-  let spent = 0.5, cfg = { at: 0.8, map: { "gpt-4o": "gpt-4o-mini" } };
-  const now = () => new Date("2026-11-16T12:00:00Z");
-  const d = createDowngrader({ config: () => cfg, usage: () => [{ scope: "day", cap: 1, spent }], lowerBound: () => true, runId: "r1", agentId: "a", now });
-  assert.equal(d.decide("gpt-4o"), null);
-  spent = 0.85;
-  assert.equal(d.decide("gpt-4o-mini"), null);
-  assert.equal(d.decide(undefined), null);
-  const dec = d.decide("gpt-4o");
-  assert.deepEqual(dec, { from: "gpt-4o", to: "gpt-4o-mini", scope: "day", fraction: 0.8, cap: 1, spent_usd: 0.85 });
-  const ev = d.notice(dec);
-  assert.equal(ev.event, "model_downgrade");
-  assert.equal(ev.period, "2026-11-16");
-  assert.equal(ev.lower_bound, true);
-  assert.match(downgradeLine(ev), /model downgrade: day spend \(lower bound\) \$0\.8500 is at or above 80% of \$1 cap; gpt-4o -> gpt-4o-mini/);
-  assert.equal(d.notice(dec), null);
-  const again = createDowngrader({ config: () => cfg, usage: () => [{ scope: "day", cap: 1, spent }], events: [ev], now });
-  assert.equal(again.notice(dec), null);
-  const periods = createDowngrader({ config: () => cfg, usage: () => [], runId: "r9", now });
-  for (const [scope, period] of [["run", "r9"], ["hour", "2026-11-16T12"], ["month", "2026-11"], ["fleet:day", "2026-11-16"]]) assert.equal(periods.notice({ ...dec, scope }).period, period);
-  periods.note({ event: "model_downgrade", scope: "team x:month", period: "2026-11" });
-  assert.equal(periods.notice({ ...dec, scope: "team x:month" }), null);
-  cfg = null;
-  assert.equal(d.decide("gpt-4o"), null);
-});
-
-test("run summary counts downgraded calls", () => {
-  const s = buildRunSummary({ run_id: "r", receipts: [
-    { model: "gpt-4o-mini", requested_model: "gpt-4o", downgrade: { scope: "day", fraction: 0.8 }, cost_usd: 0.001 },
-    { model: "gemini-2.5-flash", downgrade: "unsupported_route", cost_usd: 0.001 },
-    { event: "model_downgrade", scope: "day" },
-  ] });
-  assert.equal(s.calls, 2);
-  assert.equal(s.downgraded_calls, 1);
-  assert.match(rollupLine(s), /downgraded=1/);
-  assert.equal("downgraded_calls" in buildRunSummary({ run_id: "r", receipts: [] }), false);
-});
-
-test("resolvePolicy carries the fleet downgrade and merges local", async () => {
-  const { resolvePolicy } = await import("../src/hosted/policy.js");
+test("hosted policy: downgrade validation, resolve passes it through", () => {
+  const ok = { version: 1, caps: {}, downgrade: { at: 0.7, map: { "gpt-4o": "gpt-4o-mini" } } };
+  assert.deepEqual(validatePolicy(ok), []);
+  assert.deepEqual(validatePolicy({ version: 1, caps: {}, downgrade: null }), []);
+  for (const [d, re] of [[[], /object/], ["x", /object/], [{ map: {} }, /empty/], [{ map: { a: "a" } }, /itself/], [{ at: 1, map: { a: "b" } }, /fraction/], [{ at: 0, map: { a: "b" } }, /fraction/],
+    [{ map: [] }, /map/], [{ map: { a: 3 } }, /model ids/], [{ map: { a: "b" }, x: 1 }, /not a field/], [{ map: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`m${i}`, "x"])) }, /more than/]]) {
+    const errs = validatePolicy({ version: 1, caps: {}, downgrade: d });
+    assert.equal(errs.length, 1, JSON.stringify(d));
+    assert.match(errs[0], re);
+  }
+  assert.deepEqual(resolvePolicy({ lastKnown: ok }).downgrade, ok.downgrade);
   assert.equal("downgrade" in resolvePolicy({ lastKnown: { version: 1, caps: {} } }), false);
-  const server = { version: 2, caps: {}, downgrade: { at: 0.7, map: { a: "b" } } };
-  assert.deepEqual(resolvePolicy({ lastKnown: server }).downgrade, { at: 0.7, map: { a: "b" } });
-  assert.deepEqual(resolvePolicy({ lastKnown: server, local: { downgrade: { at: 0.5, map: { c: "d" } } } }).downgrade, { at: 0.5, map: { c: "d", a: "b" } });
+});
+
+test("mergeDowngrade: local adds pairs and lowers at, never raises it or overrides a fleet pair", () => {
+  assert.equal(mergeDowngrade(null, null), null);
+  assert.equal(mergeDowngrade(null, { map: null, at: 0.5 }), null);
+  assert.deepEqual(mergeDowngrade(null, { map: { a: "b" } }), { at: 0.8, map: { a: "b" } });
+  const fleet = { at: 0.7, map: { a: "b" } };
+  assert.deepEqual(mergeDowngrade(fleet, null), { at: 0.7, map: { a: "b" } });
+  assert.deepEqual(mergeDowngrade(fleet, { map: null, at: 0.9 }), { at: 0.7, map: { a: "b" } });
+  assert.deepEqual(mergeDowngrade(fleet, { map: null, at: 0.5 }), { at: 0.5, map: { a: "b" } });
+  assert.deepEqual(mergeDowngrade(fleet, { map: { a: "z", c: "d" }, at: 0.75 }), { at: 0.7, map: { a: "b", c: "d" } });
+  assert.deepEqual(mergeDowngrade({ map: { a: "b" } }, { map: { c: "d" } }), { at: 0.8, map: { c: "d", a: "b" } });
+  // An invalid fleet value is ignored, never trusted.
+  assert.deepEqual(mergeDowngrade({ map: {} }, { map: { c: "d" } }), { at: 0.8, map: { c: "d" } });
+});
+
+test("notifier: one model_downgrade per kind/scope/period, rebuilt from the ledger", () => {
+  const now = () => new Date("2026-11-16T10:20:00Z");
+  assert.equal(downgradePeriod("hour", { now: now() }), "2026-11-16T10");
+  assert.equal(downgradePeriod("day", { now: now() }), "2026-11-16");
+  assert.equal(downgradePeriod("month", { now: now() }), "2026-11");
+  assert.equal(downgradePeriod("run", { runId: "r1" }), "r1");
+  assert.equal(downgradePeriod("run", {}), "");
+  assert.throws(() => downgradePeriod("week"), /unknown scope/);
+  const n = createDowngradeNotifier({ runId: "r1", agentId: "a", now, events: [{ event: "model_downgrade", kind: "local", scope: "month", period: "2026-11" }, { event: "cap_warning" }] });
+  const trig = { scope: "day", kind: "local", cap: 10, spent_usd: 8, fraction: 0.8 };
+  const ev = n.observe(trig, { from: "gpt-4o", to: "gpt-4o-mini" });
+  assert.deepEqual(ev, { event: "model_downgrade", kind: "local", scope: "day", fraction: 0.8, cap: 10, spent_usd: 8, from: "gpt-4o", to: "gpt-4o-mini", period: "2026-11-16", run_id: "r1", agent_id: "a" });
+  assert.equal(n.observe(trig, { from: "gpt-4o", to: "gpt-4o-mini" }), null);
+  assert.equal(n.observe({ ...trig, scope: "month" }, { from: "x", to: "y" }), null);
+  assert.ok(n.observe({ ...trig, scope: "run" }, { from: "x", to: "y" }));
+  assert.match(downgradeLine(ev), /local day spend \$8\.0000 is 80% of \$10 cap; downgrading gpt-4o -> gpt-4o-mini \(2026-11-16 UTC\)/);
+  assert.match(downgradeLine({ ...ev, scope: "run", period: "r1" }), /\(run r1\)/);
+  assert.equal(createDowngradeNotifier().observe(trig, { from: "a", to: "b" }).run_id, null);
+});
+
+test("run summary counts downgraded calls; rollup and runs list show them", () => {
+  const s = buildRunSummary({ run_id: "r", receipts: [
+    { model: "gpt-4o-mini", requested_model: "gpt-4o", downgrade: { scope: "run", fraction: 0.8 }, cost_usd: 0.1 },
+    { model: "gpt-4o", downgrade: "unsupported_route", cost_usd: 0.1 },
+    { model: "gpt-4o", cost_usd: 0.1 }] });
+  assert.equal(s.downgraded_calls, 1);
+  assert.match(rollupLine(s), / downgraded=1/);
+  assert.equal("downgraded_calls" in buildRunSummary({ run_id: "r", receipts: [] }), false);
+  assert.doesNotMatch(rollupLine(buildRunSummary({ run_id: "r", receipts: [] })), /downgraded/);
+});
+
+test("costcap runs shows downgraded=N", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { writeRunSummary } = await import("../src/run-summary.js");
+  const dir = mkdtempSync(join(tmpdir(), "cc-dg-runs-"));
+  const receipts = join(dir, "receipts.jsonl");
+  writeRunSummary(receipts, { ...buildRunSummary({ run_id: "r1", ended_at: "2026-11-16T00:00:00Z", receipts: [{ model: "b", requested_model: "a", downgrade: { scope: "day", fraction: 0.9 }, cost_usd: 0 }] }) });
+  const out = [];
+  runsCommand(["--receipts", receipts], { log: (l) => out.push(l) });
+  assert.match(out.join("\n"), /downgraded=1/);
 });

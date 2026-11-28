@@ -1,22 +1,25 @@
-import { periodKey, samePeriod, inSpendWindow } from "../period.js";
+import { periodKey, samePeriod, countsAtNow } from "../period.js";
 // Hosted team budgets (issue #123, SRM #3017). Pure, no I/O.
 // A team shares one day/month cap across a group of enrolled agents in one org.
 // The verdict reuses the local agent-budget engine (src/agent-budget.js), so the
 // hosted answer and a local `--policy` team cannot drift. Unknown cost
 // (cost_usd: null) from any member makes the team verdict accounting_unavailable;
 // it is never treated as $0.
-import { createAgentBudgets, totalCapMessage } from "../agent-budget.js";
+import { createAgentBudgets } from "../agent-budget.js";
 import { isPendingBatch } from "../cap.js";
+import { normalizeModel } from "../model-cap.js";
 import { warnFractionsError, sortWarnFractions } from "./alerts.js";
 import { anomalyError } from "./anomaly.js";
 import { modelSpendPolicy, validModelSpend } from "./model-caps.js";
 
-// #265: total is a lifetime cap (never resets); optional in snapshots like week.
 export const TEAM_SCOPES = Object.freeze(["day", "week", "month", "total"]);
+// #265: "total" never resets (all synced spend since the beginning).
+const inPeriod = (s, aMs, bMs, bp) => s === "total" || samePeriod(s, aMs, bMs, bp);
 // Scopes an old (pre-#261) wrapper or snapshot always carries; week is optional (missing = 0).
 const REQUIRED_SPENT = ["day", "month"];
 // #195 --preflight remainders: day/month always, week (#271) only when a week cap applies.
 const REMAINING_SCOPES = ["day", "month"];
+const neverResets = (s) => (s === "total" ? { message: TOTAL_NEVER_RESETS } : {});
 const NAME = /^[a-z0-9][a-z0-9_-]{0,39}$/i;
 const round6 = (n) => Number(n.toFixed(6));
 
@@ -48,7 +51,7 @@ export function parseTeamInput(body, { orgAgents, teams, orgId }) {
     if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) bad(`Team ${scope} cap must be a positive number`);
     out[scope] = v;
   }
-  if (!TEAM_SCOPES.some((s) => out[s] != null)) bad("Team needs a day, week or month cap (or a total)");
+  if (!TEAM_SCOPES.some((s) => out[s] != null)) bad("Team needs a day, week or month cap, or a total cap");
   // Issue #165: undefined keeps the saved value, null resets to the default, [] turns warnings off.
   if (body.warnFractions === null) out.warnFractions = null;
   else if (body.warnFractions !== undefined) {
@@ -80,13 +83,12 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
   for (const agentId of team.agents) {
     for (const r of receiptsByAgent[agentId] ?? []) {
       // #261: current month OR current week (a week can start in the previous month).
-      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || inSpendWindow(Date.parse(r.ts), nowMs, budgetPeriod, def.week != null))) continue;
+      if (!Number.isFinite(Date.parse(r?.ts)) || !(lifetime || countsAtNow(r, nowMs, budgetPeriod, team.week != null))) continue;
       history.push({ id: `${agentId}:${r.id}`, ts: r.ts, cost_usd: r.cost_usd ?? null, blocked: Boolean(r.blocked), agent_id: agentId, run_id: null, ...(r.reason ? { reason: r.reason } : {}) });
     }
   }
-  // #183: keep `reason` so a synced pending batch is pending, not unknown, server side too.
   const pendingBatches = history.filter(isPendingBatch).length;
-  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate, budgetPeriod });
+  const budgets = createAgentBudgets({ policy: { teams: { [team.name]: def } }, history, now: () => nowDate });
   const spend = budgets.spend({ agent_id: team.agents[0] }, team.agents);
   // Any member's view of the team is the same once its own receipts are folded in.
   const hit = team.agents.map((a) => budgets.check({ agent_id: a })).find(Boolean) ?? null;
@@ -95,9 +97,9 @@ export function teamVerdict({ team, receiptsByAgent, nowMs, budgetPeriod = null 
     name: team.name,
     agents: [...team.agents],
     caps,
-    spend: { day_usd: round6(spend.day), week_usd: round6(spend.week), month_usd: round6(spend.month), ...(lifetime ? { total_usd: round6(spend.total) } : {}), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
+    spend: { day_usd: round6(spend.day), month_usd: round6(spend.month), unknown_count: spend.unknown, pending_batch_count: pendingBatches, cost_complete: spend.unknown === 0 && pendingBatches === 0 },
     verdict: hit ? hit.verdict : "ok",
-    ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd } : {}),
+    ...(hit?.scope ? { scope: teamScope(team.name, hit.scope), cap_usd: hit.cap_usd, spent_usd: hit.spent_usd, ...(hit.message ? { message: hit.message } : {}) } : {}),
     ...(hit?.unknown_receipts ? { unknown_receipts: hit.unknown_receipts } : {}),
     ...(Array.isArray(team.warnFractions) ? { warnFractions: [...team.warnFractions] } : {}),
     ...(team.anomaly ? { anomaly: { ...team.anomaly } } : {}),
@@ -132,14 +134,14 @@ export function cachedTotals(entry, pending, nowMs, budgetPeriod) {
   const asOfMs = Date.parse(entry.as_of);
   const total = {};
   let unknown = entry.unknown;
-  for (const s of TEAM_SCOPES) total[s] = samePeriod(s, nowMs, asOfMs, budgetPeriod) ? (entry.spent?.[s] ?? 0) : 0;
+  for (const s of TEAM_SCOPES) total[s] = inPeriod(s, nowMs, asOfMs, budgetPeriod) ? (entry.spent?.[s] ?? 0) : 0;
   for (const r of pending) {
     if (r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
-    // #183: a pending batch is not unknown spend (same rule as cap.js); its cost
-    // arrives as a settlement, which settled-aware loading has already applied.
+    // #183: a pending batch is not unknown (same rule as cap.js/agent-budget.js);
+    // its settled cost (settled-aware load) counts like any other receipt.
     if (isPendingBatch(r)) continue;
     if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
-    for (const s of TEAM_SCOPES) if (samePeriod(s, Date.parse(r.ts), nowMs, budgetPeriod)) total[s] += r.cost_usd;
+    for (const s of TEAM_SCOPES) if (inPeriod(s, Date.parse(r.ts), nowMs, budgetPeriod)) total[s] += r.cost_usd;
   }
   return { total, unknown };
 }
@@ -152,7 +154,7 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
   if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", team: team.name, unknown_receipts: unknown };
   for (const s of TEAM_SCOPES) {
     const cap = team.caps?.[s];
-    if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: teamScope(team.name, s), team: team.name, cap_usd: cap, spent_usd: round6(total[s]), ...totalCapMessage(s, cap) };
+    if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: teamScope(team.name, s), team: team.name, cap_usd: cap, spent_usd: round6(total[s]), ...neverResets(s) };
   }
   return null;
 }
@@ -161,35 +163,45 @@ export function cachedTeamVerdict(team, pending, nowMs, budgetPeriod = null) {
 // this identity), from settled-aware stored receipts. Pure.
 // #244: modelCaps adds `models`, the same totals split per capped model.
 // #265: { total: true } (the agent has caps.total) counts every receipt since the
-// beginning into spent.total;
-// #267: { week: false } (no week cap) skips the previous-month part of the current week; unknown cost anywhere in that history then refuses.
-export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false, week: includeWeek = true } = {}) {
+// beginning into spent.total; unknown cost anywhere in that history then refuses.
+export function agentSpendPolicy(receipts, nowMs, budgetPeriod = null, modelCaps = null, { total: lifetime = false, week: weekCapped = false } = {}) {
   const now = new Date(nowMs).toISOString();
-  const month = periodKey("month", nowMs, budgetPeriod), week = periodKey("week", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
-  const spent = { day: 0, week: 0, month: 0, total: 0 };
+  const month = periodKey("month", nowMs, budgetPeriod), day = periodKey("day", nowMs, budgetPeriod);
+  const spent = { day: 0, month: 0 };
+  const capped = Array.isArray(modelCaps) && modelCaps.length ? [...new Set(modelCaps.map((r) => normalizeModel(r.model)).filter(Boolean))].slice(0, MAX_SPEND_MODELS) : null;
+  const models = capped ? Object.fromEntries(capped.map((m) => [m, { day: 0, month: 0, unknown: 0 }])) : null;
   let unknown = 0;
   let pendingBatches = 0;
   for (const r of receipts) {
     if (!r || r.blocked || !Number.isFinite(Date.parse(r.ts))) continue;
     const tsMs = Date.parse(r.ts);
-    const inMonth = periodKey("month", tsMs, budgetPeriod) === month, inWeek = periodKey("week", tsMs, budgetPeriod) === week;
-    if (!inMonth && !(includeWeek && inWeek) && !lifetime) continue; // #261: a week can start in the previous month
+    if (periodKey("month", tsMs, budgetPeriod) !== month) continue;
     if (isPendingBatch(r)) { pendingBatches += 1; continue; } // #183: pending, not unknown
-    if (r.cost_usd === null || r.cost_usd === undefined) { unknown += 1; continue; }
+    // #267: a previous-month unknown counts only when the agent caps the week.
+    if (r.cost_usd === null || r.cost_usd === undefined) { if (inMonth || lifetime || weekCapped) unknown += 1; continue; }
     spent.total += r.cost_usd;
     if (inMonth) spent.month += r.cost_usd;
     if (inWeek) spent.week += r.cost_usd;
     if (periodKey("day", tsMs, budgetPeriod) === day) spent.day += r.cost_usd;
   }
-  const models = modelSpendPolicy(receipts, modelCaps, nowMs, budgetPeriod);
-  return { spent: { day: round6(spent.day), week: round6(spent.week), month: round6(spent.month), ...(lifetime ? { total: round6(spent.total) } : {}) }, unknown, pending_batches: pendingBatches, ...(models ? { models } : {}), as_of: now };
+  const out = { spent: { day: round6(spent.day), month: round6(spent.month) }, unknown, pending_batches: pendingBatches, as_of: now };
+  if (models) out.models = Object.fromEntries(Object.entries(models).map(([k, e]) => [k, { day: round6(e.day), month: round6(e.month), unknown: e.unknown }]));
+  return out;
+}
+
+export const MAX_SPEND_MODELS = 20;
+
+function validModelSpend(models) {
+  if (models === undefined) return true;
+  if (!models || typeof models !== "object" || Array.isArray(models) || Object.keys(models).length > MAX_SPEND_MODELS) return false;
+  return Object.values(models).every((e) => e && typeof e === "object" && Number.isInteger(e.unknown) && e.unknown >= 0
+    && TEAM_SCOPES.every((s) => typeof e[s] === "number" && Number.isFinite(e[s]) && e[s] >= 0));
 }
 
 export function validAgentSpend(a) {
   if (a === null || a === undefined) return true;
   if (typeof a !== "object" || !Number.isFinite(Date.parse(a.as_of)) || !Number.isInteger(a.unknown) || a.unknown < 0) return false;
-  if (!validModelSpend(a.models)) return false;
-  return TEAM_SCOPES.every((s) => (a.spent?.[s] === undefined && !REQUIRED_SPENT.includes(s)) || (typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0));
+  return TEAM_SCOPES.every((s) => typeof a.spent?.[s] === "number" && Number.isFinite(a.spent[s]) && a.spent[s] >= 0) && validModelSpend(a.models);
 }
 
 // Offline per-agent enforcement against the agent's fleet caps (#127).
@@ -200,7 +212,7 @@ export function cachedAgentVerdict(spend, caps, pending, nowMs, budgetPeriod = n
   if (unknown > 0) return { verdict: "accounting_unavailable", reason: "unreconciled_receipt", unknown_receipts: unknown };
   for (const s of TEAM_SCOPES) {
     const cap = caps[s];
-    if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: s, cap_usd: cap, spent_usd: round6(total[s]), fleet: true, ...totalCapMessage(s, cap) };
+    if (cap != null && total[s] >= cap) return { verdict: "budget_exceeded", reason: "budget_exceeded", scope: s, cap_usd: cap, spent_usd: round6(total[s]), fleet: true, ...neverResets(s) };
   }
   return null;
 }

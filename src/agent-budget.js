@@ -6,8 +6,9 @@ import { isPendingBatch, retryAfterSeconds } from "./cap.js";
 // using the shared ledger's rows for that agent.
 
 export const UNKNOWN_AGENT = "unknown";
-// #265: total is a lifetime cap (never resets).
 export const SCOPES = Object.freeze(["run", "hour", "day", "week", "month", "total"]);
+// #265: a total cap never resets; its refusal says so and carries no retry hint.
+export const TOTAL_NEVER_RESETS = "This total budget never resets; raise the cap to continue.";
 const HOUR_MS = 60 * 60 * 1000;
 
 const round6 = (n) => Number(n.toFixed(6));
@@ -57,9 +58,9 @@ function assertReceipt(r) {
   if (!Number.isFinite(Date.parse(r.ts)) || badCost) throw new Error("Invalid receipt history; reconcile before running");
 }
 
-const POLICY_KEYS = new Set(["default", "agents", "teams"]);
-const TEAM_KEYS = new Set([...SCOPES, "agents", "models"]);
-const LIMIT_KEYS = new Set([...SCOPES, "maxSteps", "models", "rpm", "tpm", "maxConcurrent"]);
+const POLICY_KEYS = new Set(["default", "agents", "teams", "preflight"]);
+const TEAM_KEYS = new Set([...SCOPES, "agents"]);
+const LIMIT_KEYS = new Set([...SCOPES, "maxSteps"]);
 
 // Unknown keys are refused: a misspelled limit must not silently mean "no limit".
 export function assertAgentPolicy(policy) {
@@ -69,6 +70,7 @@ export function assertAgentPolicy(policy) {
     for (const key of Object.keys(limits ?? {})) if (!LIMIT_KEYS.has(key)) throw new Error(`Unknown limit ${key} for ${label}`);
     assertLimits(limits, label);
   };
+  if (policy.preflight !== undefined && typeof policy.preflight !== "boolean") throw new Error("Agent policy preflight must be a boolean");
   if (policy.default) check(policy.default, "default");
   for (const [agent, limits] of Object.entries(policy.agents ?? {})) check(limits, agent);
   const members = new Set();
@@ -119,10 +121,11 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     const out = { run: 0, hour: 0, day: 0, week: 0, month: 0, total: 0, steps: 0, unknown: 0 };
     for (const r of rows) {
       if (!agentIds.includes(r.agent_id)) continue;
-      if (r.cost_usd === null && !isPendingBatch(r)) out.unknown += 1;
+      if (r.cost_usd === null && r.reason !== "batch_pending") out.unknown += 1;
       if (r.blocked) continue;
       const cost = r.cost_usd ?? 0;
       const tsMs = Date.parse(r.ts);
+      out.total += cost; // #265: every receipt since the beginning
       if (tsMs > nowMs - HOUR_MS) out.hour += cost;
       if (periodKey("day", tsMs, budgetPeriod) === today.day) out.day += cost;
       if (periodKey("week", tsMs, budgetPeriod) === today.week) out.week += cost;
@@ -145,7 +148,7 @@ export function createAgentBudgets({ policy = {}, history = [], now = () => new 
     entries.sort((a, b) => a[0] - b[0]);
     return retryAfterSeconds(entries, spent, cap, nowMs);
   }
-  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : {});
+  const hourHint = (scope, agentIds, spent, cap) => (scope === "hour" ? { retry_after_s: hourRetryAfter(agentIds, spent, cap) } : scope === "total" ? { message: TOTAL_NEVER_RESETS } : {});
 
   // Effective model allowlist (#153): intersection of the agent's, its team's and the default lists.
   // null = unrestricted; [] = every model refused.

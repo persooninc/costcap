@@ -143,5 +143,14 @@ export const samePeriod = (scope, aMs, bMs, budgetPeriod) => periodKey(scope, aM
 
 // #261: receipts that can count toward any day/week/month window at nowMs. A week
 // can start in the previous month, so this is the current month OR the current week.
-// #267: the previous-month part of the week only counts when the entity caps a week.
-export const inSpendWindow = (tsMs, nowMs, budgetPeriod, includeWeek = true) => samePeriod("month", tsMs, nowMs, budgetPeriod) || (includeWeek && samePeriod("week", tsMs, nowMs, budgetPeriod));
+export const inSpendWindow = (tsMs, nowMs, budgetPeriod) => samePeriod("month", tsMs, nowMs, budgetPeriod) || samePeriod("week", tsMs, nowMs, budgetPeriod);
+
+// #267: an unknown-cost receipt refuses only inside a window the entity caps. The
+// week reaches into the previous month only when a week cap is set.
+export const inUnknownWindow = (tsMs, nowMs, budgetPeriod, weekCapped) => samePeriod("month", tsMs, nowMs, budgetPeriod) || (Boolean(weekCapped) && samePeriod("week", tsMs, nowMs, budgetPeriod));
+const isUnknownCost = (r) => r?.cost_usd === null || r?.cost_usd === undefined;
+/** #267: whether a stored receipt enters the verdict history at nowMs (unknown cost: capped windows only). */
+export const countsAtNow = (r, nowMs, budgetPeriod, weekCapped) => {
+  const ts = Date.parse(r.ts);
+  return isUnknownCost(r) ? inUnknownWindow(ts, nowMs, budgetPeriod, weekCapped) : inSpendWindow(ts, nowMs, budgetPeriod);
+};

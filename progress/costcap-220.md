@@ -1,8 +1,8 @@
-# costcap-220: Prometheus /v1/metrics scrape endpoint (2026-11-16)
+# costcap-220: Prometheus /v1/metrics scrape endpoint
 
-- New `src/hosted/metrics.js` (pure builder + exposition validator) and `GET /v1/metrics` in `src/hosted/server.js` (cck_ key or member session, org-scoped, `text/plain; version=0.0.4`).
-- Gauges: spend (agent/team/window, optional `?by=model`), spend_complete, unknown_cost_receipts, cap/cap_remaining (agent+team), alerts_open per ALERT_KINDS, agent_frozen, last_sync; 5,000-series cap with `costcap_metrics_truncated`.
-- Spend reuses `spendBreakdown` with the org budget period and retention cutoff, so it matches `/v1/spend`.
-- Tests: `test/hosted-metrics.test.js` (unit + HTTP on JSON and Postgres stores), `/v1/metrics` added to the viewer-key route matrix in `test/hosted-api-keys.test.js`, `e2e/metrics.spec.js`.
-- README Hosted API: scrape example with `credentials_file`, gauge-not-counter note.
-- Prod check after deploy: `/v1/metrics` unauthenticated should return 401.
+- `GET /v1/metrics` (src/hosted/metrics.js + route in src/hosted/server.js) serves `text/plain; version=0.0.4` gauges for the current org budget period: spend per agent/team/window, completeness, unknown-cost receipts, agent/team caps and remaining, open alerts per kind and scope, frozen state, last sync time and `costcap_metrics_truncated`.
+- Auth: viewer/admin `cck_` key or member session; no key, unknown, revoked or expired -> 401; org-scoped (JSON and Postgres stores tested).
+- Spend comes from `spendBreakdown` over `visibleReceipts` with the plan retention cutoff, so it matches `/v1/spend`. `?by=model` swaps agent totals for per-model series; past 5,000 series it falls back to agent totals and drops optional series first.
+- Tests: test/hosted-metrics.test.js (builder, escaping, period/retention, truncation, format validator in test/support/prom.js), #220 cases in test/hosted-api-keys.test.js, e2e/metrics.spec.js.
+- README: "Prometheus metrics (hosted, #220)" with a prometheus.yml example.
+- Follow-up (out of scope): Grafana dashboard JSON; confirm prod 401 after the next deploy.

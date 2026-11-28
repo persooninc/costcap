@@ -9,8 +9,7 @@ import { billCheckCommand } from "./bill-check.js";
 import { serveMcp } from "./mcp.js";
 import { parseTagList } from "./tags.js";
 import { createTagCaps, parseTagCaps, withFleetTagCaps } from "./tag-cap.js";
-import { createModelCaps, parseModelCaps, mergeModelCapRules } from "./model-cap.js";
-import { fleetModelRules, withFleetModelCaps } from "./hosted/model-caps.js";
+import { createModelCaps, parseModelCaps, mergeModelCapRules, withFleetModelCaps, isFleetModelScope } from "./model-cap.js";
 import { enroll, createFleetClient, requestRaise } from "./hosted/client.js";
 import { resolvePolicy } from "./hosted/policy.js";
 import { lockLedger, openSharedLedger } from "./ledger-lock.js";
@@ -25,9 +24,9 @@ import { createRateLimiter, minLimit } from "./rate-limit.js";
 import { assertAgentPolicy, createAgentBudgets, intersectModels, isMaxConcurrent, MAX_CONCURRENT_LIMIT } from "./agent-budget.js";
 import { guardedAgentStatus, guardedBudgetStatus } from "./check.js";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { buildRunSummary, rollupLine, runsCommand, writeRunSummary, runEndRecord } from "./run-summary.js";
-import { createKillCheck, hostKillFile, kill, killStatus, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
+import { readFileSync } from "node:fs";
+import { buildRunSummary, rollupLine, writeRunSummary, listRunSummaries } from "./run-summary.js";
+import { createKillCheck, kill, recordKillEvent, resume, DEFAULT_KILL_FILE } from "./kill.js";
 import { VERSION } from "./version.js";
 import { writeGithubOutputs } from "./github-output.js";
 import { summaryCommand, diffCommand, summarizeLedger, stableStringify, readSummary, diffSummaries, formatDiffText, parseThresholds } from "./cost-diff.js";
@@ -38,28 +37,23 @@ import { createResponseCache, parseTtl } from "./response-cache.js";
 import { dirname, join } from "node:path";
 import { unpricedDiscountWarnings } from "./price-overrides.js";
 import { loadUpstreamPrices, parseUpstreams, upstreamEnv } from "./upstreams.js";
+import { createOtlpExporter, parseOtlpEndpoint, parseOtlpHeaders } from "./otlp.js";
 import { awsCredentials } from "./sigv4.js";
-import { createDowngrader, mergeDowngrade, parseDowngradeAt, parseDowngradeMap, scopeUsage } from "./downgrade.js";
+import { createDowngradeNotifier, mergeDowngrade, parseDowngradeAt, parseDowngradeMap } from "./downgrade.js";
 import { isPricedModel } from "./pricing.js";
-import { createOtlpExporter, parseOtlpHeaders, parseOtlpUrl } from "./otlp.js";
+import { isPricedWithOverrides } from "./price-overrides.js";
+import { userPrice } from "./upstreams.js";
 
-const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--week-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--max-concurrent N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--model-cap MODEL:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] [--otlp URL] -- <command...>\n" +
+const USAGE = "usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--max-steps N] [--rpm N] [--tpm N] [--velocity-multiple X] [--models ID,ID] [--unknown-models refuse|fallback] [--receipts FILE] [--enrollment FILE] [--kill-file FILE] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--tag-cap KEY:hour|day|month=USD]... [--model-cap MODEL:hour|day|month=USD]... [--policy FILE] [--shared-ledger] [--preflight] [--timeout SECONDS] [--warn-at F,F|off] [--downgrade FROM=TO[,FROM=TO]] [--downgrade-at F] [--cache TTL] [--cache-dir DIR] [--cache-max-mb N] [--upstream NAME=URL[,env=VAR][,insecure]]... [--upstream-prices FILE] [--otlp URL] -- <command...>\n" +
   "       (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url, e.g. http://127.0.0.1:8000/v1 for vLLM)\n" +
   "       (wrap limits: --timeout or COSTCAP_UPSTREAM_TIMEOUT_S = wait for the first response byte, default 600s; COSTCAP_STREAM_IDLE_TIMEOUT_S = max gap between stream chunks, default 300s; COSTCAP_MAX_REQUEST_MB = request body limit, default 32)\n" +
-  "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--week-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output] [--baseline FILE] [--max-increase-pct N] [--max-increase-usd N] [--summary-out FILE]\n" +
-  "       costcap summary [--receipts FILE] [--run-id ID] --json\n" +
-  "       costcap diff --baseline FILE --current FILE [--max-increase-pct N] [--max-increase-usd N] [--markdown] [--json]\n" +
+  "       costcap check [--cap USD] [--hour-cap USD] [--day-cap USD] [--month-cap USD] [--models ID,ID] [--run-id ID] [--receipts FILE] [--warn-at F,F|off] [--github-output]\n" +
   "       costcap reconcile --receipts FILE --provider FILE [--apply]\n" +
-  "       costcap bill-check --receipts FILE --provider openai|anthropic (--provider-export FILE | --fetch) [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tolerance-pct 5] [--project ID] [--workspace ID] [--json]\n" +
   "       costcap enroll --url URL --name NAME [--enrollment FILE]\n" +
-  "       costcap request-raise --scope run|hour|day|week|month|total --amount USD --hours N --reason TEXT [--enrollment FILE]\n" +
-  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE] [--kill-file FILE] [--enrollment FILE]\n" +
-  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE] [--kill-file FILE] [--enrollment FILE]\n" +
+  "       costcap mcp [--cap USD] [--receipts FILE] [--policy FILE]\n" +
+  "       costcap agent-status --agent ID --policy FILE [--run-id ID] [--receipts FILE]\n" +
   "       costcap runs [--json] [--receipts FILE]\n" +
-  "       costcap receipts [--receipts FILE] [--since 14d|24h|ISO] [--until ISO] [--agent ID] [--run-id ID] [--tag KEY=VALUE]... [--json] [--export csv]\n" +
-  "       costcap pricing verify [--receipts FILE] [--prices FILE] [--json] | costcap pricing show [model] [--prices FILE]\n" +
-  "       costcap kill [note] [--host] [--kill-file FILE] [--receipts FILE] | costcap kill --status | costcap resume [--host] [--kill-file FILE] [--receipts FILE]\n" +
-  "       (--host uses $COSTCAP_HOME/KILL, default ~/.costcap/KILL, and freezes every wrapped agent on this machine)\n" +
+  "       costcap kill [note] [--kill-file FILE] [--receipts FILE] | costcap resume [--kill-file FILE] [--receipts FILE]\n" +
   "       costcap --version | costcap --help";
 
 export function parseWrapArgs(argv) {
@@ -67,7 +61,7 @@ export function parseWrapArgs(argv) {
   if (sep === -1 || sep === argv.length - 1) throw new Error("usage: costcap wrap [--cap USD] [--hour-cap USD] [--day-cap USD] [--week-cap USD] [--month-cap USD] [--max-steps N] [--velocity-multiple X] [--receipts FILE] [--upstream NAME=URL[,env=VAR]]... -- <command...>\n  (--upstream URL is the base your SDK would use without costcap, the same value you would put in base_url)");
   const flags = argv.slice(0, sep);
   const command = argv.slice(sep + 1);
-  const opts = { caps: {}, maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", warnAt: [...DEFAULT_WARN_AT], killFile: DEFAULT_KILL_FILE, command };
+  const opts = { caps: {}, preflight: ["1", "true"].includes(process.env.COSTCAP_PREFLIGHT ?? ""), maxSteps: undefined, velocityMultiple: undefined, receiptsPath: ".costcap/receipts.jsonl", killFile: DEFAULT_KILL_FILE, command };
   const money = (name, v) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be a positive number of USD, got "${v}"`);
@@ -77,7 +71,6 @@ export function parseWrapArgs(argv) {
     const f = flags[i];
     if (f === "--shared-ledger") { opts.sharedLedger = true; continue; }
     if (f === "--preflight") { opts.preflight = true; continue; }
-    if (f === "--github-output") { opts.githubOutput = true; continue; }
     const v = flags[++i];
     if (v === undefined) throw new Error(`${f} needs a value`);
     if (f === "--cap") opts.caps.run = money(f, v);
@@ -113,7 +106,7 @@ export function parseWrapArgs(argv) {
       opts.unknownModels = v;
     } else if (f === "--timeout") opts.timeoutS = positiveNumber(f, v);
     else if (f === "--warn-at") opts.warnAt = parseWarnAt(v);
-    else if (f === "--downgrade") opts.downgradeMap = parseDowngradeMap(v);
+    else if (f === "--downgrade") opts.downgradeMap = { ...(opts.downgradeMap ?? {}), ...parseDowngradeMap(v) };
     else if (f === "--downgrade-at") opts.downgradeAt = parseDowngradeAt(v);
     else if (f === "--receipts") opts.receiptsPath = v;
     else if (f === "--enrollment") opts.enrollmentPath = v;
@@ -143,6 +136,8 @@ export function parseWrapArgs(argv) {
   // #238: per-model caps are validated before anything is spawned.
   if (opts.modelCapSpecs) { opts.modelCaps = parseModelCaps(opts.modelCapSpecs); delete opts.modelCapSpecs; }
   // #186: custom upstreams and their prices are validated before anything is spawned.
+  // #239: OTLP endpoint validated before anything is spawned (headers come only from env).
+  if (opts.otlpEndpoint !== undefined) parseOtlpEndpoint(opts.otlpEndpoint);
   opts.upstreams = parseUpstreams(opts.upstreamSpecs ?? []);
   // #239: --otlp (or COSTCAP_OTLP_ENDPOINT) is validated before anything is spawned.
   const otlpRaw = opts.otlpEndpoint ?? process.env.COSTCAP_OTLP_ENDPOINT;
@@ -150,12 +145,18 @@ export function parseWrapArgs(argv) {
   if (otlpRaw) opts.otlp = parseOtlpUrl(otlpRaw);
   delete opts.upstreamSpecs;
   if (opts.upstreamPricesPath) opts.userPrices = loadUpstreamPrices(opts.upstreamPricesPath, opts.upstreams.map((u) => u.name));
-  // #207: a downgrade target must have a rate, so spend stays known after the switch.
-  for (const to of Object.values(opts.downgradeMap ?? {})) {
-    const userPriced = Object.values(opts.userPrices?.upstreams ?? {}).some((t) => t && typeof t === "object" && Object.hasOwn(t, to));
-    if (!isPricedModel(to) && !userPriced) throw new Error(`--downgrade target "${to}" has no published rate; add it to --upstream-prices or pick a priced model`);
+  // #207: a downgrade target with no price would make spend unknown; refused before spawning.
+  for (const to of new Set(Object.values(opts.downgradeMap ?? {}))) {
+    if (!isDowngradeTargetPriced(to, opts)) throw new Error(`--downgrade target "${to}" has no published rate; pick a priced model or add it to --upstream-prices`);
   }
   return opts;
+}
+
+export function isDowngradeTargetPriced(model, { userPrices = null, upstreams = [] } = {}) {
+  if (isPricedModel(model)) return true;
+  if (!userPrices) return false;
+  if (["openai", "anthropic", "openrouter"].some((p) => isPricedWithOverrides(userPrices, p, model))) return true;
+  return upstreams.some((u) => userPrice(userPrices, `u/${u.name}`, model) !== null);
 }
 
 function positiveNumber(name, v) {
@@ -188,11 +189,14 @@ function parseKillArgs(argv) {
 const loadPolicy = (path) => assertAgentPolicy(JSON.parse(readFileSync(path, "utf8")));
 
 export async function wrap(argv) {
-  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, modelCaps: modelCapRules, rpm, tpm, maxConcurrent: maxConcurrentFlag, downgradeMap, downgradeAt, otlp } = parseWrapArgs(argv);
+  const { caps, maxSteps, models, unknownModels, velocityMultiple, receiptsPath, killFile, command, enrollmentPath, agentId, runId, policyPath, sharedLedger: shared, preflight: preflightFlag, timeoutS, warnAt, tags, cacheTtlMs, cacheDir, cacheMaxMb, upstreams: customList, userPrices, tagCaps: tagCapRules, modelCaps: modelCapRules, rpm, tpm, downgradeMap, downgradeAt, otlpEndpoint } = parseWrapArgs(argv);
+  // #239: --otlp wins over COSTCAP_OTLP_ENDPOINT; OTEL_EXPORTER_OTLP_* belong to the wrapped agent.
+  const otlpUrl = otlpEndpoint ?? (process.env.COSTCAP_OTLP_ENDPOINT || undefined);
+  const otlpTarget = otlpUrl !== undefined ? parseOtlpEndpoint(otlpUrl) : null;
+  const otlpHeaders = otlpTarget ? parseOtlpHeaders(process.env.COSTCAP_OTLP_HEADERS) : {};
+  if (otlpTarget?.insecure) console.error(`costcap: warning: --otlp uses plain http to a non-loopback host (${otlpTarget.url})`);
   for (const w of unpricedDiscountWarnings(userPrices)) console.error(w);
   for (const u of customList) if (u.insecure) console.error(`costcap: warning: custom upstream "${u.name}" uses plain http to a non-loopback host (${u.url})`);
-  if (otlp?.insecure) console.error(`costcap: warning: --otlp uses plain http to a non-loopback host (${new URL(otlp.url).host})`);
-  const otlpHeaders = otlp ? parseOtlpHeaders(process.env.COSTCAP_OTLP_HEADERS) : null;
   const limits = proxyLimits({ timeoutS });
   // Never price from a tampered table (#122): refuse before spawning anything.
   assertTableIntegrity();
@@ -200,25 +204,26 @@ export async function wrap(argv) {
   const preflight = Boolean(preflightFlag) || /^(1|true|on)$/i.test(process.env.COSTCAP_PREFLIGHT ?? "");
   if (policyPath && !agentId) throw new Error("--policy needs --agent");
   const policy = policyPath ? loadPolicy(policyPath) : null;
+  const preflight = preflightFlag || policy?.preflight === true;
   // The wrapper assigns the run id, so the wrapped agent cannot pick a fresh one.
   // #170: every receipt carries run_id, with or without --agent.
   const who = { ...(agentId ? { agent_id: agentId } : {}), run_id: runId ?? randomUUID() };
   // --shared-ledger (CC-5): several wrappers on one host share day/month caps.
   let cap, agentBudgets, tagCaps = null, modelCaps = null, hostedModelCaps = null;
   let proxySettle = () => {}; // #171: bound once the proxy is listening
+  // #181: soft cap warnings after settlements, sibling receipts and cap changes.
+  // Deferred to a microtask so it never runs inside the shared-ledger critical section.
+  let checkWarnings = () => {};
+  const warnSoon = () => queueMicrotask(() => { try { checkWarnings(); } catch { /* best effort */ } });
+  let capWarner;
   // #176: fleet and shared-ledger settlements share one helper (batch_pending aware).
   // #178: settlements of this run's receipts also feed the run summary.
   const runSettlements = [];
-  // #181: bound once the proxy is listening; capWarner once created.
-  let checkWarnings = () => {};
-  let capWarner = null;
-  let downgrader = null;
-  const settleWithWarnings = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle, tagCaps: () => tagCaps, modelCaps: () => modelCaps,
-    onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); } });
-  const settleReceipt = (s, r) => { const applied = settleWithWarnings(s, r); if (applied) checkWarnings(); return applied; };
+  const settleReceipt = createSettler({ cap: () => cap, agentBudgets: () => agentBudgets, proxySettle: () => proxySettle,
+    onSettled: (e) => { if (e.run_id === who.run_id) runSettlements.push(e); warnSoon(); } });
   const sharedLedger = shared ? openSharedLedger(receiptsPath, {
-    onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); tagCaps?.record(r); modelCaps?.record(r); checkWarnings(); },
-    onExternalWarning: (e) => { capWarner?.note(e); downgrader?.note(e); },
+    onExternal: (r) => { cap.record(r, { external: true }); agentBudgets?.record(r); warnSoon(); },
+    onExternalEvent: (e) => capWarner?.note(e),
     // #174: another wrapper (or reconcile --apply) settled a receipt we hold as unknown.
     // A batch_pending receipt was never counted as unknown, so its cost is recorded instead.
     onExternalSettle: (s, r) => settleReceipt(s, r),
@@ -228,13 +233,7 @@ export async function wrap(argv) {
   const release = () => { if (ledgerReleased) return; ledgerReleased = true; releaseLedger(); };
   try {
   const history = sharedLedger ? sharedLedger.history() : loadSettledReceipts(receiptsPath);
-  cap = createCapEngine({ caps, history, runId: who.run_id });
-  if (tagCapRules?.length) tagCaps = createTagCaps({ rules: tagCapRules, history });
-  // #238: always built when enrolled, so fleet modelCaps can arrive on any sync.
-  if (modelCapRules?.length || enrollmentPath) modelCaps = createModelCaps({ rules: modelCapRules ?? [], history });
-  // #244: hosted day/month rules are enforced fleet-wide from agent_spend.models; this
-  // engine only covers them (UTC, local ledger) until the server sends that snapshot.
-  if (enrollmentPath) hostedModelCaps = createModelCaps({ rules: [], history });
+  cap = createCapEngine({ caps, history, pendingBatchesBlock: false });
   const velocity = createVelocityBreaker({ maxSteps, ...(velocityMultiple ? { multiple: velocityMultiple } : {}) });
   let fleet;
   let fleetPolicy;
@@ -242,37 +241,24 @@ export async function wrap(argv) {
   // #192: effective rate limit = min(flag, --policy agent/default, fleet); re-applied on each fleet sync.
   const rateLimit = createRateLimiter();
   let fleetRate = {};
-  let effectiveConcurrent = 1;
   const applyRate = () => {
     const own = agentBudgets?.limitsFor(who.agent_id ?? "unknown") ?? null;
     rateLimit.setLimits({ rpm: minLimit(rpm, own?.rpm, fleetRate.rpm), tpm: minLimit(tpm, own?.tpm, fleetRate.tpm) });
-    // #249: effective concurrency = min(flag, --policy agent/default, fleet ceiling); default 1.
-    effectiveConcurrent = minLimit(maxConcurrentFlag, own?.maxConcurrent, fleetRate.maxConcurrent) ?? 1;
   };
-  // #207: local --downgrade / --downgrade-at merged with the fleet downgrade (local only adds or lowers).
-  const localDowngrade = downgradeMap ? { map: downgradeMap, at: downgradeAt } : downgradeAt != null ? { at: downgradeAt } : null;
-  let downgradeConfig = mergeDowngrade(null, localDowngrade);
   let raiseTimer = null;
+  // #207: fleet downgrade (cached offline) merged with local flags; local only adds or lowers `at`.
+  let fleetDowngrade = null;
+  const localDowngrade = downgradeMap || downgradeAt != null ? { map: downgradeMap ?? null, at: downgradeAt } : null;
   const setPolicy = (p) => {
     fleetPolicy = p;
-    // #208: a cap raise expires offline: re-resolve the cached policy at expires_at.
-    clearTimeout(raiseTimer);
-    if (fleet && p.raiseExpiresAt != null) { raiseTimer = setTimeout(() => setPolicy(fleet.policy()), Math.max(0, p.raiseExpiresAt - Date.now()) + 5); raiseTimer.unref?.(); }
-    downgradeConfig = mergeDowngrade(p.downgrade ?? null, localDowngrade);
-    // #274/#280: fleet day/week/month caps are not min-merged into the local UTC buckets; they run on the org clock.
-    const resolved = resolvePolicy({ local: { ...caps, day: undefined, week: undefined, month: undefined, maxSteps, models }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, maxSteps: p.maxSteps ?? undefined, models: p.models ?? undefined } });
-    const { day: fleetDay, week: fleetWeekCap, month: fleetMonth, ...rest } = resolved.caps;
-    const own = Object.fromEntries(["day", "week", "month"].filter((k) => caps[k] != null).map((k) => [k, caps[k]]));
-    cap.updateCaps({ ...rest, ...own });
-    cap.setFleetPeriod({ caps: { day: fleetDay ?? null, week: fleetWeekCap ?? null, month: fleetMonth ?? null }, budgetPeriod: fleet?.budgetPeriod() ?? null });
-    checkWarnings();
+    const resolved = resolvePolicy({ local: { ...caps, maxSteps }, lastKnown: { version: p.version, caps: p.caps, killed: p.killed, ...(p.maxSteps != null ? { maxSteps: p.maxSteps } : {}) } });
+    cap.updateCaps(resolved.caps);
+    warnSoon();
     velocity.setMaxSteps(resolved.maxSteps);
     fleetModels = resolved.models;
-    fleetRate = { rpm: p.rpm, tpm: p.tpm, maxConcurrent: p.maxConcurrent };
-    // #244: hosted hour rules stay local; hosted day/month rules go fleet-wide.
-    const hosted = p.modelCaps ?? [];
-    modelCaps?.setRules(mergeModelCapRules(hosted.filter((r) => r.scope === "hour"), modelCapRules ?? []));
-    hostedModelCaps?.setRules(fleetModelRules(hosted).map((r) => ({ model: r.model, scope: r.scope, cap: r.usd })));
+    fleetRate = { rpm: p.rpm, tpm: p.tpm };
+    // #244: hosted day/month rules are enforced fleet-wide (fleet.modelCheck); hosted hour rules stay local.
+    modelCaps?.setRules(mergeModelCapRules((p.modelCaps ?? []).filter((r) => !isFleetModelScope(r.scope)), modelCapRules ?? []));
     applyRate();
   };
   if (enrollmentPath) {
@@ -284,18 +270,16 @@ export async function wrap(argv) {
   }
   const localKill = createKillCheck(killFile);
   const combinedKill = () => localKill() || (fleetPolicy?.killed || fleet?.revoked() ? { reason: "killed", note: "fleet policy or revoked credentials" } : null);
-  const testUpstreams = Object.fromEntries([["openai", process.env.COSTCAP_TEST_OPENAI_UPSTREAM], ["gemini", process.env.COSTCAP_TEST_GEMINI_UPSTREAM], ["anthropic", process.env.COSTCAP_TEST_ANTHROPIC_UPSTREAM], ["openrouter", process.env.COSTCAP_TEST_OPENROUTER_UPSTREAM], ["bedrock", process.env.COSTCAP_TEST_BEDROCK_UPSTREAM], ["vertex", process.env.COSTCAP_TEST_VERTEX_UPSTREAM]].filter(([, v]) => v));
-  const upstreams = Object.keys(testUpstreams).length ? testUpstreams : undefined; // test hook
+  const upstreams = process.env.COSTCAP_TEST_OPENAI_UPSTREAM ? { openai: process.env.COSTCAP_TEST_OPENAI_UPSTREAM } : undefined; // test hook
   agentBudgets = policy ? createAgentBudgets({ policy, history }) : undefined;
   applyRate();
   const runReceipts = [];
   const summaryRunId = who.run_id;
-  const startedMs = Date.now();
-  const startedAt = new Date(startedMs).toISOString();
-  const exporter = otlp ? createOtlpExporter({ url: otlp.url, headers: otlpHeaders, runId: summaryRunId }) : null;
+  const otlp = otlpTarget ? createOtlpExporter({ endpoint: otlpTarget.url, headers: otlpHeaders, runId: summaryRunId, serviceVersion: VERSION }) : null;
+  const startedAt = new Date().toISOString();
   let priorEvents = [];
   try { priorEvents = loadEvents(receiptsPath); } catch { /* corrupt lines already fail history load */ }
-  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null, periodFor: (scope, at) => cap.fleetWindow(scope, at.getTime()) });
+  capWarner = createCapWarner({ fractions: warnAt, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #207: trigger order: local caps, --policy agent and team budgets, enrolled fleet agent and team caps.
   const downgradeUsage = () => {
     const rows = scopeUsage(cap.limits(), cap.spend());
@@ -311,33 +295,26 @@ export async function wrap(argv) {
     if (fr?.agent) rows.push(...scopeUsage(fleetPolicy?.caps, spentOf(fleetPolicy?.caps, fr.agent), "fleet"));
     const team = fleet?.team?.();
     if (fr?.team && team) { const tc = team.caps ?? {}; rows.push(...scopeUsage(tc, spentOf(tc, fr.team), `team ${team.name}`)); }
-    const org = fleet?.orgBudget?.();
-    if (fr?.org && org) rows.push(...scopeUsage(org.caps, spentOf(org.caps, fr.org), "org"));
     return rows;
   };
   downgrader = createDowngrader({ config: () => downgradeConfig, usage: downgradeUsage, lowerBound: () => cap.spend().unknown > 0, events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null });
   // #184: opt-in response cache, default <ledger-dir>/cache.
   const cache = cacheTtlMs ? createResponseCache({ dir: cacheDir ?? join(dirname(receiptsPath), "cache"), ttlMs: cacheTtlMs, ...(cacheMaxMb ? { maxMb: cacheMaxMb } : {}) }) : null;
-  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps, rateLimit, maxConcurrent: () => effectiveConcurrent, ...limits,
+  const { server, port } = await startMeteringProxy({ cache, onReceipt: (r, meta) => { runReceipts.push(r); exporter?.add(r, meta); }, receiptsPath, cap, upstreams, velocity, killCheck: combinedKill, who, agentBudgets, teamCheck: fleet ? () => fleet.fleetCheck() : undefined, fleetRemaining: fleet ? () => fleet.preflightRemaining() : null, sharedLedger, capWarner, downgrader, preflight, tags: tags ?? null, tagCaps: fleet ? withFleetTagCaps(tagCaps, fleet, tagCapRules ?? []) : tagCaps, modelCaps: fleet && modelCaps ? withFleetModelCaps(modelCaps, fleet) : modelCaps, rateLimit, ...limits,
     customUpstreams: Object.fromEntries(customList.map((u) => [u.name, u.url])), userPrices: userPrices ?? null,
     // #153: local --models ∩ synced fleet models ∩ agent policy (agent ∩ team ∩ default), re-read per call.
+    downgrade: () => mergeDowngrade(fleetDowngrade, localDowngrade),
+    downgradeNotifier: createDowngradeNotifier({ events: priorEvents, runId: summaryRunId, agentId: who.agent_id ?? null }),
     allowedModels: () => intersectModels(fleetModels, agentBudgets?.modelsFor(who.agent_id) ?? null), unknownModels });
   proxySettle = (r) => server.settle(r);
   checkWarnings = () => server.checkWarnings();
-  // #187: fractions already reached at startup (incl. a cached fleet cap) warn once, deduped by the ledger.
-  checkWarnings();
   const env = { ...process.env };
   for (const line of baseUrlOverrides(port)) {
     const [k, ...v] = line.split("=");
     env[k] = v.join("=");
   }
-  // #216: boto3 / AWS SDK v3 Converse callers read the service-specific endpoint variable.
-  if (process.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME) console.error("costcap: warning: AWS_ENDPOINT_URL_BEDROCK_RUNTIME is already set; AWS SDK Bedrock calls go there and are not metered by this wrap.");
-  else env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME = `http://127.0.0.1:${port}/bedrock`;
-  // #188: the proxy re-signs SigV4 Bedrock calls only with static credentials from this env.
-  if (process.env.CLAUDE_CODE_USE_BEDROCK === "1" && !awsCredentials(process.env) && !process.env.AWS_BEARER_TOKEN_BEDROCK) {
-    console.error("costcap: note: CLAUDE_CODE_USE_BEDROCK=1 but no static AWS credentials or AWS_BEARER_TOKEN_BEDROCK are set; signed Bedrock calls will be refused. Run: eval \"$(aws configure export-credentials --format env)\"");
-  }
+  const note = bedrockStartupNote(process.env);
+  if (note) console.error(note);
   const custom = upstreamEnv(customList, port);
   for (const note of custom.notes) console.error(note);
   Object.assign(env, custom.env);
@@ -389,10 +366,14 @@ export async function wrap(argv) {
     receipts: [...runReceipts, ...runSettlements], caps: cap.limits(), spend: s, killed: killedByCostcap, kill: killInfo, warnings: capWarner.emitted, cacheEnabled: Boolean(cache), signal: killedByCostcap ? null : exitSignal, maxConcurrent: effectiveConcurrent });
   // #225: the run-end record goes up with the final receipt sync (retried on later syncs if it fails).
   if (fleet) { fleet.queueRunEnd(runEndRecord(summary)); await fleet.sync({ wait: true }); }
+  // #239: root span + final flush, capped at 5 s; counts go in the summary and roll-up.
+  if (otlp) summary.otlp = await otlp.shutdown(summary);
   server.closeAllConnections();
   server.close();
-  // #239: final OTLP flush, capped at 5 s; failures never change the exit code.
-  if (exporter) summary.otlp = await exporter.finish(summary, { startMs: startedMs });
+  const s = cap.spend();
+  const summary = buildRunSummary({ runId: summaryRunId, startedAt, endedAt: new Date().toISOString(), exitCode: code, receipts: runReceipts, caps, spent: s, killed: killedByCostcap });
+  try { writeRunSummary(receiptsPath, summary); } catch (err) { console.error(`costcap: warning: run summary not written: ${err.code ?? err.message}`); }
+  console.error(rollupLine(summary));
   console.error(`costcap: run spend $${s.run.toFixed(4)}${caps.run != null ? ` of $${caps.run} cap` : ""}`);
   try { writeRunSummary(receiptsPath, summary); } catch (e) { console.error(`costcap: warning: run summary not written: ${e.code ?? e.message}`); }
   console.error(rollupLine(summary));
@@ -469,21 +450,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exitCode = result.ok ? 0 : 1;
       }
     } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
-  } else if (cmd === "pricing") {
-    try {
-      const { code, out, err } = pricingCommand(rest);
-      if (out) console.log(out);
-      if (err) console.error(err);
-      process.exitCode = code;
-    } catch (err) { console.error(`costcap: ${err.message}`); process.exitCode = 2; }
-  } else if (cmd === "receipts") {
-    process.exitCode = receiptsCommand(rest);
-  } else if (cmd === "summary") {
-    process.exitCode = summaryCommand(rest);
-  } else if (cmd === "diff") {
-    process.exitCode = diffCommand(rest);
   } else if (cmd === "runs") {
-    runsCommand(rest);
+    const json = rest.includes("--json");
+    const i = rest.indexOf("--receipts");
+    const { runs, errors } = listRunSummaries(i >= 0 ? rest[i + 1] : ".costcap/receipts.jsonl");
+    for (const e of errors) console.error(`costcap: skipped corrupt run summary ${e.file}: ${e.error}`);
+    if (json) console.log(JSON.stringify(runs, null, 2));
+    else if (!runs.length) console.error("costcap: no run summaries yet.");
+    else for (const r of runs) console.log(rollupLine(r).replace(/^costcap: /, `${r.ended_at} `));
   } else if (cmd === "kill" || cmd === "resume") {
     const { file: projectFile, receipts, words, host, status } = parseKillArgs(rest);
     if (status) {

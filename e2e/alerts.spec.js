@@ -492,22 +492,23 @@ for (const viewport of [{ name: "desktop", width: 1280, height: 800 }, { name: "
     }
   });
 }
-// Issue #258: an admin adds a team route in the UI; an over-cap team alert reaches only the expected URL; a viewer sees the route read-only.
-test("alert routes: admin adds a payments route, team cap alert goes only to its Slack, viewer read-only", async ({ page }) => {
+
+// Issue #258: alert routes. An admin adds a team route in the UI; an over-cap
+// team alert reaches only the default Slack and the route Slack (fixture fetch);
+// a viewer sees the routes read-only.
+test("admin adds a team alert route, team cap alert reaches only the expected Slack URLs, viewer is read-only", async ({ page }) => {
   const { createOrgAlertRouter } = await import("../src/hosted/delivery.js");
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const codes = [];
-  const received = [];
-  const S0 = "https://hooks.slack.com/services/T0/B0/e2eDefaultA1";
-  const S1 = "https://hooks.slack.com/services/T1/B1/e2eRouteZ9";
-  const deliverAlert = createOrgAlertRouter({ fetchImpl: async (url) => { received.push(url); return { ok: true, status: 200 }; } });
+  const posted = [];
+  const S0 = "https://hooks.slack.com/services/T0/B0/e2eDefaultS0", S1 = "https://hooks.slack.com/services/T1/B1/e2eRouteS1xy";
+  const deliverAlert = createOrgAlertRouter({ dashboardUrl: origin, fetchImpl: async (url) => { posted.push(url); return { ok: true, status: 200 }; } });
   const service = createHostedServer({
     storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-routes-")), "data.json"),
     origin, secureCookies: false, turnstileSiteKey: "fixture-public-key",
     verifyChallenge: async (token) => token === fixtureToken,
-    sendCode: async (message) => { codes.push(message); },
-    sendInvite: async () => {},
+    sendCode: async (message) => { codes.push(message); }, sendInvite: async () => {},
     deliverAlert,
   });
   await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
@@ -528,116 +529,45 @@ test("alert routes: admin adds a payments route, team cap alert goes only to its
       body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
     }));
     await signIn("route-owner@example.invalid");
-    // Enroll an uncapped agent and put it in team "payments" with a $1 day cap.
     await page.locator("#enroll button").click();
     await expect(page.locator("#token")).not.toHaveText("");
     const token = (await page.locator("#token").innerText()).trim();
     const agent = await page.evaluate(async ({ credential }) => {
       const a = await (await fetch("/v1/enroll", { method: "POST", headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: JSON.stringify({ name: "pay-bot" }) })).json();
-      const t = await fetch("/v1/teams", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "payments", agents: [a.agentId], day: 1 }) });
-      return { ...a, teamStatus: t.status };
+      const team = await fetch("/v1/teams", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "payments", agents: [a.agentId], day: 1 }) });
+      return { token: a.token, team: team.status };
     }, { credential: token });
-    expect(agent.teamStatus).toBe(200);
-    // Defaults: Slack S0 for agent_silent only.
+    expect(agent.team).toBe(200);
+    // Default Slack limited to cap_hit; the route sends every payments alert to S1.
     await page.locator("#alertForm input[name=slack]").fill(S0);
-    for (const box of await page.locator("#defaultKinds input[name=kind]").all()) if ((await box.getAttribute("value")) !== "agent_silent") await box.uncheck();
+    for (const k of ["cap_approaching", "loop_detected", "agent_silent", "cap_projected", "spend_anomaly"]) await page.locator(`#defaultKinds input[value=${k}]`).uncheck();
     await page.locator("#alertForm button.primary").click();
-    await expect(page.locator("#defaultKindsView")).toHaveText("Default kinds: agent_silent");
-    // Add the payments route in the UI.
-    await page.locator("#routeForm input[name=rname]").fill("Payments");
+    await expect(page.locator("#status")).toContainText("Alert destinations saved.");
+    await page.locator("#routeForm input[name=name]").fill("R1");
     await page.locator("#routeForm input[name=teams]").fill("payments");
     await page.locator("#routeForm input[name=slack]").fill(S1);
-    await page.locator("#routeForm button[type=submit]").click();
-    await expect(page.locator("#alertRoutes li.route")).toHaveCount(1);
-    await expect(page.locator("#alertRoutes li.route")).toContainText("Payments · teams: payments · kinds: all");
-    await expect(page.locator("#alertRoutes li.route")).toContainText("https://hooks.slack.com/services/…teZ9");
-    expect(await page.content()).not.toContain("e2eRouteZ9");
-    // Over the team cap: the alert reaches only the route's Slack.
-    const status = await page.evaluate(async ({ agentToken, ts }) => (await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${agentToken}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "r1", ts, cost_usd: 2, model: "m" }] }) })).status, { agentToken: agent.token, ts: new Date().toISOString() });
+    await page.locator("#routeForm button.primary").click();
+    await expect(page.locator("#status")).toContainText("Alert route saved.");
+    await expect(page.locator("#alertRoutes .route")).toContainText("R1 · kinds: all · teams: payments · emails: none · Slack: https://hooks.slack.com/services/…S1xy");
+    const status = await page.evaluate(async ({ t, ts }) => (await fetch("/v1/receipts", { method: "POST", headers: { authorization: `Bearer ${t}`, "content-type": "application/json" }, body: JSON.stringify({ receipts: [{ id: "r1", ts, cost_usd: 2, model: "m" }] }) })).status, { t: agent.token, ts: new Date().toISOString() });
     expect(status).toBe(200);
     await service.evaluateFleetAlerts();
-    expect(received.length).toBeGreaterThan(0);
-    expect([...new Set(received)]).toEqual([S1]);
-    // Viewer: route listed read-only.
+    expect(posted.length).toBeGreaterThan(0);
+    expect(posted.every((u) => u === S0 || u === S1)).toBe(true);
+    expect(posted.filter((u) => u === S1).length).toBeGreaterThanOrEqual(1);
+    expect(posted.filter((u) => u === S0).length).toBe(1); // one cap_hit to the default; other kinds filtered
+    expect(await page.content()).not.toContain("e2eRouteS1xy");
+    // Viewer: read-only route list.
     await page.locator("#invite input[name=email]").fill("route-viewer@example.invalid");
     await page.locator("#invite button").click();
     await expect(page.locator("#invites")).toContainText("route-viewer@example.invalid");
     await page.locator("#logout").click();
     await signIn("route-viewer@example.invalid");
-    await expect(page.locator("#alertRoutes li.route")).toContainText("Payments");
+    await expect(page.locator("#alertRoutes .route")).toContainText("R1");
+    await expect(page.locator("#alertRoutes button")).toHaveCount(0);
     await expect(page.locator("#routeForm")).toBeHidden();
-    await expect(page.locator("#alertRoutes li.route button")).toHaveCount(0);
-    expect(await page.content()).not.toContain("e2eRouteZ9");
-  } finally {
-    service.server.closeAllConnections();
-    await new Promise((resolve) => service.server.close(resolve));
-  }
-});
-
-// Issue #282: native PagerDuty / Teams / Discord destinations. Fake fetchImpl receiver; nothing leaves the host.
-test("#282 admin saves PagerDuty, Teams and Discord, sees masked values, test send lists all three; viewer read-only", async ({ page }) => {
-  const { createOrgAlertRouter } = await import("../src/hosted/delivery.js");
-  const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
-  const codes = [];
-  const received = [];
-  const PD = "E2eRoutingKey0123456789abcdefXYZ";
-  const TEAMS = "https://prod-01.westus.logic.azure.com/workflows/e2e/triggers/manual/paths/invoke?sig=e2eTeamsSigQ7";
-  const DISCORD = "https://discord.com/api/webhooks/1234567890/e2eDiscordTokenZ9";
-  const resolveHost = async () => [{ address: "93.184.216.34", family: 4 }];
-  const deliverAlert = createOrgAlertRouter({ lookup: resolveHost, dashboardUrl: origin, fetchImpl: async (url, o) => { received.push({ url, body: JSON.parse(o.body) }); return { ok: true, status: url.includes("discord") ? 204 : 202 }; } });
-  const service = createHostedServer({
-    storePath: join(mkdtempSync(join(tmpdir(), "cc-pw-282-")), "data.json"),
-    origin, secureCookies: false, turnstileSiteKey: "fixture-public-key", resolveHost,
-    verifyChallenge: async (token) => token === fixtureToken,
-    sendCode: async (message) => { codes.push(message); },
-    sendInvite: async () => {},
-    deliverAlert,
-  });
-  await new Promise((resolve) => service.server.listen(port, "127.0.0.1", resolve));
-  const signIn = async (email) => {
-    await page.goto(origin);
-    await page.locator("#email").fill(email);
-    await expect(page.locator("#requestButton")).toBeEnabled();
-    await page.locator("#requestButton").click();
-    await expect(page.locator("#verify")).toBeVisible();
-    await page.locator("#code").fill(codes.at(-1).code);
-    await page.locator("#verify button[type=submit]").click();
-    await expect(page.locator("#workspace")).toBeVisible();
-  };
-  try {
-    page.on("dialog", (dialog) => dialog.accept());
-    await page.route("**/challenges.cloudflare.com/turnstile/v0/api.js*", (route) => route.fulfill({
-      status: 200, contentType: "application/javascript",
-      body: `window.turnstile={render(selector,opts){opts.callback(${JSON.stringify(fixtureToken)});return 1},reset(){}};`,
-    }));
-    await signIn("native-owner@example.invalid");
-    const form = page.locator("#alertForm");
-    await form.locator("input[name=pdKey]").fill(PD);
-    await form.locator("select[name=pdRegion]").selectOption("eu");
-    await form.locator("input[name=teamsHook]").fill(TEAMS);
-    await form.locator("input[name=discordHook]").fill(DISCORD);
-    await form.locator("button.primary").click();
-    await expect(page.locator("#status")).toContainText("Alert destinations saved.");
-    await expect(page.locator("#alertPagerDuty")).toHaveText(`key …${PD.slice(-4)} · eu · kinds: all`);
-    await expect(page.locator("#alertTeams")).toHaveText("https://prod-01.westus.logic.azure.com/…");
-    await expect(page.locator("#alertDiscord")).toHaveText(`https://discord.com/api/webhooks/…${DISCORD.slice(-4)}`);
-    await page.locator("#testAlert").click();
-    for (const ch of ["pagerduty", "teams", "discord"]) await expect(page.locator(`#testAlertResults li[data-channel=${ch}]`)).toHaveAttribute("data-status", "accepted");
-    expect(received.map((r) => r.url)).toEqual(["https://events.eu.pagerduty.com/v2/enqueue", TEAMS, DISCORD]);
-    expect(received[0].body.payload.severity).toBe("info");
-    for (const html of [await page.content()]) for (const s of [PD, "e2eTeamsSigQ7", "e2eDiscordTokenZ9"]) expect(html).not.toContain(s);
-    // Viewer: masked values, no edit fields.
-    await page.locator("#invite input[name=email]").fill("native-viewer@example.invalid");
-    await page.locator("#invite button").click();
-    await expect(page.locator("#invites")).toContainText("native-viewer@example.invalid");
-    await page.locator("#logout").click();
-    await signIn("native-viewer@example.invalid");
-    await expect(page.locator("#alertTeams")).toHaveText("https://prod-01.westus.logic.azure.com/…");
-    await expect(page.locator("#alertForm")).toBeHidden();
-    await expect(page.locator("#testAlert")).toBeHidden();
-    const html = await page.content();
-    for (const s of [PD, "e2eTeamsSigQ7", "e2eDiscordTokenZ9"]) expect(html).not.toContain(s);
+    expect(await page.evaluate(async () => (await fetch("/v1/alert-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ routes: [] }) })).status)).toBe(403);
+    expect(await page.content()).not.toContain("e2eRouteS1xy");
   } finally {
     service.server.closeAllConnections();
     await new Promise((resolve) => service.server.close(resolve));

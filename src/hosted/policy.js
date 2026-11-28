@@ -8,9 +8,7 @@
 
 import { intersectModels, isModelList } from "../agent-budget.js";
 import { warnFractionsError } from "./alerts.js";
-import { anomalyError } from "./anomaly.js";
-import { modelCapsError } from "../model-cap.js";
-import { downgradeError, mergeDowngrade } from "../downgrade.js";
+import { downgradeError } from "../downgrade.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 // Enrollment tokens are shown once. Only the SHA-256 hash is stored.
@@ -29,41 +27,9 @@ export function verifyToken(token, storedHash) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-// #265: total is a lifetime cap that never resets.
 export const CAP_KEYS = ["run", "hour", "day", "week", "month", "total"];
-// Scopes a time-boxed cap raise (#208) can target; week joined in #271, total in #287.
-export const RAISE_KEYS = [...CAP_KEYS];
-// What a pre-#271 wrapper accepts under policy.raise; week and total raises travel in the additive
-// `raise_week` / `raise_total` fields.
-export const LEGACY_RAISE_KEYS = Object.freeze(RAISE_KEYS.filter((k) => k !== "week" && k !== "total"));
-
-// #271: split a stored policy for GET /v1/policy so an old wrapper never sees raise.week.
-export function splitWeekRaise(policy) {
-  const { raise, ...rest } = policy ?? {};
-  if (!raise || !("week" in raise)) return { policy: policy ?? {}, raise_week: null };
-  const { week, ...legacy } = raise;
-  return { policy: { ...rest, ...(Object.keys(legacy).length ? { raise: legacy } : {}) }, raise_week: raiseEntries(week) };
-}
-
-// #287: split total raises out the same way (raise_total), so a b91f36e wrapper never sees raise.total.
-export function splitTotalRaise(policy) {
-  const { raise, ...rest } = policy ?? {};
-  if (!raise || !("total" in raise)) return { policy: policy ?? {}, raise_total: null };
-  const { total, ...legacy } = raise;
-  return { policy: { ...rest, ...(Object.keys(legacy).length ? { raise: legacy } : {}) }, raise_total: raiseEntries(total) };
-}
-
-// #287: validates the additive raise_total field (null = no total raises).
-export function raiseTotalError(v) {
-  if (v === null || v === undefined) return null;
-  return raiseError({ total: v });
-}
-
-// #271: validates the additive raise_week field (null = no week raises).
-export function raiseWeekError(v) {
-  if (v === null || v === undefined) return null;
-  return raiseError({ week: v });
-}
+// Scopes a time-boxed cap raise (#208) can target; week and total raises are out of scope (#261, #265 Out).
+export const RAISE_KEYS = CAP_KEYS.filter((k) => k !== "week" && k !== "total");
 
 // Issue #208/#212: time-boxed cap raise overlay. policy.raise = { <scope>: [{ amount_usd, expires_at, request_id }, ...] }.
 // Raises stack: the effective cap is computed at evaluation time as current base + sum of
@@ -125,9 +91,11 @@ export function nextRaiseExpiry(policy, nowMs = Date.now()) {
   return t.length ? Math.min(...t) : null;
 }
 
-// #267: drop cap keys stored before #261 rejected them (e.g. "weekly"). Returns the
-// cleaned policy (same object when nothing changed) and the dropped key names.
-export function dropLegacyCapKeys(p) {
+/**
+ * #267: drop caps.* keys that are not cap scopes (stored before #261 made them a 400).
+ * Returns { policy, dropped } ; policy is the same object when nothing is dropped.
+ */
+export function stripLegacyCapKeys(p) {
   const caps = p?.caps;
   if (!caps || typeof caps !== "object" || Array.isArray(caps)) return { policy: p, dropped: [] };
   const dropped = Object.keys(caps).filter((k) => !CAP_KEYS.includes(k));
@@ -146,37 +114,11 @@ export function validatePolicy(p) {
     const v = p.caps?.[k];
     if (v !== undefined && !(typeof v === "number" && Number.isFinite(v) && v > 0)) errors.push(`caps.${k} must be a positive number`);
   }
-  // Step budget (issue #114): upstream calls one run may make. Optional positive integer.
   if (p.maxSteps !== undefined && p.maxSteps !== null && !(Number.isInteger(p.maxSteps) && p.maxSteps > 0)) errors.push("maxSteps must be a positive integer");
-  // Per-agent agent_silent threshold (issue #134): null/missing = 6h default, 0 = off, else 0 < n <= 720.
-  if (p.silentAfterHours !== undefined && p.silentAfterHours !== null && !(typeof p.silentAfterHours === "number" && Number.isFinite(p.silentAfterHours) && p.silentAfterHours >= 0 && p.silentAfterHours <= 720)) errors.push("silentAfterHours must be 0 (off) or a number up to 720");
-  // Model allowlist (issue #153): optional non-empty array of exact model ids.
-  if (p.models !== undefined && p.models !== null && !isModelList(p.models)) errors.push("models must be a non-empty array of model ids");
-  // Warning fractions (issue #165): null/missing = default [0.8], [] = cap_approaching off.
-  if (p.warnFractions !== undefined && p.warnFractions !== null) {
-    const err = warnFractionsError(p.warnFractions);
-    if (err) errors.push(err);
-  }
-  // Rate limits (issue #192): optional positive integers per 60 s.
-  for (const k of ["rpm", "tpm"]) if (p[k] !== undefined && p[k] !== null && !(Number.isInteger(p[k]) && p[k] > 0)) errors.push(`${k} must be a positive integer`);
-  // #249: parallel upstream calls per wrapper (a ceiling), optional integer 1..64.
-  if (p.maxConcurrent !== undefined && p.maxConcurrent !== null && !(Number.isInteger(p.maxConcurrent) && p.maxConcurrent >= 1 && p.maxConcurrent <= 64)) errors.push("maxConcurrent must be an integer from 1 to 64");
-  // Budget-triggered model downgrade (issue #207): optional { at, map }.
-  if (p.downgrade !== undefined && p.downgrade !== null) {
-    const err = downgradeError(p.downgrade);
-    if (err) errors.push(err);
-  }
-  // Spend anomaly override (issue #223): optional { enabled, multiplier, min_usd }.
-  if (p.anomaly !== undefined && p.anomaly !== null) {
-    const err = anomalyError(p.anomaly);
-    if (err) errors.push(err);
-  }
-  // Per-model caps (issue #238): optional [{model, scope, usd}].
-  if (p.modelCaps !== undefined && p.modelCaps !== null) {
-    const err = modelCapsError(p.modelCaps);
-    if (err) errors.push(err);
-  }
   if (p.killed !== undefined && typeof p.killed !== "boolean") errors.push("killed must be boolean");
+  // Budget-triggered model downgrade (issue #207): { at?, map }.
+  const dgErr = downgradeError(p.downgrade);
+  if (dgErr) errors.push(dgErr);
   const raiseErr = raiseError(p.raise);
   if (raiseErr) errors.push(raiseErr);
   return errors;
@@ -192,10 +134,7 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
   lastKnown = lastKnown && dropLegacyCapKeys(lastKnown).policy;
   if (lastKnown && validatePolicy(lastKnown).length) throw new Error("Invalid cached fleet policy; refusing to loosen enforcement");
   for (const k of CAP_KEYS) if (local[k] != null && (!Number.isFinite(local[k]) || local[k] <= 0)) throw new Error(`Invalid local cap ${k}`);
-  if (local.maxSteps != null && !(Number.isInteger(local.maxSteps) && local.maxSteps > 0)) throw new Error("Invalid local maxSteps");
-  if (local.models != null && !isModelList(local.models)) throw new Error("Invalid local models");
-  for (const k of ["rpm", "tpm"]) if (local[k] != null && !(Number.isInteger(local[k]) && local[k] > 0)) throw new Error(`Invalid local ${k}`);
-  if (local.maxConcurrent != null && !(Number.isInteger(local.maxConcurrent) && local.maxConcurrent >= 1 && local.maxConcurrent <= 64)) throw new Error("Invalid local maxConcurrent");
+  if (local.maxSteps != null && (!Number.isInteger(local.maxSteps) || local.maxSteps <= 0)) throw new Error("Invalid local maxSteps");
   let server = lastKnown;
   let source = lastKnown ? "last-known" : "none";
   if (fetched && validatePolicy(fetched).length === 0 && (!lastKnown || fetched.version > lastKnown.version)) {
@@ -208,14 +147,12 @@ export function resolvePolicy({ local = {}, lastKnown = null, fetched = null, no
     const vals = [serverCaps[k], local?.[k]].filter((v) => v != null);
     if (vals.length) caps[k] = Math.min(...vals);
   }
-  // A local step budget can tighten the fleet one, never loosen it.
+  // Step budget (upstream calls per run): the tighter of fleet and local wins.
   const steps = [server?.maxSteps, local?.maxSteps].filter((v) => v != null);
   const maxSteps = steps.length ? Math.min(...steps) : null;
   // Model allowlists combine as an intersection (most restrictive wins, #153).
   const models = intersectModels(server?.models ?? null, local?.models ?? null);
   // #192: rate limits: the minimum wins, so local can tighten but never loosen.
   const minOf = (k) => { const v = [server?.[k], local?.[k]].filter((x) => x != null); return v.length ? Math.min(...v) : null; };
-  // #207: fleet downgrade; local can only add unmapped models and lower `at`.
-  const downgrade = mergeDowngrade(server?.downgrade ?? null, local?.downgrade ?? null);
-  return { caps, maxSteps, models, ...(server?.modelCaps ? { modelCaps: server.modelCaps } : {}), ...(downgrade ? { downgrade } : {}), ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), ...(minOf("maxConcurrent") != null && { maxConcurrent: minOf("maxConcurrent") }), killed: Boolean(server?.killed), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
+  return { caps, maxSteps, models, ...(minOf("rpm") != null && { rpm: minOf("rpm") }), ...(minOf("tpm") != null && { tpm: minOf("tpm") }), killed: Boolean(server?.killed), ...(server?.downgrade ? { downgrade: server.downgrade } : {}), version: server?.version ?? null, source, raiseExpiresAt: nextRaiseExpiry(server, nowMs) };
 }

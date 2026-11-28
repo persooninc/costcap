@@ -4,15 +4,13 @@ import { budgetPeriodError } from "../period.js";
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { validatePolicy, resolvePolicy, raiseWeekError, raiseTotalError, dropLegacyCapKeys } from "./policy.js";
+import { validatePolicy, resolvePolicy, raiseWeekError, stripLegacyCapKeys } from "./policy.js";
 import { loadReceipts, loadSettledReceipts, loadEvents, isSettlement } from "../cap.js";
 import { validFleetTagCaps, cachedFleetTagVerdict, cachedFleetTagRemaining, validFleetTagTotal, cachedFleetTagTotalVerdict, cachedFleetTagTotalRemaining } from "./tag-caps.js";
 import { cachedFleetModelVerdict, cachedFleetModelRemaining, validWeekModelCaps, validTotalModelCaps, cachedFleetModelTotalVerdict, cachedFleetModelTotalRemaining } from "./model-caps.js";
 import { validTeamPolicy, cachedTeamVerdict, validAgentSpend, cachedAgentVerdict, cachedAgentRemaining, cachedTeamRemaining } from "./teams.js";
-import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining, validOrgTotalPolicy, cachedOrgTotalVerdict, cachedOrgTotalRemaining } from "./org-budget.js";
-
-// #291: org window remainders plus the lifetime org total (null when neither applies).
-const orgLeft = (windows, total) => (total == null ? windows : { ...(windows ?? {}), total });
+import { cachedFleetModelVerdict } from "../model-cap.js";
+import { validOrgBudgetPolicy, cachedOrgVerdict, cachedOrgRemaining } from "./org-budget.js";
 
 export function serviceUrl(value) {
   const url = new URL(value);
@@ -33,8 +31,8 @@ export function loadEnrollment(path) {
   if (!existsSync(path)) throw new Error("Enrollment not found. Use costcap enroll first.");
   const data = JSON.parse(readFileSync(path, "utf8"));
   serviceUrl(data.url);
-  // #267: a cache written before #261 may hold a legacy caps key; enforce the known caps.
-  if (data.policy) data.policy = dropLegacyCapKeys(data.policy).policy;
+  // #267: a cache written before #261 may hold an unknown caps.* key; enforce the known caps.
+  if (data && typeof data === "object") data.policy = stripLegacyCapKeys(data.policy).policy;
   if (!data.token || !data.agentId || validatePolicy(data.policy).length) throw new Error("Invalid enrollment cache; refusing to run");
   return data;
 }
@@ -182,33 +180,20 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         agent: data.agentSpend ? cachedAgentRemaining(data.agentSpend, policy(nowMs).caps, pending, nowMs, data.budgetPeriod) : null,
         team: data.team ? cachedTeamRemaining(data.team, pending, nowMs, data.budgetPeriod) : null,
         teamName: data.team?.name ?? null,
-        org: orgLeft(data.orgBudget ? cachedOrgRemaining(data.orgBudget, pending, nowMs, data.budgetPeriod) : null, cachedOrgTotalRemaining(data.orgTotal ?? null, pending)),
+        // #207: the caps behind those remainders, for the downgrade trigger.
+        agentCaps: data.agentSpend ? policy(nowMs).caps : null,
+        teamCaps: data.team?.caps ?? null,
       };
     },
-    // #244 (#268: plus week rules from model_caps_week): hosted modelCaps against the agent's fleet-wide per-model
-    // synced spend plus this host's unsynced receipts. No agent_spend.models: no-op.
+    // #244: hosted day/month modelCaps against agent_spend.models (every host) plus
+    // this host's unsynced receipts. A server without the models snapshot: the whole
+    // local ledger counts, in the org budget period.
     modelCheck(models, nowMs = Date.now()) {
-      if (!data.agentSpend?.models) return null;
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return cachedFleetModelVerdict(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod)
-        ?? cachedFleetModelTotalVerdict(data.agentSpend, data.modelCapsTotal ?? [], models, pending); // #286
-    },
-    // #272: fleet model remainders for --preflight (hosted day/month plus model_caps_week rules).
-    modelRemaining(models, nowMs = Date.now()) {
-      if (!data.agentSpend?.models) return [];
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return [...cachedFleetModelRemaining(data.agentSpend, [...(policy(nowMs).modelCaps ?? []), ...(data.modelCapsWeek ?? [])], models, pending, nowMs, data.budgetPeriod),
-        ...cachedFleetModelTotalRemaining(data.agentSpend, data.modelCapsTotal ?? [], models, pending)]; // #291
-    },
-    // #272: fleet tag remainders for --preflight (merged with local rules).
-    tagRemaining(tags, localRules = [], nowMs = Date.now()) {
-      if (!data.tagCaps && !data.tagCapsTotal) return [];
-      const synced = new Set(data.syncedIds ?? []);
-      const pending = loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id));
-      return [...(data.tagCaps ? cachedFleetTagRemaining(data.tagCaps, localRules, tags, pending, nowMs, data.budgetPeriod) : []),
-        ...cachedFleetTagTotalRemaining(data.tagCapsTotal ?? null, tags, pending)]; // #291
+      const rules = policy(nowMs).modelCaps;
+      if (!Array.isArray(rules) || !rules.length) return null;
+      const snapshot = data.agentSpend?.models ? data.agentSpend : null;
+      const synced = new Set(snapshot ? data.syncedIds ?? [] : []);
+      return cachedFleetModelVerdict(rules, snapshot, models, loadSettledReceipts(receiptsPath).filter((r) => !synced.has(r.id)), nowMs, data.budgetPeriod);
     },
     tagCaps: () => data.tagCaps ?? null,
     budgetPeriod: () => data.budgetPeriod ?? null,
@@ -259,7 +244,9 @@ export function createFleetClient({ path, receiptsPath, onPolicy = () => {}, onS
         await uploadRunEnds();
         const fetched = await request(data.url, data.token, "/v1/policy");
         // #268: week scopes arrive in additive fields; a pre-#268 server omits them (day/month enforced as before).
-        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, model_caps_total: modelCapsTotal = null, tag_caps_total: tagCapsTotal = null, org_budget_total: orgTotal = null, raise_week: raiseWeek = null, raise_total: raiseTotal = null, ...serverPolicy } = fetched ?? {};
+        const { team = null, agent_spend: agentSpend = null, settlements = [], tag_caps: legacyTagCaps = null, tag_caps_v2: tagCapsV2 = null, budget_period: budgetPeriod = null, org_budget: legacyOrgBudget = null, org_budget_v2: orgBudgetV2 = null, model_caps_week: modelCapsWeek = null, raise_week: raiseWeek = null, ...rawPolicy } = fetched ?? {};
+        // #267: a not-yet-migrated server may still send a legacy caps.* key; drop it.
+        const serverPolicy = stripLegacyCapKeys(rawPolicy).policy;
         // #271: active week raises arrive in raise_week and are folded back under raise.week.
         // #287: active total raises arrive in raise_total and are folded back under raise.total.
         if (raiseWeekError(raiseWeek) || raiseTotalError(raiseTotal)) throw new Error("Invalid fleet policy response");

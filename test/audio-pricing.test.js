@@ -97,6 +97,9 @@ test("pricing show prints per-minute and per-character units", () => {
   const all = pricingCommand(["show"]).out;
   assert.match(all, /whisper-1: \$0\.006 per minute of audio/);
   assert.match(all, /tts-1-hd: \$30 per 1M characters of input text/);
+  // #273: GPT-Live bills session time per second at $0.05/minute.
+  assert.match(all, /gpt-live-1: \$0\.05 per minute of session time/);
+  assert.equal(isPricedModel("gpt-live-1"), true);
   assert.match(pricingCommand(["show", "gpt-4o-mini-transcribe"]).out, /input \$1\.25, .*output \$5/);
 });
 
@@ -192,4 +195,16 @@ test("AC5 e2e: a 5 MB multipart reaches upstream byte-for-byte; malformed multip
   const m = await harness(t, json({ text: "hi", usage: { type: "duration", seconds: 1 } }));
   assert.equal((await m.post("transcriptions", multipart([["model", "whisper-1"]]), "multipart/form-data")).status, 200);
   assert.deepEqual([m.receipts()[0].model, m.receipts()[0].reason], ["unknown", "usage_unavailable"]);
+});
+
+// #273: gpt-live-1 is priced per minute of session time; `costcap pricing` lists it.
+test("#273 gpt-live-1 row: $0.05/minute, shown by costcap pricing", async () => {
+  const { lookupPrice } = await import("../src/pricing.js");
+  const { spawnSync } = await import("node:child_process");
+  const p = lookupPrice("gpt-live-1");
+  assert.equal(p.per_minute, 0.05);
+  assert.equal(p.fallback, false);
+  const r = spawnSync(process.execPath, ["src/cli.js", "pricing", "show", "gpt-live-1"], { encoding: "utf8" });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /gpt-live-1: \$0\.05 per minute of session time/);
 });
